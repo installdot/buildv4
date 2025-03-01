@@ -112,26 +112,20 @@ BOOL verifyKeyWithAPI(NSString *key) {
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setHTTPBody:jsonData];
     
-    NSURLSession *session = [NSURLSession sharedSession];
-    __block BOOL success = NO;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    NSURLResponse *response = nil;
+    NSData *responseData = [NSURLConnection sendSynchronousRequest:request returningResponse:&response error:&error];
+    if (error) {
+        NSLog(@"[Tweak] API request error: %@", error.localizedDescription);
+        return NO;
+    }
     
-    [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *err) {
-        if (err) {
-            NSLog(@"[Tweak] API request error: %@", err.localizedDescription);
-        } else {
-            NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if ([responseDict[@"status"] isEqualToString:@"error"]) {
-                NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
-            } else {
-                success = YES;
-            }
-        }
-        dispatch_semaphore_signal(semaphore);
-    }] resume];
+    NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
+    if ([responseDict[@"status"] isEqualToString:@"error"]) {
+        NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
+        return NO;
+    }
     
-    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-    return success;
+    return YES;
 }
 
 // ---------------------------
@@ -164,10 +158,22 @@ void showKeyPrompt() {
         
         [alert addAction:submitAction];
         
-        // Fix for iOS 13+ (keyWindow deprecated)
-        UIWindow *window = [[UIApplication sharedApplication].connectedScenes allObjects].firstObject;
-        if ([window isKindOfClass:[UIWindowScene class]]) {
-            UIWindow *keyWindow = [(UIWindowScene *)window keyWindow];
+        // Get the window from connected scenes
+        UIWindow *keyWindow = nil;
+        UIWindowScene *windowScene = nil;
+        
+        // Iterate through connected scenes to find the window scene
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                windowScene = (UIWindowScene *)scene;
+                keyWindow = windowScene.keyWindow;
+                if (keyWindow) {
+                    break;  // Exit the loop once we find the key window
+                }
+            }
+        }
+        
+        if (keyWindow) {
             UIViewController *rootVC = keyWindow.rootViewController;
             [rootVC presentViewController:alert animated:YES completion:nil];
         }
@@ -226,10 +232,22 @@ void showFileMenu() {
         [alert addAction:replaceAction];
         [alert addAction:closeAction];
         
-        // Fix for iOS 13+ (keyWindow deprecated)
-        UIWindow *window = [[UIApplication sharedApplication].connectedScenes allObjects].firstObject;
-        if ([window isKindOfClass:[UIWindowScene class]]) {
-            UIWindow *keyWindow = [(UIWindowScene *)window keyWindow];
+        // Get the window from connected scenes
+        UIWindow *keyWindow = nil;
+        UIWindowScene *windowScene = nil;
+        
+        // Iterate through connected scenes to find the window scene
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                windowScene = (UIWindowScene *)scene;
+                keyWindow = windowScene.keyWindow;
+                if (keyWindow) {
+                    break;  // Exit the loop once we find the key window
+                }
+            }
+        }
+        
+        if (keyWindow) {
             UIViewController *rootVC = keyWindow.rootViewController;
             [rootVC presentViewController:alert animated:YES completion:nil];
         }
@@ -237,40 +255,10 @@ void showFileMenu() {
 }
 
 // ---------------------------
-// Gesture Handler Class
+// Main Entry
 // ---------------------------
-@interface GestureHandler : NSObject
-- (void)handleGesture:(UITapGestureRecognizer *)gesture;
-@end
-
-@implementation GestureHandler
-- (void)handleGesture:(UITapGestureRecognizer *)gesture {
-    showFileMenu();
+__attribute__((constructor))
+void entry() {
+    // Show the key input prompt
+    showKeyPrompt();
 }
-@end
-
-// ---------------------------
-// Hook UIApplication to install behavior
-// ---------------------------
-%hook UIApplication
-- (void)applicationDidBecomeActive:(UIApplication *)application {
-    %orig;
-    
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        // Show key prompt on app launch (only once)
-        showKeyPrompt();
-        
-        // Add the gesture recognizer to the key window.
-        UIWindow *window = [[UIApplication sharedApplication].connectedScenes allObjects].firstObject;
-        if ([window isKindOfClass:[UIWindowScene class]]) {
-            UIWindow *keyWindow = [(UIWindowScene *)window keyWindow];
-            GestureHandler *gestureHandler = [[GestureHandler alloc] init];
-            UITapGestureRecognizer *gestureRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:gestureHandler action:@selector(handleGesture:)];
-            gestureRecognizer.numberOfTapsRequired = 2;
-            gestureRecognizer.numberOfTouchesRequired = 3;
-            [keyWindow addGestureRecognizer:gestureRecognizer];
-        }
-    });
-}
-%end
