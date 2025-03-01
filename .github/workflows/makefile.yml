@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Dependencies
         run: |
@@ -32,7 +32,7 @@ jobs:
       - name: Build Tweak
         run: |
           # Ensure THEOS environment is available for make
-          source $HOME/theos/env
+          source $HOME/theos
           make
 
       - name: Output .dylib
