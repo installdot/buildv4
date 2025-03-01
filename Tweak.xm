@@ -62,7 +62,7 @@ NSData *aesDecrypt(NSData *cipherData, NSString *key, NSString *iv) {
 
 // Fetch and decrypt keys from remote URL
 NSArray *fetchDecryptedKeys() {
-    NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/installdot/verify/refs/heads/main/keys.txt?token=GHSAT0AAAAAAC6USNUTOJDLQNDPOW3SRTK4Z6CY5QQ"];
+    NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/installdot/verify/refs/heads/main/keys.txt"];
     NSError *error = nil;
     
     // Fetch the encrypted key list as a string (each line is a Base64 string)
