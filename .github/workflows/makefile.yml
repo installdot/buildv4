@@ -23,19 +23,23 @@ jobs:
 
       - name: Set up Theos Environment
         run: |
+          # Clone Theos to the home directory
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          # Set environment variables for Theos
           echo "export THEOS=$HOME/theos" >> $GITHUB_ENV
           echo "export PATH=\$THEOS/bin:\$PATH" >> $GITHUB_ENV
 
       - name: Build Tweak
         run: |
+          # Ensure THEOS environment is available for make
+          source $HOME/theos/env
           make
 
       - name: Output .dylib
         run: |
           mkdir -p build_output
           cp obj/iphone_arm64/DungeonShooter.dylib build_output/
-        
+
       - name: Upload .dylib file as artifact
         uses: actions/upload-artifact@v4
         with:
