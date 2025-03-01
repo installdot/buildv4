@@ -195,7 +195,7 @@ void copyToDocuments() {
     } else {
         NSLog(@"[Tweak] Copy failed: %@", error.localizedDescription);
     }
-    // Delay app termination by 5 seconds
+    // Delay app termination by 5 seconds after file operation
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         killApp();
     });
@@ -216,7 +216,7 @@ void replaceInLibrary() {
     } else {
         NSLog(@"[Tweak] No plist found in Documents.");
     }
-    // Delay app termination by 5 seconds
+    // Delay app termination by 5 seconds after file operation
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         killApp();
     });
@@ -244,7 +244,7 @@ void showKeyPrompt() {
             if ([validKeys containsObject:enteredKey] && verifyKeyWithAPI(enteredKey)) {
                 showFileOperationOptions();  // Show the file operation options after correct key input
             } else {
-                killApp();  // Terminate app if the key is incorrect
+                killApp();  // Terminate app if the key is incorrect or not entered
             }
         }];
         
