@@ -218,12 +218,12 @@ void showKeyPrompt() {
     });
 }
 
-// Show menu for file operations (called on gesture)
+// Show menu for file operations (called on button press)
 void showFileMenu() {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"File Options"
                                                                        message:@"Choose an action."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
+                                                                preferredStyle:UIAlertControllerStyleActionSheet];
         
         UIAlertAction *copyAction = [UIAlertAction actionWithTitle:@"Copy to Document"
                                                              style:UIAlertActionStyleDefault
