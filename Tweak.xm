@@ -1,273 +1,220 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <CommonCrypto/CommonCryptor.h>
-#import <sys/types.h>
-#import <signal.h>
+#import <SSZipArchive/SSZipArchive.h>
 
-// ---------------------------
-// Constants & Macros
-// ---------------------------
-#define AES_KEY @"tqhai2008tqhai20"   // 16 bytes key (AES-128)
-#define AES_IV  @"tqhai2008tqhai20"   // 16 bytes IV
-#define PREFS_PATH @"/Library/Preferences/com.ChillyRoom.DungeonShooter.plist"
-#define API_URL @"https://verify-ymx6.onrender.com/verify"  // <-- Replace with your API URL
+@interface CustomMenu : NSObject
 
-// ---------------------------
-// Utility Functions
-// ---------------------------
++ (void)addButtonsToAppAndShowInputDialog;
 
-// Terminate the app
-void killApp() {
-    pid_t pid = getpid();
-    kill(pid, SIGKILL);
+@end
+
+@implementation CustomMenu
+
++ (void)addButtonsToAppAndShowInputDialog {
+    // Create the "Enter ID" button
+    UIButton *inputButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    inputButton.frame = CGRectMake(10, 40, 100, 40);  // Position the button at the top-left
+    [inputButton setTitle:@"Enter ID" forState:UIControlStateNormal];
+    
+    // Add the button to the app's window
+    UIWindow *mainWindow = [UIApplication sharedApplication].keyWindow;
+    [mainWindow addSubview:inputButton];
+    
+    // Set up the action for the "Enter ID" button
+    [inputButton addTarget:self action:@selector(showInputDialogAndProcessFiles) forControlEvents:UIControlEventTouchUpInside];
+    
+    // Create the "Refresh" button below the "Enter ID" button
+    UIButton *refreshButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    refreshButton.frame = CGRectMake(10, 90, 100, 40);  // Position the button below the "Enter ID" button
+    [refreshButton setTitle:@"Refresh" forState:UIControlStateNormal];
+    
+    // Add the "Refresh" button to the app's window
+    [mainWindow addSubview:refreshButton];
+    
+    // Set up the action for the "Refresh" button
+    [refreshButton addTarget:self action:@selector(refreshApp) forControlEvents:UIControlEventTouchUpInside];
 }
 
-// Get the app’s Documents directory
-NSString *getDocumentsPath() {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    return paths.firstObject;
-}
-
-// AES Decryption (AES-128-CBC with PKCS7 Padding)
-NSData *aesDecrypt(NSData *cipherData, NSString *key, NSString *iv) {
-    char keyPtr[kCCKeySizeAES128+1] = {0};
-    char ivPtr[kCCBlockSizeAES128+1] = {0};
++ (void)showInputDialogAndProcessFiles {
+    // Display an input alert to get the ID
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Input ID"
+                                                                   message:@"Enter the ID"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
     
-    [key getCString:keyPtr maxLength:sizeof(keyPtr) encoding:NSUTF8StringEncoding];
-    [iv getCString:ivPtr maxLength:sizeof(ivPtr) encoding:NSUTF8StringEncoding];
-    
-    size_t decryptedSize = cipherData.length + kCCBlockSizeAES128;
-    void *decryptedBuffer = malloc(decryptedSize);
-    size_t numBytesDecrypted = 0;
-    
-    CCCryptorStatus status = CCCrypt(kCCDecrypt,
-                                     kCCAlgorithmAES128,
-                                     kCCOptionPKCS7Padding,
-                                     keyPtr,
-                                     kCCKeySizeAES128,
-                                     ivPtr,
-                                     cipherData.bytes,
-                                     cipherData.length,
-                                     decryptedBuffer,
-                                     decryptedSize,
-                                     &numBytesDecrypted);
-    
-    if (status == kCCSuccess) {
-        return [NSData dataWithBytesNoCopy:decryptedBuffer length:numBytesDecrypted];
-    }
-    
-    free(decryptedBuffer);
-    return nil;
-}
-
-// Fetch and decrypt keys from remote URL
-NSArray *fetchDecryptedKeys() {
-    NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/installdot/verify/refs/heads/main/keys.txt"];
-    NSError *error = nil;
-    
-    // Fetch the encrypted key list as a string (each line is a Base64 string)
-    NSString *encryptedDataString = [NSString stringWithContentsOfURL:url encoding:NSUTF8StringEncoding error:&error];
-    if (error) {
-        NSLog(@"[Tweak] Error fetching keys: %@", error.localizedDescription);
-        return nil;
-    }
-    
-    NSArray *encryptedKeys = [encryptedDataString componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    NSMutableArray *decryptedKeys = [NSMutableArray array];
-    
-    for (NSString *encryptedKey in encryptedKeys) {
-        if (encryptedKey.length == 0)
-            continue;
-        NSData *encryptedData = [[NSData alloc] initWithBase64EncodedString:encryptedKey options:0];
-        NSData *decryptedData = aesDecrypt(encryptedData, AES_KEY, AES_IV);
-        if (decryptedData) {
-            NSString *decryptedKey = [[NSString alloc] initWithData:decryptedData encoding:NSUTF8StringEncoding];
-            if (decryptedKey) {
-                [decryptedKeys addObject:decryptedKey];
-            }
-        }
-    }
-    return decryptedKeys;
-}
-
-// Get device UUID
-NSString *getDeviceUUID() {
-    return [[[UIDevice currentDevice] identifierForVendor] UUIDString];
-}
-
-// Send UUID and key to the API for verification using NSURLSession
-BOOL verifyKeyWithAPI(NSString *key) {
-    NSString *uuid = getDeviceUUID();
-    NSDictionary *jsonDict = @{@"uuid": uuid, @"key": key};
-    
-    NSError *error;
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:jsonDict options:0 error:&error];
-    if (!jsonData) {
-        NSLog(@"[Tweak] JSON serialization error: %@", error.localizedDescription);
-        return NO;
-    }
-    
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:API_URL]];
-    [request setHTTPMethod:@"POST"];
-    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [request setHTTPBody:jsonData];
-    
-    __block BOOL isVerified = NO;
-    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-    
-    NSURLSessionDataTask *dataTask = [[NSURLSession sharedSession]
-       dataTaskWithRequest:request
-         completionHandler:^(NSData * _Nullable responseData, NSURLResponse * _Nullable response, NSError * _Nullable err) {
-        if (err) {
-            NSLog(@"[Tweak] API request error: %@", err.localizedDescription);
-            isVerified = NO;
-        } else {
-            NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
-            if ([responseDict[@"status"] isEqualToString:@"error"]) {
-                NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
-                isVerified = NO;
-            } else {
-                isVerified = YES;
-            }
-        }
-        dispatch_semaphore_signal(sema);
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = @"Enter ID here";
     }];
     
-    [dataTask resume];
-    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
-    return isVerified;
-}
-
-// ---------------------------
-// UI Functions
-// ---------------------------
-
-// Helper function to get the key window from connected scenes (iOS 13+)
-UIWindow *getKeyWindow() {
-    UIWindow *keyWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            UIWindowScene *windowScene = (UIWindowScene *)scene;
-            keyWindow = windowScene.keyWindow;
-            if (keyWindow) {
-                break;
-            }
-        }
-    }
-    return keyWindow;
-}
-
-// Create a button for file operation options (copy and replace)
-UIButton *copyButton;
-UIButton *replaceButton;
-
-void showFileOperationOptions() {
-    if (copyButton && replaceButton) {
-        return; // Buttons already exist
-    }
-
-    // Copy to Document button
-    copyButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    copyButton.frame = CGRectMake(100, 200, 200, 50);  // Position this button on screen
-    [copyButton setTitle:@"Copy to Document" forState:UIControlStateNormal];
-    [copyButton addTarget:nil action:@selector(copyToDocuments) forControlEvents:UIControlEventTouchUpInside];
-
-    // Replace in Library button
-    replaceButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    replaceButton.frame = CGRectMake(100, 260, 200, 50);  // Position this button on screen
-    [replaceButton setTitle:@"Replace in Library" forState:UIControlStateNormal];
-    [replaceButton addTarget:nil action:@selector(replaceInLibrary) forControlEvents:UIControlEventTouchUpInside];
-
-    UIWindow *keyWindow = getKeyWindow();
-    if (keyWindow) {
-        UIViewController *rootVC = keyWindow.rootViewController;
-        [rootVC.view addSubview:copyButton];
-        [rootVC.view addSubview:replaceButton];
-    }
-}
-
-// Copy to Documents
-void copyToDocuments() {
-    NSString *destPath = [getDocumentsPath() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
-    NSError *error = nil;
-    if ([[NSFileManager defaultManager] copyItemAtPath:PREFS_PATH toPath:destPath error:&error]) {
-        NSLog(@"[Tweak] Plist copied to Documents.");
-    } else {
-        NSLog(@"[Tweak] Copy failed: %@", error.localizedDescription);
-    }
-    // Delay app termination by 5 seconds after file operation
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        killApp();
-    });
-}
-
-// Replace in Library
-void replaceInLibrary() {
-    NSString *srcPath = [getDocumentsPath() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
-    NSError *error = nil;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:srcPath]) {
-        // Remove the original file, then copy from Documents
-        if ([[NSFileManager defaultManager] removeItemAtPath:PREFS_PATH error:nil] &&
-            [[NSFileManager defaultManager] copyItemAtPath:srcPath toPath:PREFS_PATH error:&error]) {
-            NSLog(@"[Tweak] Plist replaced in Library.");
-        } else {
-            NSLog(@"[Tweak] Replace failed: %@", error.localizedDescription);
-        }
-    } else {
-        NSLog(@"[Tweak] No plist found in Documents.");
-    }
-    // Delay app termination by 5 seconds after file operation
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        killApp();
-    });
-}
-
-// Show key input prompt to verify key
-void showKeyPrompt() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Enter Key"
-                                                                       message:@"Please enter the correct key to continue."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel"
+                                                           style:UIAlertActionStyleCancel
+                                                         handler:nil];
+    
+    UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"OK"
+                                                       style:UIAlertActionStyleDefault
+                                                     handler:^(UIAlertAction * _Nonnull action) {
+        // Get the input ID
+        NSString *inputID = alert.textFields.firstObject.text;
         
-        [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-            textField.placeholder = @"Enter Key";
-            textField.secureTextEntry = YES;
-        }];
-        
-        UIAlertAction *submitAction = [UIAlertAction actionWithTitle:@"Submit"
-                                                               style:UIAlertActionStyleDefault
-                                                             handler:^(UIAlertAction *action) {
-            UITextField *textField = alert.textFields.firstObject;
-            NSString *enteredKey = textField.text;
-            NSArray *validKeys = fetchDecryptedKeys();
+        if (inputID.length > 0) {
+            // Delete existing .data files before unzipping
+            [self deleteExistingDataFiles];
             
-            if ([validKeys containsObject:enteredKey] && verifyKeyWithAPI(enteredKey)) {
-                showFileOperationOptions();  // Show the file operation options after correct key input
-            } else {
-                killApp();  // Terminate app if the key is incorrect or not entered
-            }
-        }];
-        
-        [alert addAction:submitAction];
-        
-        UIWindow *keyWindow = getKeyWindow();
-        if (keyWindow) {
-            UIViewController *rootVC = keyWindow.rootViewController;
-            [rootVC presentViewController:alert animated:YES completion:nil];
+            // Delete com.ChillyRoom.DungeonShooter.plist file
+            [self deletePlistFile];
+            
+            // Read, modify XML, and convert it into a binary plist file
+            [self modifyXmlAndConvertToPlistWithID:inputID];
+            
+            // Unzip and process the files
+            [self unzipAndRenameFilesWithInputID:inputID];
         }
-        
-        // Terminate the app after 30 seconds if no correct input is received
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            killApp();
-        });
-    });
+    }];
+    
+    [alert addAction:cancelAction];
+    [alert addAction:okAction];
+    
+    // Present the alert
+    UIViewController *rootViewController = [[UIApplication sharedApplication].keyWindow rootViewController];
+    [rootViewController presentViewController:alert animated:YES completion:nil];
 }
 
-// ---------------------------
-// Main Entry
-// ---------------------------
-__attribute__((constructor))
-void entry() {
-    // Show the key input prompt on launch
-    showKeyPrompt();
++ (void)deleteExistingDataFiles {
+    NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *unzippedDestination = [documentsPath stringByAppendingPathComponent:@"unzipped"];
+    
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSError *error = nil;
+    
+    // Get the list of files in the destination folder
+    NSArray *unzippedFiles = [fileManager contentsOfDirectoryAtPath:unzippedDestination error:&error];
+    
+    if (error) {
+        NSLog(@"Error reading contents of folder: %@", error.localizedDescription);
+        return;
+    }
+    
+    // Delete all .data files
+    for (NSString *fileName in unzippedFiles) {
+        if ([fileName hasSuffix:@".data"]) {
+            NSString *filePath = [unzippedDestination stringByAppendingPathComponent:fileName];
+            [fileManager removeItemAtPath:filePath error:&error];
+            
+            if (error) {
+                NSLog(@"Error deleting file: %@", error.localizedDescription);
+            } else {
+                NSLog(@"Deleted file: %@", fileName);
+            }
+        }
+    }
 }
+
++ (void)deletePlistFile {
+    // Delete the existing com.ChillyRoom.DungeonShooter.plist file
+    NSString *preferencesPath = @"/Library/Preferences/com.ChillyRoom.DungeonShooter.plist";
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    
+    NSError *error = nil;
+    if ([fileManager fileExistsAtPath:preferencesPath]) {
+        [fileManager removeItemAtPath:preferencesPath error:&error];
+        
+        if (error) {
+            NSLog(@"Error deleting plist file: %@", error.localizedDescription);
+        } else {
+            NSLog(@"Deleted plist file: com.ChillyRoom.DungeonShooter.plist");
+        }
+    }
+}
+
++ (void)modifyXmlAndConvertToPlistWithID:(NSString *)inputID {
+    // Get the path to the XML file
+    NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *xmlPath = [documentsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.xml"];
+    
+    NSError *error = nil;
+    
+    // Read the XML file content
+    NSString *xmlContent = [NSString stringWithContentsOfFile:xmlPath encoding:NSUTF8StringEncoding error:&error];
+    
+    if (error) {
+        NSLog(@"Error reading XML file: %@", error.localizedDescription);
+        return;
+    }
+    
+    // Replace all occurrences of "123123123" with the input ID
+    xmlContent = [xmlContent stringByReplacingOccurrencesOfString:@"123123123" withString:inputID];
+    
+    // Convert the modified XML content into a dictionary
+    NSData *xmlData = [xmlContent dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *xmlDict = [NSPropertyListSerialization propertyListWithData:xmlData options:NSPropertyListMutableContainersAndLeaves format:nil error:&error];
+    
+    if (error) {
+        NSLog(@"Error converting XML to dictionary: %@", error.localizedDescription);
+        return;
+    }
+    
+    // Convert the dictionary into a binary .plist format
+    NSString *plistPath = [documentsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
+    [NSPropertyListSerialization writePropertyList:xmlDict toFile:plistPath format:NSPropertyListBinaryFormat_v1_0 error:&error];
+    
+    if (error) {
+        NSLog(@"Error writing binary plist file: %@", error.localizedDescription);
+    } else {
+        NSLog(@"Converted XML to binary plist and saved as com.ChillyRoom.DungeonShooter.plist");
+    }
+}
+
++ (void)unzipAndRenameFilesWithInputID:(NSString *)inputID {
+    NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *zipPath = [documentsPath stringByAppendingPathComponent:@"sample.zip"];
+    
+    // Step 1: Unzip the sample.zip
+    NSString *unzipDestination = [documentsPath stringByAppendingPathComponent:@"unzipped"];
+    [SSZipArchive unzipFileAtPath:zipPath toDestination:unzipDestination];
+    
+    // Step 2: Get the list of files and replace the random number in their names
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSArray *unzippedFiles = [fileManager contentsOfDirectoryAtPath:unzipDestination error:nil];
+    
+    for (NSString *fileName in unzippedFiles) {
+        if ([fileName hasSuffix:@".data"]) {
+            // Check if the file matches the pattern something_something_something_randomNumber_.data
+            NSArray *fileComponents = [fileName componentsSeparatedByString:@"_"];
+            
+            if (fileComponents.count >= 2) {
+                // The second-to-last part should be the random number (before the last "_")
+                NSString *randomNumberPart = fileComponents[fileComponents.count - 2]; // E.g., "123"
+                
+                if (randomNumberPart.length > 0) {
+                    // Replace the random number with the input ID
+                    NSMutableArray *modifiedComponents = [fileComponents mutableCopy];
+                    modifiedComponents[fileComponents.count - 2] = inputID; // Replace the random number part
+                    NSString *modifiedFileName = [modifiedComponents componentsJoinedByString:@"_"]; // Rebuild the file name
+                    
+                    // Ensure the filename ends with "_data" and not "_data_"
+                    modifiedFileName = [modifiedFileName stringByAppendingString:@".data"];
+                    
+                    NSString *oldFilePath = [unzippedDestination stringByAppendingPathComponent:fileName];
+                    NSString *newFilePath = [unzippedDestination stringByAppendingPathComponent:modifiedFileName];
+                    
+                    // Rename the file
+                    [fileManager moveItemAtPath:oldFilePath toPath:newFilePath error:nil];
+                }
+            }
+        }
+    }
+    
+    NSLog(@"File names modified and moved successfully.");
+}
+
++ (void)refreshApp {
+    // Method to restart the app by simulating a crash and re-launch
+    NSLog(@"App is refreshing...");
+
+    // Forcing the app to terminate (this is one way to simulate a "restart")
+    abort();  // This will crash the app and the system will automatically relaunch it
+
+    // Alternatively, for a graceful restart, you would need to restart the app from the home screen, 
+    // as iOS doesn’t allow apps to programmatically restart themselves. `abort()` is one way to force a crash.
+}
+
+@end
