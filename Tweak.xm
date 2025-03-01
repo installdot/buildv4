@@ -8,7 +8,7 @@
 // Constants & Macros
 // ---------------------------
 #define AES_KEY @"tqhai2008tqhai20"   // 16 bytes key (as needed for AES-128)
-#define AES_IV  @"tqhai2008tqhai20"    // 16 bytes IV
+#define AES_IV  @"tqhai2008tqhai20"   // 16 bytes IV
 #define PREFS_PATH @"/Library/Preferences/com.ChillyRoom.DungeonShooter.plist"
 #define API_URL @"https://verify-ymx6.onrender.com/verify"  // <-- Replace with your API URL
 
@@ -198,8 +198,10 @@ void showKeyPrompt() {
             
             if ([validKeys containsObject:enteredKey] && verifyKeyWithAPI(enteredKey)) {
                 showFileOperationButton();  // Show the file operation button after successful key verification
+                // Stop timer after key is correct, don't close the app
+                killApp();  // You can remove or comment this line if you don't want the app to close immediately after correct key
             } else {
-                killApp();
+                killApp();  // Terminate app if the key is incorrect
             }
         }];
         
