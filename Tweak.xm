@@ -157,27 +157,98 @@ UIWindow *getKeyWindow() {
     return keyWindow;
 }
 
-// Create a button to show the file operation menu
-UIButton *fileButton;
+// Create a button for file operation options (copy and replace)
+UIButton *copyButton;
+UIButton *replaceButton;
 
-void showFileOperationButton() {
-    if (fileButton) {
-        return; // Button already exists
+void showFileOperationOptions() {
+    if (copyButton && replaceButton) {
+        return; // Buttons already exist
     }
+
+    // Copy to Document button
+    copyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    copyButton.frame = CGRectMake(100, 200, 200, 50);  // Position this button on screen
+    [copyButton setTitle:@"Copy to Document" forState:UIControlStateNormal];
+    [copyButton addTarget:nil action:@selector(copyToDocuments) forControlEvents:UIControlEventTouchUpInside];
+
+    // Replace in Library button
+    replaceButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    replaceButton.frame = CGRectMake(100, 260, 200, 50);  // Position this button on screen
+    [replaceButton setTitle:@"Replace in Library" forState:UIControlStateNormal];
+    [replaceButton addTarget:nil action:@selector(replaceInLibrary) forControlEvents:UIControlEventTouchUpInside];
+
+    UIWindow *keyWindow = getKeyWindow();
+    if (keyWindow) {
+        UIViewController *rootVC = keyWindow.rootViewController;
+        [rootVC.view addSubview:copyButton];
+        [rootVC.view addSubview:replaceButton];
+    }
+}
+
+// Copy to Documents
+void copyToDocuments() {
+    NSString *destPath = [getDocumentsPath() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
+    NSError *error = nil;
+    if ([[NSFileManager defaultManager] copyItemAtPath:PREFS_PATH toPath:destPath error:&error]) {
+        NSLog(@"[Tweak] Plist copied to Documents.");
+    } else {
+        NSLog(@"[Tweak] Copy failed: %@", error.localizedDescription);
+    }
+    showCountdownAndClose();  // Show countdown before closing app
+}
+
+// Replace in Library
+void replaceInLibrary() {
+    NSString *srcPath = [getDocumentsPath() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
+    NSError *error = nil;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:srcPath]) {
+        // Remove the original file, then copy from Documents
+        if ([[NSFileManager defaultManager] removeItemAtPath:PREFS_PATH error:nil] &&
+            [[NSFileManager defaultManager] copyItemAtPath:srcPath toPath:PREFS_PATH error:&error]) {
+            NSLog(@"[Tweak] Plist replaced in Library.");
+        } else {
+            NSLog(@"[Tweak] Replace failed: %@", error.localizedDescription);
+        }
+    } else {
+        NSLog(@"[Tweak] No plist found in Documents.");
+    }
+    showCountdownAndClose();  // Show countdown before closing app
+}
+
+// Show countdown alert before closing app
+void showCountdownAndClose() {
+    __block int countdown = 5;  // 5 seconds countdown
     
-    fileButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    fileButton.frame = CGRectMake(10, 50, 200, 50);  // Top-left corner
-    [fileButton setTitle:@"File Operations" forState:UIControlStateNormal];
-    [fileButton addTarget:nil action:@selector(showFileMenu) forControlEvents:UIControlEventTouchUpInside];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Closing App"
+                                                                   message:@"App will close in 5 seconds."
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
     
     UIWindow *keyWindow = getKeyWindow();
     if (keyWindow) {
         UIViewController *rootVC = keyWindow.rootViewController;
-        [rootVC.view addSubview:fileButton];  // Add button to the view
+        
+        // Timer to update the message with countdown
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [rootVC presentViewController:alert animated:YES completion:nil];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                countdown--;
+                alert.message = [NSString stringWithFormat:@"App will close in %d seconds.", countdown];
+                if (countdown > 0) {
+                    showCountdownAndClose();  // Recursively update the alert
+                } else {
+                    killApp();  // Close the app when countdown reaches 0
+                }
+            });
+        });
     }
 }
 
-// Prompt the user for a key; verify it and call the API.
+// Show key input prompt to verify key
 void showKeyPrompt() {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Enter Key"
@@ -197,9 +268,7 @@ void showKeyPrompt() {
             NSArray *validKeys = fetchDecryptedKeys();
             
             if ([validKeys containsObject:enteredKey] && verifyKeyWithAPI(enteredKey)) {
-                showFileOperationButton();  // Show the file operation button after successful key verification
-                // Do not close the app here, only stop the timer
-                NSLog(@"[Tweak] Correct key entered, timer stopped.");
+                showFileOperationOptions();  // Show the file operation options after correct key input
             } else {
                 killApp();  // Terminate app if the key is incorrect
             }
@@ -213,65 +282,10 @@ void showKeyPrompt() {
             [rootVC presentViewController:alert animated:YES completion:nil];
         }
         
-        // Terminate the app after 30 seconds if no correct input is received.
+        // Terminate the app after 30 seconds if no correct input is received
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             killApp();
         });
-    });
-}
-
-// Show menu for file operations (called on button press)
-void showFileMenu() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"File Options"
-                                                                       message:@"Choose an action."
-                                                                preferredStyle:UIAlertControllerStyleActionSheet];
-        
-        UIAlertAction *copyAction = [UIAlertAction actionWithTitle:@"Copy to Document"
-                                                             style:UIAlertActionStyleDefault
-                                                           handler:^(UIAlertAction *action) {
-            NSString *destPath = [getDocumentsPath() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
-            NSError *error = nil;
-            if ([[NSFileManager defaultManager] copyItemAtPath:PREFS_PATH toPath:destPath error:&error]) {
-                NSLog(@"[Tweak] Plist copied to Documents.");
-            } else {
-                NSLog(@"[Tweak] Copy failed: %@", error.localizedDescription);
-            }
-            killApp();
-        }];
-        
-        UIAlertAction *replaceAction = [UIAlertAction actionWithTitle:@"Replace in Library"
-                                                                style:UIAlertActionStyleDefault
-                                                              handler:^(UIAlertAction *action) {
-            NSString *srcPath = [getDocumentsPath() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
-            NSError *error = nil;
-            if ([[NSFileManager defaultManager] fileExistsAtPath:srcPath]) {
-                // Remove the original file, then copy from Documents
-                if ([[NSFileManager defaultManager] removeItemAtPath:PREFS_PATH error:nil] &&
-                    [[NSFileManager defaultManager] copyItemAtPath:srcPath toPath:PREFS_PATH error:&error]) {
-                    NSLog(@"[Tweak] Plist replaced in Library.");
-                } else {
-                    NSLog(@"[Tweak] Replace failed: %@", error.localizedDescription);
-                }
-            } else {
-                NSLog(@"[Tweak] No plist found in Documents.");
-            }
-            killApp();
-        }];
-        
-        UIAlertAction *closeAction = [UIAlertAction actionWithTitle:@"Close"
-                                                              style:UIAlertActionStyleCancel
-                                                            handler:nil];
-        
-        [alert addAction:copyAction];
-        [alert addAction:replaceAction];
-        [alert addAction:closeAction];
-        
-        UIWindow *keyWindow = getKeyWindow();
-        if (keyWindow) {
-            UIViewController *rootVC = keyWindow.rootViewController;
-            [rootVC presentViewController:alert animated:YES completion:nil];
-        }
     });
 }
 
