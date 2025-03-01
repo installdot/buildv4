@@ -95,7 +95,7 @@ NSString *getDeviceUUID() {
     return [[[UIDevice currentDevice] identifierForVendor] UUIDString];
 }
 
-// Send UUID and key to the API for verification
+// Send UUID and key to the API for verification using NSURLSession
 BOOL verifyKeyWithAPI(NSString *key) {
     NSString *uuid = getDeviceUUID();
     NSDictionary *jsonDict = @{@"uuid": uuid, @"key": key};
@@ -112,25 +112,50 @@ BOOL verifyKeyWithAPI(NSString *key) {
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setHTTPBody:jsonData];
     
-    NSURLResponse *response = nil;
-    NSData *responseData = [NSURLConnection sendSynchronousRequest:request returningResponse:&response error:&error];
-    if (error) {
-        NSLog(@"[Tweak] API request error: %@", error.localizedDescription);
-        return NO;
-    }
+    __block BOOL isVerified = NO;
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
     
-    NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
-    if ([responseDict[@"status"] isEqualToString:@"error"]) {
-        NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
-        return NO;
-    }
+    NSURLSessionDataTask *dataTask = [[NSURLSession sharedSession]
+       dataTaskWithRequest:request
+         completionHandler:^(NSData * _Nullable responseData, NSURLResponse * _Nullable response, NSError * _Nullable err) {
+        if (err) {
+            NSLog(@"[Tweak] API request error: %@", err.localizedDescription);
+            isVerified = NO;
+        } else {
+            NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
+            if ([responseDict[@"status"] isEqualToString:@"error"]) {
+                NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
+                isVerified = NO;
+            } else {
+                isVerified = YES;
+            }
+        }
+        dispatch_semaphore_signal(sema);
+    }];
     
-    return YES;
+    [dataTask resume];
+    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+    return isVerified;
 }
 
 // ---------------------------
 // UI Functions
 // ---------------------------
+
+// Helper function to get the key window from connected scenes (iOS 13+)
+UIWindow *getKeyWindow() {
+    UIWindow *keyWindow = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            keyWindow = windowScene.keyWindow;
+            if (keyWindow) {
+                break;
+            }
+        }
+    }
+    return keyWindow;
+}
 
 // Prompt the user for a key; verify it and call the API.
 void showKeyPrompt() {
@@ -158,21 +183,7 @@ void showKeyPrompt() {
         
         [alert addAction:submitAction];
         
-        // Get the window from connected scenes
-        UIWindow *keyWindow = nil;
-        UIWindowScene *windowScene = nil;
-        
-        // Iterate through connected scenes to find the window scene
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                windowScene = (UIWindowScene *)scene;
-                keyWindow = windowScene.keyWindow;
-                if (keyWindow) {
-                    break;  // Exit the loop once we find the key window
-                }
-            }
-        }
-        
+        UIWindow *keyWindow = getKeyWindow();
         if (keyWindow) {
             UIViewController *rootVC = keyWindow.rootViewController;
             [rootVC presentViewController:alert animated:YES completion:nil];
@@ -232,21 +243,7 @@ void showFileMenu() {
         [alert addAction:replaceAction];
         [alert addAction:closeAction];
         
-        // Get the window from connected scenes
-        UIWindow *keyWindow = nil;
-        UIWindowScene *windowScene = nil;
-        
-        // Iterate through connected scenes to find the window scene
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                windowScene = (UIWindowScene *)scene;
-                keyWindow = windowScene.keyWindow;
-                if (keyWindow) {
-                    break;  // Exit the loop once we find the key window
-                }
-            }
-        }
-        
+        UIWindow *keyWindow = getKeyWindow();
         if (keyWindow) {
             UIViewController *rootVC = keyWindow.rootViewController;
             [rootVC presentViewController:alert animated:YES completion:nil];
@@ -259,6 +256,6 @@ void showFileMenu() {
 // ---------------------------
 __attribute__((constructor))
 void entry() {
-    // Show the key input prompt
+    // Show the key input prompt on launch
     showKeyPrompt();
 }
