@@ -1,27 +1,43 @@
-name: Makefile CI
+name: Build Tweak
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: configure
-      run: ./configure
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang make libtool libssl-dev
 
-    - name: Install dependencies
-      run: make
+      - name: Set up Theos Environment
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "export THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "export PATH=\$THEOS/bin:\$PATH" >> $GITHUB_ENV
 
-    - name: Run check
-      run: make check
+      - name: Build Tweak
+        run: |
+          make
 
-    - name: Run distcheck
-      run: make distcheck
+      - name: Output .dylib
+        run: |
+          mkdir -p build_output
+          cp obj/iphone_arm64/DungeonShooter.dylib build_output/
+        
+      - name: Upload .dylib file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DungeonShooter.dylib
+          path: build_output/DungeonShooter.dylib
