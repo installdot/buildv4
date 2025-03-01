@@ -258,4 +258,22 @@ __attribute__((constructor))
 void entry() {
     // Show the key input prompt on launch
     showKeyPrompt();
+    
+    // Add a gesture recognizer for a 3-finger double-tap
+    UIWindow *keyWindow = getKeyWindow();
+    if (keyWindow) {
+        // Create the gesture recognizer
+        UITapGestureRecognizer *tapRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:nil action:@selector(handleThreeFingerDoubleTap:)];
+        tapRecognizer.numberOfTouchesRequired = 3;  // Require 3 fingers
+        tapRecognizer.numberOfTapsRequired = 2;     // Require double tap
+        tapRecognizer.delegate = (id<UIGestureRecognizerDelegate>)keyWindow;
+        
+        // Add the gesture recognizer to the window
+        [keyWindow addGestureRecognizer:tapRecognizer];
+    }
+}
+
+// Handle 3-finger double-tap gesture
+- (void)handleThreeFingerDoubleTap:(UITapGestureRecognizer *)recognizer {
+    showFileMenu();  // Show the file menu when the gesture is recognized
 }
