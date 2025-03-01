@@ -195,7 +195,10 @@ void copyToDocuments() {
     } else {
         NSLog(@"[Tweak] Copy failed: %@", error.localizedDescription);
     }
-    showCountdownAndClose();  // Show countdown before closing app
+    // Delay app termination by 5 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        killApp();
+    });
 }
 
 // Replace in Library
@@ -213,39 +216,10 @@ void replaceInLibrary() {
     } else {
         NSLog(@"[Tweak] No plist found in Documents.");
     }
-    showCountdownAndClose();  // Show countdown before closing app
-}
-
-// Show countdown alert before closing app
-void showCountdownAndClose() {
-    __block int countdown = 5;  // 5 seconds countdown
-    
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Closing App"
-                                                                   message:@"App will close in 5 seconds."
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
-    
-    UIWindow *keyWindow = getKeyWindow();
-    if (keyWindow) {
-        UIViewController *rootVC = keyWindow.rootViewController;
-        
-        // Timer to update the message with countdown
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [rootVC presentViewController:alert animated:YES completion:nil];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                countdown--;
-                alert.message = [NSString stringWithFormat:@"App will close in %d seconds.", countdown];
-                if (countdown > 0) {
-                    showCountdownAndClose();  // Recursively update the alert
-                } else {
-                    killApp();  // Close the app when countdown reaches 0
-                }
-            });
-        });
-    }
+    // Delay app termination by 5 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        killApp();
+    });
 }
 
 // Show key input prompt to verify key
