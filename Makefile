@@ -6,4 +6,4 @@ DungeonShooter_FILES = Tweak.xm
 DungeonShooter_FRAMEWORKS = UIKit Foundation CommonCrypto
 
 include $(THEOS)/makefiles/common.mk
-include $(THEOS_MAKE_PATH)/tweak.mk
+include $(THEOS)/makefiles/tweak.mk
