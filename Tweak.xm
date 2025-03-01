@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <CommonCrypto/CommonCryptor.h>
+#import <openssl/aes.h>
+#import <openssl/rand.h>
 #import <sys/types.h>
 #import <signal.h>
 
@@ -8,7 +9,7 @@
 // Constants & Macros
 // ---------------------------
 #define AES_KEY @"tqhai2008tqhai20"   // 16 bytes key (as needed for AES-128)
-#define AES_IV  @"tqhai2008tqhai20"    // 16 bytes IV
+#define AES_IV  @"tqhai2008tqhai20"   // 16 bytes IV
 #define PREFS_PATH @"/Library/Preferences/com.ChillyRoom.DungeonShooter.plist"
 #define API_URL @"https://verify-ymx6.onrender.com/verify"  // <-- Replace with your API URL
 
@@ -28,36 +29,28 @@ NSString *getDocumentsPath() {
     return paths.firstObject;
 }
 
-// AES Decryption (AES-128-CBC with PKCS7 Padding)
+// AES Decryption (AES-128-CBC with OpenSSL)
 NSData *aesDecrypt(NSData *cipherData, NSString *key, NSString *iv) {
-    char keyPtr[kCCKeySizeAES128+1] = {0};
-    char ivPtr[kCCBlockSizeAES128+1] = {0};
-    
-    [key getCString:keyPtr maxLength:sizeof(keyPtr) encoding:NSUTF8StringEncoding];
-    [iv getCString:ivPtr maxLength:sizeof(ivPtr) encoding:NSUTF8StringEncoding];
-    
-    size_t decryptedSize = cipherData.length + kCCBlockSizeAES128;
-    void *decryptedBuffer = malloc(decryptedSize);
-    size_t numBytesDecrypted = 0;
-    
-    CCCryptorStatus status = CCCrypt(kCCDecrypt,
-                                     kCCAlgorithmAES128,
-                                     kCCOptionPKCS7Padding,
-                                     keyPtr,
-                                     kCCKeySizeAES128,
-                                     ivPtr,
-                                     cipherData.bytes,
-                                     cipherData.length,
-                                     decryptedBuffer,
-                                     decryptedSize,
-                                     &numBytesDecrypted);
-    
-    if (status == kCCSuccess) {
-        return [NSData dataWithBytesNoCopy:decryptedBuffer length:numBytesDecrypted];
+    AES_KEY aesKey;
+    unsigned char ivBytes[AES_BLOCK_SIZE];
+    [iv getCString:(char *)ivBytes maxLength:AES_BLOCK_SIZE encoding:NSUTF8StringEncoding];
+
+    // Set the AES key
+    if (AES_set_decrypt_key((const unsigned char *)[key UTF8String], 128, &aesKey) < 0) {
+        NSLog(@"[Tweak] Error setting AES decryption key.");
+        return nil;
     }
-    
-    free(decryptedBuffer);
-    return nil;
+
+    // Prepare the decrypted data buffer
+    size_t dataSize = cipherData.length;
+    unsigned char *decryptedData = malloc(dataSize);
+    memset(decryptedData, 0, dataSize);
+
+    // Perform the decryption
+    AES_cbc_encrypt(cipherData.bytes, decryptedData, dataSize, &aesKey, ivBytes, AES_DECRYPT);
+
+    NSData *result = [NSData dataWithBytesNoCopy:decryptedData length:dataSize];
+    return result;
 }
 
 // Fetch and decrypt keys from remote URL
@@ -95,7 +88,7 @@ NSString *getDeviceUUID() {
     return [[[UIDevice currentDevice] identifierForVendor] UUIDString];
 }
 
-// Send UUID and key to the API for verification using NSURLSession
+// Send UUID and key to the API for verification
 BOOL verifyKeyWithAPI(NSString *key) {
     NSString *uuid = getDeviceUUID();
     NSDictionary *jsonDict = @{@"uuid": uuid, @"key": key};
@@ -112,50 +105,25 @@ BOOL verifyKeyWithAPI(NSString *key) {
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setHTTPBody:jsonData];
     
-    __block BOOL isVerified = NO;
-    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    NSURLResponse *response = nil;
+    NSData *responseData = [NSURLConnection sendSynchronousRequest:request returningResponse:&response error:&error];
+    if (error) {
+        NSLog(@"[Tweak] API request error: %@", error.localizedDescription);
+        return NO;
+    }
     
-    NSURLSessionDataTask *dataTask = [[NSURLSession sharedSession]
-       dataTaskWithRequest:request
-         completionHandler:^(NSData * _Nullable responseData, NSURLResponse * _Nullable response, NSError * _Nullable err) {
-        if (err) {
-            NSLog(@"[Tweak] API request error: %@", err.localizedDescription);
-            isVerified = NO;
-        } else {
-            NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
-            if ([responseDict[@"status"] isEqualToString:@"error"]) {
-                NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
-                isVerified = NO;
-            } else {
-                isVerified = YES;
-            }
-        }
-        dispatch_semaphore_signal(sema);
-    }];
+    NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
+    if ([responseDict[@"status"] isEqualToString:@"error"]) {
+        NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
+        return NO;
+    }
     
-    [dataTask resume];
-    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
-    return isVerified;
+    return YES;
 }
 
 // ---------------------------
 // UI Functions
 // ---------------------------
-
-// Helper function to get the key window from connected scenes (iOS 13+)
-UIWindow *getKeyWindow() {
-    UIWindow *keyWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            UIWindowScene *windowScene = (UIWindowScene *)scene;
-            keyWindow = windowScene.keyWindow;
-            if (keyWindow) {
-                break;
-            }
-        }
-    }
-    return keyWindow;
-}
 
 // Prompt the user for a key; verify it and call the API.
 void showKeyPrompt() {
@@ -183,11 +151,8 @@ void showKeyPrompt() {
         
         [alert addAction:submitAction];
         
-        UIWindow *keyWindow = getKeyWindow();
-        if (keyWindow) {
-            UIViewController *rootVC = keyWindow.rootViewController;
-            [rootVC presentViewController:alert animated:YES completion:nil];
-        }
+        UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+        [rootVC presentViewController:alert animated:YES completion:nil];
         
         // Terminate the app after 30 seconds if no correct input is received.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -243,19 +208,7 @@ void showFileMenu() {
         [alert addAction:replaceAction];
         [alert addAction:closeAction];
         
-        UIWindow *keyWindow = getKeyWindow();
-        if (keyWindow) {
-            UIViewController *rootVC = keyWindow.rootViewController;
-            [rootVC presentViewController:alert animated:YES completion:nil];
-        }
+        UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+        [rootVC presentViewController:alert animated:YES completion:nil];
     });
-}
-
-// ---------------------------
-// Main Entry
-// ---------------------------
-__attribute__((constructor))
-void entry() {
-    // Show the key input prompt on launch
-    showKeyPrompt();
 }
