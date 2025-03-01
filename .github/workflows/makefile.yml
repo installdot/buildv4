@@ -1,47 +1,80 @@
-name: Build Tweak
+name: Build iOS Tweak
 
 on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Dependencies
+      - name: Set up dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang make libtool libssl-dev
+          git clone --recursive https://github.com/theos/theos.git
+          export THEOS=$(pwd)/theos
+          export PATH=$THEOS/bin:$PATH
+          echo "Theos installation complete."
 
-      - name: Set up Theos Environment
+      - name: Install Homebrew
         run: |
-          # Clone Theos to the home directory
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          # Set environment variables for Theos
-          echo "export THEOS=$HOME/theos" >> $GITHUB_ENV
-          echo "export PATH=\$THEOS/bin:\$PATH" >> $GITHUB_ENV
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "export PATH=/usr/local/bin:$PATH" >> ~/.bash_profile
+          source ~/.bash_profile
 
-      - name: Build Tweak
+      - name: Install ldid
         run: |
-          # Ensure THEOS environment is available for make
-          source $HOME/theos
+          brew install ldid
+
+      - name: Set up environment variables
+        run: |
+          echo "TARGET=iphone:clang:latest:7.0" >> $GITHUB_ENV  # Adjust this if targeting a different iOS version
+          echo "THEOS=$PWD/theos" >> $GITHUB_ENV
+          echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Find Tweak.xm file
+        id: find_tweak_xm
+        run: |
+          TWEAK_XM_PATH=$(find . -name 'Tweak.xm' -print -quit)
+
+          if [ -z "$TWEAK_XM_PATH" ]; then
+            echo "Tweak.xm not found!"
+            exit 1
+          fi
+
+          echo "Tweak.xm found at $TWEAK_XM_PATH"
+          echo "tweak_xm=$TWEAK_XM_PATH" >> $GITHUB_ENV
+
+      - name: Build the Tweak
+        run: |
+          TWEAK_XM_PATH="${{ env.tweak_xm }}"
+          MAKEFILE_DIR=$(dirname "$TWEAK_XM_PATH")
+          cd "$MAKEFILE_DIR"
+
+          echo "Building tweak with Tweak.xm in directory: $MAKEFILE_DIR"
+          make clean
           make
 
-      - name: Output .dylib
+      - name: Find and Upload the generated .dylib
+        id: find_dylib
         run: |
-          mkdir -p build_output
-          cp obj/iphone_arm64/DungeonShooter.dylib build_output/
+          # Search for the generated .dylib file anywhere in the workspace
+          DYLIB_PATH=$(find . -type f -name "*.dylib" -print -quit)
 
-      - name: Upload .dylib file as artifact
+          if [ -z "$DYLIB_PATH" ]; then
+            echo "No .dylib file found!"
+            exit 1
+          fi
+
+          echo "Found .dylib at: $DYLIB_PATH"
+          echo "dylib_path=$DYLIB_PATH" >> $GITHUB_ENV
+
+      - name: Upload the generated .dylib
         uses: actions/upload-artifact@v4
         with:
-          name: DungeonShooter.dylib
-          path: build_output/DungeonShooter.dylib
+          name: Tweak-dylib
+          path: "${{ env.dylib_path }}"
