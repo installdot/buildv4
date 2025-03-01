@@ -15,3 +15,9 @@ ARCHS = arm64
 
 # Include the common makefiles from Theos
 include $(THEOS)/makefiles/common.mk
+
+# Define clean rule (make sure we can clean previous builds)
+clean::
+	@echo "Cleaning build files..."
+	@rm -rf $(THEOS_OBJ_DIR)
+	@rm -rf $(THEOS_BUILD_DIR)
