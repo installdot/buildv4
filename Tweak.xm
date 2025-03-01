@@ -112,20 +112,26 @@ BOOL verifyKeyWithAPI(NSString *key) {
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     [request setHTTPBody:jsonData];
     
-    NSURLResponse *response = nil;
-    NSData *responseData = [NSURLConnection sendSynchronousRequest:request returningResponse:&response error:&error];
-    if (error) {
-        NSLog(@"[Tweak] API request error: %@", error.localizedDescription);
-        return NO;
-    }
+    NSURLSession *session = [NSURLSession sharedSession];
+    __block BOOL success = NO;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     
-    NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:responseData options:0 error:nil];
-    if ([responseDict[@"status"] isEqualToString:@"error"]) {
-        NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
-        return NO;
-    }
+    [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *err) {
+        if (err) {
+            NSLog(@"[Tweak] API request error: %@", err.localizedDescription);
+        } else {
+            NSDictionary *responseDict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if ([responseDict[@"status"] isEqualToString:@"error"]) {
+                NSLog(@"[Tweak] API verification failed: %@", responseDict[@"message"]);
+            } else {
+                success = YES;
+            }
+        }
+        dispatch_semaphore_signal(semaphore);
+    }] resume];
     
-    return YES;
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    return success;
 }
 
 // ---------------------------
@@ -158,8 +164,13 @@ void showKeyPrompt() {
         
         [alert addAction:submitAction];
         
-        UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-        [rootVC presentViewController:alert animated:YES completion:nil];
+        // Fix for iOS 13+ (keyWindow deprecated)
+        UIWindow *window = [[UIApplication sharedApplication].connectedScenes allObjects].firstObject;
+        if ([window isKindOfClass:[UIWindowScene class]]) {
+            UIWindow *keyWindow = [(UIWindowScene *)window keyWindow];
+            UIViewController *rootVC = keyWindow.rootViewController;
+            [rootVC presentViewController:alert animated:YES completion:nil];
+        }
         
         // Terminate the app after 30 seconds if no correct input is received.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -215,8 +226,13 @@ void showFileMenu() {
         [alert addAction:replaceAction];
         [alert addAction:closeAction];
         
-        UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-        [rootVC presentViewController:alert animated:YES completion:nil];
+        // Fix for iOS 13+ (keyWindow deprecated)
+        UIWindow *window = [[UIApplication sharedApplication].connectedScenes allObjects].firstObject;
+        if ([window isKindOfClass:[UIWindowScene class]]) {
+            UIWindow *keyWindow = [(UIWindowScene *)window keyWindow];
+            UIViewController *rootVC = keyWindow.rootViewController;
+            [rootVC presentViewController:alert animated:YES completion:nil];
+        }
     });
 }
 
@@ -246,14 +262,14 @@ void showFileMenu() {
         showKeyPrompt();
         
         // Add the gesture recognizer to the key window.
-        UIWindow *window = [UIApplication sharedApplication].keyWindow;
-        if (window) {
-            // Create a GestureHandler instance to act as the target.
+        UIWindow *window = [[UIApplication sharedApplication].connectedScenes allObjects].firstObject;
+        if ([window isKindOfClass:[UIWindowScene class]]) {
+            UIWindow *keyWindow = [(UIWindowScene *)window keyWindow];
             GestureHandler *gestureHandler = [[GestureHandler alloc] init];
             UITapGestureRecognizer *gestureRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:gestureHandler action:@selector(handleGesture:)];
             gestureRecognizer.numberOfTapsRequired = 2;
             gestureRecognizer.numberOfTouchesRequired = 3;
-            [window addGestureRecognizer:gestureRecognizer];
+            [keyWindow addGestureRecognizer:gestureRecognizer];
         }
     });
 }
