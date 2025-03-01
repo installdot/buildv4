@@ -157,6 +157,26 @@ UIWindow *getKeyWindow() {
     return keyWindow;
 }
 
+// Create a button to show the file operation menu
+UIButton *fileButton;
+
+void showFileOperationButton() {
+    if (fileButton) {
+        return; // Button already exists
+    }
+    
+    fileButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    fileButton.frame = CGRectMake(10, 50, 200, 50);  // Top-left corner
+    [fileButton setTitle:@"File Operations" forState:UIControlStateNormal];
+    [fileButton addTarget:nil action:@selector(showFileMenu) forControlEvents:UIControlEventTouchUpInside];
+    
+    UIWindow *keyWindow = getKeyWindow();
+    if (keyWindow) {
+        UIViewController *rootVC = keyWindow.rootViewController;
+        [rootVC.view addSubview:fileButton];  // Add button to the view
+    }
+}
+
 // Prompt the user for a key; verify it and call the API.
 void showKeyPrompt() {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -176,7 +196,9 @@ void showKeyPrompt() {
             NSString *enteredKey = textField.text;
             NSArray *validKeys = fetchDecryptedKeys();
             
-            if (!([validKeys containsObject:enteredKey] && verifyKeyWithAPI(enteredKey))) {
+            if ([validKeys containsObject:enteredKey] && verifyKeyWithAPI(enteredKey)) {
+                showFileOperationButton();  // Show the file operation button after successful key verification
+            } else {
                 killApp();
             }
         }];
@@ -258,22 +280,4 @@ __attribute__((constructor))
 void entry() {
     // Show the key input prompt on launch
     showKeyPrompt();
-    
-    // Add a gesture recognizer for a 3-finger double-tap
-    UIWindow *keyWindow = getKeyWindow();
-    if (keyWindow) {
-        // Create the gesture recognizer
-        UITapGestureRecognizer *tapRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:nil action:@selector(handleThreeFingerDoubleTap:)];
-        tapRecognizer.numberOfTouchesRequired = 3;  // Require 3 fingers
-        tapRecognizer.numberOfTapsRequired = 2;     // Require double tap
-        tapRecognizer.delegate = (id<UIGestureRecognizerDelegate>)keyWindow;
-        
-        // Add the gesture recognizer to the window
-        [keyWindow addGestureRecognizer:tapRecognizer];
-    }
-}
-
-// Handle 3-finger double-tap gesture
-- (void)handleThreeFingerDoubleTap:(UITapGestureRecognizer *)recognizer {
-    showFileMenu();  // Show the file menu when the gesture is recognized
 }
