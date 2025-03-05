@@ -15,6 +15,7 @@
         self.layer.masksToBounds = YES;
 
         self.webView = [[WKWebView alloc] initWithFrame:self.bounds];
+        self.webView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [self addSubview:self.webView];
 
         NSURL *url = [NSURL URLWithString:@"https://google.com"];
@@ -22,6 +23,13 @@
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
         [self addGestureRecognizer:pan];
+
+        UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        closeButton.frame = CGRectMake(self.bounds.size.width - 30, 5, 25, 25);
+        closeButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+        [closeButton setTitle:@"X" forState:UIControlStateNormal];
+        [closeButton addTarget:self action:@selector(closeBrowser) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:closeButton];
     }
     return self;
 }
@@ -32,13 +40,27 @@
     [gesture setTranslation:CGPointZero inView:self.superview];
 }
 
+- (void)closeBrowser {
+    [self removeFromSuperview];
+}
+
 @end
 
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
 
-    FloatingBrowser *browser = [[FloatingBrowser alloc] initWithFrame:CGRectMake(50, 100, 300, 400)];
-    [[UIApplication sharedApplication].keyWindow addSubview:browser];
+    UIWindow *keyWindow = nil;
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            keyWindow = scene.windows.firstObject;
+            break;
+        }
+    }
+
+    if (keyWindow) {
+        FloatingBrowser *browser = [[FloatingBrowser alloc] initWithFrame:CGRectMake(50, 100, 300, 400)];
+        [keyWindow addSubview:browser];
+    }
 }
 %end
