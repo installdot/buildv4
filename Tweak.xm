@@ -1,66 +1,44 @@
-#import <UIKit/UIKit.h>
-#import <WebKit/WebKit.h>
+#import <Foundation/Foundation.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 
-@interface FloatingBrowser : UIView
-@property (nonatomic, strong) WKWebView *webView;
-@end
+static IOPMAssertionID assertionID = 0;
 
-@implementation FloatingBrowser
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.backgroundColor = [UIColor whiteColor];
-        self.layer.cornerRadius = 10;
-        self.layer.masksToBounds = YES;
-
-        self.webView = [[WKWebView alloc] initWithFrame:self.bounds];
-        self.webView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [self addSubview:self.webView];
-
-        NSURL *url = [NSURL URLWithString:@"https://google.com"];
-        [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [self addGestureRecognizer:pan];
-
-        UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        closeButton.frame = CGRectMake(self.bounds.size.width - 30, 5, 25, 25);
-        closeButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-        [closeButton setTitle:@"X" forState:UIControlStateNormal];
-        [closeButton addTarget:self action:@selector(closeBrowser) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:closeButton];
+void preventSleep() {
+    if (assertionID == 0) {
+        IOPMAssertionCreateWithName(kIOPMAssertionTypeNoIdleSleep,
+                                    kIOPMAssertionLevelOn,
+                                    CFSTR("Preventing Sleep for Google Cloud Shell"),
+                                    &assertionID);
+        NSLog(@"[NoSleepCloudShell] Sleep prevention activated.");
     }
-    return self;
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:self.superview];
+void allowSleep() {
+    if (assertionID != 0) {
+        IOPMAssertionRelease(assertionID);
+        assertionID = 0;
+        NSLog(@"[NoSleepCloudShell] Sleep prevention disabled.");
+    }
 }
 
-- (void)closeBrowser {
-    [self removeFromSuperview];
-}
+%hook UIApplication
 
-@end
-
-%hook SpringBoard
+// Prevent sleep when the app starts
 - (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
-
-    UIWindow *keyWindow = nil;
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            keyWindow = scene.windows.firstObject;
-            break;
-        }
-    }
-
-    if (keyWindow) {
-        FloatingBrowser *browser = [[FloatingBrowser alloc] initWithFrame:CGRectMake(50, 100, 300, 400)];
-        [keyWindow addSubview:browser];
-    }
+    preventSleep();
 }
+
+// Keep preventing sleep when app becomes active
+- (void)applicationDidBecomeActive:(UIApplication *)application {
+    %orig;
+    preventSleep();
+}
+
+// Allow sleep only when the app is fully terminated
+- (void)applicationWillTerminate:(UIApplication *)application {
+    %orig;
+    allowSleep();
+}
+
 %end
