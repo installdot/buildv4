@@ -1,16 +1,8 @@
-// Required Imports
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <AVFoundation/AVFoundation.h>
-#import <MediaPlayer/MediaPlayer.h>
 #import <QuartzCore/QuartzCore.h>
-
-// Optional class forward declarations
-@class AVPlayer;
-@class MPMoviePlayerController;
-@class WKWebView;
-@class CADisplayLink;
 
 // AVPlayer: Speed up playback to 100x
 %hook AVPlayer
@@ -20,19 +12,6 @@
 }
 
 - (float)rate {
-    return 100.0;
-}
-
-%end
-
-// MPMoviePlayerController: Legacy API (some apps still use it)
-%hook MPMoviePlayerController
-
-- (void)setPlaybackRate:(float)rate {
-    %orig(100.0);
-}
-
-- (float)playbackRate {
     return 100.0;
 }
 
@@ -56,11 +35,11 @@
 
 %end
 
-// CADisplayLink: Boost frame rate rendering (optional visual boost)
+// CADisplayLink: Optional boost to frame rate
 %hook CADisplayLink
 
 - (void)setPreferredFramesPerSecond:(NSInteger)fps {
-    %orig(fps * 100); // Force 100x frame rate
+    %orig(fps * 100); // Boost
 }
 
 %end
