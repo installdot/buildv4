@@ -1,17 +1,48 @@
-#import <UIKit/UIKit.h>
+%hook AVPlayer
 
-%hook UIViewController
+- (void)setRate:(float)rate {
+    %orig(100.0);
+}
 
-- (void)viewDidLayoutSubviews {
+- (float)rate {
+    return 100.0;
+}
+
+%end
+
+%hook MPMoviePlayerController
+
+- (void)setPlaybackRate:(float)rate {
+    %orig(100.0);
+}
+
+- (float)playbackRate {
+    return 100.0;
+}
+
+%end
+
+%hook WKWebView
+
+- (void)didMoveToWindow {
     %orig;
 
-    UIView *mainView = self.view;
-    CGRect frame = mainView.frame;
+    NSString *js = @"setInterval(function(){\
+        var vids = document.getElementsByTagName('video');\
+        for(var i=0;i<vids.length;i++){\
+            vids[i].playbackRate = 100.0;\
+        }\
+    }, 500);";
 
-    if (frame.size.width < 500) {
-        frame.size.width = 500;
-        mainView.frame = frame;
-    }
+    [self evaluateJavaScript:js completionHandler:nil];
+}
+
+%end
+
+%hook CADisplayLink
+
+- (void)setPreferredFramesPerSecond:(NSInteger)fps {
+    %orig(fps * 100);
 }
 
 %end
