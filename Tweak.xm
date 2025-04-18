@@ -8,11 +8,11 @@
 %hook AVPlayer
 
 - (void)setRate:(float)rate {
-    %orig(100.0); // Force 100x speed
+    %orig(5.0); // Force 100x speed
 }
 
 - (float)rate {
-    return 100.0;
+    return 5.0;
 }
 
 %end
@@ -26,7 +26,7 @@
     NSString *js = @"setInterval(function(){\
         var vids = document.getElementsByTagName('video');\
         for(var i=0;i<vids.length;i++){\
-            vids[i].playbackRate = 100.0;\
+            vids[i].playbackRate = 5.0;\
         }\
     }, 500);";
 
@@ -39,7 +39,7 @@
 %hook CADisplayLink
 
 - (void)setPreferredFramesPerSecond:(NSInteger)fps {
-    %orig(fps * 100); // Boost
+    %orig(fps * 5); // Boost
 }
 
 %end
