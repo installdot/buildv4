@@ -55,21 +55,35 @@
 }
 
 - (void)simulateTapAtPoint:(CGPoint)point {
-    UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *keyWindow = app.keyWindow;
+    // Get the active window
+    UIWindow *activeWindow = nil;
+    for (UIWindowScene *windowScene in [UIApplication sharedApplication].connectedScenes) {
+        if (windowScene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *window in windowScene.windows) {
+                if (window.isKeyWindow) {
+                    activeWindow = window;
+                    break;
+                }
+            }
+        }
+    }
 
+    if (!activeWindow) {
+        activeWindow = [UIApplication sharedApplication].windows.firstObject;
+    }
+
+    // Create and dispatch touch events
     UIEvent *event = [[UIEvent alloc] init];
     UITouch *touch = [[UITouch alloc] init];
 
     object_setInstanceVariable(touch, "_locationInWindow", &point);
     object_setInstanceVariable(touch, "_phase", (void *)UITouchPhaseBegan);
-    object_setInstanceVariable(touch, "_window", (__bridge void *)keyWindow);
+    object_setInstanceVariable(touch, "_window", (__bridge void *)activeWindow);
 
-    NSSet *touches = [NSSet setWithObject:touch];
-    [app sendEvent:event];
+    [[UIApplication sharedApplication] sendEvent:event];
 
     object_setInstanceVariable(touch, "_phase", (void *)UITouchPhaseEnded);
-    [app sendEvent:event];
+    [[UIApplication sharedApplication] sendEvent:event];
 }
 
 @end
