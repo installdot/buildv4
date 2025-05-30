@@ -1,101 +1,166 @@
 #import <UIKit/UIKit.h>
-#include <objc/runtime.h>
+#import <IOKit/hid/IOHIDEventSystem.h>
+#import <dlfcn.h>
 
-@interface TweakWindow : UIWindow
-@property (nonatomic, strong) UIView *circleView;
-@property (nonatomic, strong) UIButton *clickButton;
-@property (nonatomic, assign) CGPoint circleCenter;
-@end
+static UIWindow *overlayWindow;
+static UIButton *startStopBtn;
+static UIView *targetView;
+static NSTimer *clickTimer;
+static BOOL isClicking = NO;
+static CGPoint clickPoint = {100, 300};
 
-@implementation TweakWindow
+// Declare required IOHID functions
+static void *(*IOHIDEventSystemCreate)(CFAllocatorRef allocator);
+static void *(*IOHIDEventCreateDigitizerEvent)(
+    CFAllocatorRef allocator,
+    AbsoluteTime timeStamp,
+    uint32_t transducer,
+    uint32_t index,
+    uint32_t identity,
+    uint32_t eventMask,
+    uint32_t buttonMask,
+    float x,
+    float y,
+    float z,
+    float tipPressure,
+    float twist,
+    boolean_t range,
+    boolean_t touch,
+    IOOptionBits options
+);
+static void (*IOHIDEventSystemOpen)(void *eventSystem, void *context, void *callback, void *refcon);
+static void (*IOHIDEventSystemSetProperty)(void *eventSystem, CFStringRef key, CFTypeRef value);
+static void (*IOHIDEventSystemDispatchEvent)(void *eventSystem, void *event);
 
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.windowLevel = UIWindowLevelStatusBar + 100;
-        self.backgroundColor = [UIColor clearColor];
-        [self setupUI];
+void loadIOHIDSymbols() {
+    void *ioKit = dlopen("/System/Library/PrivateFrameworks/IOKit.framework/IOKit", RTLD_NOW);
+    if (!ioKit) return;
+
+    IOHIDEventSystemCreate = dlsym(ioKit, "IOHIDEventSystemCreate");
+    IOHIDEventCreateDigitizerEvent = dlsym(ioKit, "IOHIDEventCreateDigitizerEvent");
+    IOHIDEventSystemOpen = dlsym(ioKit, "IOHIDEventSystemOpen");
+    IOHIDEventSystemSetProperty = dlsym(ioKit, "IOHIDEventSystemSetProperty");
+    IOHIDEventSystemDispatchEvent = dlsym(ioKit, "IOHIDEventSystemDispatchEvent");
+}
+
+void simulateTouch(CGPoint point) {
+    void *hidSystem = IOHIDEventSystemCreate(kCFAllocatorDefault);
+    if (!hidSystem) return;
+
+    AbsoluteTime now = mach_absolute_time();
+    IOHIDEventRef downEvent = IOHIDEventCreateDigitizerEvent(
+        kCFAllocatorDefault,
+        now,
+        0, 0, 0,
+        kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange,
+        1,
+        point.x, point.y, 0,
+        1.0, 0,
+        true, true,
+        0
+    );
+
+    IOHIDEventRef upEvent = IOHIDEventCreateDigitizerEvent(
+        kCFAllocatorDefault,
+        now,
+        0, 0, 0,
+        kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange,
+        0,
+        point.x, point.y, 0,
+        0.0, 0,
+        true, false,
+        0
+    );
+
+    IOHIDEventSystemDispatchEvent(hidSystem, downEvent);
+    IOHIDEventSystemDispatchEvent(hidSystem, upEvent);
+
+    CFRelease(downEvent);
+    CFRelease(upEvent);
+    CFRelease(hidSystem);
+}
+
+void startClicking() {
+    if (clickTimer) return;
+    isClicking = YES;
+    clickTimer = [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        simulateTouch(clickPoint);
+    }];
+}
+
+void stopClicking() {
+    isClicking = NO;
+    [clickTimer invalidate];
+    clickTimer = nil;
+}
+
+void toggleClicking() {
+    if (isClicking) {
+        stopClicking();
+        [startStopBtn setTitle:@"▶️" forState:UIControlStateNormal];
+    } else {
+        startClicking();
+        [startStopBtn setTitle:@"⏹️" forState:UIControlStateNormal];
     }
-    return self;
 }
 
-- (void)setupUI {
-    // Create draggable circle
-    self.circleView = [[UIView alloc] initWithFrame:CGRectMake(100, 100, 50, 50)];
-    self.circleView.backgroundColor = [UIColor redColor];
-    self.circleView.layer.cornerRadius = 25;
-    self.circleView.userInteractionEnabled = YES;
+void setupUI() {
+    if (overlayWindow) return;
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [self.circleView addGestureRecognizer:pan];
+    overlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    overlayWindow.windowLevel = UIWindowLevelAlert + 100;
+    overlayWindow.backgroundColor = [UIColor clearColor];
+    overlayWindow.hidden = NO;
 
-    // Create button
-    self.clickButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.clickButton.frame = CGRectMake(20, 20, 100, 40);
-    [self.clickButton setTitle:@"Click Here" forState:UIControlStateNormal];
-    [self.clickButton addTarget:self action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
-    self.clickButton.backgroundColor = [UIColor whiteColor];
-    self.clickButton.layer.cornerRadius = 5;
+    UIViewController *vc = [UIViewController new];
+    overlayWindow.rootViewController = vc;
+    overlayWindow.hidden = NO;
 
-    [self addSubview:self.circleView];
-    [self addSubview:self.clickButton];
+    // Start/Stop Button
+    startStopBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    startStopBtn.frame = CGRectMake(40, 100, 60, 60);
+    startStopBtn.layer.cornerRadius = 30;
+    startStopBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+    [startStopBtn setTitle:@"▶️" forState:UIControlStateNormal];
+    [startStopBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [startStopBtn addTarget:nil action:@selector(_toggleClicking) forControlEvents:UIControlEventTouchUpInside];
+    [vc.view addSubview:startStopBtn];
+
+    // Target circle
+    targetView = [[UIView alloc] initWithFrame:CGRectMake(clickPoint.x, clickPoint.y, 40, 40)];
+    targetView.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.6];
+    targetView.layer.cornerRadius = 20;
+    targetView.userInteractionEnabled = YES;
+    [vc.view addSubview:targetView];
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(_dragTarget:)];
+    [targetView addGestureRecognizer:pan];
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self];
-    UIView *view = gesture.view;
-    view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
-    self.circleCenter = view.center;
-    [gesture setTranslation:CGPointZero inView:self];
-}
+%hook UIApplication
 
-- (void)buttonTapped {
-    // Simulate tap at circle's center
-    [self simulateTapAtPoint:self.circleCenter];
-}
-
-- (void)simulateTapAtPoint:(CGPoint)point {
-    // Get the active window
-    UIWindow *activeWindow = nil;
-    for (UIWindowScene *windowScene in [UIApplication sharedApplication].connectedScenes) {
-        if (windowScene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *window in windowScene.windows) {
-                if (window.isKeyWindow) {
-                    activeWindow = window;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!activeWindow) {
-        activeWindow = [UIApplication sharedApplication].windows.firstObject;
-    }
-
-    // Create and dispatch touch events
-    UIEvent *event = [[UIEvent alloc] init];
-    UITouch *touch = [[UITouch alloc] init];
-
-    object_setInstanceVariable(touch, "_locationInWindow", &point);
-    object_setInstanceVariable(touch, "_phase", (void *)UITouchPhaseBegan);
-    object_setInstanceVariable(touch, "_window", (__bridge void *)activeWindow);
-
-    [[UIApplication sharedApplication] sendEvent:event];
-
-    object_setInstanceVariable(touch, "_phase", (void *)UITouchPhaseEnded);
-    [[UIApplication sharedApplication] sendEvent:event];
-}
-
-@end
-
-%hook SpringBoard
-
-- (void)applicationDidFinishLaunching:(id)application {
+- (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
-
-    // Create tweak window
-    TweakWindow *tweakWindow = [[TweakWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    tweakWindow.hidden = NO;
+    loadIOHIDSymbols();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        setupUI();
+    });
 }
 
 %end
+
+// Additional helper methods
+
+%new
+void _toggleClicking() {
+    toggleClicking();
+}
+
+%new
+void _dragTarget(UIPanGestureRecognizer *gesture) {
+    UIView *view = gesture.view;
+    CGPoint translation = [gesture translationInView:view.superview];
+    view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
+    [gesture setTranslation:CGPointZero inView:view.superview];
+    clickPoint = view.center;
+}
