@@ -1,138 +1,94 @@
-#import <UIKit/UIKit.h>
-#import <IOKit/hid/IOHIDEventSystem.h>
-#import <mach/mach_time.h>
-
-static UIWindow *overlayWindow;
-static UIButton *startStopBtn;
-static UIView *targetView;
-static NSTimer *clickTimer;
-static BOOL isClicking = NO;
-static CGPoint clickPoint = {100, 300};
-
-AbsoluteTime getAbsoluteTime() {
-    uint64_t machTime = mach_absolute_time();
-    AbsoluteTime absTime;
-    absTime.lo = (uint32_t)(machTime & 0xFFFFFFFF);
-    absTime.hi = (uint32_t)(machTime >> 32);
-    return absTime;
-}
-
-void simulateTouch(CGPoint point) {
-    IOHIDEventSystemRef system = IOHIDEventSystemCreate(kCFAllocatorDefault);
-    if (!system) return;
-
-    AbsoluteTime now = getAbsoluteTime();
-
-    IOHIDEventRef downEvent = IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault,
-        now,
-        kIOHIDDigitizerTransducerTypeFinger,
-        0, 0,
-        kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange,
-        1,
-        point.x, point.y, 0,
-        1.0, 0,
-        true, true,
-        0
-    );
-
-    IOHIDEventRef upEvent = IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault,
-        now,
-        kIOHIDDigitizerTransducerTypeFinger,
-        0, 0,
-        kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange,
-        0,
-        point.x, point.y, 0,
-        0.0, 0,
-        true, false,
-        0
-    );
-
-    IOHIDEventSystemDispatchEvent(system, downEvent);
-    IOHIDEventSystemDispatchEvent(system, upEvent);
-
-    CFRelease(downEvent);
-    CFRelease(upEvent);
-    CFRelease(system);
-}
-
-void startClicking() {
-    if (clickTimer) return;
-    isClicking = YES;
-    clickTimer = [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES block:^(NSTimer * _Nonnull timer) {
-        simulateTouch(clickPoint);
-    }];
-}
-
-void stopClicking() {
-    isClicking = NO;
-    [clickTimer invalidate];
-    clickTimer = nil;
-}
-
-void toggleClicking() {
-    if (isClicking) {
-        stopClicking();
-        [startStopBtn setTitle:@"▶️" forState:UIControlStateNormal];
-    } else {
-        startClicking();
-        [startStopBtn setTitle:@"⏹️" forState:UIControlStateNormal];
-    }
-}
-
-void setupUI() {
-    if (overlayWindow) return;
-
-    overlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    overlayWindow.windowLevel = UIWindowLevelAlert + 100;
-    overlayWindow.backgroundColor = [UIColor clearColor];
-    overlayWindow.hidden = NO;
-
-    UIViewController *vc = [UIViewController new];
-    overlayWindow.rootViewController = vc;
-    overlayWindow.hidden = NO;
-
-    startStopBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    startStopBtn.frame = CGRectMake(40, 100, 60, 60);
-    startStopBtn.layer.cornerRadius = 30;
-    startStopBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
-    [startStopBtn setTitle:@"▶️" forState:UIControlStateNormal];
-    [startStopBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [startStopBtn addTarget:nil action:@selector(_toggleClicking) forControlEvents:UIControlEventTouchUpInside];
-    [vc.view addSubview:startStopBtn];
-
-    targetView = [[UIView alloc] initWithFrame:CGRectMake(clickPoint.x, clickPoint.y, 40, 40)];
-    targetView.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.6];
-    targetView.layer.cornerRadius = 20;
-    targetView.userInteractionEnabled = YES;
-    [vc.view addSubview:targetView];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(_dragTarget:)];
-    [targetView addGestureRecognizer:pan];
-}
-
-%hook UIApplication
-
-- (void)applicationDidFinishLaunching:(UIApplication *)application {
+%hook SpringBoard
+- (void)applicationDidFinishLaunching:(id)application {
     %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        setupUI();
-    });
+
+    // Create the main window for UI elements
+    UIWindow *window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    window.windowLevel = UIWindowLevelAlert + 1;
+    window.hidden = NO;
+
+    // Create the on/off button
+    UIButton *toggleButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    toggleButton.frame = CGRectMake(50, 50, 60, 60);
+    toggleButton.backgroundColor = [UIColor blueColor];
+    toggleButton.layer.cornerRadius = 30;
+    [toggleButton setTitle:@"OFF" forState:UIControlStateNormal];
+    [toggleButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    toggleButton.tag = 1; // Tag to identify button
+    [window addSubview:toggleButton];
+
+    // Create the dot view
+    UIView *dotView = [[UIView alloc] initWithFrame:CGRectMake(100, 100, 20, 20)];
+    dotView.backgroundColor = [UIColor redColor];
+    dotView.layer.cornerRadius = 10;
+    dotView.tag = 2; // Tag to identify dot
+    [window addSubview:dotView];
+
+    // Make button and dot draggable
+    UIPanGestureRecognizer *buttonPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [toggleButton addGestureRecognizer:buttonPan];
+    toggleButton.userInteractionEnabled = YES;
+
+    UIPanGestureRecognizer *dotPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [dotView addGestureRecognizer:dotPan];
+    dotView.userInteractionEnabled = YES;
+
+    // Handle button tap
+    [toggleButton addTarget:self action:@selector(toggleButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+    // Store window and timer in instance variables
+    objc_setAssociatedObject(self, "TweakWindow", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, "TweakTimer", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, "ToggleButton", toggleButton, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, "DotView", dotView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
+// Handle dragging of button and dot
 %new
-- (void)_toggleClicking {
-    toggleClicking();
-}
-
-%new
-- (void)_dragTarget:(UIPanGestureRecognizer *)gesture {
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
     UIView *view = gesture.view;
     CGPoint translation = [gesture translationInView:view.superview];
     view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
     [gesture setTranslation:CGPointZero inView:view.superview];
-    clickPoint = view.center;
 }
 
+// Handle button tap to start/stop timer
+%new
+- (void)toggleButtonTapped:(UIButton *)button {
+    NSTimer *timer = objc_getAssociatedObject(self, "TweakTimer");
+    if (timer && [timer isValid]) {
+        [timer invalidate];
+        objc_setAssociatedObject(self, "TweakTimer", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [button setTitle:@"OFF" forState:UIControlStateNormal];
+        button.backgroundColor = [UIColor blueColor];
+    } else {
+        timer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(simulateTap) userInfo:nil repeats:YES];
+        objc_setAssociatedObject(self, "TweakTimer", timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [button setTitle:@"ON" forState:UIControlStateNormal];
+        button.backgroundColor = [UIColor greenColor];
+    }
+}
+
+// Simulate tap at dot's location
+%new
+- (void)simulateTap {
+    UIView *dotView = objc_getAssociatedObject(self, "DotView");
+    CGPoint tapPoint = dotView.center;
+
+    // Simulate touch using private API (for jailbreak environment)
+    Class SBFrontDisplay = NSClassFromString(@"SBFrontDisplay");
+    if (SBFrontDisplay) {
+        id eventGenerator = [SBFrontDisplay performSelector:@selector(eventGenerator)];
+        if (eventGenerator) {
+            [eventGenerator performSelector:@selector(_sendEventToApp:withType:atPoint:) 
+                                withObject:nil 
+                                withObject:@(1) // Touch down
+                                withObject:[NSValue valueWithCGPoint:tapPoint]];
+            [eventGenerator performSelector:@selector(_sendEventToApp:withType:atPoint:) 
+                                withObject:nil 
+                                withObject:@(2) // Touch up
+                                withObject:[NSValue valueWithCGPoint:tapPoint]];
+        }
+    }
+}
 %end
