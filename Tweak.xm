@@ -1,3 +1,5 @@
+#import <UIKit/UIKit.h>
+
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
     %orig;
@@ -73,22 +75,22 @@
 %new
 - (void)simulateTap {
     UIView *dotView = objc_getAssociatedObject(self, "DotView");
+    UIWindow *window = objc_getAssociatedObject(self, "TweakWindow");
     CGPoint tapPoint = dotView.center;
 
-    // Simulate touch using private API (for jailbreak environment)
-    Class SBFrontDisplay = NSClassFromString(@"SBFrontDisplay");
-    if (SBFrontDisplay) {
-        id eventGenerator = [SBFrontDisplay performSelector:@selector(eventGenerator)];
-        if (eventGenerator) {
-            [eventGenerator performSelector:@selector(_sendEventToApp:withType:atPoint:) 
-                                withObject:nil 
-                                withObject:@(1) // Touch down
-                                withObject:[NSValue valueWithCGPoint:tapPoint]];
-            [eventGenerator performSelector:@selector(_sendEventToApp:withType:atPoint:) 
-                                withObject:nil 
-                                withObject:@(2) // Touch up
-                                withObject:[NSValue valueWithCGPoint:tapPoint]];
-        }
-    }
+    // Simulate touch event
+    UITouch *touch = [[UITouch alloc] init];
+    [touch setLocationInWindow:tapPoint];
+    [touch setPhase:UITouchPhaseBegan];
+
+    UIEvent *event = [[UIEvent alloc] init];
+    NSSet *touches = [NSSet setWithObject:touch];
+    [event performSelector:@selector(_setTouch:) withObject:touch];
+
+    [[UIApplication sharedApplication] sendEvent:event];
+
+    // Simulate touch end
+    [touch setPhase:UITouchPhaseEnded];
+    [[UIApplication sharedApplication] sendEvent:event];
 }
 %end
