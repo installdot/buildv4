@@ -1,6 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <IOKit/hid/IOHIDEventSystem.h>
-#import <dlfcn.h>
+#import <mach/mach_time.h>
 
 static UIWindow *overlayWindow;
 static UIButton *startStopBtn;
@@ -9,49 +9,25 @@ static NSTimer *clickTimer;
 static BOOL isClicking = NO;
 static CGPoint clickPoint = {100, 300};
 
-// Declare IOHID functions pointers
-static void *(*IOHIDEventSystemCreate)(CFAllocatorRef allocator);
-static IOHIDEventRef (*IOHIDEventCreateDigitizerEvent)(
-    CFAllocatorRef allocator,
-    AbsoluteTime timeStamp,
-    uint32_t transducer,
-    uint32_t index,
-    uint32_t identity,
-    uint32_t eventMask,
-    uint32_t buttonMask,
-    float x,
-    float y,
-    float z,
-    float tipPressure,
-    float twist,
-    boolean_t range,
-    boolean_t touch,
-    IOOptionBits options
-);
-static void (*IOHIDEventSystemDispatchEvent)(void *eventSystem, IOHIDEventRef event);
-
-void loadIOHIDSymbols() {
-    void *ioKit = dlopen("/System/Library/PrivateFrameworks/IOKit.framework/IOKit", RTLD_NOW);
-    if (!ioKit) return;
-
-    IOHIDEventSystemCreate = dlsym(ioKit, "IOHIDEventSystemCreate");
-    IOHIDEventCreateDigitizerEvent = dlsym(ioKit, "IOHIDEventCreateDigitizerEvent");
-    IOHIDEventSystemDispatchEvent = dlsym(ioKit, "IOHIDEventSystemDispatchEvent");
+AbsoluteTime getAbsoluteTime() {
+    uint64_t machTime = mach_absolute_time();
+    AbsoluteTime absTime;
+    absTime.lo = (uint32_t)(machTime & 0xFFFFFFFF);
+    absTime.hi = (uint32_t)(machTime >> 32);
+    return absTime;
 }
 
 void simulateTouch(CGPoint point) {
-    if (!IOHIDEventSystemCreate || !IOHIDEventCreateDigitizerEvent || !IOHIDEventSystemDispatchEvent) return;
+    IOHIDEventSystemRef system = IOHIDEventSystemCreate(kCFAllocatorDefault);
+    if (!system) return;
 
-    void *hidSystem = IOHIDEventSystemCreate(kCFAllocatorDefault);
-    if (!hidSystem) return;
+    AbsoluteTime now = getAbsoluteTime();
 
-    AbsoluteTime now = mach_absolute_time();
-
-    // Touch Down
     IOHIDEventRef downEvent = IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
         now,
-        0, 0, 0,
+        kIOHIDDigitizerTransducerTypeFinger,
+        0, 0,
         kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange,
         1,
         point.x, point.y, 0,
@@ -60,11 +36,11 @@ void simulateTouch(CGPoint point) {
         0
     );
 
-    // Touch Up
     IOHIDEventRef upEvent = IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
         now,
-        0, 0, 0,
+        kIOHIDDigitizerTransducerTypeFinger,
+        0, 0,
         kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange,
         0,
         point.x, point.y, 0,
@@ -73,12 +49,12 @@ void simulateTouch(CGPoint point) {
         0
     );
 
-    IOHIDEventSystemDispatchEvent(hidSystem, downEvent);
-    IOHIDEventSystemDispatchEvent(hidSystem, upEvent);
+    IOHIDEventSystemDispatchEvent(system, downEvent);
+    IOHIDEventSystemDispatchEvent(system, upEvent);
 
     CFRelease(downEvent);
     CFRelease(upEvent);
-    CFRelease(hidSystem);
+    CFRelease(system);
 }
 
 void startClicking() {
@@ -117,7 +93,6 @@ void setupUI() {
     overlayWindow.rootViewController = vc;
     overlayWindow.hidden = NO;
 
-    // Start/Stop Button
     startStopBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     startStopBtn.frame = CGRectMake(40, 100, 60, 60);
     startStopBtn.layer.cornerRadius = 30;
@@ -127,7 +102,6 @@ void setupUI() {
     [startStopBtn addTarget:nil action:@selector(_toggleClicking) forControlEvents:UIControlEventTouchUpInside];
     [vc.view addSubview:startStopBtn];
 
-    // Target circle view
     targetView = [[UIView alloc] initWithFrame:CGRectMake(clickPoint.x, clickPoint.y, 40, 40)];
     targetView.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.6];
     targetView.layer.cornerRadius = 20;
@@ -142,7 +116,6 @@ void setupUI() {
 
 - (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
-    loadIOHIDSymbols();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         setupUI();
     });
