@@ -1,4 +1,6 @@
 #import <UIKit/UIKit.h>
+#include <IOKit/hid/IOHIDEvent.h>
+#include <IOKit/hid/IOHIDEventQueue.h>
 
 %hook SpringBoard
 - (void)applicationDidFinishLaunching:(id)application {
@@ -71,26 +73,34 @@
     }
 }
 
-// Simulate tap at dot's location
+// Simulate tap at dot's location using IOHIDEvent
 %new
 - (void)simulateTap {
     UIView *dotView = objc_getAssociatedObject(self, "DotView");
-    UIWindow *window = objc_getAssociatedObject(self, "TweakWindow");
     CGPoint tapPoint = dotView.center;
 
-    // Simulate touch event
-    UITouch *touch = [[UITouch alloc] init];
-    [touch setLocationInWindow:tapPoint];
-    [touch setPhase:UITouchPhaseBegan];
+    // Create touch down event
+    IOHIDEventRef touchDown = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault, mach_absolute_time(),
+                                                             kIOHIDEventTypeDigitizer, 0, 0);
+    IOHIDEventSetPosition(touchDown, (IOHIDFloat)tapPoint.x, (IOHIDFloat)tapPoint.y);
+    IOHIDEventSetIntegerValue(touchDown, kIOHIDEventFieldDigitizerTouch, 1);
 
-    UIEvent *event = [[UIEvent alloc] init];
-    NSSet *touches = [NSSet setWithObject:touch];
-    [event performSelector:@selector(_setTouch:) withObject:touch];
+    // Create touch up event
+    IOHIDEventRef touchUp = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault, mach_absolute_time(),
+                                                           kIOHIDEventTypeDigitizer, 0, 0);
+    IOHIDEventSetPosition(touchUp, (IOHIDFloat)tapPoint.x, (IOHIDFloat)tapPoint.y);
+    IOHIDEventSetIntegerValue(touchUp, kIOHIDEventFieldDigitizerTouch, 0);
 
-    [[UIApplication sharedApplication] sendEvent:event];
+    // Send events to SpringBoard
+    Class SBApplicationController = NSClassFromString(@"SBApplicationController");
+    id appController = [SBApplicationController sharedInstance];
+    if (appController) {
+        [appController performSelector:@selector(_handleHIDEvent:) withObject:(__bridge id)touchDown];
+        [appController performSelector:@selector(_handleHIDEvent:) withObject:(__bridge id)touchUp];
+    }
 
-    // Simulate touch end
-    [touch setPhase:UITouchPhaseEnded];
-    [[UIApplication sharedApplication] sendEvent:event];
+    // Clean up
+    CFRelease(touchDown);
+    CFRelease(touchUp);
 }
 %end
