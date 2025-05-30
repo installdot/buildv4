@@ -9,9 +9,9 @@ static NSTimer *clickTimer;
 static BOOL isClicking = NO;
 static CGPoint clickPoint = {100, 300};
 
-// Declare required IOHID functions
+// Declare IOHID functions pointers
 static void *(*IOHIDEventSystemCreate)(CFAllocatorRef allocator);
-static void *(*IOHIDEventCreateDigitizerEvent)(
+static IOHIDEventRef (*IOHIDEventCreateDigitizerEvent)(
     CFAllocatorRef allocator,
     AbsoluteTime timeStamp,
     uint32_t transducer,
@@ -28,9 +28,7 @@ static void *(*IOHIDEventCreateDigitizerEvent)(
     boolean_t touch,
     IOOptionBits options
 );
-static void (*IOHIDEventSystemOpen)(void *eventSystem, void *context, void *callback, void *refcon);
-static void (*IOHIDEventSystemSetProperty)(void *eventSystem, CFStringRef key, CFTypeRef value);
-static void (*IOHIDEventSystemDispatchEvent)(void *eventSystem, void *event);
+static void (*IOHIDEventSystemDispatchEvent)(void *eventSystem, IOHIDEventRef event);
 
 void loadIOHIDSymbols() {
     void *ioKit = dlopen("/System/Library/PrivateFrameworks/IOKit.framework/IOKit", RTLD_NOW);
@@ -38,16 +36,18 @@ void loadIOHIDSymbols() {
 
     IOHIDEventSystemCreate = dlsym(ioKit, "IOHIDEventSystemCreate");
     IOHIDEventCreateDigitizerEvent = dlsym(ioKit, "IOHIDEventCreateDigitizerEvent");
-    IOHIDEventSystemOpen = dlsym(ioKit, "IOHIDEventSystemOpen");
-    IOHIDEventSystemSetProperty = dlsym(ioKit, "IOHIDEventSystemSetProperty");
     IOHIDEventSystemDispatchEvent = dlsym(ioKit, "IOHIDEventSystemDispatchEvent");
 }
 
 void simulateTouch(CGPoint point) {
+    if (!IOHIDEventSystemCreate || !IOHIDEventCreateDigitizerEvent || !IOHIDEventSystemDispatchEvent) return;
+
     void *hidSystem = IOHIDEventSystemCreate(kCFAllocatorDefault);
     if (!hidSystem) return;
 
     AbsoluteTime now = mach_absolute_time();
+
+    // Touch Down
     IOHIDEventRef downEvent = IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
         now,
@@ -60,6 +60,7 @@ void simulateTouch(CGPoint point) {
         0
     );
 
+    // Touch Up
     IOHIDEventRef upEvent = IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
         now,
@@ -126,7 +127,7 @@ void setupUI() {
     [startStopBtn addTarget:nil action:@selector(_toggleClicking) forControlEvents:UIControlEventTouchUpInside];
     [vc.view addSubview:startStopBtn];
 
-    // Target circle
+    // Target circle view
     targetView = [[UIView alloc] initWithFrame:CGRectMake(clickPoint.x, clickPoint.y, 40, 40)];
     targetView.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.6];
     targetView.layer.cornerRadius = 20;
@@ -147,20 +148,18 @@ void setupUI() {
     });
 }
 
-%end
-
-// Additional helper methods
-
 %new
-void _toggleClicking() {
+- (void)_toggleClicking {
     toggleClicking();
 }
 
 %new
-void _dragTarget(UIPanGestureRecognizer *gesture) {
+- (void)_dragTarget:(UIPanGestureRecognizer *)gesture {
     UIView *view = gesture.view;
     CGPoint translation = [gesture translationInView:view.superview];
     view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
     [gesture setTranslation:CGPointZero inView:view.superview];
     clickPoint = view.center;
 }
+
+%end
