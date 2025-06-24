@@ -21,7 +21,13 @@
 
         UIButton *startButton = [UIButton buttonWithType:UIButtonTypeSystem];
         [startButton setTitle:@"Start" forState:UIControlStateNormal];
-        startButton.frame = CGRectMake(100, 100, 80, 40);
+
+        CGFloat buttonWidth = 100;
+        CGFloat buttonHeight = 40;
+        CGFloat centerX = (keyWindow.bounds.size.width - buttonWidth) / 2.0;
+        CGFloat centerY = (keyWindow.bounds.size.height - buttonHeight) / 2.0;
+        startButton.frame = CGRectMake(centerX, centerY, buttonWidth, buttonHeight);
+
         startButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
         [startButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         startButton.layer.cornerRadius = 10;
