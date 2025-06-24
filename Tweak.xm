@@ -1,6 +1,5 @@
 #import <UIKit/UIKit.h>
 
-// Task function (token fetch + file operations)
 void performTokenTask(void) {
     NSLog(@"[+] Manual task started");
 
@@ -93,14 +92,12 @@ void performTokenTask(void) {
     [task resume];
 }
 
-// Hook UIApplication
 %hook UIApplication
 
 - (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // ✅ iOS 13+ scene-safe key window lookup
         UIWindow *keyWindow = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive &&
@@ -118,20 +115,31 @@ void performTokenTask(void) {
         }
 
         if (!keyWindow) {
-            NSLog(@"[!] No keyWindow found");
+            NSLog(@"[!] No key window found");
             return;
         }
 
+        // Create button
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
         [button setTitle:@"Start Task" forState:UIControlStateNormal];
         [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         button.backgroundColor = [UIColor systemBlueColor];
-        button.frame = CGRectMake(40, 100, 150, 50);
-        button.layer.cornerRadius = 10;
-        [button addTarget:self action:@selector(runManualTask) forControlEvents:UIControlEventTouchUpInside];
-        [keyWindow addSubview:button];
+        button.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        button.frame = CGRectMake(0, 0, 180, 60);
+        button.layer.cornerRadius = 12;
+        button.clipsToBounds = YES;
 
-        NSLog(@"[+] Button added");
+        // Center button
+        button.center = keyWindow.center;
+
+        // Add action
+        [button addTarget:self action:@selector(runManualTask) forControlEvents:UIControlEventTouchUpInside];
+
+        // Add to window
+        [keyWindow addSubview:button];
+        [keyWindow bringSubviewToFront:button];
+
+        NSLog(@"[+] Manual task button added to center");
     });
 }
 
