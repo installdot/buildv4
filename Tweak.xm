@@ -1,106 +1,132 @@
 #import <UIKit/UIKit.h>
-#include <IOKit/hid/IOHIDEvent.h>
-#include <IOKit/hid/IOHIDEventQueue.h>
 
-%hook SpringBoard
-- (void)applicationDidFinishLaunching:(id)application {
+%hook UIApplication
+
+- (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
 
-    // Create the main window for UI elements
-    UIWindow *window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    window.windowLevel = UIWindowLevelAlert + 1;
-    window.hidden = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *window = [UIApplication sharedApplication].keyWindow;
+        if (!window) return;
 
-    // Create the on/off button
-    UIButton *toggleButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    toggleButton.frame = CGRectMake(50, 50, 60, 60);
-    toggleButton.backgroundColor = [UIColor blueColor];
-    toggleButton.layer.cornerRadius = 30;
-    [toggleButton setTitle:@"OFF" forState:UIControlStateNormal];
-    [toggleButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    toggleButton.tag = 1; // Tag to identify button
-    [window addSubview:toggleButton];
+        UIButton *startButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        [startButton setTitle:@"Start" forState:UIControlStateNormal];
+        startButton.frame = CGRectMake(100, 100, 80, 40);
+        startButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+        [startButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        startButton.layer.cornerRadius = 10;
+        startButton.clipsToBounds = YES;
 
-    // Create the dot view
-    UIView *dotView = [[UIView alloc] initWithFrame:CGRectMake(100, 100, 20, 20)];
-    dotView.backgroundColor = [UIColor redColor];
-    dotView.layer.cornerRadius = 10;
-    dotView.tag = 2; // Tag to identify dot
-    [window addSubview:dotView];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleDrag:)];
+        [startButton addGestureRecognizer:pan];
 
-    // Make button and dot draggable
-    UIPanGestureRecognizer *buttonPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [toggleButton addGestureRecognizer:buttonPan];
-    toggleButton.userInteractionEnabled = YES;
+        [startButton addTarget:self action:@selector(startButtonTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    UIPanGestureRecognizer *dotPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [dotView addGestureRecognizer:dotPan];
-    dotView.userInteractionEnabled = YES;
-
-    // Handle button tap
-    [toggleButton addTarget:self action:@selector(toggleButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-
-    // Store window and timer in instance variables
-    objc_setAssociatedObject(self, "TweakWindow", window, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(self, "TweakTimer", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(self, "ToggleButton", toggleButton, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(self, "DotView", dotView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [window addSubview:startButton];
+    });
 }
 
-// Handle dragging of button and dot
 %new
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    UIView *view = gesture.view;
-    CGPoint translation = [gesture translationInView:view.superview];
-    view.center = CGPointMake(view.center.x + translation.x, view.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:view.superview];
+- (void)handleDrag:(UIPanGestureRecognizer *)gesture {
+    UIView *v = gesture.view;
+    CGPoint t = [gesture translationInView:v.superview];
+    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
+    [gesture setTranslation:CGPointZero inView:v.superview];
 }
 
-// Handle button tap to start/stop timer
 %new
-- (void)toggleButtonTapped:(UIButton *)button {
-    NSTimer *timer = objc_getAssociatedObject(self, "TweakTimer");
-    if (timer && [timer isValid]) {
-        [timer invalidate];
-        objc_setAssociatedObject(self, "TweakTimer", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [button setTitle:@"OFF" forState:UIControlStateNormal];
-        button.backgroundColor = [UIColor blueColor];
-    } else {
-        timer = [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(simulateTap) userInfo:nil repeats:YES];
-        objc_setAssociatedObject(self, "TweakTimer", timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [button setTitle:@"ON" forState:UIControlStateNormal];
-        button.backgroundColor = [UIColor greenColor];
-    }
+- (void)startButtonTapped {
+    NSLog(@"[+] Start button tapped");
+
+    NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/token.php?gen"];
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
+                                                             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) {
+            NSLog(@"[!] Request failed: %@", error);
+            return;
+        }
+
+        NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        NSLog(@"[+] Response: %@", respStr);
+
+        NSArray *parts = [respStr componentsSeparatedByString:@"|"];
+        if (parts.count != 2) {
+            NSLog(@"[!] Invalid response format");
+            return;
+        }
+
+        NSString *token = parts[0]; // 28410720410e46cba6f616752b2914ef
+        NSString *uid = parts[1];   // 191106925
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+
+        // Step 1: Copy and rename data files in Documents
+        NSArray *filenames = @[
+            @"item_data_1_.data",
+            @"season_data_1_.data",
+            @"statistic_1_.data",
+            @"weapon_evolution_data_1_.data"
+        ];
+
+        for (NSString *name in filenames) {
+            NSString *originalPath = [docsDir stringByAppendingPathComponent:name];
+            if (![fm fileExistsAtPath:originalPath]) {
+                NSLog(@"[!] File not found: %@", name);
+                continue;
+            }
+
+            NSString *newName = [name stringByReplacingOccurrencesOfString:@"1" withString:uid];
+            NSString *newPath = [docsDir stringByAppendingPathComponent:newName];
+
+            NSError *copyError = nil;
+            if ([fm copyItemAtPath:originalPath toPath:newPath error:&copyError]) {
+                NSLog(@"[+] Copied %@ → %@", name, newName);
+            } else {
+                NSLog(@"[!] Copy failed: %@", copyError);
+            }
+        }
+
+        // Step 2: Handle preferences in /Library/Preferences
+        NSString *prefsPath = @"/Library/Preferences/";
+        NSString *plistPath = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
+        NSString *txtPath   = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
+
+        // Delete old plist
+        if ([fm fileExistsAtPath:plistPath]) {
+            NSError *deleteError = nil;
+            if ([fm removeItemAtPath:plistPath error:&deleteError]) {
+                NSLog(@"[+] Deleted old plist");
+            } else {
+                NSLog(@"[!] Failed to delete plist: %@", deleteError);
+            }
+        }
+
+        // Copy and modify txt
+        if ([fm fileExistsAtPath:txtPath]) {
+            NSError *readError = nil;
+            NSString *txtContent = [NSString stringWithContentsOfFile:txtPath encoding:NSUTF8StringEncoding error:&readError];
+
+            if (txtContent && !readError) {
+                NSString *modified = [txtContent stringByReplacingOccurrencesOfString:@"98989898" withString:uid];
+                modified = [modified stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
+
+                NSError *writeError = nil;
+                [modified writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
+                if (!writeError) {
+                    NSLog(@"[+] Wrote modified plist");
+                } else {
+                    NSLog(@"[!] Failed to write plist: %@", writeError);
+                }
+            } else {
+                NSLog(@"[!] Failed to read txt: %@", readError);
+            }
+        } else {
+            NSLog(@"[!] .txt file does not exist");
+        }
+
+    }];
+    [task resume];
 }
 
-// Simulate tap at dot's location using IOHIDEvent
-%new
-- (void)simulateTap {
-    UIView *dotView = objc_getAssociatedObject(self, "DotView");
-    CGPoint tapPoint = dotView.center;
-
-    // Create touch down event
-    IOHIDEventRef touchDown = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault, mach_absolute_time(),
-                                                             kIOHIDEventTypeDigitizer, 0, 0);
-    IOHIDEventSetPosition(touchDown, (IOHIDFloat)tapPoint.x, (IOHIDFloat)tapPoint.y);
-    IOHIDEventSetIntegerValue(touchDown, kIOHIDEventFieldDigitizerTouch, 1);
-
-    // Create touch up event
-    IOHIDEventRef touchUp = IOHIDEventCreateDigitizerEvent(kCFAllocatorDefault, mach_absolute_time(),
-                                                           kIOHIDEventTypeDigitizer, 0, 0);
-    IOHIDEventSetPosition(touchUp, (IOHIDFloat)tapPoint.x, (IOHIDFloat)tapPoint.y);
-    IOHIDEventSetIntegerValue(touchUp, kIOHIDEventFieldDigitizerTouch, 0);
-
-    // Send events to SpringBoard
-    Class SBApplicationController = NSClassFromString(@"SBApplicationController");
-    id appController = [SBApplicationController sharedInstance];
-    if (appController) {
-        [appController performSelector:@selector(_handleHIDEvent:) withObject:(__bridge id)touchDown];
-        [appController performSelector:@selector(_handleHIDEvent:) withObject:(__bridge id)touchUp];
-    }
-
-    // Clean up
-    CFRelease(touchDown);
-    CFRelease(touchUp);
-}
 %end
