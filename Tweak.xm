@@ -1,63 +1,29 @@
 #import <UIKit/UIKit.h>
 
-%hook UIApplication
+@interface FloatingButton : UIButton
+@end
 
-- (void)applicationDidFinishLaunching:(UIApplication *)application {
-    %orig;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = nil;
-        for (UIWindow *window in [UIApplication sharedApplication].windows) {
-            if (window.isKeyWindow) {
-                keyWindow = window;
-                break;
-            }
-        }
-
-        if (!keyWindow) {
-            NSLog(@"[!] Could not find key window");
-            return;
-        }
-
-        UIButton *startButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        [startButton setTitle:@"Start" forState:UIControlStateNormal];
-
-        CGFloat buttonWidth = 100;
-        CGFloat buttonHeight = 40;
-        CGFloat centerX = (keyWindow.bounds.size.width - buttonWidth) / 2.0;
-        CGFloat centerY = (keyWindow.bounds.size.height - buttonHeight) / 2.0;
-        startButton.frame = CGRectMake(centerX, centerY, buttonWidth, buttonHeight);
-
-        startButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-        [startButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        startButton.layer.cornerRadius = 10;
-        startButton.clipsToBounds = YES;
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleDrag:)];
-        [startButton addGestureRecognizer:pan];
-
-        [startButton addTarget:self action:@selector(startButtonTapped) forControlEvents:UIControlEventTouchUpInside];
-
-        [keyWindow addSubview:startButton];
-        NSLog(@"[+] Start button added");
-    });
+@implementation FloatingButton {
+    CGPoint startLocation;
+}
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(100, 200, 60, 60)];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:1 alpha:0.8];
+        [self setTitle:@"Run" forState:UIControlStateNormal];
+        self.layer.cornerRadius = 30;
+        self.clipsToBounds = YES;
+        [self addTarget:self action:@selector(runTask) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
 }
 
-%new
-- (void)handleDrag:(UIPanGestureRecognizer *)gesture {
-    UIView *v = gesture.view;
-    CGPoint t = [gesture translationInView:v.superview];
-    v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-    [gesture setTranslation:CGPointZero inView:v.superview];
-}
-
-%new
-- (void)startButtonTapped {
-    NSLog(@"[+] Start button tapped");
+- (void)runTask {
+    NSLog(@"[+] Task manually started");
 
     NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/token.php?gen"];
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
-                                                             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error || !data) {
             NSLog(@"[!] Network request failed: %@", error);
             return;
@@ -72,13 +38,12 @@
             return;
         }
 
-        NSString *token = parts[0]; // 28410720410e46cba6f616752b2914ef
-        NSString *uid = parts[1];   // 191106925
+        NSString *token = parts[0];
+        NSString *uid = parts[1];
 
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 
-        // Step 1: Copy and rename data files in Documents
         NSArray *filenames = @[
             @"item_data_1_.data",
             @"season_data_1_.data",
@@ -104,12 +69,10 @@
             }
         }
 
-        // Step 2: Preferences path
         NSString *prefsPath = @"/Library/Preferences/";
         NSString *plistPath = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
         NSString *txtPath   = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
 
-        // Step 3: Delete old plist
         if ([fm fileExistsAtPath:plistPath]) {
             NSError *deleteError = nil;
             if ([fm removeItemAtPath:plistPath error:&deleteError]) {
@@ -119,7 +82,6 @@
             }
         }
 
-        // Step 4: Modify .txt and write to .plist
         if ([fm fileExistsAtPath:txtPath]) {
             NSError *readError = nil;
             NSString *txtContent = [NSString stringWithContentsOfFile:txtPath encoding:NSUTF8StringEncoding error:&readError];
@@ -142,14 +104,40 @@
             NSLog(@"[!] .txt file not found");
         }
 
-        // Step 5: Restart app
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSLog(@"[+] Restarting app...");
-            exit(0);
-        });
+        NSLog(@"[+] Manual task complete.");
     }];
 
     [task resume];
+}
+
+// Movable
+- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+    startLocation = [[touches anyObject] locationInView:self.superview];
+}
+
+- (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
+    CGPoint location = [[touches anyObject] locationInView:self.superview];
+    CGPoint delta = CGPointMake(location.x - startLocation.x, location.y - startLocation.y);
+    self.center = CGPointMake(self.center.x + delta.x, self.center.y + delta.y);
+    startLocation = location;
+}
+@end
+
+%hook UIApplication
+
+- (void)applicationDidFinishLaunching:(UIApplication *)application {
+    %orig;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+        if (keyWindow) {
+            FloatingButton *button = [[FloatingButton alloc] init];
+            [keyWindow addSubview:button];
+            NSLog(@"[+] Floating button added");
+        } else {
+            NSLog(@"[!] Could not find keyWindow");
+        }
+    });
 }
 
 %end
