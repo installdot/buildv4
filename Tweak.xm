@@ -1,9 +1,8 @@
 #import <UIKit/UIKit.h>
 
-// Declare the function that returns the key window
+// Forward declarations for functions
 UIWindow *getKeyWindow(void);
-
-// Declare the function that will handle the button tap
+void showStartButton(void); // <--- Add this forward declaration
 void handleStartButton(void);
 
 %hook UIApplication
@@ -12,23 +11,28 @@ void handleStartButton(void);
     %orig;
 
     // Call this function to show the "Start Task" button
-    showStartButton();
+    showStartButton(); // Now 'showStartButton' is declared
 }
 
 %end
 
 // This function finds and returns the key window
 UIWindow *getKeyWindow(void) {
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *window in scene.windows) {
-                if (window.isKeyWindow) {
-                    return window;
+    // Attempt to get the key window using UIScene for iOS 13+
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *window in scene.windows) {
+                    if (window.isKeyWindow) {
+                        return window;
+                    }
                 }
             }
         }
     }
     // Fallback for older iOS versions or if scene-based approach fails
+    // The warning about 'keyWindow' being deprecated will still show if building with a modern SDK
+    // but targeting pre-iOS 13, which is expected.
     return [UIApplication sharedApplication].keyWindow;
 }
 
