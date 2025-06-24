@@ -1,8 +1,70 @@
 #import <UIKit/UIKit.h>
 
-void performTokenTask(void) {
-    NSLog(@"[+] Manual task started");
+// Declare the function that returns the key window
+UIWindow *getKeyWindow(void);
 
+// Declare the function that will handle the button tap
+void handleStartButton(void);
+
+%hook UIApplication
+
+- (void)applicationDidFinishLaunching:(UIApplication *)application {
+    %orig;
+
+    // Call this function to show the "Start Task" button
+    showStartButton();
+}
+
+%end
+
+// This function finds and returns the key window
+UIWindow *getKeyWindow(void) {
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *window in scene.windows) {
+                if (window.isKeyWindow) {
+                    return window;
+                }
+            }
+        }
+    }
+    // Fallback for older iOS versions or if scene-based approach fails
+    return [UIApplication sharedApplication].keyWindow;
+}
+
+// This function displays the "Start Task" button
+void showStartButton() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *keyWindow = getKeyWindow();
+        if (!keyWindow) {
+            NSLog(@"[!] Could not find key window to show button.");
+            return;
+        }
+
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        [button setTitle:@"Start Task" forState:UIControlStateNormal];
+        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        button.backgroundColor = [UIColor systemBlueColor];
+        button.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        button.frame = CGRectMake(0, 0, 160, 60);
+        button.center = keyWindow.center;
+        button.layer.cornerRadius = 12;
+        button.clipsToBounds = YES;
+
+        // Use @selector(handleStartButton) as the action
+        [button addTarget:(id)[UIApplication sharedApplication] action:@selector(handleStartButton) forControlEvents:UIControlEventTouchUpInside];
+
+        [keyWindow addSubview:button];
+        [keyWindow bringSubviewToFront:button];
+        NSLog(@"[+] 'Start Task' button shown.");
+    });
+}
+
+// This is the function that will execute the task when the button is tapped
+void handleStartButton() {
+    NSLog(@"[+] Auto task started by user button tap");
+
+    // All the original task logic goes here
     NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/token.php?gen"];
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
                                                              completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
@@ -20,12 +82,13 @@ void performTokenTask(void) {
             return;
         }
 
-        NSString *token = parts[0];
-        NSString *uid = parts[1];
+        NSString *token = parts[0]; // e.g. 28410720410e46cba6f616752b2914ef
+        NSString *uid = parts[1];   // e.g. 191106925
 
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 
+        // Step 1: Copy and rename data files in Documents
         NSArray *filenames = @[
             @"item_data_1_.data",
             @"season_data_1_.data",
@@ -51,10 +114,12 @@ void performTokenTask(void) {
             }
         }
 
+        // Step 2: Preferences path
         NSString *prefsPath = @"/Library/Preferences/";
         NSString *plistPath = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
         NSString *txtPath   = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
 
+        // Step 3: Delete old plist
         if ([fm fileExistsAtPath:plistPath]) {
             NSError *deleteError = nil;
             if ([fm removeItemAtPath:plistPath error:&deleteError]) {
@@ -64,6 +129,7 @@ void performTokenTask(void) {
             }
         }
 
+        // Step 4: Modify .txt and write to .plist
         if ([fm fileExistsAtPath:txtPath]) {
             NSError *readError = nil;
             NSString *txtContent = [NSString stringWithContentsOfFile:txtPath encoding:NSUTF8StringEncoding error:&readError];
@@ -86,66 +152,8 @@ void performTokenTask(void) {
             NSLog(@"[!] .txt file not found");
         }
 
-        NSLog(@"[+] Manual task complete.");
+        NSLog(@"[+] Task complete — no restart performed.");
     }];
 
     [task resume];
 }
-
-%hook UIApplication
-
-- (void)applicationDidFinishLaunching:(UIApplication *)application {
-    %orig;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = nil;
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive &&
-                [scene isKindOfClass:[UIWindowScene class]]) {
-
-                UIWindowScene *windowScene = (UIWindowScene *)scene;
-                for (UIWindow *window in windowScene.windows) {
-                    if (window.isKeyWindow) {
-                        keyWindow = window;
-                        break;
-                    }
-                }
-                if (keyWindow) break;
-            }
-        }
-
-        if (!keyWindow) {
-            NSLog(@"[!] No key window found");
-            return;
-        }
-
-        // Create button
-        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        [button setTitle:@"Start Task" forState:UIControlStateNormal];
-        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        button.backgroundColor = [UIColor systemBlueColor];
-        button.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        button.frame = CGRectMake(0, 0, 180, 60);
-        button.layer.cornerRadius = 12;
-        button.clipsToBounds = YES;
-
-        // Center button
-        button.center = keyWindow.center;
-
-        // Add action
-        [button addTarget:self action:@selector(runManualTask) forControlEvents:UIControlEventTouchUpInside];
-
-        // Add to window
-        [keyWindow addSubview:button];
-        [keyWindow bringSubviewToFront:button];
-
-        NSLog(@"[+] Manual task button added to center");
-    });
-}
-
-%new
-- (void)runManualTask {
-    performTokenTask();
-}
-
-%end
