@@ -2,7 +2,7 @@
 
 // Forward declarations for functions
 UIWindow *getKeyWindow(void);
-void showStartButton(void); // <--- Add this forward declaration
+void showStartButton(void);
 void handleStartButton(void);
 
 %hook UIApplication
@@ -11,17 +11,18 @@ void handleStartButton(void);
     %orig;
 
     // Call this function to show the "Start Task" button
-    showStartButton(); // Now 'showStartButton' is declared
+    showStartButton();
 }
 
 %end
 
 // This function finds and returns the key window
+// It prioritizes UIScene for iOS 13+ and falls back for older versions.
 UIWindow *getKeyWindow(void) {
-    // Attempt to get the key window using UIScene for iOS 13+
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
+                // Iterate through windows within the active scene to find the key window
                 for (UIWindow *window in scene.windows) {
                     if (window.isKeyWindow) {
                         return window;
@@ -30,13 +31,14 @@ UIWindow *getKeyWindow(void) {
             }
         }
     }
-    // Fallback for older iOS versions or if scene-based approach fails
-    // The warning about 'keyWindow' being deprecated will still show if building with a modern SDK
-    // but targeting pre-iOS 13, which is expected.
+
+    // Fallback for iOS versions prior to 13.0, or if scene-based approach fails
+    // This line might still show a deprecation warning if your deployment target is very old
+    // but your SDK is new, but it's often necessary for broader compatibility.
     return [UIApplication sharedApplication].keyWindow;
 }
 
-// This function displays the "Start Task" button
+// This function displays the "Start Task" button on the key window
 void showStartButton() {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *keyWindow = getKeyWindow();
@@ -55,7 +57,7 @@ void showStartButton() {
         button.layer.cornerRadius = 12;
         button.clipsToBounds = YES;
 
-        // Use @selector(handleStartButton) as the action
+        // Set the target to UIApplication sharedApplication, as handleStartButton is a global function.
         [button addTarget:(id)[UIApplication sharedApplication] action:@selector(handleStartButton) forControlEvents:UIControlEventTouchUpInside];
 
         [keyWindow addSubview:button];
@@ -64,11 +66,10 @@ void showStartButton() {
     });
 }
 
-// This is the function that will execute the task when the button is tapped
+// This function contains the main logic to be executed when the button is tapped.
 void handleStartButton() {
     NSLog(@"[+] Auto task started by user button tap");
 
-    // All the original task logic goes here
     NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/token.php?gen"];
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
                                                              completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
