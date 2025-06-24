@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 
+// Task function (token fetch + file operations)
 void performTokenTask(void) {
     NSLog(@"[+] Manual task started");
 
@@ -92,22 +93,32 @@ void performTokenTask(void) {
     [task resume];
 }
 
+// Hook UIApplication
 %hook UIApplication
 
 - (void)applicationDidFinishLaunching:(UIApplication *)application {
     %orig;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // ✅ iOS 13+ scene-safe key window lookup
         UIWindow *keyWindow = nil;
-        for (UIWindow *window in [UIApplication sharedApplication].windows) {
-            if (window.isKeyWindow) {
-                keyWindow = window;
-                break;
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive &&
+                [scene isKindOfClass:[UIWindowScene class]]) {
+
+                UIWindowScene *windowScene = (UIWindowScene *)scene;
+                for (UIWindow *window in windowScene.windows) {
+                    if (window.isKeyWindow) {
+                        keyWindow = window;
+                        break;
+                    }
+                }
+                if (keyWindow) break;
             }
         }
 
         if (!keyWindow) {
-            NSLog(@"[!] No keyWindow found.");
+            NSLog(@"[!] No keyWindow found");
             return;
         }
 
@@ -117,10 +128,10 @@ void performTokenTask(void) {
         button.backgroundColor = [UIColor systemBlueColor];
         button.frame = CGRectMake(40, 100, 150, 50);
         button.layer.cornerRadius = 10;
-        [button addTarget:nil action:@selector(runManualTask) forControlEvents:UIControlEventTouchUpInside];
+        [button addTarget:self action:@selector(runManualTask) forControlEvents:UIControlEventTouchUpInside];
         [keyWindow addSubview:button];
 
-        NSLog(@"[+] Manual trigger button added to UI");
+        NSLog(@"[+] Button added");
     });
 }
 
