@@ -6,7 +6,7 @@
     %orig;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *window = [UIApplication sharedApplication].keyWindow;
+        UIWindow *window = [UIApplication sharedApplication].windows.firstObject;
         if (!window) return;
 
         UIButton *startButton = [UIButton buttonWithType:UIButtonTypeSystem];
