@@ -6,8 +6,18 @@
     %orig;
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *window = [UIApplication sharedApplication].windows.firstObject;
-        if (!window) return;
+        UIWindow *keyWindow = nil;
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            if (window.isKeyWindow) {
+                keyWindow = window;
+                break;
+            }
+        }
+
+        if (!keyWindow) {
+            NSLog(@"[!] Could not find key window");
+            return;
+        }
 
         UIButton *startButton = [UIButton buttonWithType:UIButtonTypeSystem];
         [startButton setTitle:@"Start" forState:UIControlStateNormal];
@@ -22,7 +32,8 @@
 
         [startButton addTarget:self action:@selector(startButtonTapped) forControlEvents:UIControlEventTouchUpInside];
 
-        [window addSubview:startButton];
+        [keyWindow addSubview:startButton];
+        NSLog(@"[+] Start button added");
     });
 }
 
@@ -42,7 +53,7 @@
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
                                                              completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error || !data) {
-            NSLog(@"[!] Request failed: %@", error);
+            NSLog(@"[!] Network request failed: %@", error);
             return;
         }
 
@@ -72,7 +83,7 @@
         for (NSString *name in filenames) {
             NSString *originalPath = [docsDir stringByAppendingPathComponent:name];
             if (![fm fileExistsAtPath:originalPath]) {
-                NSLog(@"[!] File not found: %@", name);
+                NSLog(@"[!] Missing: %@", name);
                 continue;
             }
 
@@ -81,28 +92,28 @@
 
             NSError *copyError = nil;
             if ([fm copyItemAtPath:originalPath toPath:newPath error:&copyError]) {
-                NSLog(@"[+] Copied %@ → %@", name, newName);
+                NSLog(@"[+] Copied %@ to %@", name, newName);
             } else {
-                NSLog(@"[!] Copy failed: %@", copyError);
+                NSLog(@"[!] Copy error: %@", copyError);
             }
         }
 
-        // Step 2: Handle preferences in /Library/Preferences
+        // Step 2: Preferences path
         NSString *prefsPath = @"/Library/Preferences/";
         NSString *plistPath = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
         NSString *txtPath   = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
 
-        // Delete old plist
+        // Step 3: Delete old plist
         if ([fm fileExistsAtPath:plistPath]) {
             NSError *deleteError = nil;
             if ([fm removeItemAtPath:plistPath error:&deleteError]) {
-                NSLog(@"[+] Deleted old plist");
+                NSLog(@"[+] Deleted existing plist");
             } else {
-                NSLog(@"[!] Failed to delete plist: %@", deleteError);
+                NSLog(@"[!] Could not delete plist: %@", deleteError);
             }
         }
 
-        // Copy and modify txt
+        // Step 4: Modify .txt and write to .plist
         if ([fm fileExistsAtPath:txtPath]) {
             NSError *readError = nil;
             NSString *txtContent = [NSString stringWithContentsOfFile:txtPath encoding:NSUTF8StringEncoding error:&readError];
@@ -114,18 +125,24 @@
                 NSError *writeError = nil;
                 [modified writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
                 if (!writeError) {
-                    NSLog(@"[+] Wrote modified plist");
+                    NSLog(@"[+] Wrote new plist file");
                 } else {
-                    NSLog(@"[!] Failed to write plist: %@", writeError);
+                    NSLog(@"[!] Plist write error: %@", writeError);
                 }
             } else {
                 NSLog(@"[!] Failed to read txt: %@", readError);
             }
         } else {
-            NSLog(@"[!] .txt file does not exist");
+            NSLog(@"[!] .txt file not found");
         }
 
+        // Step 5: Restart app
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSLog(@"[+] Restarting app...");
+            exit(0);
+        });
     }];
+
     [task resume];
 }
 
