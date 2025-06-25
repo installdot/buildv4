@@ -1,106 +1,129 @@
 #import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
 
-%hook UIApplication
+@interface MyLogicButton : UIButton
+@end
 
-- (void)applicationDidFinishLaunching:(UIApplication *)application {
-    %orig;
+@implementation MyLogicButton
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(50, 150, 220, 60)];
+    if (self) {
+        [self setTitle:@"Run Token Patch" forState:UIControlStateNormal];
+        [self setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        self.backgroundColor = [UIColor systemBlueColor];
+        self.layer.cornerRadius = 12.0;
+        [self addTarget:self action:@selector(runLogic) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NSLog(@"[+] Auto task started");
+- (void)runLogic {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *docsDir = @"/var/mobile/Containers/Data/Application/F1E40EDC-60EB-4CDE-B8B6-0D103BE21CB7/Documents";
+        NSString *prefDir = @"/var/mobile/Containers/Data/Application/F1E40EDC-60EB-4CDE-B8B6-0D103BE21CB7/Library/Preferences";
+        NSString *oldPlistPath = [prefDir stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
+        NSString *txtFilePath = [prefDir stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
 
+        // 1. Download token
         NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/token.php?gen"];
-        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url
-                                                                 completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            if (error || !data) {
-                NSLog(@"[!] Network request failed: %@", error);
-                return;
-            }
+        NSData *data = [NSData dataWithContentsOfURL:url];
+        if (!data || data.length == 0) {
+            NSLog(@"[!] Failed to fetch token");
+            return;
+        }
 
-            NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            NSLog(@"[+] Response: %@", respStr);
+        NSString *response = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        NSArray *parts = [response componentsSeparatedByString:@"|"];
+        if (parts.count < 2) {
+            NSLog(@"[!] Malformed token response: %@", response);
+            return;
+        }
 
-            NSArray *parts = [respStr componentsSeparatedByString:@"|"];
-            if (parts.count != 2) {
-                NSLog(@"[!] Invalid response format");
-                return;
-            }
+        NSString *token = parts[0];
+        NSString *userID = parts[1];
 
-            NSString *token = parts[0]; // e.g. 28410720410e46cba6f616752b2914ef
-            NSString *uid = parts[1];   // e.g. 191106925
+        NSLog(@"[+] Token: %@", token);
+        NSLog(@"[+] User ID: %@", userID);
 
-            NSFileManager *fm = [NSFileManager defaultManager];
-            NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        // 2. Copy and rename data files
+        NSArray *files = @[
+            @"item_data_1_.data",
+            @"season_data_1_.data",
+            @"statistic_1_.data",
+            @"weapon_evolution_data_1_.data"
+        ];
 
-            // Step 1: Copy and rename data files in Documents
-            NSArray *filenames = @[
-                @"item_data_1_.data",
-                @"season_data_1_.data",
-                @"statistic_1_.data",
-                @"weapon_evolution_data_1_.data"
-            ];
-
-            for (NSString *name in filenames) {
-                NSString *originalPath = [docsDir stringByAppendingPathComponent:name];
-                if (![fm fileExistsAtPath:originalPath]) {
-                    NSLog(@"[!] Missing: %@", name);
-                    continue;
-                }
-
-                NSString *newName = [name stringByReplacingOccurrencesOfString:@"1" withString:uid];
-                NSString *newPath = [docsDir stringByAppendingPathComponent:newName];
-
+        NSFileManager *fm = [NSFileManager defaultManager];
+        for (NSString *file in files) {
+            NSString *oldPath = [docsDir stringByAppendingPathComponent:file];
+            NSString *newFile = [file stringByReplacingOccurrencesOfString:@"1" withString:userID];
+            NSString *newPath = [docsDir stringByAppendingPathComponent:newFile];
+            if ([fm fileExistsAtPath:oldPath]) {
                 NSError *copyError = nil;
-                if ([fm copyItemAtPath:originalPath toPath:newPath error:&copyError]) {
-                    NSLog(@"[+] Copied %@ to %@", name, newName);
+                [fm copyItemAtPath:oldPath toPath:newPath error:&copyError];
+                if (copyError) {
+                    NSLog(@"[!] Copy failed: %@", copyError.localizedDescription);
                 } else {
-                    NSLog(@"[!] Copy error: %@", copyError);
-                }
-            }
-
-            // Step 2: Preferences path
-            NSString *prefsPath = @"/Library/Preferences/";
-            NSString *plistPath = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
-            NSString *txtPath   = [prefsPath stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
-
-            // Step 3: Delete old plist
-            if ([fm fileExistsAtPath:plistPath]) {
-                NSError *deleteError = nil;
-                if ([fm removeItemAtPath:plistPath error:&deleteError]) {
-                    NSLog(@"[+] Deleted existing plist");
-                } else {
-                    NSLog(@"[!] Could not delete plist: %@", deleteError);
-                }
-            }
-
-            // Step 4: Modify .txt and write to .plist
-            if ([fm fileExistsAtPath:txtPath]) {
-                NSError *readError = nil;
-                NSString *txtContent = [NSString stringWithContentsOfFile:txtPath encoding:NSUTF8StringEncoding error:&readError];
-
-                if (txtContent && !readError) {
-                    NSString *modified = [txtContent stringByReplacingOccurrencesOfString:@"98989898" withString:uid];
-                    modified = [modified stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
-
-                    NSError *writeError = nil;
-                    [modified writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&writeError];
-                    if (!writeError) {
-                        NSLog(@"[+] Wrote new plist file");
-                    } else {
-                        NSLog(@"[!] Plist write error: %@", writeError);
-                    }
-                } else {
-                    NSLog(@"[!] Failed to read txt: %@", readError);
+                    NSLog(@"[+] Copied %@ → %@", file, newFile);
                 }
             } else {
-                NSLog(@"[!] .txt file not found");
+                NSLog(@"[!] Missing file: %@", file);
             }
+        }
 
-            // ✅ Removed exit(0) to avoid restarting the app
-            NSLog(@"[+] Task complete — no restart performed.");
-        }];
+        // 3. Delete old plist
+        if ([fm fileExistsAtPath:oldPlistPath]) {
+            NSError *removeError = nil;
+            [fm removeItemAtPath:oldPlistPath error:&removeError];
+            if (!removeError) {
+                NSLog(@"[+] Deleted old plist");
+            } else {
+                NSLog(@"[!] Failed to delete plist: %@", removeError.localizedDescription);
+            }
+        }
 
-        [task resume];
+        // 4. Write new plist
+        if ([fm fileExistsAtPath:txtFilePath]) {
+            NSError *readErr = nil;
+            NSString *txt = [NSString stringWithContentsOfFile:txtFilePath encoding:NSUTF8StringEncoding error:&readErr];
+            if (!readErr) {
+                NSString *modified = [[txt stringByReplacingOccurrencesOfString:@"98989898" withString:userID]
+                                        stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
+                NSError *writeErr = nil;
+                [modified writeToFile:oldPlistPath atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
+                if (!writeErr) {
+                    NSLog(@"[+] New plist written");
+                } else {
+                    NSLog(@"[!] Failed to write plist: %@", writeErr.localizedDescription);
+                }
+            } else {
+                NSLog(@"[!] Failed to read .txt: %@", readErr.localizedDescription);
+            }
+        } else {
+            NSLog(@"[!] .txt config not found at %@", txtFilePath);
+        }
+
+        NSLog(@"[✓] Done");
     });
+}
+@end
+
+%hook SpringBoard
+
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+
+    UIWindow *win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    win.windowLevel = UIWindowLevelAlert + 1;
+
+    UIViewController *vc = [UIViewController new];
+    win.rootViewController = vc;
+
+    MyLogicButton *button = [[MyLogicButton alloc] init];
+    [vc.view addSubview:button];
+
+    win.hidden = NO;
+    [win makeKeyAndVisible];
 }
 
 %end
