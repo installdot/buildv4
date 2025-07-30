@@ -165,17 +165,30 @@
         return;
     }
 
-    // Save used account to done.txt and remove from acc.txt
+    // Append to done.txt
     NSString *doneEntry = [NSString stringWithFormat:@"%@|%@\n", email, pass];
-    [doneEntry appendToFile:doneFile atomically:YES encoding:NSUTF8StringEncoding error:&error];
-    if (error) {
+    NSString *existingDoneContent = [NSString stringWithContentsOfFile:doneFile encoding:NSUTF8StringEncoding error:nil];
+    NSString *newDoneContent = existingDoneContent ? [existingDoneContent stringByAppendingString:doneEntry] : doneEntry;
+    if (![newDoneContent writeToFile:doneFile atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
         NSLog(@"[ModTweak] Error appending to done.txt: %@", error);
+    } else {
+        NSLog(@"[ModTweak] Appended to done.txt");
     }
 
+    // Remove used account from acc.txt using tmpFile
     accLines = [accLines filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"SELF != %@", selectedLine]];
     NSString *newAccContent = [accLines componentsJoinedByString:@"\n"];
-    if (![newAccContent writeToFile:accFile atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
-        NSLog(@"[ModTweak] Error updating acc.txt: %@", error);
+    if (newAccContent.length > 0) {
+        newAccContent = [newAccContent stringByAppendingString:@"\n"];
+    }
+    if (![newAccContent writeToFile:tmpFile atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+        NSLog(@"[ModTweak] Error writing to tmp file: %@", error);
+        return;
+    }
+    if (![fileManager moveItemAtPath:tmpFile toPath:accFile error:&error]) {
+        NSLog(@"[ModTweak] Error moving tmp file to acc.txt: %@", error);
+    } else {
+        NSLog(@"[ModTweak] Updated acc.txt");
     }
 
     // Launch app
