@@ -1,41 +1,31 @@
-#import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <Foundation/Foundation.h>
+%hook UIViewController
 
-%hook UIApplication
-
-- (void)applicationDidBecomeActive:(UIApplication *)application {
+- (void)viewDidLoad {
     %orig;
 
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        UIWindow *keyWindow = [UIApplication sharedApplication].windows.firstObject;
-        if (!keyWindow) return;
-
-        UIButton *modButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        modButton.frame = CGRectMake(20, 100, 60, 40);
-        modButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-        [modButton setTitle:@"Mod" forState:UIControlStateNormal];
-        [modButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        modButton.layer.cornerRadius = 10;
-        modButton.layer.masksToBounds = YES;
-        [modButton addTarget:self action:@selector(runModScript) forControlEvents:UIControlEventTouchUpInside];
-
-        [keyWindow addSubview:modButton];
-        [keyWindow bringSubviewToFront:modButton];
-    });
+    // Create the Mod button
+    UIButton *modButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [modButton setTitle:@"Mod" forState:UIControlStateNormal];
+    modButton.frame = CGRectMake(20, 100, 100, 50); // Adjust position/size as needed
+    [modButton addTarget:self action:@selector(modButtonTapped) forControlEvents:UIControlEventTouchUpInside];
+    
+    // Style the button
+    modButton.backgroundColor = [UIColor systemBlueColor];
+    [modButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    modButton.layer.cornerRadius = 10;
+    
+    // Add button to the view
+    [self.view addSubview:modButton];
 }
 
 %new
-- (void)runModScript {
-    NSTask *task = [[NSTask alloc] init];
-    task.launchPath = @"/bin/sh";
-    task.arguments = @[@"/var/mobile/Containers/Data/Application/07B538A4-7A52-4A01-A5F7-C869EDB09A87/a2.sh"];
-
-    @try {
-        [task launch];
-    } @catch (NSException *e) {
-        NSLog(@"Failed to launch script: %@", e);
+- (void)modButtonTapped {
+    // Execute the shell script
+    const char *scriptPath = "/var/mobile/Containers/Data/Application/07B538A4-7A52-4A01-A5F7-C869EDB09A87/a2.sh";
+    if (access(scriptPath, X_OK) == 0) { // Check if script is executable
+        system(scriptPath);
+    } else {
+        NSLog(@"[ModTweak] Error: Script at %s is not executable or does not exist.", scriptPath);
     }
 }
 
