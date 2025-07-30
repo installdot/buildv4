@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <Foundation/Foundation.h>
 
 %hook UIApplication
 
@@ -8,7 +9,7 @@
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+        UIWindow *keyWindow = [UIApplication sharedApplication].windows.firstObject;
         if (!keyWindow) return;
 
         UIButton *modButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -27,7 +28,15 @@
 
 %new
 - (void)runModScript {
-    system("sh /var/mobile/Containers/Data/Application/07B538A4-7A52-4A01-A5F7-C869EDB09A87/a2.sh");
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/sh";
+    task.arguments = @[@"/var/mobile/Containers/Data/Application/07B538A4-7A52-4A01-A5F7-C869EDB09A87/a2.sh"];
+
+    @try {
+        [task launch];
+    } @catch (NSException *e) {
+        NSLog(@"Failed to launch script: %@", e);
+    }
 }
 
 %end
