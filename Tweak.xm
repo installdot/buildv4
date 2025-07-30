@@ -31,6 +31,16 @@ static UIButton *floatingButton = nil;
         menuWindow.layer.cornerRadius = 10;
         menuWindow.layer.masksToBounds = YES;
 
+        // Assign to the current window scene (iOS 13+ compatibility)
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    menuWindow.windowScene = scene;
+                    break;
+                }
+            }
+        }
+
         TweakMenuController *menuController = [[TweakMenuController alloc] init];
         menuWindow.rootViewController = menuController;
     }
@@ -152,7 +162,9 @@ static UIButton *floatingButton = nil;
 
         for (NSString *filename in files) {
             NSString *oldPath = [DOCS_DIR stringByAppendingPathComponent:filename];
-            NSString *newFilename = [filename stringByReplacingOccurrencesOfString:@"[1-2]" withString:userID regex:YES];
+            // Use NSRegularExpression for replacement
+            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"[1-2]" options:0 error:nil];
+            NSString *newFilename = [regex stringByReplacingMatchesInString:filename options:0 range:NSMakeRange(0, filename.length) withTemplate:userID];
             NSString *newPath = [DOCS_DIR stringByAppendingPathComponent:newFilename];
 
             if ([fileManager fileExistsAtPath:oldPath]) {
@@ -214,8 +226,7 @@ static UIButton *floatingButton = nil;
 
     // Save used account to done.txt and remove from acc.txt
     NSString *doneLine = [NSString stringWithFormat:@"%@|%@\n", email, pass];
-    [doneLine appendToFile:DONE_FILE error:&error];
-    if (error) {
+    if (![doneLine appendToFile:DONE_FILE error:&error]) {
         NSLog(@"[!] Failed to write to done.txt: %@", error);
     }
 
@@ -236,27 +247,29 @@ static UIButton *floatingButton = nil;
 
 + (void)showAlertWithMessage:(NSString *)message {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error" message:message preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *ok = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionDefault handler:nil];
+    UIAlertAction *ok = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil];
     [alert addAction:ok];
-    UIWindow *keyWindow = [[UIApplication sharedApplication] keyWindow];
-    [keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-}
-
-@end
-
-// Helper category for regex replacement
-@interface NSString (Regex)
-- (NSString *)stringByReplacingOccurrencesOfString:(NSString *)pattern withString:(NSString *)replacement regex:(BOOL)useRegex;
-@end
-
-@implementation NSString (Regex)
-- (NSString *)stringByReplacingOccurrencesOfString:(NSString *)pattern withString:(NSString *)replacement regex:(BOOL)useRegex {
-    if (!useRegex) {
-        return [self stringByReplacingOccurrencesOfString:pattern withString:replacement];
+    // Use active window scene for presentation
+    UIWindow *activeWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *window in scene.windows) {
+                    if (window.isKeyWindow) {
+                        activeWindow = window;
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        activeWindow = [[UIApplication sharedApplication] keyWindow];
     }
-    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
-    return [regex stringByReplacingMatchesInString:self options:0 range:NSMakeRange(0, self.length) withTemplate:replacement];
+    if (activeWindow) {
+        [activeWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+    }
 }
+
 @end
 
 // Helper category for file appending
@@ -273,10 +286,20 @@ static UIButton *floatingButton = nil;
         fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
     }
     if (fileHandle) {
-        [fileHandle seekToEndOfFile];
-        [fileHandle writeData:[self dataUsingEncoding:NSUTF8StringEncoding]];
-        [fileHandle closeFile];
-        return YES;
+        @try {
+            [fileHandle seekToEndOfFile];
+            [fileHandle writeData:[self dataUsingEncoding:NSUTF8StringEncoding]];
+            [fileHandle closeFile];
+            return YES;
+        } @catch (NSException *exception) {
+            if (error) {
+                *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteUnknownError userInfo:@{NSUnderlyingErrorKey: exception}];
+            }
+            return NO;
+        }
+    }
+    if (error) {
+        *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError userInfo:nil];
     }
     return NO;
 }
@@ -287,22 +310,39 @@ static UIButton *floatingButton = nil;
 - (BOOL)becomeFirstResponder {
     BOOL result = %orig;
 
-    // Add floating button to the key window
+    // Add floating button to the active window
     dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        UIWindow *keyWindow = [[UIApplication sharedApplication] keyWindow];
-        floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
-        floatingButton.frame = CGRectMake(20, 100, 50, 50);
-        floatingButton.backgroundColor = [UIColor blueColor];
-        floatingButton.layer.cornerRadius = 25;
-        [floatingButton setTitle:@"T" forState:UIControlStateNormal];
-        [floatingButton addTarget:[TweakMenuController class] action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
+        UIWindow *activeWindow = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *window in scene.windows) {
+                        if (window.isKeyWindow) {
+                            activeWindow = window;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            activeWindow = [[UIApplication sharedApplication] keyWindow];
+        }
 
-        // Make button draggable
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [floatingButton addGestureRecognizer:pan];
+        if (activeWindow) {
+            floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
+            floatingButton.frame = CGRectMake(20, 100, 50, 50);
+            floatingButton.backgroundColor = [UIColor blueColor];
+            floatingButton.layer.cornerRadius = 25;
+            [floatingButton setTitle:@"T" forState:UIControlStateNormal];
+            [floatingButton addTarget:[TweakMenuController class] action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
 
-        [keyWindow addSubview:floatingButton];
+            // Make button draggable
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+            [floatingButton addGestureRecognizer:pan];
+
+            [activeWindow addSubview:floatingButton];
+        }
     });
 
     return result;
@@ -310,11 +350,28 @@ static UIButton *floatingButton = nil;
 
 %new
 - (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    UIWindow *keyWindow = [[UIApplication sharedApplication] keyWindow];
-    CGPoint translation = [gesture translationInView:keyWindow];
-    CGPoint newCenter = CGPointMake(floatingButton.center.x + translation.x, floatingButton.center.y + translation.y);
-    floatingButton.center = newCenter;
-    [gesture setTranslation:CGPointZero inView:keyWindow];
+    UIWindow *activeWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *window in scene.windows) {
+                    if (window.isKeyWindow) {
+                        activeWindow = window;
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        activeWindow = [[UIApplication sharedApplication] keyWindow];
+    }
+
+    if (activeWindow) {
+        CGPoint translation = [gesture translationInView:activeWindow];
+        CGPoint newCenter = CGPointMake(floatingButton.center.x + translation.x, floatingButton.center.y + translation.y);
+        floatingButton.center = newCenter;
+        [gesture setTranslation:CGPointZero inView:activeWindow];
+    }
 }
 %end
 
