@@ -7,6 +7,6 @@ LIBRARIES = crypto
 DungeonShooter_CFLAGS = -fobjc-arc -Wno-error
 DungeonShooter_IPHONEOS_DEPLOYMENT_TARGET = 16.6.1
 ARCHS = arm64
-TARGET = iphone:clang:latest:16.6.1
+TARGET = iphone:clang:latest:14.0
 
 include $(THEOS)/makefiles/tweak.mk
