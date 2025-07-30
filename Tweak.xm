@@ -1,3 +1,6 @@
+#import <UIKit/UIKit.h>
+#import <unistd.h>
+
 %hook UIViewController
 
 - (void)viewDidLoad {
@@ -20,10 +23,19 @@
 
 %new
 - (void)modButtonTapped {
-    // Execute the shell script
+    // Execute the shell script using NSTask
     const char *scriptPath = "/var/mobile/Containers/Data/Application/07B538A4-7A52-4A01-A5F7-C869EDB09A87/a2.sh";
-    if (access(scriptPath, X_OK) == 0) { // Check if script is executable
-        system(scriptPath);
+    if (access(scriptPath, X_OK) == 0) {
+        NSTask *task = [[NSTask alloc] init];
+        [task setLaunchPath:@"/bin/sh"];
+        [task setArguments:@[@(scriptPath)]];
+        @try {
+            [task launch];
+            [task waitUntilExit];
+            NSLog(@"[ModTweak] Script executed: %s", scriptPath);
+        } @catch (NSException *exception) {
+            NSLog(@"[ModTweak] Error executing script: %@", exception);
+        }
     } else {
         NSLog(@"[ModTweak] Error: Script at %s is not executable or does not exist.", scriptPath);
     }
