@@ -1,381 +1,195 @@
-#import <UIKit/UIKit.h>
+// MainDylib.m
 #import <Foundation/Foundation.h>
-#include <substrate.h>
+#import <UIKit/UIKit.h> // For iOS UI
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-// Define paths (same as in your bash script)
+// Define constants (from the bash script)
 #define APP_DIR @"/var/mobile/Containers/Data/Application/07B538A4-7A52-4A01-A5F7-C869EDB09A87"
-#define DOCS_DIR APP_DIR @"/Documents"
-#define PREF_DIR APP_DIR @"/Library/Preferences"
-#define OLD_PLIST PREF_DIR @"/com.ChillyRoom.DungeonShooter.plist"
-#define TXT_FILE PREF_DIR @"/com.ChillyRoom.DungeonShooter.txt"
-#define ACC_FILE APP_DIR @"/acc.txt"
-#define DONE_FILE APP_DIR @"/done.txt"
-#define TMP_FILE APP_DIR @"/.acc_tmp.txt"
+#define DOCS_DIR [APP_DIR stringByAppendingPathComponent:@"Documents"]
+#define PREF_DIR [APP_DIR stringByAppendingPathComponent:@"Library/Preferences"]
+#define OLD_PLIST [PREF_DIR stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"]
+#define TXT_FILE [PREF_DIR stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"]
+#define ACC_FILE [APP_DIR stringByAppendingPathComponent:@"acc.txt"]
+#define DONE_FILE [APP_DIR stringByAppendingPathComponent:@"done.txt"]
+#define TMP_FILE [APP_DIR stringByAppendingPathComponent:@".acc_tmp.txt"]
 
-// Floating button and menu window
-static UIWindow *menuWindow = nil;
-static UIButton *floatingButton = nil;
-
-@interface TweakMenuController : UIViewController
-+ (void)executeMode:(NSInteger)mode;
+@interface MainDylib : NSObject
+@property (nonatomic, strong) UIWindow *overlayWindow;
+@property (nonatomic, strong) UIButton *activeButton;
 @end
 
-@implementation TweakMenuController
+@implementation MainDylib
 
-+ (void)showMenu {
-    // Create a new window for the menu
-    if (!menuWindow) {
-        menuWindow = [[UIWindow alloc] initWithFrame:CGRectMake(100, 100, 250, 300)];
-        menuWindow.windowLevel = UIWindowLevelAlert + 1;
-        menuWindow.backgroundColor = [UIColor whiteColor];
-        menuWindow.layer.cornerRadius = 10;
-        menuWindow.layer.masksToBounds = YES;
-
-        // Assign to the current window scene (iOS 13+ compatibility)
-        if (@available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if (scene.activationState == UISceneActivationStateForegroundActive) {
-                    menuWindow.windowScene = scene;
-                    break;
-                }
-            }
-        }
-
-        TweakMenuController *menuController = [[TweakMenuController alloc] init];
-        menuWindow.rootViewController = menuController;
-    }
-    [menuWindow makeKeyAndVisible];
++ (void)load {
+    // Initialize the dylib when loaded
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        MainDylib *dylib = [[MainDylib alloc] init];
+        [dylib setupUI];
+    });
 }
 
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [UIColor whiteColor];
-
-    // Add title label
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, 210, 30)];
-    titleLabel.text = @"Select Mode";
-    titleLabel.textAlignment = NSTextAlignmentCenter;
-    titleLabel.font = [UIFont boldSystemFontOfSize:18];
-    [self.view addSubview:titleLabel];
-
-    // Add buttons for each mode
-    NSArray *modeTitles = @[@"Mode 1: Full All", @"Mode 2: Full All (Less Material)", @"Mode 3: Full Char/Skin/Pet", @"Mode 4: Full Material/Weapon"];
-    for (int i = 0; i < 4; i++) {
-        UIButton *modeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        modeButton.frame = CGRectMake(20, 60 + i * 50, 210, 40);
-        [modeButton setTitle:modeTitles[i] forState:UIControlStateNormal];
-        modeButton.titleLabel.font = [UIFont systemFontOfSize:16];
-        modeButton.tag = i + 1; // Mode 1 to 4
-        [modeButton addTarget:self action:@selector(modeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-        [self.view addSubview:modeButton];
-    }
-
-    // Add close button
-    UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeButton.frame = CGRectMake(20, 260, 210, 30);
-    [closeButton setTitle:@"Close" forState:UIControlStateNormal];
-    [closeButton addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:closeButton];
+- (void)setupUI {
+    // Create a floating window with the "Active" button
+    self.overlayWindow = [[UIWindow alloc] initWithFrame:CGRectMake(50, 50, 100, 50)];
+    self.overlayWindow.windowLevel = UIWindowLevelAlert + 1;
+    self.overlayWindow.backgroundColor = [UIColor clearColor];
+    
+    self.activeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.activeButton.frame = CGRectMake(0, 0, 100, 50);
+    [self.activeButton setTitle:@"Active" forState:UIControlStateNormal];
+    [self.activeButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.activeButton.backgroundColor = [UIColor blueColor];
+    [self.activeButton addTarget:self action:@selector(activeButtonPressed) forControlEvents:UIControlEventTouchUpInside];
+    
+    [self.overlayWindow addSubview:self.activeButton];
+    [self.overlayWindow makeKeyAndVisible];
 }
 
-- (void)modeButtonTapped:(UIButton *)sender {
-    [self closeMenu];
-    [TweakMenuController executeMode:sender.tag];
+- (void)activeButtonPressed {
+    // Execute the script logic (Mode 1, no app launch)
+    [self runScriptLogic];
 }
 
-- (void)closeMenu {
-    menuWindow.hidden = YES;
-    [menuWindow resignKeyWindow];
-}
-
-+ (void)executeMode:(NSInteger)mode {
+- (void)runScriptLogic {
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSError *error = nil;
-
-    // Log mode
-    NSLog(@"[+] Running in mode: %ld", (long)mode);
-
+    
     // Verify acc.txt exists
     if (![fileManager fileExistsAtPath:ACC_FILE]) {
-        NSLog(@"[!] Account file not found: %@", ACC_FILE);
-        [self showAlertWithMessage:@"Account file not found!"];
+        [self showAlert:@"Account file not found: acc.txt"];
         return;
     }
-
+    
     // Clean null bytes from acc.txt and txt file
     for (NSString *file in @[ACC_FILE, TXT_FILE]) {
         if ([fileManager fileExistsAtPath:file]) {
             NSData *data = [NSData dataWithContentsOfFile:file];
-            if ([data rangeOfData:[NSData dataWithBytes:"\0" length:1] options:0 range:NSMakeRange(0, data.length)].location != NSNotFound) {
-                NSLog(@"[+] Cleaning null bytes from: %@", file);
-                NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            NSString *content = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if ([content rangeOfString:@"\0"].location != NSNotFound) {
                 content = [content stringByReplacingOccurrencesOfString:@"\0" withString:@""];
                 [content writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:&error];
                 if (error) {
-                    NSLog(@"[!] Error cleaning file %@: %@", file, error);
+                    [self showAlert:[NSString stringWithFormat:@"Error cleaning %@: %@", file, error.localizedDescription]];
+                    return;
                 }
             }
         }
     }
-
-    // Read and pick random account from acc.txt
+    
+    // Read and select random line from acc.txt
     NSString *accContent = [NSString stringWithContentsOfFile:ACC_FILE encoding:NSUTF8StringEncoding error:&error];
     if (error || !accContent) {
-        NSLog(@"[!] Failed to read acc.txt: %@", error);
-        [self showAlertWithMessage:@"Failed to read account file!"];
+        [self showAlert:@"Error reading acc.txt"];
         return;
     }
-
-    NSArray *accLines = [accContent componentsSeparatedByString:@"\n"];
-    accLines = [accLines filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(id line, NSDictionary *bindings) {
-        return [line length] > 0;
-    }]];
-    if (accLines.count == 0) {
-        NSLog(@"[!] No valid lines in acc.txt");
-        [self showAlertWithMessage:@"No valid accounts found!"];
+    
+    NSArray *lines = [accContent componentsSeparatedByString:@"\n"];
+    lines = [lines filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+    if (lines.count == 0) {
+        [self showAlert:@"No valid lines in acc.txt"];
         return;
     }
-
-    NSString *selectedLine = accLines[arc4random_uniform((u_int32_t)accLines.count)];
-    NSArray *accParts = [selectedLine componentsSeparatedByString:@"|"];
-    if (accParts.count != 4) {
-        NSLog(@"[!] Invalid line in acc.txt: %@", selectedLine);
-        [self showAlertWithMessage:@"Invalid account format!"];
+    
+    NSString *selectedLine = lines[arc4random_uniform((u_int32_t)lines.count)];
+    NSArray *components = [selectedLine componentsSeparatedByString:@"|"];
+    if (components.count != 4) {
+        [self showAlert:[NSString stringWithFormat:@"Invalid line format: %@", selectedLine]];
         return;
     }
-
-    NSString *email = accParts[0];
-    NSString *pass = accParts[1];
-    NSString *userID = accParts[2];
-    NSString *token = accParts[3];
-
-    NSLog(@"[+] Selected account: Email=%@, Pass=%@, ID=%@, Token=%@", email, pass, userID, token);
-
-    // Copy and rename data files (skip for Mode 3)
-    if (mode != 3) {
-        NSArray *files;
-        if (mode == 2 || mode == 4) {
-            files = @[@"item_data_2_.data", @"season_data_1_.data", @"statistic_2_.data", @"weapon_evolution_data_1_.data"];
-        } else {
-            files = @[@"item_data_1_.data", @"season_data_1_.data", @"statistic_1_.data", @"weapon_evolution_data_1_.data"];
-        }
-
-        for (NSString *filename in files) {
-            NSString *oldPath = [DOCS_DIR stringByAppendingPathComponent:filename];
-            // Use NSRegularExpression for replacement
-            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"[1-2]" options:0 error:nil];
-            NSString *newFilename = [regex stringByReplacingMatchesInString:filename options:0 range:NSMakeRange(0, filename.length) withTemplate:userID];
-            NSString *newPath = [DOCS_DIR stringByAppendingPathComponent:newFilename];
-
-            if ([fileManager fileExistsAtPath:oldPath]) {
-                [fileManager copyItemAtPath:oldPath toPath:newPath error:&error];
-                if (error) {
-                    NSLog(@"[!] Failed to copy %@: %@", filename, error);
-                } else {
-                    NSLog(@"[+] Copied %@ to %@", filename, newFilename);
-                }
-            } else {
-                NSLog(@"[!] Missing file: %@", filename);
+    
+    NSString *email = components[0];
+    NSString *pass = components[1];
+    NSString *userID = components[2];
+    NSString *token = components[3];
+    
+    // Log selected account
+    NSLog(@"[+] Selected account: Email: %@, Pass: %@, ID: %@, Token: %@", email, pass, userID, token);
+    
+    // Copy and rename data files (Mode 1)
+    NSArray *files = @[
+        @"item_data_1_.data",
+        @"season_data_1_.data",
+        @"statistic_1_.data",
+        @"weapon_evolution_data_1_.data"
+    ];
+    
+    for (NSString *filename in files) {
+        NSString *oldPath = [DOCS_DIR stringByAppendingPathComponent:filename];
+        NSString *newFilename = [filename stringByReplacingOccurrencesOfString:@"1" withString:userID];
+        NSString *newPath = [DOCS_DIR stringByAppendingPathComponent:newFilename];
+        
+        if ([fileManager fileExistsAtPath:oldPath]) {
+            [fileManager copyItemAtPath:oldPath toPath:newPath error:&error];
+            if (error) {
+                [self showAlert:[NSString stringWithFormat:@"Error copying %@: %@", filename, error.localizedDescription]];
+                return;
             }
+            NSLog(@"[+] Copied %@ to %@", filename, newFilename);
+        } else {
+            [self showAlert:[NSString stringWithFormat:@"Missing file: %@", filename]];
         }
-    } else {
-        NSLog(@"[+] Mode 3: Skipping data file operations");
     }
-
+    
     // Remove old plist
     if ([fileManager fileExistsAtPath:OLD_PLIST]) {
         [fileManager removeItemAtPath:OLD_PLIST error:&error];
         if (error) {
-            NSLog(@"[!] Failed to remove plist: %@", error);
-        } else {
-            NSLog(@"[+] Removed old plist");
+            [self showAlert:[NSString stringWithFormat:@"Error removing plist: %@", error.localizedDescription]];
+            return;
         }
+        NSLog(@"[+] Removed old plist");
     }
-
-    // Replace and write new plist from TXT
+    
+    // Replace and write new plist
     if ([fileManager fileExistsAtPath:TXT_FILE]) {
         NSString *txtContent = [NSString stringWithContentsOfFile:TXT_FILE encoding:NSUTF8StringEncoding error:&error];
         if (error || !txtContent) {
-            NSLog(@"[!] Failed to read txt file: %@", error);
-            [self showAlertWithMessage:@"TXT config not found!"];
+            [self showAlert:@"Error reading txt config"];
             return;
         }
-
-        NSString *modified;
-        if (mode == 3) {
-            modified = [txtContent stringByReplacingOccurrencesOfString:@"98989898" withString:userID];
-            modified = [modified stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
-        } else if (mode == 4) {
-            modified = [txtContent stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
-        } else {
-            modified = [txtContent stringByReplacingOccurrencesOfString:@"98989898" withString:userID];
-            modified = [modified stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
-        }
-
+        
+        NSString *modified = [txtContent stringByReplacingOccurrencesOfString:@"98989898" withString:userID];
+        modified = [modified stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
+        
         [modified writeToFile:OLD_PLIST atomically:YES encoding:NSUTF8StringEncoding error:&error];
         if (error) {
-            NSLog(@"[!] Failed to write plist: %@", error);
-        } else {
-            NSLog(@"[+] New plist written");
+            [self showAlert:[NSString stringWithFormat:@"Error writing plist: %@", error.localizedDescription]];
+            return;
         }
+        NSLog(@"[+] New plist written");
     } else {
-        NSLog(@"[!] TXT config not found at %@", TXT_FILE);
-        [self showAlertWithMessage:@"TXT config not found!"];
+        [self showAlert:@"txt config not found"];
         return;
     }
-
-    // Save used account to done.txt and remove from acc.txt
-    NSString *doneLine = [NSString stringWithFormat:@"%@|%@\n", email, pass];
-    if (![doneLine appendToFile:DONE_FILE error:&error]) {
-        NSLog(@"[!] Failed to write to done.txt: %@", error);
-    }
-
-    NSMutableArray *newAccLines = [accLines mutableCopy];
-    [newAccLines removeObject:selectedLine];
-    NSString *newAccContent = [newAccLines componentsJoinedByString:@"\n"];
-    [newAccContent writeToFile:ACC_FILE atomically:YES encoding:NSUTF8StringEncoding error:&error];
+    
+    // Save to done.txt and remove from acc.txt
+    NSString *doneEntry = [NSString stringWithFormat:@"%@|%@\n", email, pass];
+    [doneEntry writeToFile:DONE_FILE atomically:YES encoding:NSUTF8StringEncoding error:&error];
     if (error) {
-        NSLog(@"[!] Failed to update acc.txt: %@", error);
-    } else {
-        NSLog(@"[+] Updated acc.txt and done.txt");
+        [self showAlert:[NSString stringWithFormat:@"Error writing to done.txt: %@", error.localizedDescription]];
+        return;
     }
-
-    // Launch app
-    NSLog(@"[✓] Done – Launching App");
-    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"fb166745907472360://"] options:@{} completionHandler:nil];
-}
-
-+ (void)showAlertWithMessage:(NSString *)message {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error" message:message preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *ok = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil];
-    [alert addAction:ok];
-    // Use active window scene for presentation
-    UIWindow *activeWindow = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *window in scene.windows) {
-                    if (window.isKeyWindow) {
-                        activeWindow = window;
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        activeWindow = [[UIApplication sharedApplication] keyWindow];
-    }
-    if (activeWindow) {
-        [activeWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-    }
-}
-
-@end
-
-// Helper category for file appending
-@interface NSString (FileAppend)
-- (BOOL)appendToFile:(NSString *)path error:(NSError **)error;
-@end
-
-@implementation NSString (FileAppend)
-- (BOOL)appendToFile:(NSString *)path error:(NSError **)error {
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (!fileHandle) {
-        // File doesn't exist, create it
-        [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
-        fileHandle = [NSFileHandle fileHandleForWritingAtPath:path];
-    }
-    if (fileHandle) {
-        @try {
-            [fileHandle seekToEndOfFile];
-            [fileHandle writeData:[self dataUsingEncoding:NSUTF8StringEncoding]];
-            [fileHandle closeFile];
-            return YES;
-        } @catch (NSException *exception) {
-            if (error) {
-                *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteUnknownError userInfo:@{NSUnderlyingErrorKey: exception}];
-            }
-            return NO;
-        }
-    }
+    
+    accContent = [accContent stringByReplacingOccurrencesOfString:[selectedLine stringByAppendingString:@"\n"] withString:@""];
+    [accContent writeToFile:ACC_FILE atomically:YES encoding:NSUTF8StringEncoding error:&error];
     if (error) {
-        *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteInvalidFileNameError userInfo:nil];
+        [self showAlert:[NSString stringWithFormat:@"Error updating acc.txt: %@", error.localizedDescription]];
+        return;
     }
-    return NO;
+    
+    [self showAlert:@"Done!"];
 }
+
+- (void)showAlert:(NSString *)message {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Status" message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    
+    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+    UIViewController *rootVC = keyWindow.rootViewController;
+    [rootVC presentViewController:alert animated:YES completion:nil];
+}
+
 @end
-
-// Hook to inject the floating button
-%hook UIApplication
-- (BOOL)becomeFirstResponder {
-    BOOL result = %orig;
-
-    // Add floating button to the active window
-    dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        UIWindow *activeWindow = nil;
-        if (@available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if (scene.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *window in scene.windows) {
-                        if (window.isKeyWindow) {
-                            activeWindow = window;
-                            break;
-                        }
-                    }
-                }
-            }
-        } else {
-            activeWindow = [[UIApplication sharedApplication] keyWindow];
-        }
-
-        if (activeWindow) {
-            floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
-            floatingButton.frame = CGRectMake(20, 100, 50, 50);
-            floatingButton.backgroundColor = [UIColor blueColor];
-            floatingButton.layer.cornerRadius = 25;
-            [floatingButton setTitle:@"T" forState:UIControlStateNormal];
-            [floatingButton addTarget:[TweakMenuController class] action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
-
-            // Make button draggable
-            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-            [floatingButton addGestureRecognizer:pan];
-
-            [activeWindow addSubview:floatingButton];
-        }
-    });
-
-    return result;
-}
-
-%new
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    UIWindow *activeWindow = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *window in scene.windows) {
-                    if (window.isKeyWindow) {
-                        activeWindow = window;
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        activeWindow = [[UIApplication sharedApplication] keyWindow];
-    }
-
-    if (activeWindow) {
-        CGPoint translation = [gesture translationInView:activeWindow];
-        CGPoint newCenter = CGPointMake(floatingButton.center.x + translation.x, floatingButton.center.y + translation.y);
-        floatingButton.center = newCenter;
-        [gesture setTranslation:CGPointZero inView:activeWindow];
-    }
-}
-%end
-
-%ctor {
-    %init;
-    NSLog(@"Tweak loaded");
-}
