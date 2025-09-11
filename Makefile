@@ -2,7 +2,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = DungeonShooter
 DungeonShooter_FILES = Tweak.xm
-FRAMEWORKS = Foundation UIKit Security CommonCrypto AVFoundation MediaPlayer WebKit QuartzCore IOKit
+FRAMEWORKS = Foundation UIKit Security DeviceCheck
 LIBRARIES = crypto
 DungeonShooter_CFLAGS = -fobjc-arc -Wno-error
 DungeonShooter_IPHONEOS_DEPLOYMENT_TARGET = 16.6.1
