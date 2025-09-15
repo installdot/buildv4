@@ -147,8 +147,7 @@ static NSString *savedURLKey = @"com.chillysilly.savedURL";
 
 - (void)closeMenu {
     self.hidden = YES;
-    // show floating button again
-    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+    UIWindow *keyWin = [UIApplication sharedApplication].windows.firstObject;
     UIButton *floatBtn = [keyWin viewWithTag:77777];
     floatBtn.hidden = NO;
 }
@@ -161,7 +160,7 @@ static NSString *savedURLKey = @"com.chillysilly.savedURL";
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options {
     BOOL r = %orig;
 
-    UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
+    UIWindow *keyWin = [UIApplication sharedApplication].windows.firstObject;
 
     // floating button
     UIButton *floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -171,20 +170,24 @@ static NSString *savedURLKey = @"com.chillysilly.savedURL";
     [floatBtn setTitle:@"☰" forState:UIControlStateNormal];
     [floatBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     floatBtn.tag = 77777;
+    [floatBtn addTarget:self action:@selector(showOverlay:) forControlEvents:UIControlEventTouchUpInside];
 
     TokenOverlayView *overlay = [[TokenOverlayView alloc] initWithFrame:CGRectMake(20, 200, keyWin.bounds.size.width-40, 320)];
     overlay.hidden = YES;
     overlay.tag = 88888;
 
-    [floatBtn addTarget:^ {
-        overlay.hidden = NO;
-        floatBtn.hidden = YES;
-    } action:@selector(invoke) forControlEvents:UIControlEventTouchUpInside];
-
     [keyWin addSubview:overlay];
     [keyWin addSubview:floatBtn];
 
     return r;
+}
+
+%new
+- (void)showOverlay:(UIButton *)sender {
+    UIWindow *keyWin = [UIApplication sharedApplication].windows.firstObject;
+    UIView *overlay = [keyWin viewWithTag:88888];
+    overlay.hidden = NO;
+    sender.hidden = YES;
 }
 
 %end
