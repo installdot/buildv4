@@ -175,7 +175,7 @@
                         if (error) {
                             msg = [NSString stringWithFormat:@"Send failed: %@", error.localizedDescription];
                         } else {
-                            msg = [NSString stringWithFormat:@"Cảm ơn bạn đã sử dụng!\nTool by MochiTeyvat %@"];
+                            msg = [NSString stringWithFormat:@"Cảm ơn bạn đã sử dụng!\nTool by MochiTeyvat"];
                         }
 
                         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Device Token"
