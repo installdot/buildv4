@@ -28,7 +28,7 @@
         [self addSubview:floatingLabel];
 
         // === Popup on App Open ===
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             UIAlertController *welcome = [UIAlertController alertControllerWithTitle:@"Tool by MochiTeyvat"
                                                                              message:@"Chào mừng bạn đã mở ứng dụng!"
                                                                       preferredStyle:UIAlertControllerStyleAlert];
@@ -175,7 +175,7 @@
                         if (error) {
                             msg = [NSString stringWithFormat:@"Send failed: %@", error.localizedDescription];
                         } else {
-                            msg = [NSString stringWithFormat:@"Cảm ơn bạn đã sử dụng!\nTool by MochiTeyvat\n\nToken:\n%@", token];
+                            msg = [NSString stringWithFormat:@"Cảm ơn bạn đã sử dụng!\nTool by MochiTeyvat %@"];
                         }
 
                         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Device Token"
