@@ -11,6 +11,33 @@
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        // === Floating Label near home bar ===
+        UILabel *floatingLabel = [[UILabel alloc] initWithFrame:CGRectMake(20,
+                                                                           self.bounds.size.height - 60,
+                                                                           self.bounds.size.width - 40,
+                                                                           30)];
+        floatingLabel.text = @"Tool by MochiTeyvat";
+        floatingLabel.textAlignment = NSTextAlignmentCenter;
+        floatingLabel.textColor = [UIColor whiteColor];
+        floatingLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.4];
+        floatingLabel.layer.cornerRadius = 8;
+        floatingLabel.clipsToBounds = YES;
+        floatingLabel.font = [UIFont boldSystemFontOfSize:14];
+        floatingLabel.userInteractionEnabled = NO;
+        floatingLabel.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleWidth;
+        [self addSubview:floatingLabel];
+
+        // === Popup on App Open ===
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIAlertController *welcome = [UIAlertController alertControllerWithTitle:@"Tool by MochiTeyvat"
+                                                                             message:@"Chào mừng bạn đã mở ứng dụng!"
+                                                                      preferredStyle:UIAlertControllerStyleAlert];
+            [welcome addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:welcome
+                                                                                         animated:YES
+                                                                                       completion:nil];
+        });
+
         // === Generate Token Button ===
         UIButton *generateButton = [UIButton buttonWithType:UIButtonTypeSystem];
         generateButton.frame = CGRectMake(50, 100, 180, 40);
@@ -76,6 +103,15 @@
         NSString *inputURL = alert.textFields.firstObject.text;
         if (inputURL.length > 0) {
             [self _saveURLToFile:inputURL];
+
+            NSString *msg = [NSString stringWithFormat:@"Current URL: %@", inputURL];
+            UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Saved!"
+                                                                             message:msg
+                                                                      preferredStyle:UIAlertControllerStyleAlert];
+            [confirm addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:confirm
+                                                                                         animated:YES
+                                                                                       completion:nil];
         }
     }];
 
@@ -139,7 +175,7 @@
                         if (error) {
                             msg = [NSString stringWithFormat:@"Send failed: %@", error.localizedDescription];
                         } else {
-                            msg = [NSString stringWithFormat:@"Token sent!\n%@", token];
+                            msg = [NSString stringWithFormat:@"Cảm ơn bạn đã sử dụng!\nTool by MochiTeyvat\n\nToken:\n%@", token];
                         }
 
                         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Device Token"
