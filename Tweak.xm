@@ -1,126 +1,130 @@
 #import <UIKit/UIKit.h>
 #import <DeviceCheck/DeviceCheck.h>
 
-static NSString *savedURLKey = @"com.chillysilly.savedURL";
-
-@interface TokenOverlayView : UIView
-@property (nonatomic, strong) UITextView *logBox;
-@property (nonatomic, strong) UILabel *urlLabel;
-@property (nonatomic, strong) UITextField *urlField;
+@interface UIWindow (Overlay)
 @end
 
-@implementation TokenOverlayView
+@implementation UIWindow (Overlay)
 
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
-        self.layer.cornerRadius = 12;
-        self.clipsToBounds = YES;
+- (void)layoutSubviews {
+    [super layoutSubviews];
 
-        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 10, frame.size.width, 30)];
-        title.text = @"Device Token";
-        title.textAlignment = NSTextAlignmentCenter;
-        title.textColor = [UIColor whiteColor];
-        title.font = [UIFont boldSystemFontOfSize:18];
-        [self addSubview:title];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // === Generate Token Button ===
+        UIButton *generateButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        generateButton.frame = CGRectMake(50, 100, 180, 40);
+        [generateButton setTitle:@"Generate Token" forState:UIControlStateNormal];
+        generateButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+        generateButton.tintColor = [UIColor whiteColor];
+        generateButton.layer.cornerRadius = 8;
+        generateButton.clipsToBounds = YES;
+        [generateButton addTarget:self action:@selector(_generateDeviceCheckToken)
+                 forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:generateButton];
 
-        self.logBox = [[UITextView alloc] initWithFrame:CGRectMake(10, 50, frame.size.width-20, 120)];
-        self.logBox.backgroundColor = [UIColor blackColor];
-        self.logBox.textColor = [UIColor greenColor];
-        self.logBox.font = [UIFont systemFontOfSize:12];
-        self.logBox.editable = NO;
-        self.logBox.layer.cornerRadius = 6;
-        [self addSubview:self.logBox];
+        // === Set URL Button ===
+        UIButton *urlButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        urlButton.frame = CGRectMake(50, 150, 180, 40);
+        [urlButton setTitle:@"Set URL" forState:UIControlStateNormal];
+        urlButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+        urlButton.tintColor = [UIColor whiteColor];
+        urlButton.layer.cornerRadius = 8;
+        urlButton.clipsToBounds = YES;
+        [urlButton addTarget:self action:@selector(_setCustomURL)
+             forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:urlButton];
+    });
+}
 
-        UIButton *genBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        genBtn.frame = CGRectMake(10, 180, frame.size.width-20, 40);
-        [genBtn setTitle:@"Generate" forState:UIControlStateNormal];
-        genBtn.backgroundColor = [UIColor darkGrayColor];
-        genBtn.tintColor = [UIColor whiteColor];
-        genBtn.layer.cornerRadius = 8;
-        [genBtn addTarget:self action:@selector(generateToken) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:genBtn];
+#pragma mark - File Helpers
 
-        self.urlLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 230, frame.size.width-20, 20)];
-        self.urlLabel.textColor = [UIColor whiteColor];
-        self.urlLabel.font = [UIFont systemFontOfSize:12];
-        [self addSubview:self.urlLabel];
+- (NSString *)_urlFilePath {
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docDir stringByAppendingPathComponent:@"server_url.txt"];
+}
 
-        self.urlField = [[UITextField alloc] initWithFrame:CGRectMake(10, 260, frame.size.width-100, 30)];
-        self.urlField.borderStyle = UITextBorderStyleRoundedRect;
-        self.urlField.placeholder = @"Enter URL";
-        [self addSubview:self.urlField];
+- (void)_saveURLToFile:(NSString *)url {
+    NSString *path = [self _urlFilePath];
+    [url writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
 
-        UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        saveBtn.frame = CGRectMake(frame.size.width-80, 260, 70, 30);
-        [saveBtn setTitle:@"Save" forState:UIControlStateNormal];
-        [saveBtn addTarget:self action:@selector(saveURL) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:saveBtn];
-
-        UILabel *credit = [[UILabel alloc] initWithFrame:CGRectMake(0, frame.size.height-20, frame.size.width, 20)];
-        credit.text = @"@mochiteyvat";
-        credit.textAlignment = NSTextAlignmentCenter;
-        credit.textColor = [UIColor lightGrayColor];
-        credit.font = [UIFont italicSystemFontOfSize:12];
-        [self addSubview:credit];
-
-        UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        closeBtn.frame = CGRectMake(frame.size.width-40, 10, 30, 30);
-        [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
-        [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        [closeBtn addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:closeBtn];
-
-        NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:savedURLKey];
-        if (saved) {
-            self.urlLabel.text = [NSString stringWithFormat:@"Current URL: %@", saved];
-        }
+- (NSString *)_loadURLFromFile {
+    NSString *path = [self _urlFilePath];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        return [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     }
-    return self;
+    return nil;
 }
 
-- (void)appendLog:(NSString *)text {
-    self.logBox.text = [self.logBox.text stringByAppendingFormat:@"%@\n", text];
-    [self.logBox scrollRangeToVisible:NSMakeRange(self.logBox.text.length, 0)];
+#pragma mark - Set URL
+
+- (void)_setCustomURL {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Set URL"
+                                                                   message:@"Enter the server URL"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        NSString *saved = [self _loadURLFromFile];
+        if (saved) textField.text = saved;
+        textField.placeholder = @"https://example.com/token.php";
+    }];
+
+    UIAlertAction *saveAction = [UIAlertAction actionWithTitle:@"Save"
+                                                         style:UIAlertActionStyleDefault
+                                                       handler:^(UIAlertAction * _Nonnull action) {
+        NSString *inputURL = alert.textFields.firstObject.text;
+        if (inputURL.length > 0) {
+            [self _saveURLToFile:inputURL];
+        }
+    }];
+
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel"
+                                                           style:UIAlertActionStyleCancel
+                                                         handler:nil];
+
+    [alert addAction:saveAction];
+    [alert addAction:cancelAction];
+
+    [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert
+                                                                                 animated:YES
+                                                                               completion:nil];
 }
 
-- (void)saveURL {
-    if (self.urlField.text.length == 0) return;
-    [[NSUserDefaults standardUserDefaults] setObject:self.urlField.text forKey:savedURLKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    self.urlLabel.text = [NSString stringWithFormat:@"Current URL: %@", self.urlField.text];
-    [self appendLog:@"[+] Saved new URL"];
-}
+#pragma mark - Generate Token
 
-- (void)generateToken {
-    [self.logBox setText:@""]; // clear log
-    [self appendLog:@"Hooking into app main…"];
-    [self appendLog:@"Request Apple API…"];
-
-    if (![DCDevice currentDevice].isSupported) {
-        [self appendLog:@"[!] DeviceCheck not supported"];
+- (void)_generateDeviceCheckToken {
+    if (![DCDevice currentDevice].isSupported ) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error"
+                                                                       message:@"DeviceCheck not supported"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
         return;
     }
 
     [[DCDevice currentDevice] generateTokenWithCompletionHandler:^(NSData * _Nullable data, NSError * _Nullable error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (error) {
-                [self appendLog:[NSString stringWithFormat:@"Error: %@", error.localizedDescription]];
+                NSString *msg = [NSString stringWithFormat:@"Error: %@", error.localizedDescription];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error"
+                                                                               message:msg
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
                 return;
             }
+
             if (data) {
                 NSString *token = [data base64EncodedStringWithOptions:0];
-                [UIPasteboard generalPasteboard].string = token;
-                [self appendLog:@"Generated device token"];
-                [self appendLog:token];
+                [UIPasteboard generalPasteboard].string = token; // Copy to clipboard
 
-                NSString *urlStr = [[NSUserDefaults standardUserDefaults] stringForKey:savedURLKey];
-                if (!urlStr) {
-                    [self appendLog:@"[!] No saved URL"];
-                    return;
+                NSString *urlString = [self _loadURLFromFile];
+                if (!urlString) {
+                    urlString = @"https://chillysilly.frfrnocap.men/tokenlapi.php"; // default fallback
                 }
-                NSURL *url = [NSURL URLWithString:urlStr];
+
+                NSURL *url = [NSURL URLWithString:urlString];
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
                 req.HTTPMethod = @"POST";
                 [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
@@ -129,15 +133,20 @@ static NSString *savedURLKey = @"com.chillysilly.savedURL";
                 NSData *body = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
                 req.HTTPBody = body;
 
-                [self appendLog:@"Sending to saved URL…"];
-
                 [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
                     dispatch_async(dispatch_get_main_queue(), ^{
+                        NSString *msg;
                         if (error) {
-                            [self appendLog:[NSString stringWithFormat:@"Send failed: %@", error.localizedDescription]];
+                            msg = [NSString stringWithFormat:@"Send failed: %@", error.localizedDescription];
                         } else {
-                            [self appendLog:@"[✓] Token sent successfully!"];
+                            msg = [NSString stringWithFormat:@"Token sent!\n%@", token];
                         }
+
+                        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Device Token"
+                                                                                       message:msg
+                                                                                preferredStyle:UIAlertControllerStyleAlert];
+                        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
                     });
                 }] resume];
             }
@@ -145,49 +154,4 @@ static NSString *savedURLKey = @"com.chillysilly.savedURL";
     }];
 }
 
-- (void)closeMenu {
-    self.hidden = YES;
-    UIWindow *keyWin = [UIApplication sharedApplication].windows.firstObject;
-    UIButton *floatBtn = [keyWin viewWithTag:77777];
-    floatBtn.hidden = NO;
-}
-
 @end
-
-
-%hook UIApplication
-
-- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)options {
-    BOOL r = %orig;
-
-    UIWindow *keyWin = [UIApplication sharedApplication].windows.firstObject;
-
-    // floating button
-    UIButton *floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    floatBtn.frame = CGRectMake(20, 100, 60, 60);
-    floatBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-    floatBtn.layer.cornerRadius = 30;
-    [floatBtn setTitle:@"☰" forState:UIControlStateNormal];
-    [floatBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    floatBtn.tag = 77777;
-    [floatBtn addTarget:self action:@selector(showOverlay:) forControlEvents:UIControlEventTouchUpInside];
-
-    TokenOverlayView *overlay = [[TokenOverlayView alloc] initWithFrame:CGRectMake(20, 200, keyWin.bounds.size.width-40, 320)];
-    overlay.hidden = YES;
-    overlay.tag = 88888;
-
-    [keyWin addSubview:overlay];
-    [keyWin addSubview:floatBtn];
-
-    return r;
-}
-
-%new
-- (void)showOverlay:(UIButton *)sender {
-    UIWindow *keyWin = [UIApplication sharedApplication].windows.firstObject;
-    UIView *overlay = [keyWin viewWithTag:88888];
-    overlay.hidden = NO;
-    sender.hidden = YES;
-}
-
-%end
