@@ -10,77 +10,77 @@
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        UIButton *plistButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        plistButton.frame = CGRectMake(50, 150, 160, 40);
-        [plistButton setTitle:@"Edit Prefs" forState:UIControlStateNormal];
-        plistButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.5];
-        [plistButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        plistButton.layer.cornerRadius = 8.0;
-        plistButton.clipsToBounds = YES;
-
-        [plistButton addTarget:self action:@selector(showPlistKeys) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:plistButton];
+        UIButton *prefsButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        prefsButton.frame = CGRectMake(50, 100, 120, 40);
+        [prefsButton setTitle:@"Edit Prefs" forState:UIControlStateNormal];
+        prefsButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+        [prefsButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        prefsButton.layer.cornerRadius = 8.0;
+        prefsButton.clipsToBounds = YES;
+        [prefsButton addTarget:self action:@selector(showNSUserDefaultsEditor) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:prefsButton];
     });
 }
 
-- (NSString *)appPrefsPlistPath {
-    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-    return [NSString stringWithFormat:@"/var/mobile/Containers/Data/Application/%@/Library/Preferences/%@.plist",
-            [[NSBundle mainBundle] bundleIdentifier], bundleID];
-}
+- (void)showNSUserDefaultsEditor {
+    NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    NSArray *keys = [defaults allKeys];
 
-- (void)showPlistKeys {
-    NSString *plistPath = [self appPrefsPlistPath];
-    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
-    if (!dict) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error"
-                                                                       message:@"Plist not found"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-        [self.rootViewController presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Select Key"
-                                                                   message:nil
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"NSUserDefaults"
+                                                                   message:@"Select a key to edit"
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
-    for (NSString *key in dict.allKeys) {
-        [alert addAction:[UIAlertAction actionWithTitle:key
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction * _Nonnull action) {
-            [self editValueForKey:key inPlist:plistPath];
-        }]];
+    for (NSString *key in keys) {
+        UIAlertAction *action = [UIAlertAction actionWithTitle:key
+                                                         style:UIAlertActionStyleDefault
+                                                       handler:^(UIAlertAction * _Nonnull act) {
+            [self editValueForKey:key currentValue:[defaults objectForKey:key]];
+        }];
+        [alert addAction:action];
     }
 
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self.rootViewController presentViewController:alert animated:YES completion:nil];
+
+    UIViewController *rootVC = self.rootViewController;
+    if (rootVC) {
+        [rootVC presentViewController:alert animated:YES completion:nil];
+    }
 }
 
-- (void)editValueForKey:(NSString *)key inPlist:(NSString *)plistPath {
-    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
-    if (!dict) return;
+- (void)editValueForKey:(NSString *)key currentValue:(id)value {
+    NSString *valueString = value ? [value description] : @"";
 
-    NSString *currentValue = [NSString stringWithFormat:@"%@", dict[key]];
+    UIAlertController *editAlert = [UIAlertController alertControllerWithTitle:key
+                                                                       message:@"Edit value"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:key
-                                                                   message:@"Edit value"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-
-    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-        textField.text = currentValue;
+    [editAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.text = valueString;
     }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction * _Nonnull action) {
-        NSString *newValue = alert.textFields.firstObject.text;
-        dict[key] = newValue; // stores as string
-        [dict writeToFile:plistPath atomically:YES];
+    [editAlert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        NSString *newVal = editAlert.textFields.firstObject.text;
+
+        // Save back into NSUserDefaults
+        [[NSUserDefaults standardUserDefaults] setObject:newVal forKey:key];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Saved!"
+                                                                      message:[NSString stringWithFormat:@"%@ = %@", key, newVal]
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        UIViewController *rootVC = self.rootViewController;
+        if (rootVC) {
+            [rootVC presentViewController:done animated:YES completion:nil];
+        }
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self.rootViewController presentViewController:alert animated:YES completion:nil];
+    [editAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    UIViewController *rootVC = self.rootViewController;
+    if (rootVC) {
+        [rootVC presentViewController:editAlert animated:YES completion:nil];
+    }
 }
 
 @end
