@@ -25,7 +25,7 @@ static NSString *stringFromDataIfText(NSData *d) {
     if (s) return s;
     // fallback to hex
     NSMutableString *hex = [NSMutableString stringWithCapacity:d.length*2];
-    const unsigned char *bytes = d.bytes;
+    const unsigned char *bytes = (const unsigned char *)[d bytes];
     for (NSUInteger i=0;i<d.length;i++) [hex appendFormat:@"%02x", bytes[i]];
     return [NSString stringWithFormat:@"<hex:%@>", hex];
 }
