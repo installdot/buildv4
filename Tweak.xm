@@ -2,7 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCryptor.h>
 
-static NSString * const kServerURL = @"https://yourserver.example/verify.php"; // replace
+static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/tverify.php"; // replace
 static NSString * const kAESKeyHex = @"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01234567";
 static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
 
