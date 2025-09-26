@@ -6,7 +6,7 @@ static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/tverify
 static NSString * const kAESKeyHex = @"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01234567";
 static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
 
-static NSString *selectedID = nil; // which ID prefix is active
+static NSString *selectedID = nil;
 
 @interface UIWindow (Overlay)
 @end
@@ -23,7 +23,6 @@ static NSString *selectedID = nil; // which ID prefix is active
         menuButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
         [menuButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         menuButton.layer.cornerRadius = 8.0;
-        menuButton.clipsToBounds = YES;
         [menuButton addTarget:self action:@selector(openIDSelector) forControlEvents:UIControlEventTouchUpInside];
         [self addSubview:menuButton];
     });
@@ -47,11 +46,8 @@ static NSString *selectedID = nil; // which ID prefix is active
         NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
         NSMutableSet *ids = [NSMutableSet set];
         for (NSString *key in defaults.allKeys) {
-            // collect prefix until first "_"
-            NSArray *parts = [key componentsSeparatedByString:@"_"];
-            if (parts.count > 1) {
-                [ids addObject:parts[0]];
-            }
+            NSArray *parts = [key componentsSeparatedByString:@"_c1"];
+            if (parts.count > 1) [ids addObject:parts[0]];
         }
 
         UIAlertController *picker = [UIAlertController alertControllerWithTitle:@"Select ID"
@@ -80,22 +76,22 @@ static NSString *selectedID = nil; // which ID prefix is active
         [self promptSearchKey];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Char" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        [self massEditPattern:[NSString stringWithFormat:@"%@_c[0-9]+_unlock", selectedID] newValue:@"true"];
+        [self massEditPattern:[NSString stringWithFormat:@"%@_c[0-9]+_unlock", selectedID] newValue:@"true" useNumber:NO];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skin" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        [self massEditPattern:[NSString stringWithFormat:@"%@_c[0-9]+_skin[0-9]+", selectedID] newValue:@"1"];
+        [self massEditPattern:[NSString stringWithFormat:@"%@_c[0-9]+_skin[0-9]+", selectedID] newValue:@"1" useNumber:YES];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skill" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        [self massEditPattern:[NSString stringWithFormat:@"%@_c_.*_skill_.*_unlock", selectedID] newValue:@"1"];
+        [self massEditPattern:[NSString stringWithFormat:@"%@_c_.*_skill_.*_unlock", selectedID] newValue:@"1" useNumber:YES];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Pet" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        [self massEditPattern:[NSString stringWithFormat:@"%@_p[0-9]+_unlock", selectedID] newValue:@"true"];
+        [self massEditPattern:[NSString stringWithFormat:@"%@_p[0-9]+_unlock", selectedID] newValue:@"true" useNumber:NO];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
         [self promptSetGems];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        [self massEditPattern:[NSString stringWithFormat:@"%@_reborn_card", selectedID] newValue:@"1"];
+        [self massEditPattern:[NSString stringWithFormat:@"%@_reborn_card", selectedID] newValue:@"1" useNumber:YES];
     }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 
@@ -134,13 +130,17 @@ static NSString *selectedID = nil; // which ID prefix is active
 
 #pragma mark - Mass edit
 
-- (void)massEditPattern:(NSString *)regexPattern newValue:(NSString *)val {
+- (void)massEditPattern:(NSString *)regexPattern newValue:(NSString *)val useNumber:(BOOL)num {
     NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
     NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:regexPattern options:0 error:nil];
     for (NSString *key in defaults.allKeys) {
         if ([key hasPrefix:selectedID]) {
             if ([regex firstMatchInString:key options:0 range:NSMakeRange(0, key.length)]) {
-                [[NSUserDefaults standardUserDefaults] setObject:val forKey:key];
+                if (num) {
+                    [[NSUserDefaults standardUserDefaults] setObject:@([val integerValue]) forKey:key];
+                } else {
+                    [[NSUserDefaults standardUserDefaults] setObject:val forKey:key];
+                }
             }
         }
     }
@@ -152,7 +152,7 @@ static NSString *selectedID = nil; // which ID prefix is active
     [self.rootViewController presentViewController:done animated:YES completion:nil];
 }
 
-#pragma mark - Search/Edit (same as before)
+#pragma mark - Search/Edit (unchanged)
 
 - (void)promptSearchKey {
     UIAlertController *search = [UIAlertController alertControllerWithTitle:@"Search Key"
@@ -204,8 +204,8 @@ static NSString *selectedID = nil; // which ID prefix is active
     [self.rootViewController presentViewController:edit animated:YES completion:nil];
 }
 
-
-#pragma mark - Server verification (kept from your code)
+#pragma mark - Server verification (same as before)
+// (verifyWithServerThen, AES helpers unchanged – keep them from your version)
 
 - (void)verifyWithServerThen:(void(^)(BOOL allowed))completion {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
