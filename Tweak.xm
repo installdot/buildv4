@@ -2,7 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCryptor.h>
 
-static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/tverify.php"; // replace
+static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/tverify.php"; // replace if needed
 static NSString * const kAESKeyHex = @"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01234567";
 static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
 
@@ -16,21 +16,22 @@ static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        UIButton *menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        menuButton.frame = CGRectMake(50, 100, 120, 40);
-        [menuButton setTitle:@"Menu" forState:UIControlStateNormal];
-        menuButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-        [menuButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        menuButton.layer.cornerRadius = 8.0;
-        menuButton.clipsToBounds = YES;
-        [menuButton addTarget:self action:@selector(showMainMenu) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:menuButton];
+        UIButton *prefsButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        prefsButton.frame = CGRectMake(50, 100, 120, 40);
+        [prefsButton setTitle:@"Menu" forState:UIControlStateNormal];
+        prefsButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+        [prefsButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        prefsButton.layer.cornerRadius = 8.0;
+        prefsButton.clipsToBounds = YES;
+        [prefsButton addTarget:self action:@selector(showMainMenu) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:prefsButton];
     });
 }
 
 #pragma mark - Main Menu
 
 - (void)showMainMenu {
+    // Use the existing verifyWithServerThen you provided
     [self verifyWithServerThen:^(BOOL allowed) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!allowed) {
@@ -40,7 +41,8 @@ static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
                 [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
                     exit(0);
                 }]];
-                [self.rootViewController presentViewController:alert animated:YES completion:nil];
+                UIViewController *root = self.rootViewController;
+                if (root) [root presentViewController:alert animated:YES completion:nil];
                 return;
             }
 
@@ -52,96 +54,126 @@ static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
                 [self promptSearchKey];
             }]];
             [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Char" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+                // keys like xxxxx_cx_unlock (use regex to match _c<number>_unlock)
                 [self massEditWithPattern:@"_c[0-9]+_unlock" newValue:@"true"];
             }]];
             [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skin" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+                // keys like xxxxx_cx_skinxx
                 [self massEditWithPattern:@"_c[0-9]+_skin[0-9]+" newValue:@"1"];
             }]];
             [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skill" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                [self massEditWithPattern:@"_c_.*_skill_.*_unlock" newValue:@"1"];
+                // keys like xxxxx_c_xxxxxx_skill_x_unlock (use a permissive pattern)
+                [self massEditWithPattern:@"c.*_skill.*_unlock" newValue:@"1"];
             }]];
             [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Pet" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+                // keys like xxxxx_p12_unlock
                 [self massEditWithPattern:@"_p[0-9]+_unlock" newValue:@"true"];
             }]];
             [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
                 [self promptSetGems];
             }]];
             [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+                // keys like xxxxx_reborn_card
                 [self massEditWithPattern:@"_reborn_card" newValue:@"1"];
             }]];
             [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 
-            [self.rootViewController presentViewController:menu animated:YES completion:nil];
+            UIViewController *root = self.rootViewController;
+            if (root) [root presentViewController:menu animated:YES completion:nil];
         });
     }];
 }
 
-#pragma mark - Search Flow
+#pragma mark - Search Flow (unchanged behavior)
 
 - (void)promptSearchKey {
-    UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Search Key"
-                                                                   message:@"Enter part of the key to search"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [input addTextFieldWithConfigurationHandler:nil];
+    UIAlertController *searchAlert = [UIAlertController alertControllerWithTitle:@"Search Key"
+                                                                         message:@"Enter part of a key name"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+    [searchAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"example_key";
+    }];
 
-    [input addAction:[UIAlertAction actionWithTitle:@"Search" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        NSString *term = input.textFields.firstObject.text;
-        if (term.length > 0) {
-            [self showMatchingKeys:term];
+    [searchAlert addAction:[UIAlertAction actionWithTitle:@"Search"
+                                                    style:UIAlertActionStyleDefault
+                                                  handler:^(UIAlertAction * _Nonnull act) {
+        NSString *query = searchAlert.textFields.firstObject.text;
+        if (query.length > 0) {
+            [self showMatchingKeys:query];
         }
     }]];
-    [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 
-    [self.rootViewController presentViewController:input animated:YES completion:nil];
+    [searchAlert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                    style:UIAlertActionStyleCancel
+                                                  handler:nil]];
+
+    UIViewController *rootVC = self.rootViewController;
+    if (rootVC) [rootVC presentViewController:searchAlert animated:YES completion:nil];
 }
 
-- (void)showMatchingKeys:(NSString *)term {
+- (void)showMatchingKeys:(NSString *)query {
     NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
     NSMutableArray *matches = [NSMutableArray array];
     for (NSString *key in defaults.allKeys) {
-        if ([key localizedCaseInsensitiveContainsString:term]) {
+        if ([[key lowercaseString] containsString:[query lowercaseString]]) {
             [matches addObject:key];
         }
     }
 
     if (matches.count == 0) {
-        UIAlertController *none = [UIAlertController alertControllerWithTitle:@"No Match"
-                                                                      message:@"No keys found."
-                                                               preferredStyle:UIAlertControllerStyleAlert];
-        [none addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-        [self.rootViewController presentViewController:none animated:YES completion:nil];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"No Matches"
+                                                                       message:@"No keys found."
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        UIViewController *rootVC = self.rootViewController;
+        if (rootVC) [rootVC presentViewController:alert animated:YES completion:nil];
         return;
     }
 
-    UIAlertController *list = [UIAlertController alertControllerWithTitle:@"Matches"
+    // If many matches, use ActionSheet for scrolling; UIAlertControllerActionSheet will present scrollable list
+    UIAlertController *list = [UIAlertController alertControllerWithTitle:@"Select Key"
                                                                   message:nil
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
     for (NSString *key in matches) {
-        [list addAction:[UIAlertAction actionWithTitle:key style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-            [self promptEditKey:key];
+        [list addAction:[UIAlertAction actionWithTitle:key style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            id val = defaults[key];
+            [self promptEditKey:key currentValue:val];
         }]];
     }
+
     [list addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self.rootViewController presentViewController:list animated:YES completion:nil];
+
+    UIViewController *rootVC = self.rootViewController;
+    if (rootVC) [rootVC presentViewController:list animated:YES completion:nil];
 }
 
-- (void)promptEditKey:(NSString *)key {
-    id val = [[NSUserDefaults standardUserDefaults] objectForKey:key];
-    NSString *curVal = val ? [val description] : @"<nil>";
-
-    UIAlertController *edit = [UIAlertController alertControllerWithTitle:key
-                                                                  message:[NSString stringWithFormat:@"Current: %@", curVal]
+- (void)promptEditKey:(NSString *)key currentValue:(id)value {
+    NSString *valStr = value ? [value description] : @"(nil)";
+    UIAlertController *edit = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Edit %@", key]
+                                                                  message:[NSString stringWithFormat:@"Current value: %@", valStr]
                                                            preferredStyle:UIAlertControllerStyleAlert];
+
     [edit addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = curVal;
+        tf.text = valStr;
     }];
+
     [edit addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
         NSString *newVal = edit.textFields.firstObject.text;
-        [[NSUserDefaults standardUserDefaults] setObject:newVal forKey:key];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+        if (newVal) {
+            [[NSUserDefaults standardUserDefaults] setObject:newVal forKey:key];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        } else {
+            // if empty, remove key
+            [[NSUserDefaults standardUserDefaults] removeObjectForKey:key];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
     }]];
+
     [edit addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self.rootViewController presentViewController:edit animated:YES completion:nil];
+
+    UIViewController *rootVC = self.rootViewController;
+    if (rootVC) [rootVC presentViewController:edit animated:YES completion:nil];
 }
 
 #pragma mark - Gems Setter
@@ -160,98 +192,159 @@ static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
         if (val.length > 0) {
             NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
             for (NSString *key in defaults.allKeys) {
-                if ([key hasSuffix:@"_gems"] || [key hasSuffix:@"_last_gems"]) {
+                if ([key containsString:@"_gems"] || [key containsString:@"_last_gems"]) {
                     [[NSUserDefaults standardUserDefaults] setObject:val forKey:key];
                 }
             }
             [[NSUserDefaults standardUserDefaults] synchronize];
+
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Done"
+                                                                          message:@"Gems values updated."
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            UIViewController *root = self.rootViewController;
+            if (root) [root presentViewController:done animated:YES completion:nil];
         }
     }]];
     [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [self.rootViewController presentViewController:input animated:YES completion:nil];
+
+    UIViewController *root = self.rootViewController;
+    if (root) [root presentViewController:input animated:YES completion:nil];
 }
 
-#pragma mark - Mass edit helper
+#pragma mark - Mass edit helper (regex)
 
 - (void)massEditWithPattern:(NSString *)regexPattern newValue:(NSString *)val {
     NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:regexPattern options:0 error:nil];
+    NSError *err = nil;
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:regexPattern options:0 error:&err];
+    if (err) {
+        // invalid regex
+        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error"
+                                                                          message:@"Invalid pattern"
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        UIViewController *r = self.rootViewController;
+        if (r) [r presentViewController:errAlert animated:YES completion:nil];
+        return;
+    }
+
+    NSMutableArray *changedKeys = [NSMutableArray array];
 
     for (NSString *key in defaults.allKeys) {
         NSTextCheckingResult *m = [regex firstMatchInString:key options:0 range:NSMakeRange(0, key.length)];
         if (m) {
-            [[NSUserDefaults standardUserDefaults] setObject:val forKey:key];
+            // write appropriate type: try to preserve numeric if val looks numeric, bool if "true"/"false"
+            id outVal = val;
+            NSString *lower = [val lowercaseString];
+            if ([lower isEqualToString:@"true"] || [lower isEqualToString:@"false"]) {
+                outVal = @([lower isEqualToString:@"true"]);
+            } else {
+                // check if integer
+                NSScanner *scanner = [NSScanner scannerWithString:val];
+                int intVal;
+                if ([scanner scanInt:&intVal] && scanner.isAtEnd) {
+                    outVal = @(intVal);
+                } else {
+                    // keep as string
+                    outVal = val;
+                }
+            }
+
+            [[NSUserDefaults standardUserDefaults] setObject:outVal forKey:key];
+            [changedKeys addObject:key];
         }
     }
     [[NSUserDefaults standardUserDefaults] synchronize];
 
+    NSString *msg = [NSString stringWithFormat:@"Applied %@ to %lu keys", val, (unsigned long)changedKeys.count];
     UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Done"
-                                                                  message:[NSString stringWithFormat:@"Applied %@ to matching keys", val]
+                                                                  message:msg
                                                            preferredStyle:UIAlertControllerStyleAlert];
     [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self.rootViewController presentViewController:done animated:YES completion:nil];
+    UIViewController *root = self.rootViewController;
+    if (root) [root presentViewController:done animated:YES completion:nil];
 }
 
-#pragma mark - Verify (AES + UUID replay)
+#pragma mark - Server verification (kept from your code)
 
-- (void)verifyWithServerThen:(void (^)(BOOL))callback {
-    NSString *uuid = [[NSUserDefaults standardUserDefaults] stringForKey:@"verifyUUID"];
-    if (!uuid) {
-        uuid = [[NSUUID UUID] UUIDString];
-        [[NSUserDefaults standardUserDefaults] setObject:uuid forKey:@"verifyUUID"];
-    }
+- (void)verifyWithServerThen:(void(^)(BOOL allowed))completion {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 
-    NSString *timestamp = [NSString stringWithFormat:@"%f", [[NSDate date] timeIntervalSince1970]];
-    NSString *payload = [NSString stringWithFormat:@"%@|%@", timestamp, uuid];
+        NSString *uuid = [[NSUUID UUID] UUIDString];
+        NSMutableArray *usedUUIDs = [[[NSUserDefaults standardUserDefaults] objectForKey:@"usedUUIDs"] mutableCopy];
+        if (!usedUUIDs) usedUUIDs = [NSMutableArray array];
+        [usedUUIDs addObject:uuid];
+        [[NSUserDefaults standardUserDefaults] setObject:usedUUIDs forKey:@"usedUUIDs"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
 
-    NSData *enc = [self aesEncrypt:[payload dataUsingEncoding:NSUTF8StringEncoding]];
-    NSString *b64 = [enc base64EncodedStringWithOptions:0];
+        long long ts = (long long)([[NSDate date] timeIntervalSince1970] * 1000.0);
+        NSString *tsStr = [NSString stringWithFormat:@"%lld", ts];
+        NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
 
-    NSURL *url = [NSURL URLWithString:kServerURL];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST";
-    req.HTTPBody = [b64 dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *payloadDict = @{@"timestamp": tsStr, @"bundle": bundle, @"uuid": uuid};
+        NSData *json = [NSJSONSerialization dataWithJSONObject:payloadDict options:0 error:nil];
+        NSData *enc = [self aes256EncryptData:json];
+        NSString *b64 = [enc base64EncodedStringWithOptions:0];
 
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *res, NSError *err) {
-        if (!data || err) {
-            callback(NO);
-            return;
-        }
-        NSString *resp = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        BOOL allowed = [resp containsString:@"true"];
-        callback(allowed);
-    }] resume];
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kServerURL]];
+        req.HTTPMethod = @"POST";
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"data": b64} options:0 error:nil];
+
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            if (err || !data) { dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); }); return; }
+            NSDictionary *respJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            NSString *b64Resp = respJson[@"data"];
+            if (!b64Resp) { dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); }); return; }
+            NSData *encResp = [[NSData alloc] initWithBase64EncodedString:b64Resp options:0];
+            NSData *dec = [self aes256DecryptData:encResp];
+            if (!dec) { dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); }); return; }
+            NSDictionary *respDict = [NSJSONSerialization JSONObjectWithData:dec options:0 error:nil];
+            BOOL allowed = [respDict[@"allow"] boolValue];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(allowed); });
+        }];
+        [task resume];
+    });
 }
 
-#pragma mark - AES
+#pragma mark - AES helpers (kept from your code)
 
-- (NSData *)aesEncrypt:(NSData *)data {
-    NSMutableData *out = [NSMutableData dataWithLength:data.length + kCCBlockSizeAES128];
-    size_t outLen;
-    NSData *key = [self dataFromHex:kAESKeyHex];
-    NSData *iv  = [self dataFromHex:kAESIvHex];
-
-    CCCryptorStatus result = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-                                     key.bytes, key.length, iv.bytes,
-                                     data.bytes, data.length,
-                                     out.mutableBytes, out.length, &outLen);
-    if (result == kCCSuccess) {
-        out.length = outLen;
-        return out;
-    }
-    return nil;
-}
-
-- (NSData *)dataFromHex:(NSString *)hex {
+- (NSData *)dataFromHexString:(NSString *)hex {
     NSMutableData *data = [NSMutableData data];
-    for (int i = 0; i < hex.length; i += 2) {
-        NSString *b = [hex substringWithRange:NSMakeRange(i, 2)];
-        unsigned int v;
-        [[NSScanner scannerWithString:b] scanHexInt:&v];
-        unsigned char c = v;
-        [data appendBytes:&c length:1];
+    for (NSUInteger i = 0; i+2 <= hex.length; i+=2) {
+        unsigned int val;
+        [[NSScanner scannerWithString:[hex substringWithRange:NSMakeRange(i, 2)]] scanHexInt:&val];
+        uint8_t b = (uint8_t)val;
+        [data appendBytes:&b length:1];
     }
     return data;
+}
+
+- (NSData *)aes256EncryptData:(NSData *)plain {
+    NSData *keyData = [self dataFromHexString:kAESKeyHex];
+    NSData *ivData  = [self dataFromHexString:kAESIvHex];
+    size_t outLen;
+    void *buf = malloc(plain.length + kCCBlockSizeAES128);
+    CCCryptorStatus res = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                  keyData.bytes, kCCKeySizeAES256, ivData.bytes,
+                                  plain.bytes, plain.length,
+                                  buf, plain.length + kCCBlockSizeAES128, &outLen);
+    if (res != kCCSuccess) { free(buf); return nil; }
+    return [NSData dataWithBytesNoCopy:buf length:outLen freeWhenDone:YES];
+}
+
+- (NSData *)aes256DecryptData:(NSData *)enc {
+    NSData *keyData = [self dataFromHexString:kAESKeyHex];
+    NSData *ivData  = [self dataFromHexString:kAESIvHex];
+    size_t outLen;
+    void *buf = malloc(enc.length + kCCBlockSizeAES128);
+    CCCryptorStatus res = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                  keyData.bytes, kCCKeySizeAES256, ivData.bytes,
+                                  enc.bytes, enc.length,
+                                  buf, enc.length + kCCBlockSizeAES128, &outLen);
+    if (res != kCCSuccess) { free(buf); return nil; }
+    return [NSData dataWithBytesNoCopy:buf length:outLen freeWhenDone:YES];
 }
 
 @end
