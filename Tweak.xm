@@ -2,9 +2,11 @@
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCryptor.h>
 
-static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/tverify.php"; // replace if needed
+static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/tverify.php";
 static NSString * const kAESKeyHex = @"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF01234567";
 static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
+
+static NSString *selectedID = nil; // which ID prefix is active
 
 @interface UIWindow (Overlay)
 @end
@@ -13,170 +15,94 @@ static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        UIButton *prefsButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        prefsButton.frame = CGRectMake(50, 100, 120, 40);
-        [prefsButton setTitle:@"Menu" forState:UIControlStateNormal];
-        prefsButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
-        [prefsButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        prefsButton.layer.cornerRadius = 8.0;
-        prefsButton.clipsToBounds = YES;
-        [prefsButton addTarget:self action:@selector(showMainMenu) forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:prefsButton];
+        UIButton *menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        menuButton.frame = CGRectMake(50, 100, 120, 40);
+        [menuButton setTitle:@"Menu" forState:UIControlStateNormal];
+        menuButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.6];
+        [menuButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        menuButton.layer.cornerRadius = 8.0;
+        menuButton.clipsToBounds = YES;
+        [menuButton addTarget:self action:@selector(openIDSelector) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:menuButton];
     });
+}
+
+#pragma mark - ID selector
+
+- (void)openIDSelector {
+    [self verifyWithServerThen:^(BOOL allowed) {
+        if (!allowed) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Access Denied"
+                                                                           message:@"Editing disabled by server."
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                exit(0);
+            }]];
+            [self.rootViewController presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+
+        NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+        NSMutableSet *ids = [NSMutableSet set];
+        for (NSString *key in defaults.allKeys) {
+            // collect prefix until first "_"
+            NSArray *parts = [key componentsSeparatedByString:@"_"];
+            if (parts.count > 1) {
+                [ids addObject:parts[0]];
+            }
+        }
+
+        UIAlertController *picker = [UIAlertController alertControllerWithTitle:@"Select ID"
+                                                                        message:nil
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+        for (NSString *idPrefix in ids) {
+            [picker addAction:[UIAlertAction actionWithTitle:idPrefix style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+                selectedID = idPrefix;
+                [self showMainMenu];
+            }]];
+        }
+        [picker addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [self.rootViewController presentViewController:picker animated:YES completion:nil];
+    }];
 }
 
 #pragma mark - Main Menu
 
 - (void)showMainMenu {
-    // Use the existing verifyWithServerThen you provided
-    [self verifyWithServerThen:^(BOOL allowed) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!allowed) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Access Denied"
-                                                                               message:@"Server rejected request."
-                                                                        preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    exit(0);
-                }]];
-                UIViewController *root = self.rootViewController;
-                if (root) [root presentViewController:alert animated:YES completion:nil];
-                return;
-            }
-
-            UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Options"
-                                                                          message:nil
-                                                                   preferredStyle:UIAlertControllerStyleActionSheet];
-
-            [menu addAction:[UIAlertAction actionWithTitle:@"Search" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                [self promptSearchKey];
-            }]];
-            [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Char" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                // keys like xxxxx_cx_unlock (use regex to match _c<number>_unlock)
-                [self massEditWithPattern:@"_c[0-9]+_unlock" newValue:@"true"];
-            }]];
-            [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skin" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                // keys like xxxxx_cx_skinxx
-                [self massEditWithPattern:@"_c[0-9]+_skin[0-9]+" newValue:@"1"];
-            }]];
-            [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skill" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                // keys like xxxxx_c_xxxxxx_skill_x_unlock (use a permissive pattern)
-                [self massEditWithPattern:@"c.*_skill.*_unlock" newValue:@"1"];
-            }]];
-            [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Pet" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                // keys like xxxxx_p12_unlock
-                [self massEditWithPattern:@"_p[0-9]+_unlock" newValue:@"true"];
-            }]];
-            [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                [self promptSetGems];
-            }]];
-            [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-                // keys like xxxxx_reborn_card
-                [self massEditWithPattern:@"_reborn_card" newValue:@"1"];
-            }]];
-            [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-            UIViewController *root = self.rootViewController;
-            if (root) [root presentViewController:menu animated:YES completion:nil];
-        });
-    }];
-}
-
-#pragma mark - Search Flow (unchanged behavior)
-
-- (void)promptSearchKey {
-    UIAlertController *searchAlert = [UIAlertController alertControllerWithTitle:@"Search Key"
-                                                                         message:@"Enter part of a key name"
-                                                                  preferredStyle:UIAlertControllerStyleAlert];
-    [searchAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"example_key";
-    }];
-
-    [searchAlert addAction:[UIAlertAction actionWithTitle:@"Search"
-                                                    style:UIAlertActionStyleDefault
-                                                  handler:^(UIAlertAction * _Nonnull act) {
-        NSString *query = searchAlert.textFields.firstObject.text;
-        if (query.length > 0) {
-            [self showMatchingKeys:query];
-        }
-    }]];
-
-    [searchAlert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                                    style:UIAlertActionStyleCancel
-                                                  handler:nil]];
-
-    UIViewController *rootVC = self.rootViewController;
-    if (rootVC) [rootVC presentViewController:searchAlert animated:YES completion:nil];
-}
-
-- (void)showMatchingKeys:(NSString *)query {
-    NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-    NSMutableArray *matches = [NSMutableArray array];
-    for (NSString *key in defaults.allKeys) {
-        if ([[key lowercaseString] containsString:[query lowercaseString]]) {
-            [matches addObject:key];
-        }
-    }
-
-    if (matches.count == 0) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"No Matches"
-                                                                       message:@"No keys found."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        UIViewController *rootVC = self.rootViewController;
-        if (rootVC) [rootVC presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-
-    // If many matches, use ActionSheet for scrolling; UIAlertControllerActionSheet will present scrollable list
-    UIAlertController *list = [UIAlertController alertControllerWithTitle:@"Select Key"
+    if (!selectedID) return;
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Options for %@", selectedID]
                                                                   message:nil
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
 
-    for (NSString *key in matches) {
-        [list addAction:[UIAlertAction actionWithTitle:key style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            id val = defaults[key];
-            [self promptEditKey:key currentValue:val];
-        }]];
-    }
-
-    [list addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-    UIViewController *rootVC = self.rootViewController;
-    if (rootVC) [rootVC presentViewController:list animated:YES completion:nil];
-}
-
-- (void)promptEditKey:(NSString *)key currentValue:(id)value {
-    NSString *valStr = value ? [value description] : @"(nil)";
-    UIAlertController *edit = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Edit %@", key]
-                                                                  message:[NSString stringWithFormat:@"Current value: %@", valStr]
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-
-    [edit addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = valStr;
-    }];
-
-    [edit addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        NSString *newVal = edit.textFields.firstObject.text;
-        if (newVal) {
-            [[NSUserDefaults standardUserDefaults] setObject:newVal forKey:key];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        } else {
-            // if empty, remove key
-            [[NSUserDefaults standardUserDefaults] removeObjectForKey:key];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-        }
+    [menu addAction:[UIAlertAction actionWithTitle:@"Search" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        [self promptSearchKey];
     }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Char" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        [self massEditPattern:[NSString stringWithFormat:@"%@_c[0-9]+_unlock", selectedID] newValue:@"true"];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skin" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        [self massEditPattern:[NSString stringWithFormat:@"%@_c[0-9]+_skin[0-9]+", selectedID] newValue:@"1"];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Skill" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        [self massEditPattern:[NSString stringWithFormat:@"%@_c_.*_skill_.*_unlock", selectedID] newValue:@"1"];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Unlock Pet" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        [self massEditPattern:[NSString stringWithFormat:@"%@_p[0-9]+_unlock", selectedID] newValue:@"true"];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        [self promptSetGems];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        [self massEditPattern:[NSString stringWithFormat:@"%@_reborn_card", selectedID] newValue:@"1"];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 
-    [edit addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-    UIViewController *rootVC = self.rootViewController;
-    if (rootVC) [rootVC presentViewController:edit animated:YES completion:nil];
+    [self.rootViewController presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Gems Setter
+#pragma mark - Gems
 
 - (void)promptSetGems {
     UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Set Gems"
@@ -188,83 +114,96 @@ static NSString * const kAESIvHex  = @"0123456789ABCDEF0123456789ABCDEF";
     }];
 
     [input addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
-        NSString *val = input.textFields.firstObject.text;
-        if (val.length > 0) {
+        NSString *valStr = input.textFields.firstObject.text;
+        if (valStr.length > 0) {
+            NSNumber *numVal = @([valStr integerValue]);
             NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
             for (NSString *key in defaults.allKeys) {
-                if ([key containsString:@"_gems"] || [key containsString:@"_last_gems"]) {
-                    [[NSUserDefaults standardUserDefaults] setObject:val forKey:key];
+                if ([key hasPrefix:selectedID]) {
+                    if ([key hasSuffix:@"_gems"] || [key hasSuffix:@"_last_gems"]) {
+                        [[NSUserDefaults standardUserDefaults] setObject:numVal forKey:key];
+                    }
                 }
             }
             [[NSUserDefaults standardUserDefaults] synchronize];
-
-            UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Done"
-                                                                          message:@"Gems values updated."
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-            [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            UIViewController *root = self.rootViewController;
-            if (root) [root presentViewController:done animated:YES completion:nil];
         }
     }]];
     [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-    UIViewController *root = self.rootViewController;
-    if (root) [root presentViewController:input animated:YES completion:nil];
+    [self.rootViewController presentViewController:input animated:YES completion:nil];
 }
 
-#pragma mark - Mass edit helper (regex)
+#pragma mark - Mass edit
 
-- (void)massEditWithPattern:(NSString *)regexPattern newValue:(NSString *)val {
+- (void)massEditPattern:(NSString *)regexPattern newValue:(NSString *)val {
     NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
-    NSError *err = nil;
-    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:regexPattern options:0 error:&err];
-    if (err) {
-        // invalid regex
-        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error"
-                                                                          message:@"Invalid pattern"
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        UIViewController *r = self.rootViewController;
-        if (r) [r presentViewController:errAlert animated:YES completion:nil];
-        return;
-    }
-
-    NSMutableArray *changedKeys = [NSMutableArray array];
-
+    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:regexPattern options:0 error:nil];
     for (NSString *key in defaults.allKeys) {
-        NSTextCheckingResult *m = [regex firstMatchInString:key options:0 range:NSMakeRange(0, key.length)];
-        if (m) {
-            // write appropriate type: try to preserve numeric if val looks numeric, bool if "true"/"false"
-            id outVal = val;
-            NSString *lower = [val lowercaseString];
-            if ([lower isEqualToString:@"true"] || [lower isEqualToString:@"false"]) {
-                outVal = @([lower isEqualToString:@"true"]);
-            } else {
-                // check if integer
-                NSScanner *scanner = [NSScanner scannerWithString:val];
-                int intVal;
-                if ([scanner scanInt:&intVal] && scanner.isAtEnd) {
-                    outVal = @(intVal);
-                } else {
-                    // keep as string
-                    outVal = val;
-                }
+        if ([key hasPrefix:selectedID]) {
+            if ([regex firstMatchInString:key options:0 range:NSMakeRange(0, key.length)]) {
+                [[NSUserDefaults standardUserDefaults] setObject:val forKey:key];
             }
-
-            [[NSUserDefaults standardUserDefaults] setObject:outVal forKey:key];
-            [changedKeys addObject:key];
         }
     }
     [[NSUserDefaults standardUserDefaults] synchronize];
-
-    NSString *msg = [NSString stringWithFormat:@"Applied %@ to %lu keys", val, (unsigned long)changedKeys.count];
     UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Done"
-                                                                  message:msg
+                                                                  message:@"Applied changes"
                                                            preferredStyle:UIAlertControllerStyleAlert];
     [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    UIViewController *root = self.rootViewController;
-    if (root) [root presentViewController:done animated:YES completion:nil];
+    [self.rootViewController presentViewController:done animated:YES completion:nil];
 }
+
+#pragma mark - Search/Edit (same as before)
+
+- (void)promptSearchKey {
+    UIAlertController *search = [UIAlertController alertControllerWithTitle:@"Search Key"
+                                                                    message:@"Enter part of a key"
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+    [search addTextFieldWithConfigurationHandler:nil];
+    [search addAction:[UIAlertAction actionWithTitle:@"Search" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        NSString *query = search.textFields.firstObject.text;
+        if (query.length > 0) {
+            [self showMatchingKeys:query];
+        }
+    }]];
+    [search addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self.rootViewController presentViewController:search animated:YES completion:nil];
+}
+
+- (void)showMatchingKeys:(NSString *)query {
+    NSDictionary *defaults = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    NSMutableArray *matches = [NSMutableArray array];
+    for (NSString *key in defaults.allKeys) {
+        if ([key hasPrefix:selectedID] && [[key lowercaseString] containsString:[query lowercaseString]]) {
+            [matches addObject:key];
+        }
+    }
+    if (matches.count == 0) return;
+    UIAlertController *list = [UIAlertController alertControllerWithTitle:@"Select Key" message:nil preferredStyle:UIAlertControllerStyleAlert];
+    for (NSString *key in matches) {
+        [list addAction:[UIAlertAction actionWithTitle:key style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+            id val = defaults[key];
+            [self promptEditKey:key currentValue:val];
+        }]];
+    }
+    [list addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self.rootViewController presentViewController:list animated:YES completion:nil];
+}
+
+- (void)promptEditKey:(NSString *)key currentValue:(id)value {
+    NSString *valStr = value ? [value description] : @"(nil)";
+    UIAlertController *edit = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Edit %@", key]
+                                                                  message:[NSString stringWithFormat:@"Current: %@", valStr]
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [edit addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.text = valStr; }];
+    [edit addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull act) {
+        NSString *newVal = edit.textFields.firstObject.text;
+        [[NSUserDefaults standardUserDefaults] setObject:newVal forKey:key];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    }]];
+    [edit addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self.rootViewController presentViewController:edit animated:YES completion:nil];
+}
+
 
 #pragma mark - Server verification (kept from your code)
 
