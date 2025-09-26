@@ -1,45 +1,12 @@
-// Tweak.xm
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <substrate.h>
 
-// simple global recording state
+// === Global state ===
 static BOOL isRecording = NO;
 static NSMutableString *logBuffer;
 
-// Helper to read an NSInputStream into NSData (destructive - consumes stream)
-static NSData * dataFromInputStream(NSInputStream *stream) {
-    if (!stream) return nil;
-    @try {
-        uint8_t buffer[1024];
-        NSMutableData *collected = [NSMutableData data];
-        [stream open];
-        NSInteger len = 0;
-        while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
-            [collected appendBytes:buffer length:len];
-        }
-        [stream close];
-        if (collected.length > 0) return collected;
-    } @catch (NSException *ex) {
-        // ignore
-    }
-    return nil;
-}
-
-static NSString * stringFromDataIfText(NSData *d) {
-    if (!d) return nil;
-    // try utf8, fallback to hex if binary
-    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    if (s) return s;
-    // not text
-    NSMutableString *hex = [NSMutableString stringWithCapacity:d.length*2];
-    const unsigned char *bytes = (const unsigned char*)d.bytes;
-    for (NSUInteger i=0;i<d.length;i++) [hex appendFormat:@"%02x", bytes[i]];
-    return [NSString stringWithFormat:@"<hex:%@>", hex];
-}
-
-// append safe formatted entry
+// === Helpers ===
 static void appendLog(NSString *fmt, ...) {
     if (!logBuffer) return;
     va_list args;
@@ -52,206 +19,142 @@ static void appendLog(NSString *fmt, ...) {
     }
 }
 
-// UI helpers
-%hook UIApplication
+static NSString *stringFromDataIfText(NSData *d) {
+    if (!d) return @"<nil>";
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (s) return s;
+    // fallback to hex
+    NSMutableString *hex = [NSMutableString stringWithCapacity:d.length*2];
+    const unsigned char *bytes = d.bytes;
+    for (NSUInteger i=0;i<d.length;i++) [hex appendFormat:@"%02x", bytes[i]];
+    return [NSString stringWithFormat:@"<hex:%@>", hex];
+}
 
-- (void)didFinishLaunching:(id)arg {
-    %orig(arg);
+static NSData *dataFromInputStream(NSInputStream *stream) {
+    if (!stream) return nil;
+    NSMutableData *collected = [NSMutableData data];
+    uint8_t buffer[1024];
+    [stream open];
+    NSInteger len;
+    while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+        [collected appendBytes:buffer length:len];
+    }
+    [stream close];
+    return collected.length ? collected : nil;
+}
 
-    // Delay to let UI settle
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *window = [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
-        if (!window) return;
+// === UI Buttons (always appear) ===
+%hook UIWindow
 
-        UIButton *recordBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        recordBtn.frame = CGRectMake(20, 80, 90, 40);
-        recordBtn.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
-        recordBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-        recordBtn.layer.cornerRadius = 8;
-        [recordBtn setTitle:@"Record" forState:UIControlStateNormal];
-        recordBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-        recordBtn.tintColor = [UIColor whiteColor];
-        recordBtn.tag = 0xF00DB1;
-        [recordBtn addTarget:self action:@selector(_tweak_toggleRecord) forControlEvents:UIControlEventTouchUpInside];
-        [window addSubview:recordBtn];
+- (void)becomeKeyWindow {
+    %orig;
 
-        UIButton *doneBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        doneBtn.frame = CGRectMake(20, 130, 90, 40);
-        doneBtn.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
-        doneBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-        doneBtn.layer.cornerRadius = 8;
-        [doneBtn setTitle:@"Done" forState:UIControlStateNormal];
-        doneBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-        doneBtn.tintColor = [UIColor whiteColor];
-        doneBtn.tag = 0xF00DB2;
-        [doneBtn addTarget:self action:@selector(_tweak_finishRecord) forControlEvents:UIControlEventTouchUpInside];
-        [window addSubview:doneBtn];
-    });
+    if ([self viewWithTag:0xF00DB1]) return;
+
+    UIButton *recordBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    recordBtn.frame = CGRectMake(20, 80, 90, 40);
+    recordBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    recordBtn.layer.cornerRadius = 8;
+    [recordBtn setTitle:@"Record" forState:UIControlStateNormal];
+    recordBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    recordBtn.tintColor = [UIColor whiteColor];
+    recordBtn.tag = 0xF00DB1;
+    [recordBtn addTarget:self action:@selector(_tweak_toggleRecord) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:recordBtn];
+
+    UIButton *doneBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    doneBtn.frame = CGRectMake(20, 130, 90, 40);
+    doneBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+    doneBtn.layer.cornerRadius = 8;
+    [doneBtn setTitle:@"Done" forState:UIControlStateNormal];
+    doneBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    doneBtn.tintColor = [UIColor whiteColor];
+    doneBtn.tag = 0xF00DB2;
+    [doneBtn addTarget:self action:@selector(_tweak_finishRecord) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:doneBtn];
 }
 
 %new
 - (void)_tweak_toggleRecord {
     isRecording = !isRecording;
     if (isRecording) {
-        logBuffer = [NSMutableString stringWithString:@"--- Network Recorder Started ---\n"];
+        logBuffer = [NSMutableString stringWithString:@"--- Recording Started ---\n"];
         appendLog(@"[Recorder] START at %@", [NSDate date]);
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"Recording ON" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
+        NSLog(@"[Recorder] ON");
     } else {
         appendLog(@"[Recorder] PAUSED at %@", [NSDate date]);
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"Recording PAUSED" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
+        NSLog(@"[Recorder] OFF");
     }
 }
 
 %new
 - (void)_tweak_finishRecord {
-    if (!logBuffer) {
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"No logs" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
-        return;
-    }
+    if (!logBuffer) return;
     appendLog(@"[Recorder] FINISH at %@", [NSDate date]);
-    // copy to clipboard
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIPasteboard *pb = [UIPasteboard generalPasteboard];
-        pb.string = logBuffer;
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"Logs copied to clipboard" preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
-    });
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    pb.string = logBuffer;
+    NSLog(@"[Recorder] Logs copied to clipboard, length=%lu", (unsigned long)logBuffer.length);
 }
 
 %end
 
-// Hook NSMutableURLRequest body setters so we see when app sets code in body
+// === Network Hooks (unchanged) ===
 %hook NSMutableURLRequest
-
 - (void)setHTTPBody:(NSData *)body {
     if (isRecording) {
-        NSString *s = stringFromDataIfText(body) ?: @"<nil>";
-        appendLog(@"[setHTTPBody] URL: %@\nMethod: %@\nBody: %@\nHeaders: %@",
-                  self.URL ?: @"<nil>",
-                  self.HTTPMethod ?: @"<nil>",
-                  s,
-                  self.allHTTPHeaderFields ?: @{});
+        appendLog(@"[setHTTPBody] URL: %@\nMethod: %@\nBody: %@",
+                  self.URL, self.HTTPMethod, stringFromDataIfText(body));
     }
     %orig(body);
 }
-
 - (void)setHTTPBodyStream:(NSInputStream *)stream {
     if (isRecording) {
         NSData *d = dataFromInputStream(stream);
-        NSString *s = stringFromDataIfText(d) ?: @"<stream:nil>";
-        appendLog(@"[setHTTPBodyStream] URL: %@\nMethod: %@\nBodyStream (read): %@\nHeaders: %@",
-                  self.URL ?: @"<nil>",
-                  self.HTTPMethod ?: @"<nil>",
-                  s,
-                  self.allHTTPHeaderFields ?: @{});
-
-        // try to convert into HTTPBody for safety (so future reads still see it)
-        if (d && [self isKindOfClass:[NSMutableURLRequest class]]) {
-            @try {
-                [(NSMutableURLRequest *)self setHTTPBody:d];
-            } @catch (NSException *ex) {
-                // ignore
-            }
-        }
+        appendLog(@"[setHTTPBodyStream] URL: %@\nMethod: %@\nBody: %@",
+                  self.URL, self.HTTPMethod, stringFromDataIfText(d));
+        if (d) @try { [self setHTTPBody:d]; } @catch(...) {}
     }
     %orig(stream);
 }
-
 %end
 
-// Hook NSURLSession creation flow and task resume point
 %hook NSURLSession
-
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)handler {
     if (isRecording) {
-        NSString *bodyStr = @"<nil>";
-        if ([request HTTPBody]) bodyStr = stringFromDataIfText([request HTTPBody]) ?: @"<binary>";
-        else if ([request HTTPBodyStream]) {
-            NSData *d = dataFromInputStream([request HTTPBodyStream]);
-            bodyStr = stringFromDataIfText(d) ?: @"<binary>";
-            // try to replace stream with body when possible - best effort
-            if (d && [request isKindOfClass:[NSMutableURLRequest class]]) {
-                @try { [(NSMutableURLRequest *)request setHTTPBody:d]; } @catch (NSException *e) {}
-            }
-        }
+        NSData *d = request.HTTPBody ?: dataFromInputStream(request.HTTPBodyStream);
         appendLog(@"[dataTaskWithRequest] URL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
-                  request.URL ?: @"<nil>",
-                  request.HTTPMethod ?: @"<nil>",
-                  request.allHTTPHeaderFields ?: @{},
-                  bodyStr);
+                  request.URL, request.HTTPMethod,
+                  request.allHTTPHeaderFields, stringFromDataIfText(d));
     }
     return %orig(request, handler);
 }
-
 %end
 
 %hook NSURLSessionTask
-
 - (void)resume {
     if (isRecording) {
-        NSURLRequest *req = nil;
-        @try {
-            req = [self originalRequest] ?: [self currentRequest];
-        } @catch (NSException *ex) { req = nil; }
-
-        if (req) {
-            NSString *bodyStr = @"<nil>";
-            if ([req HTTPBody]) bodyStr = stringFromDataIfText([req HTTPBody]) ?: @"<binary>";
-            else if ([req HTTPBodyStream]) {
-                NSData *d = dataFromInputStream([req HTTPBodyStream]);
-                bodyStr = stringFromDataIfText(d) ?: @"<binary>";
-                if (d && [req isKindOfClass:[NSMutableURLRequest class]]) {
-                    @try { [(NSMutableURLRequest *)req setHTTPBody:d]; } @catch (NSException *e) {}
-                }
-            }
-            appendLog(@"[Task resume] Task: %p\nURL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
-                      self,
-                      req.URL ?: @"<nil>",
-                      req.HTTPMethod ?: @"<nil>",
-                      req.allHTTPHeaderFields ?: @{},
-                      bodyStr);
-        } else {
-            appendLog(@"[Task resume] Task: %p (no request available)", self);
-        }
+        NSURLRequest *req = [self originalRequest] ?: [self currentRequest];
+        NSData *d = req.HTTPBody ?: dataFromInputStream(req.HTTPBodyStream);
+        appendLog(@"[Task resume] URL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
+                  req.URL, req.HTTPMethod,
+                  req.allHTTPHeaderFields, stringFromDataIfText(d));
     }
     %orig;
 }
-
 %end
 
-// Hook older NSURLConnection sync send as fallback
 %hook NSURLConnection
-
-+ (NSData *)sendSynchronousRequest:(NSURLRequest *)request returningResponse:(NSURLResponse * __autoreleasing *)response error:(NSError * __autoreleasing *)error {
++ (NSData *)sendSynchronousRequest:(NSURLRequest *)request returningResponse:(NSURLResponse **)response error:(NSError **)error {
     if (isRecording) {
-        NSString *bodyStr = @"<nil>";
-        if ([request HTTPBody]) bodyStr = stringFromDataIfText([request HTTPBody]) ?: @"<binary>";
-        else if ([request HTTPBodyStream]) {
-            NSData *d = dataFromInputStream([request HTTPBodyStream]);
-            bodyStr = stringFromDataIfText(d) ?: @"<binary>";
-            if (d && [request isKindOfClass:[NSMutableURLRequest class]]) {
-                @try { [(NSMutableURLRequest *)request setHTTPBody:d]; } @catch (NSException *e) {}
-            }
-        }
-        appendLog(@"[NSURLConnection sendSynchronousRequest] URL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
-                  request.URL ?: @"<nil>",
-                  request.HTTPMethod ?: @"<nil>",
-                  request.allHTTPHeaderFields ?: @{},
-                  bodyStr);
+        NSData *d = request.HTTPBody ?: dataFromInputStream(request.HTTPBodyStream);
+        appendLog(@"[NSURLConnection sync] URL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
+                  request.URL, request.HTTPMethod,
+                  request.allHTTPHeaderFields, stringFromDataIfText(d));
     }
     return %orig(request, response, error);
 }
-
 %end
 
-// Constructor to initialize buffer
 %ctor {
     logBuffer = [NSMutableString stringWithString:@"--- Recorder Initialized ---\n"];
 }
