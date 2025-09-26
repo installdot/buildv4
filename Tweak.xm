@@ -1,276 +1,257 @@
 // Tweak.xm
-// Logos/Theos tweak - floating Record / Done buttons that log UIControl actions
-// Place into a Theos tweak project and build normally.
-
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#import <substrate.h>
 
-// Globals for recording state and storage
-static BOOL gIsRecording = NO;
-static NSMutableArray *gRecords = nil;
+// simple global recording state
+static BOOL isRecording = NO;
+static NSMutableString *logBuffer;
 
-// Helper to get short timestamp string
-static NSString *ShortTimestamp() {
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    [fmt setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
-    return [fmt stringFromDate:[NSDate date]];
+// Helper to read an NSInputStream into NSData (destructive - consumes stream)
+static NSData * dataFromInputStream(NSInputStream *stream) {
+    if (!stream) return nil;
+    @try {
+        uint8_t buffer[1024];
+        NSMutableData *collected = [NSMutableData data];
+        [stream open];
+        NSInteger len = 0;
+        while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+            [collected appendBytes:buffer length:len];
+        }
+        [stream close];
+        if (collected.length > 0) return collected;
+    } @catch (NSException *ex) {
+        // ignore
+    }
+    return nil;
 }
 
-// Append a record safely (main thread)
-static void AppendRecord(NSDictionary *rec) {
-    if (!gRecords) gRecords = [NSMutableArray array];
-    @synchronized(gRecords) {
-        [gRecords addObject:rec];
+static NSString * stringFromDataIfText(NSData *d) {
+    if (!d) return nil;
+    // try utf8, fallback to hex if binary
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    if (s) return s;
+    // not text
+    NSMutableString *hex = [NSMutableString stringWithCapacity:d.length*2];
+    const unsigned char *bytes = (const unsigned char*)d.bytes;
+    for (NSUInteger i=0;i<d.length;i++) [hex appendFormat:@"%02x", bytes[i]];
+    return [NSString stringWithFormat:@"<hex:%@>", hex];
+}
+
+// append safe formatted entry
+static void appendLog(NSString *fmt, ...) {
+    if (!logBuffer) return;
+    va_list args;
+    va_start(args, fmt);
+    NSString *entry = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    @synchronized (logBuffer) {
+        [logBuffer appendString:entry];
+        [logBuffer appendString:@"\n"];
     }
 }
 
-// Build export text for all records
-static NSString *ExportAllRecordsText() {
-    NSMutableString *out = [NSMutableString string];
-    @synchronized(gRecords) {
-        [out appendFormat:@"Recorded %lu actions\n\n", (unsigned long)gRecords.count];
-        NSUInteger idx = 0;
-        for (NSDictionary *r in gRecords) {
-            idx++;
-            [out appendFormat:@"[%lu] time: %@\n", (unsigned long)idx, r[@"time"]];
-            [out appendFormat:@"    selector: %@\n", r[@"selector"]];
-            [out appendFormat:@"    target: %@\n", r[@"targetClass"]];
-            [out appendFormat:@"    sender: %@\n", r[@"senderClass"]];
-            [out appendFormat:@"    event: %@\n", r[@"eventDesc"]];
-            NSArray *stack = r[@"stack"];
-            if (stack && stack.count > 0) {
-                [out appendString:@"    stack:\n"];
-                NSUInteger n = MIN(6, stack.count);
-                for (NSUInteger i=0;i<n;i++) {
-                    [out appendFormat:@"      %@\n", stack[i]];
+// UI helpers
+%hook UIApplication
+
+- (void)didFinishLaunching:(id)arg {
+    %orig(arg);
+
+    // Delay to let UI settle
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *window = [UIApplication sharedApplication].keyWindow ?: [UIApplication sharedApplication].windows.firstObject;
+        if (!window) return;
+
+        UIButton *recordBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        recordBtn.frame = CGRectMake(20, 80, 90, 40);
+        recordBtn.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+        recordBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+        recordBtn.layer.cornerRadius = 8;
+        [recordBtn setTitle:@"Record" forState:UIControlStateNormal];
+        recordBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        recordBtn.tintColor = [UIColor whiteColor];
+        recordBtn.tag = 0xF00DB1;
+        [recordBtn addTarget:self action:@selector(_tweak_toggleRecord) forControlEvents:UIControlEventTouchUpInside];
+        [window addSubview:recordBtn];
+
+        UIButton *doneBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        doneBtn.frame = CGRectMake(20, 130, 90, 40);
+        doneBtn.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+        doneBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
+        doneBtn.layer.cornerRadius = 8;
+        [doneBtn setTitle:@"Done" forState:UIControlStateNormal];
+        doneBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        doneBtn.tintColor = [UIColor whiteColor];
+        doneBtn.tag = 0xF00DB2;
+        [doneBtn addTarget:self action:@selector(_tweak_finishRecord) forControlEvents:UIControlEventTouchUpInside];
+        [window addSubview:doneBtn];
+    });
+}
+
+%new
+- (void)_tweak_toggleRecord {
+    isRecording = !isRecording;
+    if (isRecording) {
+        logBuffer = [NSMutableString stringWithString:@"--- Network Recorder Started ---\n"];
+        appendLog(@"[Recorder] START at %@", [NSDate date]);
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"Recording ON" preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
+    } else {
+        appendLog(@"[Recorder] PAUSED at %@", [NSDate date]);
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"Recording PAUSED" preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
+    }
+}
+
+%new
+- (void)_tweak_finishRecord {
+    if (!logBuffer) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"No logs" preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    appendLog(@"[Recorder] FINISH at %@", [NSDate date]);
+    // copy to clipboard
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIPasteboard *pb = [UIPasteboard generalPasteboard];
+        pb.string = logBuffer;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Recorder" message:@"Logs copied to clipboard" preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [[UIApplication sharedApplication].keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
+    });
+}
+
+%end
+
+// Hook NSMutableURLRequest body setters so we see when app sets code in body
+%hook NSMutableURLRequest
+
+- (void)setHTTPBody:(NSData *)body {
+    if (isRecording) {
+        NSString *s = stringFromDataIfText(body) ?: @"<nil>";
+        appendLog(@"[setHTTPBody] URL: %@\nMethod: %@\nBody: %@\nHeaders: %@",
+                  self.URL ?: @"<nil>",
+                  self.HTTPMethod ?: @"<nil>",
+                  s,
+                  self.allHTTPHeaderFields ?: @{});
+    }
+    %orig(body);
+}
+
+- (void)setHTTPBodyStream:(NSInputStream *)stream {
+    if (isRecording) {
+        NSData *d = dataFromInputStream(stream);
+        NSString *s = stringFromDataIfText(d) ?: @"<stream:nil>";
+        appendLog(@"[setHTTPBodyStream] URL: %@\nMethod: %@\nBodyStream (read): %@\nHeaders: %@",
+                  self.URL ?: @"<nil>",
+                  self.HTTPMethod ?: @"<nil>",
+                  s,
+                  self.allHTTPHeaderFields ?: @{});
+
+        // try to convert into HTTPBody for safety (so future reads still see it)
+        if (d && [self isKindOfClass:[NSMutableURLRequest class]]) {
+            @try {
+                [(NSMutableURLRequest *)self setHTTPBody:d];
+            } @catch (NSException *ex) {
+                // ignore
+            }
+        }
+    }
+    %orig(stream);
+}
+
+%end
+
+// Hook NSURLSession creation flow and task resume point
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)handler {
+    if (isRecording) {
+        NSString *bodyStr = @"<nil>";
+        if ([request HTTPBody]) bodyStr = stringFromDataIfText([request HTTPBody]) ?: @"<binary>";
+        else if ([request HTTPBodyStream]) {
+            NSData *d = dataFromInputStream([request HTTPBodyStream]);
+            bodyStr = stringFromDataIfText(d) ?: @"<binary>";
+            // try to replace stream with body when possible - best effort
+            if (d && [request isKindOfClass:[NSMutableURLRequest class]]) {
+                @try { [(NSMutableURLRequest *)request setHTTPBody:d]; } @catch (NSException *e) {}
+            }
+        }
+        appendLog(@"[dataTaskWithRequest] URL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
+                  request.URL ?: @"<nil>",
+                  request.HTTPMethod ?: @"<nil>",
+                  request.allHTTPHeaderFields ?: @{},
+                  bodyStr);
+    }
+    return %orig(request, handler);
+}
+
+%end
+
+%hook NSURLSessionTask
+
+- (void)resume {
+    if (isRecording) {
+        NSURLRequest *req = nil;
+        @try {
+            req = [self originalRequest] ?: [self currentRequest];
+        } @catch (NSException *ex) { req = nil; }
+
+        if (req) {
+            NSString *bodyStr = @"<nil>";
+            if ([req HTTPBody]) bodyStr = stringFromDataIfText([req HTTPBody]) ?: @"<binary>";
+            else if ([req HTTPBodyStream]) {
+                NSData *d = dataFromInputStream([req HTTPBodyStream]);
+                bodyStr = stringFromDataIfText(d) ?: @"<binary>";
+                if (d && [req isKindOfClass:[NSMutableURLRequest class]]) {
+                    @try { [(NSMutableURLRequest *)req setHTTPBody:d]; } @catch (NSException *e) {}
                 }
             }
-            [out appendString:@"\n"];
-        }
-    }
-    return out;
-}
-
-// Helper: show UIAlert on topmost view controller
-static void ShowAlertMainThread(NSString *title, NSString *message) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
-        UIViewController *root = w.rootViewController;
-        UIViewController *presenter = root;
-        while (presenter.presentedViewController) presenter = presenter.presentedViewController;
-
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [presenter presentViewController:ac animated:YES completion:nil];
-    });
-}
-
-
-// ---------- UI overlay injection ----------
-
-%hook UIWindow (RecordingOverlay)
-
-- (void)layoutSubviews {
-    %orig;
-
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            // container view so we can move both buttons if we like
-            CGFloat btnSize = 64;
-            CGFloat miniSize = 36;
-
-            UIView *container = [[UIView alloc] initWithFrame:CGRectMake(16, [UIScreen mainScreen].bounds.size.height - btnSize - 80, btnSize, btnSize)];
-            container.layer.cornerRadius = 10;
-            container.backgroundColor = [UIColor clearColor];
-            container.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleRightMargin;
-
-            // Record toggle button
-            UIButton *recordBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-            recordBtn.frame = CGRectMake(0, 0, btnSize, btnSize);
-            recordBtn.layer.cornerRadius = btnSize/2;
-            recordBtn.clipsToBounds = YES;
-            recordBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.0 blue:0.0 alpha:0.85];
-            recordBtn.tintColor = [UIColor whiteColor];
-            recordBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-            [recordBtn setTitle:@"REC" forState:UIControlStateNormal];
-            recordBtn.accessibilityIdentifier = @"RecordingOverlay_RecordButton";
-
-            // Done small button
-            UIButton *doneBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            doneBtn.frame = CGRectMake(btnSize - miniSize/2, -miniSize/2, miniSize, miniSize);
-            doneBtn.layer.cornerRadius = miniSize/2;
-            doneBtn.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.85];
-            doneBtn.tintColor = [UIColor whiteColor];
-            doneBtn.titleLabel.font = [UIFont systemFontOfSize:12];
-            [doneBtn setTitle:@"Done" forState:UIControlStateNormal];
-            doneBtn.accessibilityIdentifier = @"RecordingOverlay_DoneButton";
-
-            // Pan gesture to move overlay
-            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:container action:@selector(handlePan:)];
-            [container addGestureRecognizer:pan];
-
-            // Add actions
-            [recordBtn addTarget:recordBtn action:@selector(recordTapped:) forControlEvents:UIControlEventTouchUpInside];
-            [doneBtn addTarget:doneBtn action:@selector(doneTapped:) forControlEvents:UIControlEventTouchUpInside];
-
-            // Add as associated objects so methods can find them later
-            objc_setAssociatedObject(container, "recordBtn", recordBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(container, "doneBtn", doneBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-            [container addSubview:recordBtn];
-            [container addSubview:doneBtn];
-
-            // Add small shadow
-            container.layer.shadowColor = [UIColor blackColor].CGColor;
-            container.layer.shadowOpacity = 0.4;
-            container.layer.shadowRadius = 5;
-            container.layer.shadowOffset = CGSizeMake(0,2);
-
-            // Add to window
-            [self addSubview:container];
-
-            // Add helper selectors on the buttons using blocks via objc_setAssociatedObject wrappers
-        });
-    });
-}
-
-%end
-
-// Extend UIView for pan handling and button actions (helpers)
-@interface UIView (RecordingHelpers)
-- (void)handlePan:(UIPanGestureRecognizer *)g;
-- (void)recordTapped:(id)sender;
-- (void)doneTapped:(id)sender;
-@end
-
-@implementation UIView (RecordingHelpers)
-
-- (void)handlePan:(UIPanGestureRecognizer *)g {
-    UIView *v = g.view;
-    CGPoint trans = [g translationInView:v.superview];
-    if (g.state == UIGestureRecognizerStateChanged || g.state == UIGestureRecognizerStateEnded) {
-        CGRect f = v.frame;
-        f.origin.x += trans.x;
-        f.origin.y += trans.y;
-        // clamp to screen
-        CGRect bounds = [UIScreen mainScreen].bounds;
-        f.origin.x = MAX(4, MIN(f.origin.x, bounds.size.width - f.size.width - 4));
-        f.origin.y = MAX(4, MIN(f.origin.y, bounds.size.height - f.size.height - 4));
-        v.frame = f;
-        [g setTranslation:CGPointZero inView:v.superview];
-    }
-}
-
-- (void)recordTapped:(id)sender {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIButton *btn = (UIButton *)sender;
-        gIsRecording = !gIsRecording;
-        if (gIsRecording) {
-            // start a fresh session (clear previous)
-            @synchronized(gRecords) { gRecords = [NSMutableArray array]; }
-            btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.6 blue:0.0 alpha:0.9]; // green while recording
-            [btn setTitle:@"REC✓" forState:UIControlStateNormal];
-            NSLog(@"[TweakRecorder] Recording STARTED");
-            ShowAlertMainThread(@"Recording", @"Action recording started.");
+            appendLog(@"[Task resume] Task: %p\nURL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
+                      self,
+                      req.URL ?: @"<nil>",
+                      req.HTTPMethod ?: @"<nil>",
+                      req.allHTTPHeaderFields ?: @{},
+                      bodyStr);
         } else {
-            btn.backgroundColor = [UIColor colorWithRed:0.85 green:0.0 blue:0.0 alpha:0.85];
-            [btn setTitle:@"REC" forState:UIControlStateNormal];
-            NSLog(@"[TweakRecorder] Recording PAUSED");
-            ShowAlertMainThread(@"Recording", @"Recording paused (tap Done to export).");
-        }
-    });
-}
-
-- (void)doneTapped:(id)sender {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // stop recording
-        BOOL wasRecording = gIsRecording;
-        gIsRecording = NO;
-        UIButton *recordBtn = objc_getAssociatedObject(self.superview, "recordBtn");
-        if ([recordBtn isKindOfClass:[UIButton class]]) {
-            recordBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.0 blue:0.0 alpha:0.85];
-            [recordBtn setTitle:@"REC" forState:UIControlStateNormal];
-        }
-
-        // Export text
-        NSString *out = ExportAllRecordsText();
-        if (!out) out = @"<no-records>";
-
-        // Copy to pasteboard
-        dispatch_async(dispatch_get_main_queue(), ^{
-            @try {
-                UIPasteboard *pb = [UIPasteboard generalPasteboard];
-                pb.strings = @[out]; // strings array to be safer
-            } @catch (NSException *ex) {
-                // fallback
-                @try {
-                    [UIPasteboard generalPasteboard].string = out;
-                } @catch (NSException *e2) {}
-            }
-        });
-
-        // Optionally also NSLog to syslog
-        NSLog(@"[TweakRecorder] Exported %lu records, copied to clipboard.", (unsigned long)(gRecords ? gRecords.count : 0));
-        ShowAlertMainThread(@"Exported", [NSString stringWithFormat:@"Exported %lu actions (copied to clipboard).", (unsigned long)(gRecords ? gRecords.count : 0)]);
-    });
-}
-
-@end
-
-
-// ---------- Hook UIControl sendAction:to:forEvent: to capture actions ----------
-
-%hook UIControl
-
-- (void)sendAction:(SEL)action to:(id)target forEvent:(UIEvent *)event {
-    // Capture only when recording
-    if (gIsRecording) {
-        @try {
-            NSString *selName = action ? NSStringFromSelector(action) : @"<nil>";
-            NSString *targetClass = target ? NSStringFromClass([target class]) : @"<nil>";
-            NSString *senderClass = NSStringFromClass([self class]);
-            NSString *time = ShortTimestamp();
-
-            // Basic event description
-            NSString *eventDesc = @"<event>";
-            if ([event respondsToSelector:@selector(type)]) {
-                UIEventType t = [event type];
-                eventDesc = [NSString stringWithFormat:@"type=%ld", (long)t];
-            }
-
-            // Short stack
-            NSArray *stack = [NSThread callStackSymbols];
-            // Keep only first N lines to reduce size
-            NSUInteger keep = MIN(40, stack.count);
-            NSArray *shortStack = [stack subarrayWithRange:NSMakeRange(0, keep)];
-
-            NSDictionary *rec = @{
-                @"selector": selName ?: @"<nil>",
-                @"targetClass": targetClass ?: @"<nil>",
-                @"senderClass": senderClass ?: @"<nil>",
-                @"time": time ?: @"",
-                @"eventDesc": eventDesc ?: @"",
-                @"stack": shortStack ?: @[]
-            };
-
-            AppendRecord(rec);
-        } @catch (NSException *ex) {
-            NSLog(@"[TweakRecorder] Exception while capturing action: %@", ex);
+            appendLog(@"[Task resume] Task: %p (no request available)", self);
         }
     }
-
-    // Always call original so behavior is unchanged
-    %orig(action, target, event);
+    %orig;
 }
 
 %end
 
+// Hook older NSURLConnection sync send as fallback
+%hook NSURLConnection
 
-// ensure categories and runtime-loaded objects compile cleanly
++ (NSData *)sendSynchronousRequest:(NSURLRequest *)request returningResponse:(NSURLResponse * __autoreleasing *)response error:(NSError * __autoreleasing *)error {
+    if (isRecording) {
+        NSString *bodyStr = @"<nil>";
+        if ([request HTTPBody]) bodyStr = stringFromDataIfText([request HTTPBody]) ?: @"<binary>";
+        else if ([request HTTPBodyStream]) {
+            NSData *d = dataFromInputStream([request HTTPBodyStream]);
+            bodyStr = stringFromDataIfText(d) ?: @"<binary>";
+            if (d && [request isKindOfClass:[NSMutableURLRequest class]]) {
+                @try { [(NSMutableURLRequest *)request setHTTPBody:d]; } @catch (NSException *e) {}
+            }
+        }
+        appendLog(@"[NSURLConnection sendSynchronousRequest] URL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
+                  request.URL ?: @"<nil>",
+                  request.HTTPMethod ?: @"<nil>",
+                  request.allHTTPHeaderFields ?: @{},
+                  bodyStr);
+    }
+    return %orig(request, response, error);
+}
+
+%end
+
+// Constructor to initialize buffer
 %ctor {
-    // initialize record array
-    gRecords = [NSMutableArray array];
-    gIsRecording = NO;
-    NSLog(@"[TweakRecorder] loaded and ready.");
+    logBuffer = [NSMutableString stringWithString:@"--- Recorder Initialized ---\n"];
 }
