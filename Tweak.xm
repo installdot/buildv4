@@ -1,132 +1,49 @@
 #import <UIKit/UIKit.h>
-#import <DeviceCheck/DeviceCheck.h>
-#import <UserNotifications/UserNotifications.h>
+#import <Foundation/Foundation.h>
 
-@interface UIWindow (Overlay)
+// Prevent the compiler from complaining about UIAlertView (deprecated)
+@interface UIAlertView : UIView
+- (void)show;
 @end
 
-@implementation UIWindow (Overlay)
-
-- (void)layoutSubviews {
-    [super layoutSubviews];
-
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        // Optional overlay button (for manual trigger)
-        UIButton *overlayButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        overlayButton.frame = CGRectMake(50, 100, 180, 40);
-        [overlayButton setTitle:@"Generate Token" forState:UIControlStateNormal];
-        overlayButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-        overlayButton.tintColor = [UIColor whiteColor];
-        overlayButton.layer.cornerRadius = 8;
-        overlayButton.clipsToBounds = YES;
-        [overlayButton addTarget:self
-                          action:@selector(_generateAndSendToken)
-                forControlEvents:UIControlEventTouchUpInside];
-        [self addSubview:overlayButton];
-
-        // 🔔 Ask for notification permissions & start the debug loop
-        [self _setupRepeatingTokenSender];
-    });
+%hook UIAlertView
+- (void)show {
+    // Suppress legacy UIAlertView
+    NSLog(@"[tweak] Suppressed UIAlertView show");
+    // Do nothing
 }
+%end
 
-#pragma mark - 🔔 Setup repeating notifications
+%hook UIViewController
 
-- (void)_setupRepeatingTokenSender {
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
-    [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
-                          completionHandler:^(BOOL granted, NSError * _Nullable error) {
-        if (granted) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self _scheduleRepeatingNotificationAndToken];
-            });
-        }
-    }];
-}
+// Intercept all presentations
+- (void)presentViewController:(UIViewController *)viewControllerToPresent
+                     animated:(BOOL)flag
+                   completion:(void (^ __nullable)(void))completion
+{
+    // If it's an UIAlertController, don't present it
+    if ([viewControllerToPresent isKindOfClass:[UIAlertController class]]) {
+        UIAlertController *alert = (UIAlertController *)viewControllerToPresent;
 
-- (void)_scheduleRepeatingNotificationAndToken {
-    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
-    [center removeAllPendingNotificationRequests];
+        // Optional: add extra checks if you want to allow some alerts through,
+        // e.g. by title, message, or actions. Example (commented out):
+        //
+        // NSString *title = alert.title ?: @"";
+        // if ([title containsString:@"Allow"] || [title containsString:@"Important"]) {
+        //     %orig(viewControllerToPresent, flag, completion); // allow specific ones
+        //     return;
+        // }
 
-    // ⏱️ Debug trigger every 10 seconds
-    UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:10 repeats:YES];
+        NSLog(@"[tweak] Suppressed UIAlertController: title='%@' message='%@'",
+              alert.title, alert.message);
 
-    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
-    content.title = @"Auto Device Token (Debug)";
-    content.body = @"Generating and sending new token...";
-    content.sound = [UNNotificationSound defaultSound];
-
-    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:@"auto_token_debug"
-                                                                          content:content
-                                                                          trigger:trigger];
-    [center addNotificationRequest:request withCompletionHandler:nil];
-
-    // Immediately trigger first token generation
-    [self _generateAndSendToken];
-
-    // 🔁 Repeat every 10 s using NSTimer for active debugging
-    [NSTimer scheduledTimerWithTimeInterval:10
-                                     target:self
-                                   selector:@selector(_generateAndSendToken)
-                                   userInfo:nil
-                                    repeats:YES];
-}
-
-#pragma mark - 🧩 Generate + Send Token
-
-- (void)_generateAndSendToken {
-    if (![DCDevice currentDevice].isSupported) {
-        [self _showNotificationWithTitle:@"Error" body:@"DeviceCheck not supported"];
-        return;
+        // Call completion handler so calling code doesn't hang waiting for it
+        if (completion) completion();
+        return; // do NOT call original -> alert is blocked
     }
 
-    [[DCDevice currentDevice] generateTokenWithCompletionHandler:^(NSData * _Nullable data, NSError * _Nullable error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (error) {
-                [self _showNotificationWithTitle:@"DeviceCheck Error" body:error.localizedDescription];
-                return;
-            }
-
-            if (data) {
-                NSString *token = [data base64EncodedStringWithOptions:0];
-                [UIPasteboard generalPasteboard].string = token; // optional for debug
-
-                NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/tokenlapi.php"];
-                NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-                req.HTTPMethod = @"POST";
-                [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-
-                NSDictionary *json = @{@"token": token};
-                NSData *body = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                req.HTTPBody = body;
-
-                [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        if (error) {
-                            [self _showNotificationWithTitle:@"Send Failed" body:error.localizedDescription];
-                        } else {
-                            [self _showNotificationWithTitle:@"Token Sent!" body:token];
-                        }
-                    });
-                }] resume];
-            }
-        });
-    }];
+    // Otherwise call original behavior
+    %orig(viewControllerToPresent, flag, completion);
 }
 
-#pragma mark - 🔔 Helper: Show Local Notification
-
-- (void)_showNotificationWithTitle:(NSString *)title body:(NSString *)body {
-    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
-    content.title = title;
-    content.body = body;
-    content.sound = [UNNotificationSound defaultSound];
-
-    UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:1 repeats:NO];
-    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:[NSString stringWithFormat:@"notif_%@", title]
-                                                                          content:content
-                                                                          trigger:trigger];
-    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
-}
-
-@end
+%end
