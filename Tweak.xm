@@ -7,6 +7,7 @@
 static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
 static NSString * const kHexHmacKey = @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE
 static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/iost.php";
+static BOOL g_hasShownCreditAlert = NO;
 
 #pragma mark - Helpers
 
@@ -475,8 +476,32 @@ static UIButton *floatingButton = nil;
 %hook UIApplication
 %new
 - (void)showMenuPressed {
-    // start encrypted verification flow
-    verifyAccessAndOpenMenu();
+    // === ONE-TIME CREDIT ALERT ===
+    if (!g_hasShownCreditAlert) {
+        g_hasShownCreditAlert = YES;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *message = @"This dylib is made by mochiteyvat(Discord).\n"
+                                @"This is free dylib, if you bought this then u likely got scammed.\n"
+                                @"Đây là dylib được tạo bởi mochiteyvat(Discord).\n"
+                                @"Nếu bạn mua thì bạn đã bị dắt như bò!";
+
+            UIAlertController *credit = [UIAlertController alertControllerWithTitle:@"Info"
+                                                                            message:message
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+
+            [credit addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                // After user dismisses the credit alert → proceed to normal verification flow
+                verifyAccessAndOpenMenu();
+            }]];
+
+            UIViewController *root = topVC();
+            [root presentViewController:credit animated:YES completion:nil];
+        });
+    } else {
+        // Normal flow (already shown once this session)
+        verifyAccessAndOpenMenu();
+    }
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
