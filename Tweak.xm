@@ -153,7 +153,7 @@ static void patchReborn() {
 #pragma mark - Bypass Patch
 
 static void patchBypass() {
-    NSString *pattern = @"(<key>OpenNewtonJsonTest_\\d+</key>\\s*<integer>)\\d+|(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+";
+    NSString *pattern = @"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+";
     NSString *replace = @"$10";
     applyPatch(@"Bypass", pattern, replace);
 }
