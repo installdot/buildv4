@@ -150,7 +150,34 @@ static void patchReborn() {
     applyPatch(@"Reborn", pattern, replace);
 }
 
+#pragma mark - Bypass Patch
+
+static void patchBypass() {
+    NSString *pattern = @"(<key>OpenNewtonJsonTest_\\d+</key>\\s*<integer>)\\d+|(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+";
+    NSString *replace = @"$10";
+    applyPatch(@"Bypass", pattern, replace);
+}
+
 #pragma mark - Player Patch Menu
+
+static void patchAll() {
+    NSArray *patches = @[@"Characters", @"Skins", @"Skills", @"Pets", @"Level", @"Furniture", @"Reborn", @"Bypass"];
+    for (NSString *p in patches) {
+        if ([p isEqualToString:@"Reborn"]) patchReborn();
+        else if ([p isEqualToString:@"Bypass"]) patchBypass();
+        else {
+            NSDictionary *dict = @{
+                @"Characters": @{@"re": @"(<key>\\d+_c\\d+_unlock.*\n.*)false", @"rep": @"$1True"},
+                @"Skins":      @{@"re": @"(<key>\\d+_c\\d+_skin\\d+.*\n.*>)[+-]?\\d+", @"rep": @"$11"},
+                @"Skills":     @{@"re": @"(<key>\\d+_c_.*_skill_\\d_unlock.*\n.*<integer>)\\d", @"rep": @"$11"},
+                @"Pets":       @{@"re": @"(<key>\\d+_p\\d+_unlock.*\n.*)false", @"rep": @"$1True"},
+                @"Level":      @{@"re": @"(<key>\\d+_c\\d+_level+.*\n.*>)[+-]?\\d+", @"rep": @"$18"},
+                @"Furniture":  @{@"re": @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+", @"rep": @"$15"}
+            };
+            applyPatch(p, dict[p][@"re"], dict[p][@"rep"]);
+        }
+    }
+}
 
 static void showPlayerMenu() {
     UIAlertController *menu =
@@ -164,23 +191,19 @@ static void showPlayerMenu() {
         @"Skills":     @{@"re": @"(<key>\\d+_c_.*_skill_\\d_unlock.*\n.*<integer>)\\d", @"rep": @"$11"},
         @"Pets":       @{@"re": @"(<key>\\d+_p\\d+_unlock.*\n.*)false", @"rep": @"$1True"},
         @"Level":      @{@"re": @"(<key>\\d+_c\\d+_level+.*\n.*>)[+-]?\\d+", @"rep": @"$18"},
-        @"Furniture":  @{@"re": @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+", @"rep": @"$15"},
-        @"Gems":       @{@"re": @"", @"rep": @""}, // handled separately
-        @"Reborn":     @{@"re": @"", @"rep": @""}  // handled separately
+        @"Furniture":  @{@"re": @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+", @"rep": @"$15"}
     };
 
     for (NSString *name in patches) {
         [menu addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-            if ([name isEqualToString:@"Gems"]) {
-                patchGems();
-            } else if ([name isEqualToString:@"Reborn"]) {
-                patchReborn();
-            } else {
-                NSDictionary *p = patches[name];
-                applyPatch(name, p[@"re"], p[@"rep"]);
-            }
+            applyPatch(name, patches[name][@"re"], patches[name][@"rep"]);
         }]];
     }
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchGems(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchReborn(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Bypass" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchBypass(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Patch All" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchAll(); }]];
 
     [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:menu animated:YES completion:nil];
@@ -193,7 +216,11 @@ static NSArray* listDocumentsFiles() {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *err = nil;
     NSArray *files = [fm contentsOfDirectoryAtPath:docs error:&err];
-    return files ?: @[];
+    NSMutableArray *filtered = [NSMutableArray array];
+    for (NSString *f in files) {
+        if (![f hasSuffix:@".new"]) [filtered addObject:f];
+    }
+    return filtered;
 }
 
 static void showFileActionMenu(NSString *fileName) {
@@ -204,12 +231,9 @@ static void showFileActionMenu(NSString *fileName) {
                                                                    message:@"Choose Action"
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
-    // Export → copy contents to clipboard
     [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-        NSError *err = nil;
-        NSString *content = [NSString stringWithContentsOfFile:filePath encoding:NSUTF8StringEncoding error:&err];
+        NSString *content = [NSString stringWithContentsOfFile:filePath encoding:NSUTF8StringEncoding error:nil];
         if (content) UIPasteboard.generalPasteboard.string = content;
-
         UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Exported"
                                                                       message:@"Copied contents to clipboard"
                                                                preferredStyle:UIAlertControllerStyleAlert];
@@ -217,7 +241,6 @@ static void showFileActionMenu(NSString *fileName) {
         [topVC() presentViewController:done animated:YES completion:nil];
     }]];
 
-    // Import → input text and overwrite
     [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
         UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import"
                                                                        message:@"Paste text to import"
@@ -239,7 +262,6 @@ static void showFileActionMenu(NSString *fileName) {
         [topVC() presentViewController:input animated:YES completion:nil];
     }]];
 
-    // Delete → remove file
     [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action){
         NSError *err = nil;
         [[NSFileManager defaultManager] removeItemAtPath:filePath error:&err];
@@ -304,25 +326,36 @@ static void showMainMenu() {
 
 static CGPoint startPoint;
 static CGPoint btnStart;
+static UIButton *floatingButton = nil;
+
+static void toggleMenuVisibility() {
+    floatingButton.hidden = !floatingButton.hidden;
+}
 
 %ctor {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         UIWindow *win = firstWindow();
 
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(20, 200, 70, 70);
-        btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
-        btn.layer.cornerRadius = 35;
-        btn.tintColor = UIColor.whiteColor;
-        [btn setTitle:@"Menu" forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        floatingButton.frame = CGRectMake(20, 200, 70, 70);
+        floatingButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        floatingButton.layer.cornerRadius = 35;
+        floatingButton.tintColor = UIColor.whiteColor;
+        [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
+        floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
 
-        [btn addTarget:nil action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
+        [floatingButton addTarget:nil action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
-        [btn addGestureRecognizer:pan];
+        [floatingButton addGestureRecognizer:pan];
 
-        [win addSubview:btn];
+        // 3-finger double tap gesture
+        UITapGestureRecognizer *threeFingerDoubleTap = [[UITapGestureRecognizer alloc] initWithTarget:nil action:@selector(handleThreeFingerDoubleTap:)];
+        threeFingerDoubleTap.numberOfTouchesRequired = 3;
+        threeFingerDoubleTap.numberOfTapsRequired = 2;
+        [win addGestureRecognizer:threeFingerDoubleTap];
+
+        [win addSubview:floatingButton];
     });
 }
 
@@ -341,5 +374,9 @@ static CGPoint btnStart;
         CGFloat dy = pt.y - startPoint.y;
         btn.center = CGPointMake(btnStart.x + dx, btnStart.y + dy);
     }
+}
+
+- (void)handleThreeFingerDoubleTap:(UITapGestureRecognizer*)tap {
+    toggleMenuVisibility();
 }
 %end
