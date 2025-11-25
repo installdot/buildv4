@@ -456,9 +456,9 @@ static UIButton *floatingButton = nil;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *win = firstWindow();
         floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        floatingButton.frame = CGRectMake(20, 250, 70, 70);
+        floatingButton.frame = CGRectMake(10, 50, 40, 40);
         floatingButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
-        floatingButton.layer.cornerRadius = 35;
+        floatingButton.layer.cornerRadius = 10;
         floatingButton.tintColor = UIColor.whiteColor;
         [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
         floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
