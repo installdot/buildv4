@@ -3,43 +3,41 @@
 #import <Foundation/Foundation.h>
 #import <substrate.h>
 
-static CGPoint startPoint;
-static CGPoint btnStart;
-
-// Helper to get the first window
-UIWindow *firstWindow() {
+static UIWindow *firstWindow() {
     NSArray *windows = [UIApplication sharedApplication].windows;
     return windows.firstObject;
 }
 
-%ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+%hook UIApplication
+
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    BOOL ret = %orig;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *win = firstWindow();
         if (!win) return;
 
         CGFloat btnSize = 70;
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-
-        // Place button in the middle of the screen
         btn.frame = CGRectMake((win.bounds.size.width - btnSize)/2,
                                (win.bounds.size.height - btnSize)/2,
                                btnSize,
                                btnSize);
-
         btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
-        btn.layer.cornerRadius = btnSize / 2;
+        btn.layer.cornerRadius = btnSize/2;
         btn.tintColor = UIColor.whiteColor;
         [btn setTitle:@"Menu" forState:UIControlStateNormal];
         btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
 
-        [btn addTarget:nil action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
+        [btn addTarget:self action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
 
         [win addSubview:btn];
     });
+
+    return ret;
 }
 
-// Function to show Documents files
-%new
+// Add new method inside the hook
 - (void)showMenuPressed {
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *documentsDirectory = [paths firstObject];
@@ -64,3 +62,5 @@ UIWindow *firstWindow() {
     UIWindow *win = firstWindow();
     [win.rootViewController presentViewController:alert animated:YES completion:nil];
 }
+
+%end
