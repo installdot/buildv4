@@ -1,10 +1,118 @@
+// Tweak.xm
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <CommonCrypto/CommonCrypto.h>
 
-#pragma mark - Top VC helper
+#pragma mark - CONFIG: set these to match server hex keys
+static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
+static NSString * const kHexHmacKey = @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE
+static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/iost.php";
+
+#pragma mark - Helpers
+
+static NSData* dataFromHex(NSString *hex) {
+    NSMutableData *d = [NSMutableData data];
+    for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
+        NSRange r = NSMakeRange(i, 2);
+        NSString *byteStr = [hex substringWithRange:r];
+        unsigned int byte = 0;
+        [[NSScanner scannerWithString:byteStr] scanHexInt:&byte];
+        uint8_t b = (uint8_t)byte;
+        [d appendBytes:&b length:1];
+    }
+    return d;
+}
+
+static NSString* base64Encode(NSData *d) {
+    return [d base64EncodedStringWithOptions:0];
+}
+static NSData* base64Decode(NSString *s) {
+    return [[NSData alloc] initWithBase64EncodedString:s options:0];
+}
+
+#pragma mark - AES-256-CBC encrypt/decrypt + HMAC-SHA256
+
+// returns box: iv(16) + cipher + hmac(32) as NSData
+static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
+    // generate IV
+    uint8_t ivBytes[16];
+    arc4random_buf(ivBytes, sizeof(ivBytes));
+    NSData *iv = [NSData dataWithBytes:ivBytes length:16];
+
+    // AES-256-CBC encrypt
+    size_t outlen = plaintext.length + kCCBlockSizeAES128;
+    void *outbuf = malloc(outlen);
+    size_t actualOut = 0;
+    CCCryptorStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                 key.bytes, key.length,
+                                 iv.bytes,
+                                 plaintext.bytes, plaintext.length,
+                                 outbuf, outlen, &actualOut);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    NSData *cipher = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
+
+    // compute HMAC over (iv || cipher)
+    NSMutableData *forHmac = [NSMutableData data];
+    [forHmac appendData:iv];
+    [forHmac appendData:cipher];
+    unsigned char hmac[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, hmac);
+    NSData *hmacData = [NSData dataWithBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
+
+    // compose box
+    NSMutableData *box = [NSMutableData data];
+    [box appendData:iv];
+    [box appendData:cipher];
+    [box appendData:hmacData];
+    return box;
+}
+
+static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
+    if (box.length < 16 + 32) return nil;
+    NSData *iv = [box subdataWithRange:NSMakeRange(0,16)];
+    NSData *hmac = [box subdataWithRange:NSMakeRange(box.length - 32, 32)];
+    NSData *cipher = [box subdataWithRange:NSMakeRange(16, box.length - 16 - 32)];
+
+    // verify hmac
+    NSMutableData *forHmac = [NSMutableData data];
+    [forHmac appendData:iv];
+    [forHmac appendData:cipher];
+    unsigned char calc[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, calc);
+    NSData *calcData = [NSData dataWithBytes:calc length:CC_SHA256_DIGEST_LENGTH];
+    if (![calcData isEqualToData:hmac]) return nil;
+
+    // decrypt
+    size_t outlen = cipher.length + kCCBlockSizeAES128;
+    void *outbuf = malloc(outlen);
+    size_t actualOut = 0;
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                 key.bytes, key.length,
+                                 iv.bytes,
+                                 cipher.bytes, cipher.length,
+                                 outbuf, outlen, &actualOut);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    NSData *plain = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
+    return plain;
+}
+
+#pragma mark - App UUID persistence
+
+static NSString* appUUID() {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/uuid.txt"];
+    NSError *err = nil;
+    NSString *uuid = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+    if (!uuid || uuid.length == 0) {
+        uuid = [[NSUUID UUID] UUIDString];
+        [uuid writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return uuid;
+}
+
+#pragma mark - UI helpers
 
 static UIWindow* firstWindow() {
-    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if ([scene isKindOfClass:[UIWindowScene class]]) {
             UIWindowScene *ws = (UIWindowScene *)scene;
             for (UIWindow *w in ws.windows) {
@@ -14,247 +122,280 @@ static UIWindow* firstWindow() {
     }
     return UIApplication.sharedApplication.windows.firstObject;
 }
-
 static UIViewController* topVC() {
     UIWindow *win = firstWindow();
     UIViewController *root = win.rootViewController;
-    while (root.presentedViewController)
-        root = root.presentedViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
     return root;
 }
 
-#pragma mark - Plist Helpers
-
-static NSString* dictToPlist(NSDictionary *dict) {
-    NSError *err = nil;
-    NSData *data = [NSPropertyListSerialization dataWithPropertyList:dict
-                                                              format:NSPropertyListXMLFormat_v1_0
-                                                             options:0
-                                                               error:&err];
-    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+#pragma mark - Force close
+static void killApp() {
+    exit(0);
 }
 
-static NSDictionary* plistToDict(NSString *plist) {
-    NSData *data = [plist dataUsingEncoding:NSUTF8StringEncoding];
-    NSError *err = nil;
-    id obj = [NSPropertyListSerialization propertyListWithData:data
-                                                       options:NSPropertyListMutableContainersAndLeaves
-                                                        format:nil
-                                                         error:&err];
-    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
-}
+#pragma mark - Save lastTimestamp for verification
+static NSString *g_lastTimestamp = nil;
 
-#pragma mark - Apply Patch
+#pragma mark - Network: verify then open menu
 
-static void applyPatch(NSString *title, NSString *pattern, NSString *replace) {
-    NSString *bid = NSBundle.mainBundle.bundleIdentifier;
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+// Forward declarations for existing menu functions
+static void showMainMenu();
+static void showPlayerMenu();
+static void showDataMenu();
 
-    NSString *plist = dictToPlist(domain);
-    if (!plist) return;
-
-    NSError *err = nil;
-    NSRegularExpression *re =
-        [NSRegularExpression regularExpressionWithPattern:pattern
-                                                  options:NSRegularExpressionCaseInsensitive
-                                                    error:&err];
-
-    NSString *modified =
-        [re stringByReplacingMatchesInString:plist
-                                     options:0
-                                       range:NSMakeRange(0, plist.length)
-                                withTemplate:replace];
-
-    NSDictionary *newDomain = plistToDict(modified);
-    if (!newDomain) {
-        UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"Patch Failed"
-                                                message:@"Broken plist output."
-                                         preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [topVC() presentViewController:alert animated:YES completion:nil];
+// Build JSON payload and send encrypted
+static void verifyAccessAndOpenMenu() {
+    NSData *key = dataFromHex(kHexKey);
+    NSData *hmacKey = dataFromHex(kHexHmacKey);
+    if (!key || key.length != 32 || !hmacKey || hmacKey.length != 32) {
+        // invalid keys
+        killApp();
         return;
     }
 
-    [defs setPersistentDomain:newDomain forName:bid];
-    [defs synchronize];
+    NSString *uuid = appUUID();
+    NSString *timestamp = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
+    g_lastTimestamp = timestamp; // store local copy for later verification
 
-    UIAlertController *done =
-        [UIAlertController alertControllerWithTitle:@"Success"
-                                            message:[NSString stringWithFormat:@"%@ patched.", title]
-                                     preferredStyle:UIAlertControllerStyleAlert];
-    [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [topVC() presentViewController:done animated:YES completion:nil];
+    NSDictionary *payload = @{@"uuid": uuid, @"timestamp": timestamp, @"encrypted": @"yes"};
+    NSData *plain = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+
+    NSData *box = encryptPayload(plain, key, hmacKey);
+    if (!box) { killApp(); return; }
+
+    NSString *b64 = base64Encode(box);
+    NSDictionary *post = @{@"data": b64};
+    NSData *postData = [NSJSONSerialization dataWithJSONObject:post options:0 error:nil];
+
+    NSURL *url = [NSURL URLWithString:kServerURL];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 10.0;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = postData;
+
+    NSURLSession *s = [NSURLSession sharedSession];
+    NSURLSessionDataTask *task = [s dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err){
+        if (err || !data) { killApp(); return; }
+
+        // parse server JSON: { data: "<base64>" }
+        NSDictionary *outer = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (!outer || !outer[@"data"]) { killApp(); return; }
+        NSString *respB64 = outer[@"data"];
+        NSData *respBox = base64Decode(respB64);
+        if (!respBox) { killApp(); return; }
+
+        NSData *plainResp = decryptAndVerify(respBox, key, hmacKey);
+        if (!plainResp) { killApp(); return; }
+
+        NSDictionary *respJSON = [NSJSONSerialization JSONObjectWithData:plainResp options:0 error:nil];
+        if (!respJSON) { killApp(); return; }
+
+        NSString *r_uuid = respJSON[@"uuid"];
+        NSString *r_ts = respJSON[@"timestamp"];
+        BOOL allow = [respJSON[@"allow"] boolValue];
+
+        // Security checks: must match exactly the sent uuid & timestamp and allow true
+        if (!r_uuid || ![r_uuid isEqualToString:uuid]) { killApp(); return; }
+        if (!r_ts || ![r_ts isEqualToString:g_lastTimestamp]) { killApp(); return; }
+        if (!allow) { killApp(); return; }
+
+        // OK — show menu on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            showMainMenu();
+        });
+    }];
+    [task resume];
 }
 
-#pragma mark - Gems & Reborn patches
+#pragma mark - Regex patch helpers (NSUserDefaults domain approach)
+
+// Convert dict -> XML string
+static NSString* dictToPlist(NSDictionary *d) {
+    NSError *err = nil;
+    NSData *dat = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
+    if (!dat) return nil;
+    return [[NSString alloc] initWithData:dat encoding:NSUTF8StringEncoding];
+}
+static NSDictionary* plistToDict(NSString *plist) {
+    if (!plist) return nil;
+    NSData *dat = [plist dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *err = nil;
+    id obj = [NSPropertyListSerialization propertyListWithData:dat options:NSPropertyListMutableContainersAndLeaves format:NULL error:&err];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
+}
+
+static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+    NSString *plist = dictToPlist(domain);
+    if (!plist) return NO;
+    NSError *err = nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:&err];
+    if (!re) return NO;
+    NSString *modified = [re stringByReplacingMatchesInString:plist options:0 range:NSMakeRange(0, plist.length) withTemplate:replacement];
+    NSDictionary *newDomain = plistToDict(modified);
+    if (!newDomain) return NO;
+    [defs setPersistentDomain:newDomain forName:bid];
+    [defs synchronize];
+    return YES;
+}
+
+static void applyPatchWithAlert(NSString *title, NSString *pattern, NSString *replacement) {
+    BOOL ok = silentApplyRegexToDomain(pattern, replacement);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok?@"Success":@"Failed")
+                                                                       message:[NSString stringWithFormat:@"%@ %@", title, ok?@"applied":@"failed"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+#pragma mark - Gems/Reborn/Bypass/PatchAll
 
 static void patchGems() {
-    NSString *bid = NSBundle.mainBundle.bundleIdentifier;
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *domain = [[defs persistentDomainForName:bid] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+    NSString *plist = dictToPlist(domain) ?: @"";
 
-    UIAlertController *input =
-        [UIAlertController alertControllerWithTitle:@"Set Gems"
-                                            message:@"Input new gem value:"
-                                     preferredStyle:UIAlertControllerStyleAlert];
-
-    [input addTextFieldWithConfigurationHandler:^(UITextField *textField){
-        textField.placeholder = @"Number";
-        textField.keyboardType = UIKeyboardTypeNumberPad;
-    }];
-
-    [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-        NSInteger value = [input.textFields.firstObject.text integerValue];
-        NSString *plist = dictToPlist(domain);
-        NSError *err = nil;
-
-        NSRegularExpression *reGems = [NSRegularExpression regularExpressionWithPattern:
-            @"(<key>\\d+_gems</key>\\s*<integer>)\\d+"
-                                                              options:NSRegularExpressionCaseInsensitive error:&err];
-
-        NSString *modified = [reGems stringByReplacingMatchesInString:plist
-                                                              options:0
-                                                                range:NSMakeRange(0, plist.length)
-                                                         withTemplate:[NSString stringWithFormat:@"$1%ld", (long)value]];
-
-        NSRegularExpression *reLastGems = [NSRegularExpression regularExpressionWithPattern:
-            @"(<key>\\d+_last_gems</key>\\s*<integer>)\\d+"
-                                                              options:NSRegularExpressionCaseInsensitive error:&err];
-
-        modified = [reLastGems stringByReplacingMatchesInString:modified
-                                                        options:0
-                                                          range:NSMakeRange(0, modified.length)
-                                                   withTemplate:[NSString stringWithFormat:@"$1%ld", (long)value]];
-
-        NSDictionary *newDomain = plistToDict(modified);
-        [defs setPersistentDomain:newDomain forName:bid];
-        [defs synchronize];
-
-        UIAlertController *done =
-            [UIAlertController alertControllerWithTitle:@"Gems Updated"
-                                                message:[NSString stringWithFormat:@"Set gems to %ld", (long)value]
-                                         preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Set Gems" message:@"Enter value" preferredStyle:UIAlertControllerStyleAlert];
+    [input addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.keyboardType = UIKeyboardTypeNumberPad; tf.placeholder = @"0"; }];
+    [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSInteger v = [input.textFields.firstObject.text integerValue];
+        NSString *re1 = @"(<key>\\d+_gems</key>\\s*<integer>)\\d+";
+        NSString *re2 = @"(<key>\\d+_last_gems</key>\\s*<integer>)\\d+";
+        silentApplyRegexToDomain(re1, [NSString stringWithFormat:@"$1%ld", (long)v]);
+        silentApplyRegexToDomain(re2, [NSString stringWithFormat:@"$1%ld", (long)v]);
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Gems Updated" message:[NSString stringWithFormat:@"%ld", (long)v] preferredStyle:UIAlertControllerStyleAlert];
         [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [topVC() presentViewController:done animated:YES completion:nil];
     }]];
-
     [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:input animated:YES completion:nil];
 }
 
-static void patchReborn() {
-    NSString *pattern = @"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+";
-    NSString *replace = @"$11";
-    applyPatch(@"Reborn", pattern, replace);
+static void patchRebornWithAlert() {
+    applyPatchWithAlert(@"Reborn", @"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
 }
 
-#pragma mark - Bypass Patch
-
-static void patchBypass() {
-    NSString *pattern = @"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+";
-    NSString *replace = @"$10";
-    applyPatch(@"Bypass", pattern, replace);
+static void silentPatchBypass() {
+    silentApplyRegexToDomain(@"(<key>OpenNewtonJsonTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
+    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
 }
 
-#pragma mark - Player Patch Menu
-
-static void patchAll() {
-    NSArray *patches = @[@"Characters", @"Skins", @"Skills", @"Pets", @"Level", @"Furniture", @"Reborn", @"Bypass"];
-    for (NSString *p in patches) {
-        if ([p isEqualToString:@"Reborn"]) patchReborn();
-        else if ([p isEqualToString:@"Bypass"]) patchBypass();
-        else {
-            NSDictionary *dict = @{
-                @"Characters": @{@"re": @"(<key>\\d+_c\\d+_unlock.*\n.*)false", @"rep": @"$1True"},
-                @"Skins":      @{@"re": @"(<key>\\d+_c\\d+_skin\\d+.*\n.*>)[+-]?\\d+", @"rep": @"$11"},
-                @"Skills":     @{@"re": @"(<key>\\d+_c_.*_skill_\\d_unlock.*\n.*<integer>)\\d", @"rep": @"$11"},
-                @"Pets":       @{@"re": @"(<key>\\d+_p\\d+_unlock.*\n.*)false", @"rep": @"$1True"},
-                @"Level":      @{@"re": @"(<key>\\d+_c\\d+_level+.*\n.*>)[+-]?\\d+", @"rep": @"$18"},
-                @"Furniture":  @{@"re": @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+", @"rep": @"$15"}
-            };
-            applyPatch(p, dict[p][@"re"], dict[p][@"rep"]);
-        }
-    }
-}
-
-static void showPlayerMenu() {
-    UIAlertController *menu =
-        [UIAlertController alertControllerWithTitle:@"Player Patches"
-                                            message:@"Choose patch"
-                                     preferredStyle:UIAlertControllerStyleAlert];
-
-    NSDictionary *patches = @{
-        @"Characters": @{@"re": @"(<key>\\d+_c\\d+_unlock.*\n.*)false", @"rep": @"$1True"},
-        @"Skins":      @{@"re": @"(<key>\\d+_c\\d+_skin\\d+.*\n.*>)[+-]?\\d+", @"rep": @"$11"},
-        @"Skills":     @{@"re": @"(<key>\\d+_c_.*_skill_\\d_unlock.*\n.*<integer>)\\d", @"rep": @"$11"},
-        @"Pets":       @{@"re": @"(<key>\\d+_p\\d+_unlock.*\n.*)false", @"rep": @"$1True"},
-        @"Level":      @{@"re": @"(<key>\\d+_c\\d+_level+.*\n.*>)[+-]?\\d+", @"rep": @"$18"},
-        @"Furniture":  @{@"re": @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+", @"rep": @"$15"}
+static void patchAllExcludingGems() {
+    // characters, skins, skills, pets, level, furniture, reborn, bypass (no gems)
+    NSDictionary *map = @{
+        @"Characters": @"(<key>\\d+_c\\d+_unlock.*\\n.*)false",
+        @"Skins":      @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+",
+        @"Skills":     @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d",
+        @"Pets":       @"(<key>\\d+_p\\d+_unlock.*\\n.*)false",
+        @"Level":      @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+",
+        @"Furniture":  @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+"
     };
 
-    for (NSString *name in patches) {
-        [menu addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-            applyPatch(name, patches[name][@"re"], patches[name][@"rep"]);
-        }]];
+    for (NSString *k in map) {
+        NSString *pattern = map[k];
+        NSString *rep = @"$1";
+        // pattern-specific replacement:
+        if ([k isEqualToString:@"Characters"] || [k isEqualToString:@"Pets"]) rep = @"$1True";
+        else if ([k isEqualToString:@"Skins"] || [k isEqualToString:@"Skills"] ) rep = @"$11";
+        else if ([k isEqualToString:@"Level"]) rep = @"$18";
+        else if ([k isEqualToString:@"Furniture"]) rep = @"$15";
+        silentApplyRegexToDomain(pattern, rep);
     }
+    // Reborn
+    silentApplyRegexToDomain(@"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
+    // Bypass
+    silentPatchBypass();
 
-    [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchGems(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchReborn(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Bypass" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchBypass(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Patch All" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ patchAll(); }]];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Patch All" message:@"Applied (excluding Gems)" preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    });
+}
+
+#pragma mark - Player menu
+
+static void showPlayerMenu() {
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Player" message:@"Choose patch" preferredStyle:UIAlertControllerStyleAlert];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Characters" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\\n.*)false", @"$1True");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Skins" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+", @"$11");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Skills" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d", @"$11");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Pets" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Pets", @"(<key>\\d+_p\\d+_unlock.*\\n.*)false", @"$1True");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Level" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Level", @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+", @"$18");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Furniture" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+", @"$15");
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchGems();
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchRebornWithAlert();
+    }]];
+    // Bypass is removed from menu; it runs silently before showing
+    [menu addAction:[UIAlertAction actionWithTitle:@"Patch All" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchAllExcludingGems();
+    }]];
 
     [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Document Folder Helpers
+#pragma mark - Document helpers (hide .new)
 
 static NSArray* listDocumentsFiles() {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSError *err = nil;
-    NSArray *files = [fm contentsOfDirectoryAtPath:docs error:&err];
-    NSMutableArray *filtered = [NSMutableArray array];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
+    NSMutableArray *out = [NSMutableArray array];
     for (NSString *f in files) {
-        if (![f hasSuffix:@".new"]) [filtered addObject:f];
+        if (![f hasSuffix:@".new"]) [out addObject:f];
     }
-    return filtered;
+    return out;
 }
 
 static void showFileActionMenu(NSString *fileName) {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *filePath = [docs stringByAppendingPathComponent:fileName];
+    NSString *path = [docs stringByAppendingPathComponent:fileName];
 
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:fileName
-                                                                   message:@"Choose Action"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:fileName message:@"Action" preferredStyle:UIAlertControllerStyleAlert];
 
-    [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-        NSString *content = [NSString stringWithContentsOfFile:filePath encoding:NSUTF8StringEncoding error:nil];
-        if (content) UIPasteboard.generalPasteboard.string = content;
-        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Exported"
-                                                                      message:@"Copied contents to clipboard"
-                                                               preferredStyle:UIAlertControllerStyleAlert];
+    // Export (copy contents to clipboard)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+        if (txt) UIPasteboard.generalPasteboard.string = txt;
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(txt?@"Exported":@"Error") message:(txt?@"Copied to clipboard":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
         [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [topVC() presentViewController:done animated:YES completion:nil];
     }]];
 
-    [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-        UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import"
-                                                                       message:@"Paste text to import"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [input addTextFieldWithConfigurationHandler:^(UITextField *textField){
-            textField.placeholder = @"Paste text here";
-        }];
-        [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-            NSString *text = input.textFields.firstObject.text ?: @"";
-            [text writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-            UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Imported"
-                                                                          message:@"File overwritten"
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
+    // Import (replace)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
+        [input addTextFieldWithConfigurationHandler:nil];
+        [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
+            NSString *txt = input.textFields.firstObject.text ?: @"";
+            NSError *err = nil;
+            BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"File overwritten":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
             [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
             [topVC() presentViewController:done animated:YES completion:nil];
         }]];
@@ -262,12 +403,11 @@ static void showFileActionMenu(NSString *fileName) {
         [topVC() presentViewController:input animated:YES completion:nil];
     }]];
 
-    [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action){
+    // Delete
+    [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
         NSError *err = nil;
-        [[NSFileManager defaultManager] removeItemAtPath:filePath error:&err];
-        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Deleted"
-                                                                      message:err ? err.localizedDescription : @"File removed"
-                                                               preferredStyle:UIAlertControllerStyleAlert];
+        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
         [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [topVC() presentViewController:done animated:YES completion:nil];
     }]];
@@ -279,81 +419,54 @@ static void showFileActionMenu(NSString *fileName) {
 static void showDataMenu() {
     NSArray *files = listDocumentsFiles();
     if (files.count == 0) {
-        UIAlertController *empty = [UIAlertController alertControllerWithTitle:@"No Files"
-                                                                       message:@"Documents folder is empty."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [empty addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [topVC() presentViewController:empty animated:YES completion:nil];
+        UIAlertController *e = [UIAlertController alertControllerWithTitle:@"No files" message:@"Documents is empty" preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:e animated:YES completion:nil];
         return;
     }
-
-    UIAlertController *menu =
-        [UIAlertController alertControllerWithTitle:@"Documents Folder"
-                                            message:@"Select a file"
-                                     preferredStyle:UIAlertControllerStyleAlert];
-
-    for (NSString *file in files) {
-        [menu addAction:[UIAlertAction actionWithTitle:file style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-            showFileActionMenu(file);
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Documents" message:@"Select file" preferredStyle:UIAlertControllerStyleAlert];
+    for (NSString *f in files) {
+        [menu addAction:[UIAlertAction actionWithTitle:f style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+            showFileActionMenu(f);
         }]];
     }
-
     [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Main Menu (Player / Data)
+#pragma mark - Main Menu (runs silent bypass before showing)
 
 static void showMainMenu() {
-    UIAlertController *menu =
-        [UIAlertController alertControllerWithTitle:@"Menu"
-                                            message:@"Select option"
-                                     preferredStyle:UIAlertControllerStyleAlert];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"Player" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-        showPlayerMenu();
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"Data" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
-        showDataMenu();
-    }]];
-
+    // silent bypass
+    silentPatchBypass();
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu" message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Player" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showPlayerMenu(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Data" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showDataMenu(); }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Floating Button
+#pragma mark - Floating draggable button
 
-static CGPoint startPoint;
-static CGPoint btnStart;
+static CGPoint g_startPoint;
+static CGPoint g_btnStart;
 static UIButton *floatingButton = nil;
 
-static void toggleMenuVisibility() {
-    floatingButton.hidden = !floatingButton.hidden;
-}
-
 %ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *win = firstWindow();
-
         floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        floatingButton.frame = CGRectMake(20, 200, 70, 70);
+        floatingButton.frame = CGRectMake(20, 250, 70, 70);
         floatingButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
         floatingButton.layer.cornerRadius = 35;
         floatingButton.tintColor = UIColor.whiteColor;
         [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
         floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
 
-        [floatingButton addTarget:nil action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
+        [floatingButton addTarget:UIApplication.sharedApplication action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
 
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:UIApplication.sharedApplication action:@selector(handlePan:)];
         [floatingButton addGestureRecognizer:pan];
-
-        // 3-finger double tap gesture
-        UITapGestureRecognizer *threeFingerDoubleTap = [[UITapGestureRecognizer alloc] initWithTarget:nil action:@selector(handleThreeFingerDoubleTap:)];
-        threeFingerDoubleTap.numberOfTouchesRequired = 3;
-        threeFingerDoubleTap.numberOfTapsRequired = 2;
-        [win addGestureRecognizer:threeFingerDoubleTap];
 
         [win addSubview:floatingButton];
     });
@@ -361,22 +474,21 @@ static void toggleMenuVisibility() {
 
 %hook UIApplication
 %new
-- (void)showMenuPressed { showMainMenu(); }
+- (void)showMenuPressed {
+    // start encrypted verification flow
+    verifyAccessAndOpenMenu();
+}
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     UIButton *btn = (UIButton*)pan.view;
     if (pan.state == UIGestureRecognizerStateBegan) {
-        startPoint = [pan locationInView:btn.superview];
-        btnStart = btn.center;
+        g_startPoint = [pan locationInView:btn.superview];
+        g_btnStart = btn.center;
     } else if (pan.state == UIGestureRecognizerStateChanged) {
         CGPoint pt = [pan locationInView:btn.superview];
-        CGFloat dx = pt.x - startPoint.x;
-        CGFloat dy = pt.y - startPoint.y;
-        btn.center = CGPointMake(btnStart.x + dx, btnStart.y + dy);
+        CGFloat dx = pt.x - g_startPoint.x;
+        CGFloat dy = pt.y - g_startPoint.y;
+        btn.center = CGPointMake(g_btnStart.x + dx, g_btnStart.y + dy);
     }
-}
-
-- (void)handleThreeFingerDoubleTap:(UITapGestureRecognizer*)tap {
-    toggleMenuVisibility();
 }
 %end
