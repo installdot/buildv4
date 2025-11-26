@@ -3,266 +3,539 @@
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
 
-#pragma mark - CONFIG
-static NSString * const kHexKey       = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-static NSString * const kHexHmacKey   = @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-static NSString * const kServerURL    = @"https://chillysilly.frfrnocap.men/iost2.php";
+#pragma mark - CONFIG: set these to match server hex keys
+static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
+static NSString * const kHexHmacKey = @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE
+static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/iost.php";
 static BOOL g_hasShownCreditAlert = NO;
 
 #pragma mark - Helpers
+
 static NSData* dataFromHex(NSString *hex) {
     NSMutableData *d = [NSMutableData data];
     for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
         NSRange r = NSMakeRange(i, 2);
+        NSString *byteStr = [hex substringWithRange:r];
         unsigned int byte = 0;
-        [[NSScanner scannerWithString:[hex substringWithRange:r]] scanHexInt:&byte];
-        [d appendBytes:&byte length:1];
+        [[NSScanner scannerWithString:byteStr] scanHexInt:&byte];
+        uint8_t b = (uint8_t)byte;
+        [d appendBytes:&b length:1];
     }
     return d;
 }
 
-static NSString* base64Encode(NSData *d) { return [d base64EncodedStringWithOptions:0]; }
-static NSData*   base64Decode(NSString *s) { return [[NSData alloc] initWithBase64EncodedString:s options:0]; }
+static NSString* base64Encode(NSData *d) {
+    return [d base64EncodedStringWithOptions:0];
+}
+static NSData* base64Decode(NSString *s) {
+    return [[NSData alloc] initWithBase64EncodedString:s options:0];
+}
 
-#pragma mark - AES-256-CBC + HMAC-SHA256
-static NSData* encryptPayload(NSData *plain, NSData *key, NSData *hmacKey) {
-    uint8_t iv[16]; arc4random_buf(iv, 16);
-    NSData *ivData = [NSData dataWithBytes:iv length:16];
+#pragma mark - AES-256-CBC encrypt/decrypt + HMAC-SHA256
 
-    size_t bufSize = plain.length + kCCBlockSizeAES128;
-    void *buffer = malloc(bufSize);
-    size_t numBytesEncrypted = 0;
-    CCCryptorStatus status = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-                                     key.bytes, key.length, ivData.bytes,
-                                     plain.bytes, plain.length,
-                                     buffer, bufSize, &numBytesEncrypted);
-    if (status != kCCSuccess) { free(buffer); return nil; }
-    NSData *cipher = [NSData dataWithBytesNoCopy:buffer length:numBytesEncrypted freeWhenDone:YES];
+// returns box: iv(16) + cipher + hmac(32) as NSData
+static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
+    // generate IV
+    uint8_t ivBytes[16];
+    arc4random_buf(ivBytes, sizeof(ivBytes));
+    NSData *iv = [NSData dataWithBytes:ivBytes length:16];
 
-    NSMutableData *forHmac = [NSMutableData dataWithData:ivData];
+    // AES-256-CBC encrypt
+    size_t outlen = plaintext.length + kCCBlockSizeAES128;
+    void *outbuf = malloc(outlen);
+    size_t actualOut = 0;
+    CCCryptorStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                 key.bytes, key.length,
+                                 iv.bytes,
+                                 plaintext.bytes, plaintext.length,
+                                 outbuf, outlen, &actualOut);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    NSData *cipher = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
+
+    // compute HMAC over (iv || cipher)
+    NSMutableData *forHmac = [NSMutableData data];
+    [forHmac appendData:iv];
     [forHmac appendData:cipher];
     unsigned char hmac[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, hmac);
     NSData *hmacData = [NSData dataWithBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
 
+    // compose box
     NSMutableData *box = [NSMutableData data];
-    [box appendData:ivData];
+    [box appendData:iv];
     [box appendData:cipher];
     [box appendData:hmacData];
     return box;
 }
 
 static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
-    if (box.length < 48) return nil;
-    NSData *iv = [box subdataWithRange:NSMakeRange(0, 16)];
-    NSData *hmacReceived = [box subdataWithRange:NSMakeRange(box.length - 32, 32)];
-    NSData *cipher = [box subdataWithRange:NSMakeRange(16, box.length - 48)];
+    if (box.length < 16 + 32) return nil;
+    NSData *iv = [box subdataWithRange:NSMakeRange(0,16)];
+    NSData *hmac = [box subdataWithRange:NSMakeRange(box.length - 32, 32)];
+    NSData *cipher = [box subdataWithRange:NSMakeRange(16, box.length - 16 - 32)];
 
-    NSMutableData *forHmac = [NSMutableData dataWithData:iv];
+    // verify hmac
+    NSMutableData *forHmac = [NSMutableData data];
+    [forHmac appendData:iv];
     [forHmac appendData:cipher];
-    unsigned char hmacCalc[CC_SHA256_DIGEST_LENGTH];
-    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, hmacCalc);
-    if (memcmp(hmacCalc, hmacReceived.bytes, 32) != 0) return nil;
+    unsigned char calc[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, calc);
+    NSData *calcData = [NSData dataWithBytes:calc length:CC_SHA256_DIGEST_LENGTH];
+    if (![calcData isEqualToData:hmac]) return nil;
 
-    size_t bufSize = cipher.length + kCCBlockSizeAES128;
-    void *buffer = malloc(bufSize);
-    size_t numBytesDecrypted = 0;
-    CCCryptorStatus status = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-                                     key.bytes, key.length, iv.bytes,
-                                     cipher.bytes, cipher.length,
-                                     buffer, bufSize, &numBytesDecrypted);
-    if (status != kCCSuccess) { free(buffer); return nil; }
-    return [NSData dataWithBytesNoCopy:buffer length:numBytesDecrypted freeWhenDone:YES];
+    // decrypt
+    size_t outlen = cipher.length + kCCBlockSizeAES128;
+    void *outbuf = malloc(outlen);
+    size_t actualOut = 0;
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                 key.bytes, key.length,
+                                 iv.bytes,
+                                 cipher.bytes, cipher.length,
+                                 outbuf, outlen, &actualOut);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    NSData *plain = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
+    return plain;
 }
 
-#pragma mark - UUID
+#pragma mark - App UUID persistence
+
 static NSString* appUUID() {
     NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/uuid.txt"];
-    NSString *uuid = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-    if (!uuid.length) {
+    NSError *err = nil;
+    NSString *uuid = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+    if (!uuid || uuid.length == 0) {
         uuid = [[NSUUID UUID] UUIDString];
         [uuid writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
     return uuid;
 }
 
-#pragma mark - UI Helpers
-static UIWindow* keyWindow() {
-    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes)
-        if (scene.activationState == UISceneActivationStateForegroundActive)
-            for (UIWindow *w in scene.windows)
+#pragma mark - UI helpers
+
+static UIWindow* firstWindow() {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *w in ws.windows) {
                 if (w.isKeyWindow) return w;
+            }
+        }
+    }
     return UIApplication.sharedApplication.windows.firstObject;
 }
 static UIViewController* topVC() {
-    UIViewController *vc = keyWindow().rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
+    UIWindow *win = firstWindow();
+    UIViewController *root = win.rootViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
+    return root;
 }
 
-#pragma mark - Regex Patch (NSUserDefaults)
-static void applyRegex(NSString *pattern, NSString *replacement) {
-    NSString *bid = NSBundle.mainBundle.bundleIdentifier;
-    NSUserDefaults *defs = NSUserDefaults.standardUserDefaults;
-    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
-    NSString *xml = [[NSString alloc] initWithData:[NSPropertyListSerialization dataWithPropertyList:domain format:NSPropertyListXMLFormat_v1_0 options:0 error:nil] encoding:NSUTF8StringEncoding];
-    if (!xml) return;
+#pragma mark - Force close
+static void killApp() {
+    exit(0);
+}
 
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:nil];
-    NSString *modified = [re stringByReplacingMatchesInString:xml options:0 range:NSMakeRange(0, xml.length) withTemplate:replacement];
+#pragma mark - Save lastTimestamp for verification
+static NSString *g_lastTimestamp = nil;
 
-    NSData *newData = [modified dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *newDomain = [NSPropertyListSerialization propertyListWithData:newData options:NSPropertyListMutableContainersAndLeaves format:nil error:nil];
-    if ([newDomain isKindOfClass:NSDictionary.class]) {
-        [defs setPersistentDomain:newDomain forName:bid];
-        [defs synchronize];
+#pragma mark - Network: verify then open menu
+
+// Forward declarations for existing menu functions
+static void showMainMenu();
+static void showPlayerMenu();
+static void showDataMenu();
+
+// Build JSON payload and send encrypted
+static void verifyAccessAndOpenMenu() {
+    NSData *key = dataFromHex(kHexKey);
+    NSData *hmacKey = dataFromHex(kHexHmacKey);
+    if (!key || key.length != 32 || !hmacKey || hmacKey.length != 32) {
+        // invalid keys
+        killApp();
+        return;
     }
+
+    NSString *uuid = appUUID();
+    NSString *timestamp = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
+    g_lastTimestamp = timestamp; // store local copy for later verification
+
+    NSDictionary *payload = @{@"uuid": uuid, @"timestamp": timestamp, @"encrypted": @"yes"};
+    NSData *plain = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+
+    NSData *box = encryptPayload(plain, key, hmacKey);
+    if (!box) { killApp(); return; }
+
+    NSString *b64 = base64Encode(box);
+    NSDictionary *post = @{@"data": b64};
+    NSData *postData = [NSJSONSerialization dataWithJSONObject:post options:0 error:nil];
+
+    NSURL *url = [NSURL URLWithString:kServerURL];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 10.0;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = postData;
+
+    NSURLSession *s = [NSURLSession sharedSession];
+    NSURLSessionDataTask *task = [s dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err){
+        if (err || !data) { killApp(); return; }
+
+        // parse server JSON: { data: "<base64>" }
+        NSDictionary *outer = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (!outer || !outer[@"data"]) { killApp(); return; }
+        NSString *respB64 = outer[@"data"];
+        NSData *respBox = base64Decode(respB64);
+        if (!respBox) { killApp(); return; }
+
+        NSData *plainResp = decryptAndVerify(respBox, key, hmacKey);
+        if (!plainResp) { killApp(); return; }
+
+        NSDictionary *respJSON = [NSJSONSerialization JSONObjectWithData:plainResp options:0 error:nil];
+        if (!respJSON) { killApp(); return; }
+
+        NSString *r_uuid = respJSON[@"uuid"];
+        NSString *r_ts = respJSON[@"timestamp"];
+        BOOL allow = [respJSON[@"allow"] boolValue];
+
+        // Security checks: must match exactly the sent uuid & timestamp and allow true
+        if (!r_uuid || ![r_uuid isEqualToString:uuid]) { killApp(); return; }
+        if (!r_ts || ![r_ts isEqualToString:g_lastTimestamp]) { killApp(); return; }
+        if (!allow) { killApp(); return; }
+
+        // OK — show menu on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            showMainMenu();
+        });
+    }];
+    [task resume];
 }
 
-#pragma mark - Patches
-static void patchCharacters() { applyRegex(@"(<key>\\d+_c\\d+_unlock[^<]*</key>\\s*<[^>]*>)false", @"$1true"); }
-static void patchSkins()      { applyRegex(@"(<key>\\d+_c\\d+_skin\\d+[^<]*</key>\\s*<[^>]*>)[-+]?\\d+", @"$11"); }
-static void patchPets()       { applyRegex(@"(<key>\\d+_p\\d+_unlock[^<]*</key>\\s*<[^>]*>)false", @"$1true"); }
+#pragma mark - Regex patch helpers (NSUserDefaults domain approach)
+
+// Convert dict -> XML string
+static NSString* dictToPlist(NSDictionary *d) {
+    NSError *err = nil;
+    NSData *dat = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
+    if (!dat) return nil;
+    return [[NSString alloc] initWithData:dat encoding:NSUTF8StringEncoding];
+}
+static NSDictionary* plistToDict(NSString *plist) {
+    if (!plist) return nil;
+    NSData *dat = [plist dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *err = nil;
+    id obj = [NSPropertyListSerialization propertyListWithData:dat options:NSPropertyListMutableContainersAndLeaves format:NULL error:&err];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
+}
+
+static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+    NSString *plist = dictToPlist(domain);
+    if (!plist) return NO;
+    NSError *err = nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:&err];
+    if (!re) return NO;
+    NSString *modified = [re stringByReplacingMatchesInString:plist options:0 range:NSMakeRange(0, plist.length) withTemplate:replacement];
+    NSDictionary *newDomain = plistToDict(modified);
+    if (!newDomain) return NO;
+    [defs setPersistentDomain:newDomain forName:bid];
+    [defs synchronize];
+    return YES;
+}
+
+static void applyPatchWithAlert(NSString *title, NSString *pattern, NSString *replacement) {
+    BOOL ok = silentApplyRegexToDomain(pattern, replacement);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok?@"Success":@"Failed")
+                                                                       message:[NSString stringWithFormat:@"%@ %@", title, ok?@"applied":@"failed"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+#pragma mark - Gems/Reborn/Bypass/PatchAll
 
 static void patchGems() {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Set Gems" message:nil preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.keyboardType = UIKeyboardTypeNumberPad;
-        tf.placeholder = @"999999";
-    }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSInteger value = [alert.textFields.firstObject.text integerValue];
-        if (value < 0) value = 999999;
-        NSString *v = @(value).stringValue;
-        applyRegex(@"(<key>\\d+_gems</key>\\s*<integer>)\\d+", [NSString stringWithFormat:@"$1%@", v]);
-        applyRegex(@"(<key>\\d+_last_gems</key>\\s*<integer>)\\d+", [NSString stringWithFormat:@"$1%@", v]);
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+    NSString *plist = dictToPlist(domain) ?: @"";
+
+    UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Set Gems" message:@"Enter value" preferredStyle:UIAlertControllerStyleAlert];
+    [input addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.keyboardType = UIKeyboardTypeNumberPad; tf.placeholder = @"0"; }];
+    [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSInteger v = [input.textFields.firstObject.text integerValue];
+        NSString *re1 = @"(<key>\\d+_gems</key>\\s*<integer>)\\d+";
+        NSString *re2 = @"(<key>\\d+_last_gems</key>\\s*<integer>)\\d+";
+        silentApplyRegexToDomain(re1, [NSString stringWithFormat:@"$1%ld", (long)v]);
+        silentApplyRegexToDomain(re2, [NSString stringWithFormat:@"$1%ld", (long)v]);
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Gems Updated" message:[NSString stringWithFormat:@"%ld", (long)v] preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [topVC() presentViewController:alert animated:YES completion:nil];
+    [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:input animated:YES completion:nil];
 }
 
-#pragma mark - Menu
-static void showMenu() {
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu" message:nil preferredStyle:UIAlertControllerStyleAlert];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Characters" style:UIAlertActionStyleDefault handler:^(id){ patchCharacters(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Skins"       style:UIAlertActionStyleDefault handler:^(id){ patchSkins(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Pets"        style:UIAlertActionStyleDefault handler:^(id){ patchPets(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Gems"        style:UIAlertActionStyleDefault handler:^(id){ patchGems(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel"      style:UIAlertActionStyleCancel handler:nil]];
+static void patchRebornWithAlert() {
+    applyPatchWithAlert(@"Reborn", @"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
+}
+
+static void silentPatchBypass() {
+    silentApplyRegexToDomain(@"(<key>OpenNewtonJsonTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
+    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
+}
+
+static void patchAllExcludingGems() {
+    // characters, skins, skills, pets, level, furniture, reborn, bypass (no gems)
+    NSDictionary *map = @{
+        @"Characters": @"(<key>\\d+_c\\d+_unlock.*\\n.*)false",
+        @"Skins":      @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+",
+        @"Skills":     @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d",
+        @"Pets":       @"(<key>\\d+_p\\d+_unlock.*\\n.*)false",
+        @"Level":      @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+",
+        @"Furniture":  @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+"
+    };
+
+    for (NSString *k in map) {
+        NSString *pattern = map[k];
+        NSString *rep = @"$1";
+        // pattern-specific replacement:
+        if ([k isEqualToString:@"Characters"] || [k isEqualToString:@"Pets"]) rep = @"$1True";
+        else if ([k isEqualToString:@"Skins"] || [k isEqualToString:@"Skills"] ) rep = @"$11";
+        else if ([k isEqualToString:@"Level"]) rep = @"$18";
+        else if ([k isEqualToString:@"Furniture"]) rep = @"$15";
+        silentApplyRegexToDomain(pattern, rep);
+    }
+    // Reborn
+    silentApplyRegexToDomain(@"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
+    // Bypass
+    silentPatchBypass();
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Patch All" message:@"Applied (excluding Gems)" preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    });
+}
+
+#pragma mark - Player menu
+
+static void showPlayerMenu() {
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Player" message:@"Choose patch" preferredStyle:UIAlertControllerStyleAlert];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Characters" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\\n.*)false", @"$1True");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Skins" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+", @"$11");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Skills" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d", @"$11");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Pets" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Pets", @"(<key>\\d+_p\\d+_unlock.*\\n.*)false", @"$1True");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Level" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Level", @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+", @"$18");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Furniture" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+", @"$15");
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchGems();
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchRebornWithAlert();
+    }]];
+    // Bypass is removed from menu; it runs silently before showing
+    [menu addAction:[UIAlertAction actionWithTitle:@"Patch All" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchAllExcludingGems();
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
+}
+#pragma mark - Auto cleanup & bypass on launch (runs ONLY ONCE)
+
+static BOOL g_alreadyRanLaunchPatches = NO;
+
+static void runOnceOnLaunch() {
+    if (g_alreadyRanLaunchPatches) return;
+    g_alreadyRanLaunchPatches = YES;
+
+    // 1. Delete all .new files in Documents
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSArray *allFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
+    for (NSString *file in allFiles) {
+        if ([file hasSuffix:@".new"]) {
+            NSString *fullPath = [docs stringByAppendingPathComponent:file];
+            [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
+            // ignore errors – best effort
+        }
+    }
+
+    // 2. Apply bypass silently (exactly the same as silentPatchBypass())
+    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", $10");
+}
+#pragma mark - Document helpers (hide .new)
+
+static NSArray* listDocumentsFiles() {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *f in files) {
+        if (![f hasSuffix:@".new"]) [out addObject:f];
+    }
+    return out;
+}
+
+static void showFileActionMenu(NSString *fileName) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [docs stringByAppendingPathComponent:fileName];
+
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:fileName message:@"Action" preferredStyle:UIAlertControllerStyleAlert];
+
+    // Export (copy contents to clipboard)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+        if (txt) UIPasteboard.generalPasteboard.string = txt;
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(txt?@"Exported":@"Error") message:(txt?@"Copied to clipboard":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+
+    // Import (replace)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
+        [input addTextFieldWithConfigurationHandler:nil];
+        [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
+            NSString *txt = input.textFields.firstObject.text ?: @"";
+            NSError *err = nil;
+            BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"File applied\nPlease leave game to apply\nThoát game để cập nhật":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [topVC() presentViewController:done animated:YES completion:nil];
+        }]];
+        [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [topVC() presentViewController:input animated:YES completion:nil];
+    }]];
+
+    // Delete
+    [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Access Check (FIXED)
-static void checkAccessAndProceed() {
-    NSString *uuid = appUUID();
-    NSData *key = dataFromHex(kHexKey);
-    NSData *hmacKey = dataFromHex(kHexHmacKey);
-
-    NSDictionary *payload = @{
-        @"uuid": uuid,
-        @"timestamp": @((long long)[NSDate.date timeIntervalSince1970]),
-        @"encrypted": @"yes"
-    };
-    NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-    NSData *box = encryptPayload(json, key, hmacKey);
-    if (!box) return;
-    NSString *b64 = base64Encode(box);
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kServerURL]];
-    req.HTTPMethod = @"POST";
-    req.timeoutInterval = 12.0;
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"data": b64} options:0 error:nil];
-
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
-        // ← renamed parameters to avoid conflict
-
-        if (error || !data) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSString *link = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid];
-                [UIApplication.sharedApplication openURL:[NSURL URLWithString:link] options:@{} completionHandler:nil];
-            });
-            return;
-        }
-
-        NSDictionary *outer = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        NSString *respB64 = outer[@"data"];
-        NSData *respBox = base64Decode(respB64);
-        if (!respBox) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSString *link = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid];
-                [UIApplication.sharedApplication openURL:[NSURL URLWithString:link] options:@{} completionHandler:nil];
-            });
-            return;
-        }
-
-        NSData *plain = decryptAndVerify(respBox, key, hmacKey);
-        if (!plain) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                NSString *link = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid];
-                [UIApplication.sharedApplication openURL:[NSURL URLWithString:link] options:@{} completionHandler:nil];
-            });
-            return;
-        }
-
-        NSDictionary *jsonResponse = [NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
-        BOOL allowed = [jsonResponse[@"allow"] boolValue];
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (allowed) {
-                showMenu();
-            } else {
-                NSString *link = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid];
-                [UIApplication.sharedApplication openURL:[NSURL URLWithString:link] options:@{} completionHandler:nil];
-            }
-        });
-    }] resume];
+static void showDataMenu() {
+    NSArray *files = listDocumentsFiles();
+    if (files.count == 0) {
+        UIAlertController *e = [UIAlertController alertControllerWithTitle:@"No files" message:@"Documents is empty" preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:e animated:YES completion:nil];
+        return;
+    }
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Documents" message:@"Select file" preferredStyle:UIAlertControllerStyleAlert];
+    for (NSString *f in files) {
+        [menu addAction:[UIAlertAction actionWithTitle:f style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+            showFileActionMenu(f);
+        }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Floating Button
-static UIButton *g_button = nil;
+#pragma mark - Main Menu (runs silent bypass before showing)
+
+static void showMainMenu() {
+    // silent bypass
+    silentPatchBypass();
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu" message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Player" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showPlayerMenu(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Data" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showDataMenu(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
+}
+
+#pragma mark - Floating draggable button
+
+static CGPoint g_startPoint;
+static CGPoint g_btnStart;
+static UIButton *floatingButton = nil;
 
 %ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        g_button = [UIButton buttonWithType:UIButtonTypeCustom];
-        g_button.frame = CGRectMake(20, 80, 50, 50);
-        g_button.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-        g_button.layer.cornerRadius = 25;
-        [g_button setTitle:@"M" forState:UIControlStateNormal];
-        g_button.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        [g_button addTarget:UIApplication.sharedApplication action:@selector(btnPressed) forControlEvents:UIControlEventTouchUpInside];
+    // Run cleanup + bypass immediately when dylib loads (before UI appears)
+    runOnceOnLaunch();
 
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:UIApplication.sharedApplication action:@selector(dragButton:)];
-        [g_button addGestureRecognizer:pan];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *win = firstWindow();
+        floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        floatingButton.frame = CGRectMake(10, 50, 40, 40);
+        floatingButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        floatingButton.layer.cornerRadius = 10;
+        floatingButton.tintColor = UIColor.whiteColor;
+        [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
+        floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
 
-        [keyWindow() addSubview:g_button];
+        [floatingButton addTarget:UIApplication.sharedApplication action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:UIApplication.sharedApplication action:@selector(handlePan:)];
+        [floatingButton addGestureRecognizer:pan];
+
+        [win addSubview:floatingButton];
     });
 }
 
 %hook UIApplication
 %new
-- (void)btnPressed {
+- (void)showMenuPressed {
+    // === ONE-TIME CREDIT ALERT ===
     if (!g_hasShownCreditAlert) {
         g_hasShownCreditAlert = YES;
-        UIAlertController *c = [UIAlertController alertControllerWithTitle:@"Info"
-                                 message:@"This dylib is made by mochiteyvat(Discord).\nThis is free dylib, if you bought this then u likely got scammed.\nNếu bạn mua thì bạn đã bị dắt như bò!"
-                                 preferredStyle:UIAlertControllerStyleAlert];
-        [c addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(id){
-            checkAccessAndProceed();
-        }]];
-        [topVC() presentViewController:c animated:YES completion:nil];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *message = @"Thanks for using~.\n"
+                                @"Cảm ơn vì đã dùng";
+
+            UIAlertController *credit = [UIAlertController alertControllerWithTitle:@"Info"
+                                                                            message:message
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+
+            [credit addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                // After user dismisses the credit alert → proceed to normal verification flow
+                verifyAccessAndOpenMenu();
+            }]];
+
+            UIViewController *root = topVC();
+            [root presentViewController:credit animated:YES completion:nil];
+        });
     } else {
-        checkAccessAndProceed();
+        // Normal flow (already shown once this session)
+        verifyAccessAndOpenMenu();
     }
 }
 
-%new
-- (void)dragButton:(UIPanGestureRecognizer *)pan {
-    UIView *v = pan.view;
-    if (pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint t = [pan translationInView:v.superview];
-        v.center = CGPointMake(v.center.x + t.x, v.center.y + t.y);
-        [pan setTranslation:CGPointZero inView:v.superview];
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    UIButton *btn = (UIButton*)pan.view;
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        g_startPoint = [pan locationInView:btn.superview];
+        g_btnStart = btn.center;
+    } else if (pan.state == UIGestureRecognizerStateChanged) {
+        CGPoint pt = [pan locationInView:btn.superview];
+        CGFloat dx = pt.x - g_startPoint.x;
+        CGFloat dy = pt.y - g_startPoint.y;
+        btn.center = CGPointMake(g_btnStart.x + dx, g_btnStart.y + dy);
     }
 }
 %end
