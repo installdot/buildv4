@@ -266,7 +266,6 @@ static void patchRebornWithAlert() {
 }
 
 static void silentPatchBypass() {
-    silentApplyRegexToDomain(@"(<key>OpenNewtonJsonTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
     silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
 }
 
