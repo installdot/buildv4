@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import <GLKit/GLKit.h>
 
 #pragma mark - CONFIG: set these to match server hex keys
 static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
@@ -408,14 +409,297 @@ static void showDataMenu() {
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Main Menu
+#pragma mark - ImGui-like overlay (GLKit background + UIKit buttons)
+
+@interface ImGuiOverlay : UIView <GLKViewDelegate>
++ (instancetype)sharedOverlay;
+- (void)showMenuWithTitle:(NSString*)title
+                  options:(NSArray<NSString*>*)options
+                 handlers:(NSArray<void(^)(void)>*)handlers;
+- (void)dismiss;
+@end
+
+@implementation ImGuiOverlay {
+    GLKView *_glView;
+    UIView *_panel;
+    UILabel *_titleLabel;
+    NSMutableArray<UIButton*> *_optionButtons;
+    NSArray<void(^)(void)> *_handlers;
+}
+
++ (instancetype)sharedOverlay {
+    static ImGuiOverlay *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [[ImGuiOverlay alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    });
+    return s;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    self.backgroundColor = [UIColor clearColor];
+    self.userInteractionEnabled = YES;
+    self->_optionButtons = [NSMutableArray array];
+
+    // GLKView background (animated subtle noise/darken)
+    EAGLContext *ctx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+    _glView = [[GLKView alloc] initWithFrame:self.bounds context:ctx];
+    _glView.delegate = self;
+    _glView.enableSetNeedsDisplay = YES;
+    _glView.userInteractionEnabled = NO; // touch passes to overlay UI
+    _glView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
+    _glView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self addSubview:_glView];
+
+    // Panel container (ImGui-like)
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(20, 0, self.bounds.size.width - 40, 260)];
+    _panel.center = CGPointMake(self.bounds.size.width/2, self.bounds.size.height/2);
+    _panel.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.92];
+    _panel.layer.cornerRadius = 10;
+    _panel.layer.borderWidth = 1.0;
+    _panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.06].CGColor;
+    _panel.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+    [self addSubview:_panel];
+
+    // Title label
+    _titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 10, _panel.bounds.size.width-24, 28)];
+    _titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    _titleLabel.textColor = [UIColor whiteColor];
+    _titleLabel.numberOfLines = 1;
+    _titleLabel.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [_panel addSubview:_titleLabel];
+
+    // Tap to dismiss background
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(backgroundTapped:)];
+    [self addGestureRecognizer:tap];
+
+    return self;
+}
+
+- (void)backgroundTapped:(UITapGestureRecognizer*)g {
+    CGPoint p = [g locationInView:_panel];
+    if (!CGRectContainsPoint(_panel.bounds, p)) {
+        [self dismiss];
+    }
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    _glView.frame = self.bounds;
+    _panel.center = CGPointMake(self.bounds.size.width/2, self.bounds.size.height/2);
+}
+
+- (void)showMenuWithTitle:(NSString*)title options:(NSArray<NSString*>*)options handlers:(NSArray<void(^)(void)>*)handlers {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        _titleLabel.text = title;
+
+        // remove old buttons
+        for (UIButton *b in _optionButtons) [b removeFromSuperview];
+        [_optionButtons removeAllObjects];
+
+        // create buttons
+        CGFloat y = CGRectGetMaxY(_titleLabel.frame) + 8;
+        CGFloat btnH = 44;
+        CGFloat pad = 10;
+        CGFloat width = _panel.bounds.size.width - 24;
+        for (NSUInteger i = 0; i < options.count; ++i) {
+            NSString *opt = options[i];
+            UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+            btn.frame = CGRectMake(12, y + (btnH + pad) * i, width, btnH);
+            btn.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
+            btn.layer.cornerRadius = 6;
+            btn.layer.borderWidth = 1.0;
+            btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.04].CGColor;
+            btn.titleLabel.font = [UIFont systemFontOfSize:15];
+            [btn setTitle:opt forState:UIControlStateNormal];
+            [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+            btn.tag = i;
+            btn.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+            [btn addTarget:self action:@selector(optionTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [_panel addSubview:btn];
+            [_optionButtons addObject:btn];
+        }
+
+        // adjust panel height
+        CGFloat panelH = CGRectGetMaxY(_titleLabel.frame) + 8 + options.count * (btnH + pad);
+        panelH += 8; // bottom padding
+        CGRect pf = _panel.frame;
+        pf.size.height = panelH;
+        _panel.frame = pf;
+        _panel.center = CGPointMake(self.bounds.size.width/2, self.bounds.size.height/2);
+
+        // store handlers copy
+        _handlers = handlers;
+
+        // fade in
+        self.alpha = 0;
+        UIWindow *w = firstWindow();
+        if (self.superview != w) [w addSubview:self];
+        [UIView animateWithDuration:0.18 animations:^{
+            self.alpha = 1.0;
+        }];
+    });
+}
+
+- (void)optionTapped:(UIButton*)btn {
+    NSUInteger idx = btn.tag;
+    if (idx < _handlers.count) {
+        void(^h)(void) = _handlers[idx];
+        [self dismiss];
+        // small delay to allow dismiss animation, then call handler
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (h) h();
+        });
+    } else {
+        [self dismiss];
+    }
+}
+
+- (void)dismiss {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.12 animations:^{
+            self.alpha = 0;
+        } completion:^(BOOL finished) {
+            [self removeFromSuperview];
+        }];
+    });
+}
+
+#pragma mark - GLKView delegate (simple animated background)
+- (void)glkView:(GLKView *)view drawInRect:(CGRect)rect {
+    // draw a subtle animated gradient-like background using glClear with varying alpha
+    static float t = 0.0;
+    t += 0.01;
+    float a = 0.35 + 0.05 * sinf(t * 2.0);
+    glClearColor(0.04 * (1.0 - a) , 0.04 * (1.0 - a), 0.06 * (1.0 - a), a);
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+@end
+
+#pragma mark - Helpers to present overlay in place of UIAlertController menus
+
+static void presentImGuiMenu(NSString *title, NSArray<NSString*> *options, NSArray<void(^)(void)> *handlers) {
+    ImGuiOverlay *ov = [ImGuiOverlay sharedOverlay];
+    [ov showMenuWithTitle:title options:options handlers:handlers];
+}
+
+#pragma mark - Replacements for menu functions (ImGui-like)
 
 static void showMainMenu() {
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu" message:nil preferredStyle:UIAlertControllerStyleAlert];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Player" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showPlayerMenu(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Data" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showDataMenu(); }]];
-    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [topVC() presentViewController:menu animated:YES completion:nil];
+    NSArray *titles = @[@"Player", @"Data", @"Cancel"];
+    void (^h0)(void) = ^{
+        showPlayerMenu();
+    };
+    void (^h1)(void) = ^{
+        showDataMenu();
+    };
+    void (^h2)(void) = ^{
+        // Cancel -> just dismiss (no-op)
+    };
+    NSArray *handlers = @[h0, h1, h2];
+    presentImGuiMenu(@"Menu", titles, handlers);
+}
+
+static void showPlayerMenu() {
+    NSArray *titles = @[@"Characters", @"Skins", @"Skills", @"Pets", @"Level", @"Furniture", @"Gems", @"Reborn", @"Patch All", @"Cancel"];
+
+    NSMutableArray<void(^)(void)> *handlers = [NSMutableArray array];
+
+    [handlers addObject:^{ applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\\n.*)false", @"$1True"); }];
+    [handlers addObject:^{ applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+", @"$11"); }];
+    [handlers addObject:^{ applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d", @"$11"); }];
+    [handlers addObject:^{ applyPatchWithAlert(@"Pets", @"(<key>\\d+_p\\d+_unlock.*\\n.*)false", @"$1True"); }];
+    [handlers addObject:^{ applyPatchWithAlert(@"Level", @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+", @"$18"); }];
+    [handlers addObject:^{ applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+", @"$15"); }];
+    [handlers addObject:^{ patchGems(); }];
+    [handlers addObject:^{ patchRebornWithAlert(); }];
+    [handlers addObject:^{ patchAllExcludingGems(); }];
+    [handlers addObject:^{ /* Cancel: no-op */ }];
+
+    presentImGuiMenu(@"Player", titles, handlers);
+}
+
+static void showDataMenu() {
+    NSArray *files = listDocumentsFiles();
+    if (files.count == 0) {
+        // keep original behavior for "No files" (alert)
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *e = [UIAlertController alertControllerWithTitle:@"No files" message:@"Documents is empty" preferredStyle:UIAlertControllerStyleAlert];
+            [e addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [topVC() presentViewController:e animated:YES completion:nil];
+        });
+        return;
+    }
+
+    NSMutableArray *titles = [NSMutableArray array];
+    NSMutableArray<void(^)(void)> *handlers = [NSMutableArray array];
+
+    for (NSString *f in files) {
+        [titles addObject:f];
+        NSString *fileName = f;
+        [handlers addObject:^{
+            showFileActionMenu(fileName);
+        }];
+    }
+    [titles addObject:@"Cancel"];
+    [handlers addObject:^{}];
+
+    presentImGuiMenu(@"Documents", titles, handlers);
+}
+
+static void showFileActionMenu(NSString *fileName) {
+    // Replaces the UIAlertController action list with overlay buttons but calls same internal behaviors.
+    NSArray *titles = @[@"Export", @"Import", @"Delete", @"Cancel"];
+    NSMutableArray<void(^)(void)> *handlers = [NSMutableArray array];
+
+    // Export
+    [handlers addObject:^{
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *path = [docs stringByAppendingPathComponent:fileName];
+        NSError *err = nil;
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+        if (txt) UIPasteboard.generalPasteboard.string = txt;
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(txt?@"Exported":@"Error") message:(txt?@"Copied to clipboard":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }];
+
+    // Import
+    [handlers addObject:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
+            [input addTextFieldWithConfigurationHandler:nil];
+            [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
+                NSString *txt = input.textFields.firstObject.text ?: @"";
+                NSError *err = nil;
+                NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+                NSString *path = [docs stringByAppendingPathComponent:fileName];
+                BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+                UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"Edit Applied\nLeave game to load new data\nThoát game để load data mới":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+                [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [topVC() presentViewController:done animated:YES completion:nil];
+            }]];
+            [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [topVC() presentViewController:input animated:YES completion:nil];
+        });
+    }];
+
+    // Delete
+    [handlers addObject:^{
+        NSError *err = nil;
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *path = [docs stringByAppendingPathComponent:fileName];
+        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }];
+
+    // Cancel
+    [handlers addObject:^{}];
+
+    presentImGuiMenu(fileName, titles, handlers);
 }
 
 #pragma mark - Floating draggable button + AUTO CLEANUP & BYPASS
@@ -485,35 +769,28 @@ static UIButton *floatingButton = nil;
 
 %new
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
-    UIView *piece = pan.view;
-    CGPoint translation = [pan translationInView:piece.superview];
-
+    UIView *btn = pan.view;
+    if (!btn) return;
     if (pan.state == UIGestureRecognizerStateBegan) {
-        g_startPoint = piece.center;
-        g_btnStart = [pan locationInView:piece.superview];
-    }
-
-    if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint location = [pan locationInView:piece.superview];
-        CGFloat dx = location.x - g_btnStart.x;
-        CGFloat dy = location.y - g_btnStart.y;
-        piece.center = CGPointMake(g_startPoint.x + dx, g_startPoint.y + dy);
-    }
-
-    if (pan.state == UIGestureRecognizerStateEnded ||
-        pan.state == UIGestureRecognizerStateCancelled) {
-
-        // Giới hạn nút trong màn hình
-        CGFloat W = piece.superview.bounds.size.width;
-        CGFloat H = piece.superview.bounds.size.height;
-        CGFloat halfW = piece.frame.size.width / 2;
-        CGFloat halfH = piece.frame.size.height / 2;
-
-        CGFloat finalX = MIN(MAX(piece.center.x, halfW), W - halfW);
-        CGFloat finalY = MIN(MAX(piece.center.y, halfH), H - halfH);
-
+        g_startPoint = btn.center;
+        g_btnStart = [pan locationInView:btn.superview];
+    } else if (pan.state == UIGestureRecognizerStateChanged) {
+        CGPoint pt = [pan locationInView:btn.superview];
+        CGFloat dx = pt.x - g_btnStart.x;
+        CGFloat dy = pt.y - g_btnStart.y;
+        btn.center = CGPointMake(g_startPoint.x + dx, g_startPoint.y + dy);
+    } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
+        // constrain to screen bounds
+        UIView *sup = btn.superview;
+        if (!sup) return;
+        CGFloat W = sup.bounds.size.width;
+        CGFloat H = sup.bounds.size.height;
+        CGFloat halfW = btn.frame.size.width / 2;
+        CGFloat halfH = btn.frame.size.height / 2;
+        CGFloat finalX = MIN(MAX(btn.center.x, halfW), W - halfW);
+        CGFloat finalY = MIN(MAX(btn.center.y, halfH), H - halfH);
         [UIView animateWithDuration:0.25 animations:^{
-            piece.center = CGPointMake(finalX, finalY);
+            btn.center = CGPointMake(finalX, finalY);
         }];
     }
 }
