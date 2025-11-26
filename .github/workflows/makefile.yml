@@ -1,4 +1,4 @@
-name: Build iOS Tweak
+name: Build iOS Tweak with ImGui
 
 on:
   workflow_dispatch:
@@ -11,68 +11,110 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up dependencies
+      - name: Set up Theos
         run: |
           git clone --recursive https://github.com/theos/theos.git
           export THEOS=$(pwd)/theos
           export PATH=$THEOS/bin:$PATH
-          echo "Theos installation complete."
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
 
-      - name: Install Homebrew
+      - name: Install Homebrew & ldid
         run: |
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          echo "export PATH=/usr/local/bin:$PATH" >> ~/.bash_profile
-          source ~/.bash_profile
-
-      - name: Install ldid
-        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+          echo "/opt/homebrew/bin" >> $GITHUB_PATH
           brew install ldid
+
+      - name: Download & Build Dear ImGui (iOS + OpenGL ES3 backend)
+        run: |
+          git clone --depth 1 https://github.com/ocornut/imgui.git
+          cd imgui
+          
+          # Compile the backends we need
+          clang -c -fobjc-arc \
+            backends/imgui_impl_opengl3.cpp \
+            backends/imgui_impl_ios.cpp \
+            imgui.cpp imgui_draw.cpp imgui_widgets.cpp imgui_tables.cpp \
+            -I. -Ibackends \
+            -o ../imgui_ios.o
+
+          # Create universal static lib
+          libtool -static -o ../libimgui.a ../imgui_ios.o
+          
+          # Copy headers
+          mkdir -p ../imgui_includes
+          cp *.h backends/imgui_impl_*.h ../imgui_includes/
+
+          echo "ImGui compiled and ready at $(pwd)/.."
+
+      - name: Create ImGui headers for tweak
+        run: |
+          mkdir -p ImGui
+          cp -r imgui_includes/* ImGui/
+          cp libimgui.a ImGui/
 
       - name: Set up environment variables
         run: |
-          echo "TARGET=iphone:clang:latest:7.0" >> $GITHUB_ENV  # Adjust this if targeting a different iOS version
-          echo "THEOS=$PWD/theos" >> $GITHUB_ENV
-          echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
+          echo "TARGET=iphone:clang:latest:14.0" >> $GITHUB_ENV
+          echo "ARCHS=arm64 arm64e" >> $GITHUB_ENV
 
       - name: Find Tweak.xm file
         id: find_tweak_xm
         run: |
           TWEAK_XM_PATH=$(find . -name 'Tweak.xm' -print -quit)
-
           if [ -z "$TWEAK_XM_PATH" ]; then
             echo "Tweak.xm not found!"
             exit 1
           fi
-
           echo "Tweak.xm found at $TWEAK_XM_PATH"
           echo "tweak_xm=$TWEAK_XM_PATH" >> $GITHUB_ENV
+          echo "tweak_dir=$(dirname $TWEAK_XM_PATH)" >> $GITHUB_ENV
 
-      - name: Build the Tweak
+      - name: Build the Tweak (with ImGui linked)
         run: |
-          TWEAK_XM_PATH="${{ env.tweak_xm }}"
-          MAKEFILE_DIR=$(dirname "$TWEAK_XM_PATH")
-          cd "$MAKEFILE_DIR"
-
-          echo "Building tweak with Tweak.xm in directory: $MAKEFILE_DIR"
+          cd "${{ env.tweak_dir }}"
+          
+          # Auto-generate minimal makefile if not exists
+          cat > makefile << 'EOF'
+          include $(THEOS)/makefiles/common.mk
+          
+          TWEAK_NAME = YourTweakNameHere
+          $(TWEAK_NAME)_FILES = Tweak.xm
+          $(TWEAK_NAME)_CFLAGS = -fobjc-arc -I.
+          $(TWEAK_NAME)_LDFLAGS = -L. -limgui
+          $(TWEAK_NAME)_LIBRARIES = substrate
+          
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          EOF
+          
+          # Copy ImGui lib and headers into build dir
+          cp -r ../ImGui .
+          
           make clean
-          make
+          make package FINALPACKAGE=1
 
-      - name: Find and Upload the generated .dylib
-        id: find_dylib
+      - name: Find built .deb or .dylib
+        id: find_output
         run: |
-          # Search for the generated .dylib file anywhere in the workspace
-          DYLIB_PATH=$(find . -type f -name "*.dylib" -print -quit)
-
-          if [ -z "$DYLIB_PATH" ]; then
-            echo "No .dylib file found!"
-            exit 1
+          # Look for .deb first (preferred), fallback to .dylib
+          DEB_PATH=$(find . -name "*.deb" -print -quit)
+          if [ -n "$DEB_PATH" ]; then
+            echo "Found .deb: $DEB_PATH"
+            echo "artifact_path=$DEB_PATH" >> $GITHUB_ENV
+            echo "artifact_name=Tweak.deb" >> $GITHUB_ENV
+          else
+            DYLIB_PATH=$(find . -name "*.dylib" -print -quit)
+            if [ -z "$DYLIB_PATH" ]; then
+              echo "No .deb or .dylib found!"
+              exit 1
+            fi
+            echo "Found .dylib: $DYLIB_PATH"
+            echo "artifact_path=$DYLIB_PATH" >> $GITHUB_ENV
+            echo "artifact_name=Tweak.dylib" >> $GITHUB_ENV
           fi
 
-          echo "Found .dylib at: $DYLIB_PATH"
-          echo "dylib_path=$DYLIB_PATH" >> $GITHUB_ENV
-
-      - name: Upload the generated .dylib
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Tweak-dylib
-          path: "${{ env.dylib_path }}"
+          name: ${{ env.artifact_name }}
+          path: ${{ env.artifact_path }}
