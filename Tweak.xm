@@ -152,35 +152,61 @@ static void showMenu() {
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Access Check
+#pragma mark - Access Check (FIXED)
 static void checkAccessAndProceed() {
     NSString *uuid = appUUID();
     NSData *key = dataFromHex(kHexKey);
     NSData *hmacKey = dataFromHex(kHexHmacKey);
 
-    NSDictionary *payload = @{@"uuid": uuid, @"timestamp": @((long long)[NSDate.date timeIntervalSince1970]), @"encrypted": @"yes"};
+    NSDictionary *payload = @{
+        @"uuid": uuid,
+        @"timestamp": @((long long)[NSDate.date timeIntervalSince1970]),
+        @"encrypted": @"yes"
+    };
     NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     NSData *box = encryptPayload(json, key, hmacKey);
+    if (!box) return;
     NSString *b64 = base64Encode(box);
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kServerURL]];
     req.HTTPMethod = @"POST";
-    req.timeoutInterval = 10;
+    req.timeoutInterval = 12.0;
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"data": b64} options:0 error:nil];
 
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (!data || err) {
-            dispatch_async(dispatch_get_main_queue(), ^{ [UIApplication.sharedApplication openURL:[NSURL URLWithString:[NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid]] options:@{} completionHandler:nil]; });
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+        // ← renamed parameters to avoid conflict
+
+        if (error || !data) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *link = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid];
+                [UIApplication.sharedApplication openURL:[NSURL URLWithString:link] options:@{} completionHandler:nil];
+            });
             return;
         }
 
         NSDictionary *outer = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        NSData *respBox = base64Decode(outer[@"data"]);
-        NSData *plain = decryptAndVerify(respBox, key, hmacKey);
-        NSDictionary *resp = [NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
+        NSString *respB64 = outer[@"data"];
+        NSData *respBox = base64Decode(respB64);
+        if (!respBox) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *link = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid];
+                [UIApplication.sharedApplication openURL:[NSURL URLWithString:link] options:@{} completionHandler:nil];
+            });
+            return;
+        }
 
-        BOOL allowed = [resp[@"allow"] boolValue];
+        NSData *plain = decryptAndVerify(respBox, key, hmacKey);
+        if (!plain) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *link = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/iost2.php?uuid=%@", uuid];
+                [UIApplication.sharedApplication openURL:[NSURL URLWithString:link] options:@{} completionHandler:nil];
+            });
+            return;
+        }
+
+        NSDictionary *jsonResponse = [NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
+        BOOL allowed = [jsonResponse[@"allow"] boolValue];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (allowed) {
