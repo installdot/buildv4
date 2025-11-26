@@ -33,14 +33,11 @@ static NSData* base64Decode(NSString *s) {
 
 #pragma mark - AES-256-CBC encrypt/decrypt + HMAC-SHA256
 
-// returns box: iv(16) + cipher + hmac(32) as NSData
 static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
-    // generate IV
     uint8_t ivBytes[16];
     arc4random_buf(ivBytes, sizeof(ivBytes));
     NSData *iv = [NSData dataWithBytes:ivBytes length:16];
 
-    // AES-256-CBC encrypt
     size_t outlen = plaintext.length + kCCBlockSizeAES128;
     void *outbuf = malloc(outlen);
     size_t actualOut = 0;
@@ -52,7 +49,6 @@ static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
     if (st != kCCSuccess) { free(outbuf); return nil; }
     NSData *cipher = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
 
-    // compute HMAC over (iv || cipher)
     NSMutableData *forHmac = [NSMutableData data];
     [forHmac appendData:iv];
     [forHmac appendData:cipher];
@@ -60,7 +56,6 @@ static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
     CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, hmac);
     NSData *hmacData = [NSData dataWithBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
 
-    // compose box
     NSMutableData *box = [NSMutableData data];
     [box appendData:iv];
     [box appendData:cipher];
@@ -74,7 +69,6 @@ static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
     NSData *hmac = [box subdataWithRange:NSMakeRange(box.length - 32, 32)];
     NSData *cipher = [box subdataWithRange:NSMakeRange(16, box.length - 16 - 32)];
 
-    // verify hmac
     NSMutableData *forHmac = [NSMutableData data];
     [forHmac appendData:iv];
     [forHmac appendData:cipher];
@@ -83,7 +77,6 @@ static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
     NSData *calcData = [NSData dataWithBytes:calc length:CC_SHA256_DIGEST_LENGTH];
     if (![calcData isEqualToData:hmac]) return nil;
 
-    // decrypt
     size_t outlen = cipher.length + kCCBlockSizeAES128;
     void *outbuf = malloc(outlen);
     size_t actualOut = 0;
@@ -123,6 +116,7 @@ static UIWindow* firstWindow() {
     }
     return UIApplication.sharedApplication.windows.firstObject;
 }
+
 static UIViewController* topVC() {
     UIWindow *win = firstWindow();
     UIViewController *root = win.rootViewController;
@@ -140,24 +134,21 @@ static NSString *g_lastTimestamp = nil;
 
 #pragma mark - Network: verify then open menu
 
-// Forward declarations for existing menu functions
 static void showMainMenu();
 static void showPlayerMenu();
 static void showDataMenu();
 
-// Build JSON payload and send encrypted
 static void verifyAccessAndOpenMenu() {
     NSData *key = dataFromHex(kHexKey);
     NSData *hmacKey = dataFromHex(kHexHmacKey);
     if (!key || key.length != 32 || !hmacKey || hmacKey.length != 32) {
-        // invalid keys
         killApp();
         return;
     }
 
     NSString *uuid = appUUID();
     NSString *timestamp = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
-    g_lastTimestamp = timestamp; // store local copy for later verification
+    g_lastTimestamp = timestamp;
 
     NSDictionary *payload = @{@"uuid": uuid, @"timestamp": timestamp, @"encrypted": @"yes"};
     NSData *plain = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
@@ -180,7 +171,6 @@ static void verifyAccessAndOpenMenu() {
     NSURLSessionDataTask *task = [s dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err){
         if (err || !data) { killApp(); return; }
 
-        // parse server JSON: { data: "<base64>" }
         NSDictionary *outer = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         if (!outer || !outer[@"data"]) { killApp(); return; }
         NSString *respB64 = outer[@"data"];
@@ -197,12 +187,10 @@ static void verifyAccessAndOpenMenu() {
         NSString *r_ts = respJSON[@"timestamp"];
         BOOL allow = [respJSON[@"allow"] boolValue];
 
-        // Security checks: must match exactly the sent uuid & timestamp and allow true
         if (!r_uuid || ![r_uuid isEqualToString:uuid]) { killApp(); return; }
         if (!r_ts || ![r_ts isEqualToString:g_lastTimestamp]) { killApp(); return; }
         if (!allow) { killApp(); return; }
 
-        // OK — show menu on main thread
         dispatch_async(dispatch_get_main_queue(), ^{
             showMainMenu();
         });
@@ -210,9 +198,8 @@ static void verifyAccessAndOpenMenu() {
     [task resume];
 }
 
-#pragma mark - Regex patch helpers (NSUserDefaults domain approach)
+#pragma mark - Regex patch helpers
 
-// Convert dict -> XML string
 static NSString* dictToPlist(NSDictionary *d) {
     NSError *err = nil;
     NSData *dat = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
@@ -258,11 +245,6 @@ static void applyPatchWithAlert(NSString *title, NSString *pattern, NSString *re
 #pragma mark - Gems/Reborn/Bypass/PatchAll
 
 static void patchGems() {
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
-    NSString *plist = dictToPlist(domain) ?: @"";
-
     UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Set Gems" message:@"Enter value" preferredStyle:UIAlertControllerStyleAlert];
     [input addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.keyboardType = UIKeyboardTypeNumberPad; tf.placeholder = @"0"; }];
     [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
@@ -289,7 +271,6 @@ static void silentPatchBypass() {
 }
 
 static void patchAllExcludingGems() {
-    // characters, skins, skills, pets, level, furniture, reborn, bypass (no gems)
     NSDictionary *map = @{
         @"Characters": @"(<key>\\d+_c\\d+_unlock.*\\n.*)false",
         @"Skins":      @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+",
@@ -302,16 +283,13 @@ static void patchAllExcludingGems() {
     for (NSString *k in map) {
         NSString *pattern = map[k];
         NSString *rep = @"$1";
-        // pattern-specific replacement:
         if ([k isEqualToString:@"Characters"] || [k isEqualToString:@"Pets"]) rep = @"$1True";
-        else if ([k isEqualToString:@"Skins"] || [k isEqualToString:@"Skills"] ) rep = @"$11";
+        else if ([k isEqualToString:@"Skins"] || [k isEqualToString:@"Skills"]) rep = @"$11";
         else if ([k isEqualToString:@"Level"]) rep = @"$18";
         else if ([k isEqualToString:@"Furniture"]) rep = @"$15";
         silentApplyRegexToDomain(pattern, rep);
     }
-    // Reborn
     silentApplyRegexToDomain(@"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
-    // Bypass
     silentPatchBypass();
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -351,7 +329,6 @@ static void showPlayerMenu() {
     [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         patchRebornWithAlert();
     }]];
-    // Bypass is removed from menu; it runs silently before showing
     [menu addAction:[UIAlertAction actionWithTitle:@"Patch All" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         patchAllExcludingGems();
     }]];
@@ -359,28 +336,7 @@ static void showPlayerMenu() {
     [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
-#pragma mark - Auto cleanup & bypass on launch (runs ONLY ONCE)
 
-static BOOL g_alreadyRanLaunchPatches = NO;
-
-static void runOnceOnLaunch() {
-    if (g_alreadyRanLaunchPatches) return;
-    g_alreadyRanLaunchPatches = YES;
-
-    // 1. Delete all .new files in Documents
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSArray *allFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
-    for (NSString *file in allFiles) {
-        if ([file hasSuffix:@".new"]) {
-            NSString *fullPath = [docs stringByAppendingPathComponent:file];
-            [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
-            // ignore errors – best effort
-        }
-    }
-
-    // 2. Apply bypass silently (exactly the same as silentPatchBypass())
-    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", $10");
-}
 #pragma mark - Document helpers (hide .new)
 
 static NSArray* listDocumentsFiles() {
@@ -399,7 +355,6 @@ static void showFileActionMenu(NSString *fileName) {
 
     UIAlertController *menu = [UIAlertController alertControllerWithTitle:fileName message:@"Action" preferredStyle:UIAlertControllerStyleAlert];
 
-    // Export (copy contents to clipboard)
     [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         NSError *err = nil;
         NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
@@ -409,7 +364,6 @@ static void showFileActionMenu(NSString *fileName) {
         [topVC() presentViewController:done animated:YES completion:nil];
     }]];
 
-    // Import (replace)
     [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
         UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
         [input addTextFieldWithConfigurationHandler:nil];
@@ -417,7 +371,7 @@ static void showFileActionMenu(NSString *fileName) {
             NSString *txt = input.textFields.firstObject.text ?: @"";
             NSError *err = nil;
             BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-            UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"File applied\nPlease leave game to apply\nThoát game để cập nhật":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"Edit Applied\nLeave game to load new data\nThoát game để load data mới":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
             [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
             [topVC() presentViewController:done animated:YES completion:nil];
         }]];
@@ -425,7 +379,6 @@ static void showFileActionMenu(NSString *fileName) {
         [topVC() presentViewController:input animated:YES completion:nil];
     }]];
 
-    // Delete
     [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
         NSError *err = nil;
         BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
@@ -456,11 +409,9 @@ static void showDataMenu() {
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Main Menu (runs silent bypass before showing)
+#pragma mark - Main Menu
 
 static void showMainMenu() {
-    // silent bypass
-    silentPatchBypass();
     UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu" message:nil preferredStyle:UIAlertControllerStyleAlert];
     [menu addAction:[UIAlertAction actionWithTitle:@"Player" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showPlayerMenu(); }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Data" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showDataMenu(); }]];
@@ -468,17 +419,28 @@ static void showMainMenu() {
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - Floating draggable button
+#pragma mark - Floating draggable button + AUTO CLEANUP & BYPASS
 
 static CGPoint g_startPoint;
 static CGPoint g_btnStart;
 static UIButton *floatingButton = nil;
 
 %ctor {
-    // Run cleanup + bypass immediately when dylib loads (before UI appears)
-    runOnceOnLaunch();
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // === AUTO DELETE ALL .new FILES ONCE WHEN DYLIB LOADS ===
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSArray *allFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
+        for (NSString *file in allFiles) {
+            if ([file hasSuffix:@".new"]) {
+                NSString *fullPath = [docs stringByAppendingPathComponent:file];
+                [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
+            }
+        }
+
+        // === AUTO APPLY BYPASS ONCE WHEN DYLIB LOADS ===
+        silentPatchBypass();
+
+        // === CREATE FLOATING BUTTON ===
         UIWindow *win = firstWindow();
         floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
         floatingButton.frame = CGRectMake(10, 50, 40, 40);
@@ -500,28 +462,24 @@ static UIButton *floatingButton = nil;
 %hook UIApplication
 %new
 - (void)showMenuPressed {
-    // === ONE-TIME CREDIT ALERT ===
     if (!g_hasShownCreditAlert) {
         g_hasShownCreditAlert = YES;
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *message = @"Thanks for using~.\n"
-                                @"Cảm ơn vì đã dùng";
+            NSString *message = @"Thank you for using!\n"
+                                @"Cảm ơn vì đã sử dụng!\n";
 
             UIAlertController *credit = [UIAlertController alertControllerWithTitle:@"Info"
                                                                             message:message
                                                                      preferredStyle:UIAlertControllerStyleAlert];
 
             [credit addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                // After user dismisses the credit alert → proceed to normal verification flow
                 verifyAccessAndOpenMenu();
             }]];
 
-            UIViewController *root = topVC();
-            [root presentViewController:credit animated:YES completion:nil];
+            [topVC() presentViewController:credit animated:YES completion:nil];
         });
     } else {
-        // Normal flow (already shown once this session)
         verifyAccessAndOpenMenu();
     }
 }
