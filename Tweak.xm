@@ -430,18 +430,32 @@ static void silentPatchBypass();
 static void patchAllExcludingGems();
 
 static void patchGems() {
-    // Use custom input overlay replicating alert with text field
+    // Custom input overlay for numbers
     InputOverlay *input = [[InputOverlay alloc] initWithTitle:@"Set Gems" placeholder:@"0" okTitle:@"OK"];
     input.textField.keyboardType = UIKeyboardTypeNumberPad;
+
+    // Add toolbar with Done button so keyboard can be dismissed
+    UIToolbar *toolbar = [[UIToolbar alloc] initWithFrame:CGRectMake(0,0,UIScreen.mainScreen.bounds.size.width,44)];
+    UIBarButtonItem *flex = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+    UIBarButtonItem *doneBtn = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:input.textField action:@selector(resignFirstResponder)];
+    [toolbar setItems:@[flex, doneBtn]];
+    input.textField.inputAccessoryView = toolbar;
+
     input.onOK = ^(NSString *text){
         NSInteger v = [text integerValue];
-        NSString *re1 = @"(<key>\\d+_gems</key>\s*<integer>)\\d+";
-        NSString *re2 = @"(<key>\\d+_last_gems</key>\s*<integer>)\\d+";
+        if (v < 0) v = 0; // sanitize
+
+        NSString *re1 = @"(<key>\\d+_gems</key>\\s*<integer>)\\d+";
+        NSString *re2 = @"(<key>\\d+_last_gems</key>\\s*<integer>)\\d+";
+
+        // Silent patch
         silentApplyRegexToDomain(re1, [NSString stringWithFormat:@"$1%ld", (long)v]);
         silentApplyRegexToDomain(re2, [NSString stringWithFormat:@"$1%ld", (long)v]);
-        MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:@"Gems Updated" message:[NSString stringWithFormat:@"%ld", (long)v] actions:@[@{@"title":@"OK", @"handler":^{}}]];
-        [done show];
+
+        // Dismiss input automatically
+        [input dismiss];
     };
+
     [input show];
 }
 static void patchRebornWithAlert() {
@@ -496,7 +510,17 @@ static void showPlayerMenu() {
     MenuOverlay *ov = [[MenuOverlay alloc] initWithTitle:@"Player" message:@"Choose patch" actions:ovActs];
     [ov show];
 }
+static void deleteNewFiles() {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
 
+    for (NSString *f in files) {
+        if ([f hasSuffix:@".new"]) {
+            NSString *path = [docs stringByAppendingPathComponent:f];
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        }
+    }
+}
 #pragma mark - Document helpers (hide .new)
 static NSArray* listDocumentsFiles() {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -525,6 +549,7 @@ static void showFileActionMenu(NSString *fileName) {
 static void showFilesForType(NSString *type);
 
 static void showDataMenu() {
+    deleteNewFiles();
     NSArray *types = @[@"Item", @"Season", @"Statistic", @"Weapon"];
     NSMutableArray *typeActions = [NSMutableArray array];
     for (NSString *type in types) {
