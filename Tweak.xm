@@ -522,50 +522,51 @@ static NSArray* listDocumentsFiles() {
     }
     return out;
 }
+
 static void showFileActionMenu(NSString *fileName) {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [docs stringByAppendingPathComponent:fileName];
 
-    NSArray *actions = @[
-        @{@"title":@"Export", @"handler":^{
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:fileName message:@"Action" preferredStyle:UIAlertControllerStyleAlert];
+
+    // Export (copy contents to clipboard)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+        if (txt) UIPasteboard.generalPasteboard.string = txt;
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(txt?@"Exported":@"Error") message:(txt?@"Copied to clipboard":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+
+    // Import (replace)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
+        [input addTextFieldWithConfigurationHandler:nil];
+        [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
+            NSString *txt = input.textFields.firstObject.text ?: @"";
             NSError *err = nil;
-            NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
-            if (txt) {
-                UIPasteboard.generalPasteboard.string = txt;
-                MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:@"Exported" message:@"Copied to clipboard" actions:@[@{@"title":@"OK", @"handler":^{}}]];
-                [done show];
-            } else {
-                MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:@"Error" message:err.localizedDescription actions:@[@{@"title":@"OK", @"handler":^{}}]];
-                [done show];
-            }
-        }},
-        @{@"title":@"Import", @"handler":^{
-            UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
-            [input addTextFieldWithConfigurationHandler:nil];
+            BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"File overwritten":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [topVC() presentViewController:done animated:YES completion:nil];
+        }]];
+        [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [topVC() presentViewController:input animated:YES completion:nil];
+    }]];
 
-            [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
-                NSString *txt = input.textFields.firstObject.text ?: @"";
-                NSError *err = nil;
-                BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-                UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed")
-                                                                              message:(okw?@"File overwritten":err.localizedDescription)
-                                                                       preferredStyle:UIAlertControllerStyleAlert];
-                [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                [topVC() presentViewController:done animated:YES completion:nil];
-            }]];
+    // Delete
+    [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
 
-            [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-            [topVC() presentViewController:input animated:YES completion:nil];
-        }},
-        @{@"title":@"Delete", @"handler":^{
-            NSError *err = nil;
-            BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
-            MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) actions:@[@{@"title":@"OK", @"handler":^{}}]];
-            [done show];
-        }},
-        @{@"title":@"Cancel", @"handler":^{}}
-    ];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
+}
 
     NSMutableArray *ovActs = [NSMutableArray array];
     for (NSDictionary *a in actions) [ovActs addObject:@{@"title": a[@"title"], @"handler": a[@"handler"]}];
