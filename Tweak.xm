@@ -115,138 +115,199 @@ static void killApp() {
 #pragma mark - Save lastTimestamp for verification
 static NSString *g_lastTimestamp = nil;
 
-#pragma mark - Custom lightweight menu overlay (replaces UIAlertController UI)
-@interface MenuOverlay : UIView
+#pragma mark - Custom scrollable menu overlay
+@interface MenuOverlay : UIView <UIScrollViewDelegate>
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, copy) void (^onDismiss)(void);
+@property (nonatomic, strong) UIScrollView *scroll;
 @end
 
 @implementation MenuOverlay
 - (instancetype)initWithTitle:(NSString*)title message:(NSString*)message actions:(NSArray<NSDictionary*>*)actions {
     self = [super initWithFrame:UIScreen.mainScreen.bounds];
     if (!self) return nil;
-    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(20, 0, CGRectGetWidth(self.bounds)-40, 240)];
-    _panel.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
-    _panel.backgroundColor = [UIColor colorWithWhite:0.06 alpha:1.0];
-    _panel.layer.cornerRadius = 12;
+    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+
+    CGFloat panelW = 280;
+    CGFloat panelH = MIN(400, 80 + actions.count * 46);
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, panelW, panelH)];
+    _panel.center = self.center;
+    _panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+    _panel.layer.cornerRadius = 14;
     _panel.layer.shadowColor = [UIColor blackColor].CGColor;
     _panel.layer.shadowOpacity = 0.3;
     _panel.layer.shadowRadius = 8;
     [self addSubview:_panel];
 
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, _panel.bounds.size.width-24, 24)];
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, panelW-24, 24)];
     titleLabel.text = title;
+    titleLabel.font = [UIFont boldSystemFontOfSize:17];
     titleLabel.textColor = [UIColor whiteColor];
-    titleLabel.font = [UIFont boldSystemFontOfSize:18];
     [_panel addSubview:titleLabel];
 
-    UILabel *msgLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 42, _panel.bounds.size.width-24, 40)];
+    UILabel *msgLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 38, panelW-24, 36)];
     msgLabel.text = message;
     msgLabel.numberOfLines = 0;
-    msgLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
+    msgLabel.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
     msgLabel.font = [UIFont systemFontOfSize:14];
     [_panel addSubview:msgLabel];
 
-    CGFloat y = CGRectGetMaxY(msgLabel.frame) + 12;
+    CGFloat y = CGRectGetMaxY(msgLabel.frame) + 8;
+    _scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, y, panelW, panelH - y - 12)];
+    _scroll.showsVerticalScrollIndicator = YES;
+    [_panel addSubview:_scroll];
+
+    CGFloat btnY = 0;
     for (NSDictionary *act in actions) {
         NSString *title = act[@"title"];
         void (^handler)(void) = act[@"handler"];
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-        b.frame = CGRectMake(12, y, _panel.bounds.size.width-24, 38);
+        b.frame = CGRectMake(12, btnY, panelW-24, 38);
         b.layer.cornerRadius = 8;
         b.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1.0];
-        b.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
         [b setTitle:title forState:UIControlStateNormal];
         [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
         [b addTarget:self action:@selector(buttonTapped:) forControlEvents:UIControlEventTouchUpInside];
-        // store handler using associated object
         objc_setAssociatedObject(b, "handler", handler, OBJC_ASSOCIATION_COPY_NONATOMIC);
-        [_panel addSubview:b];
-        y += 46;
+        [_scroll addSubview:b];
+        btnY += 46;
     }
-    // resize panel to fit
-    CGRect pf = _panel.frame;
-    pf.size.height = y + 12;
-    _panel.frame = pf;
-    _panel.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+    _scroll.contentSize = CGSizeMake(panelW, btnY);
+
+    // X button
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    close.frame = CGRectMake(panelW-36, 8, 28, 28);
+    [close setTitle:@"✕" forState:UIControlStateNormal];
+    close.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [close addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:close];
+
     return self;
 }
 - (void)buttonTapped:(UIButton*)b {
     void (^handler)(void) = objc_getAssociatedObject(b, "handler");
     [self dismissWithCompletion:^{ if (handler) handler(); }];
 }
+- (void)closeTapped {
+    [self dismissWithCompletion:nil];
+}
 - (void)show {
     UIWindow *w = firstWindow();
     [w addSubview:self];
     self.alpha = 0.0;
-    self.panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+    self.panel.transform = CGAffineTransformMakeScale(0.95, 0.95);
     [UIView animateWithDuration:0.22 delay:0 usingSpringWithDamping:0.8 initialSpringVelocity:0.6 options:0 animations:^{
         self.alpha = 1.0;
         self.panel.transform = CGAffineTransformIdentity;
     } completion:nil];
 }
 - (void)dismissWithCompletion:(void(^)(void))cb {
-    [UIView animateWithDuration:0.16 animations:^{ self.alpha = 0.0; self.panel.transform = CGAffineTransformMakeScale(0.96, 0.96); } completion:^(BOOL finished){ [self removeFromSuperview]; if (cb) cb(); if (self.onDismiss) self.onDismiss(); }];
+    [UIView animateWithDuration:0.16 animations:^{
+        self.alpha = 0.0;
+        self.panel.transform = CGAffineTransformMakeScale(0.95, 0.95);
+    } completion:^(BOOL finished){
+        [self removeFromSuperview];
+        if (cb) cb();
+        if (self.onDismiss) self.onDismiss();
+    }];
 }
 @end
 
-#pragma mark - Simple input overlay (for text input used in patchGems / import)
-@interface InputOverlay : UIView
+#pragma mark - Input overlay with keyboard handling
+@interface InputOverlay : UIView <UITextFieldDelegate>
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UITextField *textField;
 @property (nonatomic, copy) void (^onOK)(NSString*);
+@property (nonatomic, strong) UIButton *okButton;
 @end
+
 @implementation InputOverlay
 - (instancetype)initWithTitle:(NSString*)title placeholder:(NSString*)ph okTitle:(NSString*)okTitle {
     self = [super initWithFrame:UIScreen.mainScreen.bounds];
     if (!self) return nil;
-    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(20, 0, CGRectGetWidth(self.bounds)-40, 160)];
-    _panel.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
-    _panel.backgroundColor = [UIColor colorWithWhite:0.06 alpha:1.0];
+    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+
+    CGFloat w = 260, h = 150;
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    _panel.center = self.center;
+    _panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
     _panel.layer.cornerRadius = 12;
     [self addSubview:_panel];
 
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, _panel.bounds.size.width-24, 22)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, w-24, 22)];
     label.text = title;
     label.textColor = [UIColor whiteColor];
-    label.font = [UIFont boldSystemFontOfSize:17];
+    label.font = [UIFont boldSystemFontOfSize:16];
     [_panel addSubview:label];
 
-    _textField = [[UITextField alloc] initWithFrame:CGRectMake(12, 44, _panel.bounds.size.width-24, 40)];
+    _textField = [[UITextField alloc] initWithFrame:CGRectMake(12, 44, w-24, 38)];
     _textField.placeholder = ph;
     _textField.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
     _textField.textColor = [UIColor whiteColor];
     _textField.layer.cornerRadius = 8;
     _textField.keyboardAppearance = UIKeyboardAppearanceDark;
-    _textField.keyboardType = UIKeyboardTypeDefault;
+    _textField.delegate = self;
     [_panel addSubview:_textField];
 
-    UIButton *ok = [UIButton buttonWithType:UIButtonTypeSystem];
-    ok.frame = CGRectMake(12, 96, (_panel.bounds.size.width-36)/2, 40);
-    ok.layer.cornerRadius = 8;
-    ok.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
-    [ok setTitle:okTitle forState:UIControlStateNormal];
-    [ok setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [ok addTarget:self action:@selector(okTapped) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:ok];
+    _okButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _okButton.frame = CGRectMake(12, 92, w-24, 38);
+    _okButton.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+    [_okButton setTitle:okTitle forState:UIControlStateNormal];
+    [_okButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _okButton.layer.cornerRadius = 8;
+    [_okButton addTarget:self action:@selector(okTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:_okButton];
 
-    UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
-    cancel.frame = CGRectMake(CGRectGetMaxX(ok.frame)+12, 96, (_panel.bounds.size.width-36)/2, 40);
-    cancel.layer.cornerRadius = 8;
-    cancel.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
-    [cancel setTitle:@"Cancel" forState:UIControlStateNormal];
-    [cancel setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [cancel addTarget:self action:@selector(cancelTapped) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:cancel];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillShow:) name:UIKeyboardWillShowNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillHide:) name:UIKeyboardWillHideNotification object:nil];
 
     return self;
 }
-- (void)okTapped { if (self.onOK) self.onOK(self.textField.text ?: @""); [self removeFromSuperview]; }
-- (void)cancelTapped { [self removeFromSuperview]; }
-- (void)show { UIWindow *w = firstWindow(); [w addSubview:self]; [self.textField becomeFirstResponder]; }
+- (void)keyboardWillShow:(NSNotification*)note {
+    CGRect kbFrame = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGFloat moveY = kbFrame.size.height + 10;
+    CGRect f = _okButton.frame;
+    f.origin.y = _panel.bounds.size.height - moveY;
+    _okButton.frame = f;
+}
+- (void)keyboardWillHide:(NSNotification*)note {
+    CGRect f = _okButton.frame;
+    f.origin.y = 92;
+    _okButton.frame = f;
+}
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [self okTapped];
+    return YES;
+}
+- (void)okTapped {
+    if (self.onOK) self.onOK(_textField.text ?: @"");
+    [self removeFromSuperview];
+}
+- (void)show {
+    UIWindow *w = firstWindow();
+    [w addSubview:self];
+    [_textField becomeFirstResponder];
+}
 @end
+
+#pragma mark - Data menu filtering
+static NSArray* listDocumentsFilesFiltered() {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *f in files) {
+        if ([f rangeOfString:@"Item"].location != NSNotFound ||
+            [f rangeOfString:@"Season"].location != NSNotFound ||
+            [f rangeOfString:@"Statistic"].location != NSNotFound ||
+            [f rangeOfString:@"Weapon"].location != NSNotFound) {
+            [out addObject:f];
+        }
+    }
+    return out;
+}
+
 
 #pragma mark - Network: verify then open menu
 static void showMainMenu();
@@ -436,9 +497,9 @@ static void showFileActionMenu(NSString *fileName) {
     [menu show];
 }
 static void showDataMenu() {
-    NSArray *files = listDocumentsFiles();
+    NSArray *files = listDocumentsFilesFiltered();
     if (files.count == 0) {
-        MenuOverlay *e = [[MenuOverlay alloc] initWithTitle:@"No files" message:@"Documents is empty" actions:@[@{@"title":@"OK", @"handler":^{}}]];
+        MenuOverlay *e = [[MenuOverlay alloc] initWithTitle:@"No files" message:@"No matching files" actions:@[@{@"title":@"OK",@"handler":^{}}]];
         [e show];
         return;
     }
@@ -447,7 +508,7 @@ static void showDataMenu() {
         NSString *ff = [f copy];
         [acts addObject:@{@"title": ff, @"handler":^{ showFileActionMenu(ff); }}];
     }
-    [acts addObject:@{@"title":@"Cancel", @"handler":^{}}];
+    [acts addObject:@{@"title":@"Cancel",@"handler":^{}}];
     MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:@"Documents" message:@"Select file" actions:acts];
     [menu show];
 }
