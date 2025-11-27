@@ -497,19 +497,45 @@ static void showFileActionMenu(NSString *fileName) {
     [menu show];
 }
 static void showDataMenu() {
-    NSArray *files = listDocumentsFilesFiltered();
-    if (files.count == 0) {
-        MenuOverlay *e = [[MenuOverlay alloc] initWithTitle:@"No files" message:@"No matching files" actions:@[@{@"title":@"OK",@"handler":^{}}]];
+    NSArray *types = @[@"Item", @"Season", @"Statistic", @"Weapon"];
+    NSMutableArray *typeActions = [NSMutableArray array];
+    for (NSString *type in types) {
+        NSString *t = [type copy];
+        [typeActions addObject:@{@"title":t, @"handler":^{
+            showFilesForType(t);
+        }}];
+    }
+    [typeActions addObject:@{@"title":@"Cancel", @"handler":^{}}];
+    
+    MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:@"Choose Type" message:@"Select data file type" actions:typeActions];
+    [menu show];
+}
+
+// Filter files by chosen type
+static void showFilesForType(NSString *type) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *f in files) {
+        if ([f rangeOfString:type options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            [out addObject:f];
+        }
+    }
+    
+    if (out.count == 0) {
+        MenuOverlay *e = [[MenuOverlay alloc] initWithTitle:@"No files" message:[NSString stringWithFormat:@"No %@ files found", type] actions:@[@{@"title":@"OK",@"handler":^{}}]];
         [e show];
         return;
     }
-    NSMutableArray *acts = [NSMutableArray array];
-    for (NSString *f in files) {
+    
+    NSMutableArray *fileActions = [NSMutableArray array];
+    for (NSString *f in out) {
         NSString *ff = [f copy];
-        [acts addObject:@{@"title": ff, @"handler":^{ showFileActionMenu(ff); }}];
+        [fileActions addObject:@{@"title": ff, @"handler":^{ showFileActionMenu(ff); }}];
     }
-    [acts addObject:@{@"title":@"Cancel",@"handler":^{}}];
-    MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:@"Documents" message:@"Select file" actions:acts];
+    [fileActions addObject:@{@"title":@"Cancel",@"handler":^{}}];
+    
+    MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:[NSString stringWithFormat:@"%@ Files", type] message:@"Select file" actions:fileActions];
     [menu show];
 }
 
