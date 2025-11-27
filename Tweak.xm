@@ -3,6 +3,20 @@
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
 
+@interface UIButton (Blocks)
+- (void)addBlockForControlEvents:(UIControlEvents)events block:(void(^)(void))block;
+@end
+
+@implementation UIButton (Blocks)
+- (void)addBlockForControlEvents:(UIControlEvents)events block:(void(^)(void))block {
+    objc_setAssociatedObject(self, _cmd, block, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    [self addTarget:self action:@selector(_invokeBlock: ) forControlEvents:events];
+}
+- (void)_invokeBlock:(id)sender {
+    void(^block)(void) = objc_getAssociatedObject(self, @selector(_invokeBlock:));
+    if (block) block();
+}
+@end
 #pragma mark - CONFIG
 static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 static NSString * const kHexHmacKey = @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
