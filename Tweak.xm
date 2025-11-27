@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import <objc/runtime.h>
 
 @interface UIButton (Blocks)
 - (void)addBlockForControlEvents:(UIControlEvents)events block:(void(^)(void))block;
