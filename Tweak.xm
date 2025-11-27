@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import <objc/runtime.h>
 
 #pragma mark - CONFIG: set these to match server hex keys
 static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
@@ -348,8 +349,8 @@ static void patchGems() {
     input.textField.keyboardType = UIKeyboardTypeNumberPad;
     input.onOK = ^(NSString *text){
         NSInteger v = [text integerValue];
-        NSString *re1 = @"(<key>\d+_gems</key>\s*<integer>)\d+";
-        NSString *re2 = @"(<key>\d+_last_gems</key>\s*<integer>)\d+";
+        NSString *re1 = @"(<key>\\d+_gems</key>\s*<integer>)\\d+";
+        NSString *re2 = @"(<key>\\d+_last_gems</key>\s*<integer>)\\d+";
         silentApplyRegexToDomain(re1, [NSString stringWithFormat:@"$1%ld", (long)v]);
         silentApplyRegexToDomain(re2, [NSString stringWithFormat:@"$1%ld", (long)v]);
         MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:@"Gems Updated" message:[NSString stringWithFormat:@"%ld", (long)v] actions:@[@{@"title":@"OK", @"handler":^{}}]];
@@ -358,19 +359,19 @@ static void patchGems() {
     [input show];
 }
 static void patchRebornWithAlert() {
-    applyPatchWithAlert(@"Reborn", @"(<key>\d+_reborn_card</key>\s*<integer>)\d+", @"$11");
+    applyPatchWithAlert(@"Reborn", @"(<key>\\d+_reborn_card</key>\s*<integer>)\\d+", @"$11");
 }
 static void silentPatchBypass() {
-    silentApplyRegexToDomain(@"(<key>OpenRijTest_\d+</key>\s*<integer>)\d+", @"$10");
+    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\s*<integer>)\\d+", @"$10");
 }
 static void patchAllExcludingGems() {
     NSDictionary *map = @{
-        @"Characters": @"(<key>\d+_c\d+_unlock.*\n.*)false",
-        @"Skins": @"(<key>\d+_c\d+_skin\d+.*\n.*>)[+-]?\d+",
-        @"Skills": @"(<key>\d+_c_.*_skill_\d_unlock.*\n.*<integer>)\d",
-        @"Pets": @"(<key>\d+_p\d+_unlock.*\n.*)false",
-        @"Level": @"(<key>\d+_c\d+_level+.*\n.*>)[+-]?\d+",
-        @"Furniture": @"(<key>\d+_furniture+_+.*\n.*>)[+-]?\d+"
+        @"Characters": @"(<key>\\d+_c\\d+_unlock.*\n.*)false",
+        @"Skins": @"(<key>\\d+_c\\d+_skin\\d+.*\n.*>)[+-]?\\d+",
+        @"Skills": @"(<key>\\d+_c_.*_skill_\\d_unlock.*\n.*<integer>)\\d",
+        @"Pets": @"(<key>\\d+_p\\d+_unlock.*\n.*)false",
+        @"Level": @"(<key>\\d+_c\\d+_level+.*\n.*>)[+-]?\\d+",
+        @"Furniture": @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+"
     };
     for (NSString *k in map) {
         NSString *pattern = map[k];
@@ -381,7 +382,7 @@ static void patchAllExcludingGems() {
         else if ([k isEqualToString:@"Furniture"]) rep = @"$15";
         silentApplyRegexToDomain(pattern, rep);
     }
-    silentApplyRegexToDomain(@"(<key>\d+_reborn_card</key>\s*<integer>)\d+", @"$11");
+    silentApplyRegexToDomain(@"(<key>\\d+_reborn_card</key>\s*<integer>)\\d+", @"$11");
     silentPatchBypass();
     MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:@"Patch All" message:@"Applied (excluding Gems)" actions:@[@{@"title":@"OK", @"handler":^{}}]];
     [done show];
@@ -390,12 +391,12 @@ static void patchAllExcludingGems() {
 #pragma mark - Player menu
 static void showPlayerMenu() {
     NSArray *actions = @[
-        @{@"title":@"Characters", @"handler":^{ applyPatchWithAlert(@"Characters", @"(<key>\d+_c\d+_unlock.*\n.*)false", @"$1True"); }},
-        @{@"title":@"Skins", @"handler":^{ applyPatchWithAlert(@"Skins", @"(<key>\d+_c\d+_skin\d+.*\n.*>)[+-]?\d+", @"$11"); }},
-        @{@"title":@"Skills", @"handler":^{ applyPatchWithAlert(@"Skills", @"(<key>\d+_c_.*_skill_\d_unlock.*\n.*<integer>)\d", @"$11"); }},
-        @{@"title":@"Pets", @"handler":^{ applyPatchWithAlert(@"Pets", @"(<key>\d+_p\d+_unlock.*\n.*)false", @"$1True"); }},
-        @{@"title":@"Level", @"handler":^{ applyPatchWithAlert(@"Level", @"(<key>\d+_c\d+_level+.*\n.*>)[+-]?\d+", @"$18"); }},
-        @{@"title":@"Furniture", @"handler":^{ applyPatchWithAlert(@"Furniture", @"(<key>\d+_furniture+_+.*\n.*>)[+-]?\d+", @"$15"); }},
+        @{@"title":@"Characters", @"handler":^{ applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\n.*)false", @"$1True"); }},
+        @{@"title":@"Skins", @"handler":^{ applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\n.*>)[+-]?\\d+", @"$11"); }},
+        @{@"title":@"Skills", @"handler":^{ applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\n.*<integer>)\\d", @"$11"); }},
+        @{@"title":@"Pets", @"handler":^{ applyPatchWithAlert(@"Pets", @"(<key>\\d+_p\\d+_unlock.*\n.*)false", @"$1True"); }},
+        @{@"title":@"Level", @"handler":^{ applyPatchWithAlert(@"Level", @"(<key>\\d+_c\\d+_level+.*\n.*>)[+-]?\\d+", @"$18"); }},
+        @{@"title":@"Furniture", @"handler":^{ applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+", @"$15"); }},
         @{@"title":@"Gems", @"handler":^{ patchGems(); }},
         @{@"title":@"Reborn", @"handler":^{ patchRebornWithAlert(); }},
         @{@"title":@"Patch All", @"handler":^{ patchAllExcludingGems(); }},
@@ -497,35 +498,50 @@ static UIButton *floatingButton = nil;
     });
 }
 %hook UIApplication
+
 %new
 - (void)showMenuPressed {
     if (!g_hasShownCreditAlert) {
         g_hasShownCreditAlert = YES;
+
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *message = @"Thank you for using!
-"
-                                @"Cảm ơn vì đã sử dụng!
-";
-            // Use custom overlay instead of UIAlertController
-            MenuOverlay *credit = [[MenuOverlay alloc] initWithTitle:@"Info" message:message actions:@[@{@"title":@"OK", @"handler":^{ verifyAccessAndOpenMenu(); }}]];
+            NSString *message =
+                @"Thank you for using!\n"
+                @"Cảm ơn vì đã sử dụng!";
+
+            // Custom overlay
+            MenuOverlay *credit =
+                [[MenuOverlay alloc] initWithTitle:@"Info"
+                                            message:message
+                                            actions:@[
+                                                @{@"title":@"OK",
+                                                  @"handler":^{ verifyAccessAndOpenMenu(); }}
+                                            ]];
+
             [credit show];
         });
+
     } else {
         verifyAccessAndOpenMenu();
     }
 }
+
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     UIButton *btn = (UIButton*)pan.view;
+
     if (pan.state == UIGestureRecognizerStateBegan) {
         g_startPoint = [pan locationInView:btn.superview];
-        g_btnStart = btn.center;
+        g_btnStart   = btn.center;
+
     } else if (pan.state == UIGestureRecognizerStateChanged) {
         CGPoint pt = [pan locationInView:btn.superview];
         CGFloat dx = pt.x - g_startPoint.x;
         CGFloat dy = pt.y - g_startPoint.y;
+
         btn.center = CGPointMake(g_btnStart.x + dx, g_btnStart.y + dy);
     }
 }
+
 %end
 
 // End of file
