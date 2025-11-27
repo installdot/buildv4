@@ -1,7 +1,8 @@
-// Tweak.xm - FULLY REDESIGNED COOL UI + BACKGROUND IMAGE + X BUTTON + FILTERED DATA MENU
+// Tweak.xm - FULLY FIXED & COMPILABLE - BEAUTIFUL UI + BACKGROUND + FILTERED DATA
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
+#import <objc/runtime.h>
 
 #pragma mark - CONFIG
 static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -9,13 +10,14 @@ static NSString * const kHexHmacKey = @"fedcba9876543210fedcba9876543210fedcba98
 static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/iost.php";
 static BOOL g_hasShownCreditAlert = NO;
 
-#pragma mark - Global UI References
+#pragma mark - Global UI
 static UIView *g_overlay = nil;
 static UIImageView *g_backgroundImageView = nil;
 static UIButton *g_floatingButton = nil;
 static NSString *g_backgroundURL = nil;
+static const void *kFileNameKey = &kFileNameKey;
 
-#pragma mark - Background Image Persistence
+#pragma mark - Background Image
 static NSString *backgroundURLPath() {
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/bg_url.txt"];
 }
@@ -28,13 +30,13 @@ static void saveBackgroundURL(NSString *url) {
 static void loadBackgroundURL() {
     g_backgroundURL = [NSString stringWithContentsOfFile:backgroundURLPath() encoding:NSUTF8StringEncoding error:nil];
     if (!g_backgroundURL || g_backgroundURL.length == 0) {
-        g_backgroundURL = @"https://i.imgur.com/9k0L3aZ.jpg"; // default cool dark game bg
+        g_backgroundURL = @"https://i.imgur.com/9k0L3aZ.jpg";
         saveBackgroundURL(g_backgroundURL);
     }
 }
 
 static void downloadAndSetBackground(NSString *urlStr) {
-    if (!urlStr || urlStr.length == 0) return;
+    if (!urlStr.length) return;
     NSURL *url = [NSURL URLWithString:urlStr];
     [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (data && !err) {
@@ -64,7 +66,7 @@ static NSData* dataFromHex(NSString *hex) {
 static NSString* base64Encode(NSData *d) { return [d base64EncodedStringWithOptions:0]; }
 static NSData* base64Decode(NSString *s) { return [[NSData alloc] initWithBase64EncodedString:s options:0]; }
 
-#pragma mark - AES-256-CBC + HMAC (unchanged)
+#pragma mark - AES-256-CBC + HMAC
 static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
     uint8_t ivBytes[16]; arc4random_buf(ivBytes, sizeof(ivBytes));
     NSData *iv = [NSData dataWithBytes:ivBytes length:16];
@@ -102,7 +104,6 @@ static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
     return [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
 }
 
-#pragma mark - UUID & Network (unchanged)
 static NSString* appUUID() {
     NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/uuid.txt"];
     NSString *uuid = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
@@ -114,12 +115,23 @@ static NSString* appUUID() {
 }
 
 static NSString *g_lastTimestamp = nil;
-
 static void killApp() { exit(0); }
 
-#pragma mark - Custom UI Components
+#pragma mark - Window & VC
+static UIWindow* firstWindow() {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) return w;
+            }
+        }
+    }
+    return UIApplication.sharedApplication.windows.firstObject;
+}
+
 static UIViewController* topVC() {
-    UIWindow *win = UIApplication.sharedApplication.windows.firstObject;
+    UIWindow *win = firstWindow();
     UIViewController *vc = win.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
@@ -130,23 +142,7 @@ static void dismissOverlay() {
     g_overlay = nil;
 }
 
-static UIButton* createMenuButton(NSString *title, UIColor *color, SEL action) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.translatesAutoresizingMaskIntoConstraints = NO;
-    b.backgroundColor = color;
-    b.layer.cornerRadius = 16;
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-    [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    b.layer.shadowColor = UIColor.blackColor.CGColor;
-    b.layer.shadowOpacity = 0.6;
-    b.layer.shadowOffset = CGSizeMake(0, 4);
-    b.layer.shadowRadius = 8;
-    [b addTarget:topVC() action:action forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
-#pragma mark - All Patch Functions (100% UNCHANGED)
+#pragma mark - Patch Functions (100% unchanged)
 static NSString* dictToPlist(NSDictionary *d) {
     NSError *err = nil;
     NSData *dat = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
@@ -236,22 +232,56 @@ static void patchAllExcludingGems() {
     });
 }
 
-#pragma mark - Document File List (Filtered)
+#pragma mark - File List & Actions
 static NSArray* filteredDocumentsFiles(NSString *keyword) {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *f in files) {
         if ([f hasSuffix:@".new"]) continue;
-        if (!keyword || [f localizedCaseInsensitiveContainsString:keyword]) {
-            [out addObject:f];
-        }
+        if (!keyword || [f localizedCaseInsensitiveContainsString:keyword]) [out addObject:f];
     }
     return out;
 }
 
-static void showFileActionMenu(NSString *fileName);
+static void showFileActionMenu(NSString *fileName) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [docs stringByAppendingPathComponent:fileName];
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:fileName message:@"Action" preferredStyle:UIAlertControllerStyleAlert];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+        if (txt) UIPasteboard.generalPasteboard.string = txt;
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(txt?@"Exported":@"Error") message:(txt?@"Copied to clipboard":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
+        [input addTextFieldWithConfigurationHandler:nil];
+        [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
+            NSString *txt = input.textFields.firstObject.text ?: @"";
+            NSError *err = nil;
+            BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"Edit Applied\nLeave game to load new data\nThoát game để load data mới":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [topVC() presentViewController:done animated:YES completion:nil];
+        }]];
+        [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [topVC() presentViewController:input animated:YES completion:nil];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
+}
 
+#pragma mark - Menus (Beautiful UI)
 static void showFilteredDataMenu(NSString *filter) {
     NSArray *files = filteredDocumentsFiles(filter);
     if (files.count == 0) {
@@ -276,10 +306,10 @@ static void showFilteredDataMenu(NSString *filter) {
 
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
     close.frame = CGRectMake(panel.frame.size.width - 60, 10, 50, 50);
-    [close setTitle:@"✕" forState:UIControlStateNormal];
+    [close setTitle:@"X" forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont systemFontOfSize:32 weight:UIFontWeightBold];
     [close setTitleColor:UIColor.redColor forState:UIControlStateNormal];
-    [close addTarget:topVC() action:@selector(dismissOverlay) forControlEvents:UIControlEventTouchUpInside];
+    [close addTarget:nil action:@selector(dismissOverlay) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:close];
 
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(20, 80, panel.frame.size.width - 40, 380)];
@@ -294,17 +324,8 @@ static void showFilteredDataMenu(NSString *filter) {
         [b setTitle:f forState:UIControlStateNormal];
         [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         b.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
-        [b addTarget:topVC() action:NSSelectorFromString([NSString stringWithFormat:@"showFileActionMenu_%@", f]) forControlEvents:UIControlEventTouchUpInside];
-
-        __weak typeof(b) weakB = b;
-        b.tag = (NSInteger)CFBridgingRetain(f);
-        [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id sender) {
-            dismissOverlay();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                showFileActionMenu((NSString *)CFBridgingRelease((__bridge CFTypeRef _Nullable)(weakB.tag)));
-            });
-        }];
-
+        objc_setAssociatedObject(b, kFileNameKey, f, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [b addTarget:nil action:@selector(fileButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
         [scroll addSubview:b];
         y += 65;
     }
@@ -314,7 +335,15 @@ static void showFilteredDataMenu(NSString *filter) {
     [topVC().view addSubview:g_overlay];
 }
 
-#pragma mark - Menus (ALL NEW UI)
++ (void)fileButtonTapped:(UIButton *)btn {
+    NSString *fileName = objc_getAssociatedObject(btn, kFileNameKey);
+    [g_overlay removeFromSuperview];
+    g_overlay = nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        showFileActionMenu(fileName);
+    });
+}
+
 static void showDataMenu() {
     UIView *panel = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
     panel.backgroundColor = [UIColor clearColor];
@@ -344,23 +373,24 @@ static void showDataMenu() {
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     closeBtn.frame = CGRectMake(content.frame.size.width - 70, 15, 60, 60);
-    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"X" forState:UIControlStateNormal];
     closeBtn.titleLabel.font = [UIFont systemFontOfSize:36 weight:UIFontWeightBold];
     [closeBtn setTitleColor:UIColor.redColor forState:UIControlStateNormal];
-    [closeBtn addTarget:topVC() action:@selector(dismissOverlay) forControlEvents:UIControlEventTouchUpInside];
+    [closeBtn addTarget:nil action:@selector(dismissOverlay) forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:closeBtn];
 
     NSArray *options = @[@"Statistic", @"Item", @"Season", @"Weapon"];
     NSArray *colors = @[[UIColor systemPurpleColor], [UIColor systemOrangeColor], [UIColor systemGreenColor], [UIColor systemBlueColor]];
     for (int i = 0; i < options.count; i++) {
-        UIButton *b = createMenuButton(options[i], colors[i], NSSelectorFromString(@"tmp"));
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
         b.frame = CGRectMake(25, 100 + i * 80, content.frame.size.width - 50, 65);
-        [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id s) {
-            dismissOverlay();
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                showFilteredDataMenu(options[i]);
-            });
-        }];
+        b.backgroundColor = colors[i];
+        b.layer.cornerRadius = 16;
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        [b setTitle:options[i] forState:UIControlStateNormal];
+        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        b.tag = i;
+        [b addTarget:nil action:@selector(dataFilterTapped:) forControlEvents:UIControlEventTouchUpInside];
         [content addSubview:b];
     }
 
@@ -368,14 +398,20 @@ static void showDataMenu() {
     [topVC().view addSubview:g_overlay];
 }
 
++ (void)dataFilterTapped:(UIButton *)b {
+    [g_overlay removeFromSuperview];
+    g_overlay = nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        showFilteredDataMenu(@[@"Statistic", @"Item", @"Season", @"Weapon"][b.tag]);
+    });
+}
+
 static void showPlayerMenu() {
-    // Same style as Data Menu
     UIView *panel = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
     panel.backgroundColor = [UIColor clearColor];
 
     g_backgroundImageView = [[UIImageView alloc] initWithFrame:panel.bounds];
     g_backgroundImageView.contentMode = UIViewContentModeScaleAspectFill;
-    g_backgroundImageView.clipsToBounds = YES;
     [panel addSubview:g_backgroundImageView];
 
     UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleDark]];
@@ -385,8 +421,6 @@ static void showPlayerMenu() {
     UIView *content = [[UIView alloc] initWithFrame:CGRectMake(30, 80, panel.frame.size.width - 60, 580)];
     content.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.97];
     content.layer.cornerRadius = 28;
-    content.layer.shadowOpacity = 0.9;
-    content.layer.shadowRadius = 25;
     [panel addSubview:content];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 25, content.frame.size.width, 50)];
@@ -398,10 +432,10 @@ static void showPlayerMenu() {
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     closeBtn.frame = CGRectMake(content.frame.size.width - 70, 15, 60, 60);
-    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"X" forState:UIControlStateNormal];
     closeBtn.titleLabel.font = [UIFont systemFontOfSize:36 weight:UIFontWeightBold];
     [closeBtn setTitleColor:UIColor.redColor forState:UIControlStateNormal];
-    [closeBtn addTarget:topVC() action:@selector(dismissOverlay) forControlEvents:UIControlEventTouchUpInside];
+    [closeBtn addTarget:nil action:@selector(dismissOverlay) forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:closeBtn];
 
     NSArray *titles = @[@"Characters", @"Skins", @"Skills", @"Pets", @"Level", @"Furniture", @"Gems", @"Reborn", @"Patch All"];
@@ -409,24 +443,38 @@ static void showPlayerMenu() {
                         [UIColor systemYellowColor], [UIColor systemGrayColor], [UIColor systemGreenColor], [UIColor systemPurpleColor], [UIColor orangeColor]];
 
     for (int i = 0; i < titles.count; i++) {
-        UIButton *b = createMenuButton(titles[i], colors[i], NSSelectorFromString(@"tmp"));
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
         b.frame = CGRectMake(25, 90 + i * 68, content.frame.size.width - 50, 60);
-        switch (i) {
-            case 0: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\\n.*)false", @"$1True"); }]; break;
-            case 1: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+", @"$11"); }]; break;
-            case 2: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d", @"$11"); }]; break;
-            case 3: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); applyPatchWithAlert(@"Pets", @"(<key>\\d+_p\\d+_unlock.*\\n.*)false", @"$1True"); }]; break;
-            case 4: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); applyPatchWithAlert(@"Level", @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+", @"$18"); }]; break;
-            case 5: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+", @"$15"); }]; break;
-            case 6: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ patchGems(); }); }]; break;
-            case 7: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); patchRebornWithAlert(); }]; break;
-            case 8: [b addBlockForControlEvents:UIControlEventTouchUpInside block:^(id){ dismissOverlay(); patchAllExcludingGems(); }]; break;
-        }
+        b.backgroundColor = colors[i];
+        b.layer.cornerRadius = 16;
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        [b setTitle:titles[i] forState:UIControlStateNormal];
+        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        b.tag = i;
+        [b addTarget:nil action:@selector(playerButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
         [content addSubview:b];
     }
 
     g_overlay = panel;
     [topVC().view addSubview:g_overlay];
+}
+
++ (void)playerButtonTapped:(UIButton *)b {
+    [g_overlay removeFromSuperview];
+    g_overlay = nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        switch (b.tag) {
+            case 0: applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\\n.*)false", @"$1True"); break;
+            case 1: applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+", @"$11"); break;
+            case 2: applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d", @"$11"); break;
+            case 3: applyPatchWithAlert(@"Pets", @"(<key>\\d+_p\\d+_unlock.*\\n.*)false", @"$1True"); break;
+            case 4: applyPatchWithAlert(@"Level", @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+", @"$18"); break;
+            case 5: applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+", @"$15"); break;
+            case 6: patchGems(); break;
+            case 7: patchRebornWithAlert(); break;
+            case 8: patchAllExcludingGems(); break;
+        }
+    });
 }
 
 static void showSettingsMenu();
@@ -635,15 +683,15 @@ static void verifyAccessAndOpenMenu() {
         loadBackgroundURL();
         downloadAndSetBackground(g_backgroundURL);
 
-        // Clean .new files
+        // clean .new files + bypass
         NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil]) {
             if ([f hasSuffix:@".new"]) [[NSFileManager defaultManager] removeItemAtPath:[docs stringByAppendingPathComponent:f] error:nil];
         }
         silentPatchBypass();
 
-        // Cool Floating Button
-        UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
+        // floating button
+        UIWindow *win = firstWindow();
         g_floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
         g_floatingButton.frame = CGRectMake(15, 80, 60, 60);
         g_floatingButton.backgroundColor = [UIColor colorWithRed:0.1 green:0.7 blue:1.0 alpha:1.0];
@@ -651,12 +699,11 @@ static void verifyAccessAndOpenMenu() {
         g_floatingButton.layer.shadowColor = UIColor.cyanColor.CGColor;
         g_floatingButton.layer.shadowOpacity = 0.8;
         g_floatingButton.layer.shadowRadius = 12;
-        g_floatingButton.layer.shadowOffset = CGSizeZero;
-        [g_floatingButton setTitle:@"✦" forState:UIControlStateNormal];
+        [g_floatingButton setTitle:@"Star" forState:UIControlStateNormal];
         g_floatingButton.titleLabel.font = [UIFont systemFontOfSize:32 weight:UIFontWeightBold];
-        [g_floatingButton addTarget:UIApplication.sharedApplication action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
+        [g_floatingButton addTarget:[UIApplication sharedApplication] action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
 
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:UIApplication.sharedApplication action:@selector(handleDrag:)];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[UIApplication sharedApplication] action:@selector(handleDrag:)];
         [g_floatingButton addGestureRecognizer:pan];
         [win addSubview:g_floatingButton];
     });
