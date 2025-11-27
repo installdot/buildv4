@@ -525,32 +525,55 @@ static NSArray* listDocumentsFiles() {
 static void showFileActionMenu(NSString *fileName) {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [docs stringByAppendingPathComponent:fileName];
+
     NSArray *actions = @[
-        @{@"title":@"Export", @"handler":^{ NSError *err = nil; NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err]; if (txt) UIPasteboard.generalPasteboard.string = txt; MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:(txt?@"Exported":@"Error") message:(txt?@"Copied to clipboard":err.localizedDescription) actions:@[@{@"title":@"OK", @"handler":^{}}]]; [done show]; }},
-        @{@"title":@"Import", @"handler":^{ 
-            dispatch_async(dispatch_get_main_queue(), ^{
-                InputOverlay *input = [[InputOverlay alloc] initWithTitle:@"Import" placeholder:@"" okTitle:@"OK"];
-                input.onOK = ^(NSString *txt){
-                    NSError *err = nil;
-                    BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:(okw?@"Imported":@"Import Failed") 
-                                                                 message:(okw?@"File overwritten\nLeave game to load new data":err.localizedDescription) 
-                                                                 actions:@[@{@"title":@"OK",@"handler":^{}}]];
-                      [done show];
-                    });
-               };
-               [input show];
-          });
-        }
-        @{@"title":@"Delete", @"handler":^{ NSError *err = nil; BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err]; MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) actions:@[@{@"title":@"OK", @"handler":^{}}]]; [done show]; }},
+        @{@"title":@"Export", @"handler":^{
+            NSError *err = nil;
+            NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+            if (txt) {
+                UIPasteboard.generalPasteboard.string = txt;
+                MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:@"Exported" message:@"Copied to clipboard" actions:@[@{@"title":@"OK", @"handler":^{}}]];
+                [done show];
+            } else {
+                MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:@"Error" message:err.localizedDescription actions:@[@{@"title":@"OK", @"handler":^{}}]];
+                [done show];
+            }
+        }},
+        @{@"title":@"Import", @"handler":^{
+            UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
+            [input addTextFieldWithConfigurationHandler:nil];
+
+            [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
+                NSString *txt = input.textFields.firstObject.text ?: @"";
+                NSError *err = nil;
+                BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+                UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed")
+                                                                              message:(okw?@"File overwritten":err.localizedDescription)
+                                                                       preferredStyle:UIAlertControllerStyleAlert];
+                [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [topVC() presentViewController:done animated:YES completion:nil];
+            }]];
+
+            [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+            [topVC() presentViewController:input animated:YES completion:nil];
+        }},
+        @{@"title":@"Delete", @"handler":^{
+            NSError *err = nil;
+            BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+            MenuOverlay *done = [[MenuOverlay alloc] initWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) actions:@[@{@"title":@"OK", @"handler":^{}}]];
+            [done show];
+        }},
         @{@"title":@"Cancel", @"handler":^{}}
     ];
+
     NSMutableArray *ovActs = [NSMutableArray array];
     for (NSDictionary *a in actions) [ovActs addObject:@{@"title": a[@"title"], @"handler": a[@"handler"]}];
+
     MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:fileName message:@"Action" actions:ovActs];
     [menu show];
 }
+
 
 static void showFilesForType(NSString *type);
 
@@ -615,12 +638,13 @@ static void showMainMenu() {
 static CGPoint g_startPoint;
 static CGPoint g_btnStart;
 static UIButton *floatingButton = nil;
-
 %ctor {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // === AUTO DELETE ALL .new FILES ONCE WHEN DYLIB LOADS ===
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSArray *allFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
         // === AUTO APPLY BYPASS ONCE WHEN DYLIB LOADS ===
         silentPatchBypass();
-
         // === CREATE FLOATING BUTTON ===
         UIWindow *win = firstWindow();
         floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -631,15 +655,11 @@ static UIButton *floatingButton = nil;
         [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
         floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
         [floatingButton addTarget:UIApplication.sharedApplication action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
-
-        // draggable
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:UIApplication.sharedApplication action:@selector(handlePan:)];
         [floatingButton addGestureRecognizer:pan];
-
         [win addSubview:floatingButton];
     });
 }
-
 %hook UIApplication
 
 %new
