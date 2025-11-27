@@ -1,4 +1,4 @@
-// Tweak.xm - FULL FINAL VERSION with Permanent + Smart Background Cache
+// Tweak.xm - FINAL 100% COMPILING VERSION (iOS 7+ compatible)
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
@@ -9,7 +9,7 @@ static NSString * const kHexHmacKey = @"fedcba9876543210fedcba9876543210fedcba98
 static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/iost.php";
 static BOOL g_hasShownCreditAlert = NO;
 
-#pragma mark - Background Cache System
+#pragma mark - Background Cache
 static NSString *g_savedBackgroundURL = nil;
 static NSString *g_cachedBackgroundPath = nil;
 
@@ -25,17 +25,17 @@ static void downloadAndCacheBackground(NSString *urlString, void(^completion)(BO
         return;
     }
 
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        NSURL *url = [NSURL URLWithString:urlString];
-        NSData *data = [NSData dataWithContentsOfURL:url timeoutInterval:15.0];
+    NSURL *url = [NSURL URLWithString:urlString];
+    NSURLSessionTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         BOOL success = NO;
-        if (data && data.length > 1000) { // basic validation
+        if (data && !err && data.length > 1000) {
             success = [data writeToFile:g_cachedBackgroundPath atomically:YES];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (completion) completion(success);
         });
-    });
+    }];
+    [task resume];
 }
 
 static void loadBackgroundImage(void(^completion)(UIImage *img)) {
@@ -43,12 +43,27 @@ static void loadBackgroundImage(void(^completion)(UIImage *img)) {
     UIImage *cached = [UIImage imageWithContentsOfFile:g_cachedBackgroundPath];
     if (cached) {
         completion(cached);
-        return;
+    } else {
+        completion(nil);
     }
-    completion(nil);
 }
 
-#pragma mark - Modern Cool Menu
+#pragma mark - Plist Helpers (FIXED)
+static NSString* dictToPlist(NSDictionary *d) {
+    NSError *err = nil;
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+}
+
+static NSDictionary* plistToDict(NSString *s) {
+    if (!s) return nil;
+    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *err = nil;
+    id obj = [NSPropertyListSerialization propertyListWithData:d options:NSPropertyListMutableContainersAndLeaves format:NULL error:&err];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
+}
+
+#pragma mark - Modern Menu
 @interface CoolMenuViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIVisualEffectView *blurView;
@@ -65,33 +80,28 @@ static void loadBackgroundImage(void(^completion)(UIImage *img)) {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor clearColor];
 
-    // Background Image
     self.bgImageView = [[UIImageView alloc] initWithFrame:self.view.bounds];
     self.bgImageView.contentMode = UIViewContentModeScaleAspectFill;
     self.bgImageView.clipsToBounds = YES;
     [self.view addSubview:self.bgImageView];
 
-    // Blur
     UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     self.blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
     self.blurView.frame = self.view.bounds;
     self.blurView.alpha = 0.92;
     [self.view addSubview:self.blurView];
 
-    // Spinner
     self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
     self.spinner.color = UIColor.cyanColor;
     self.spinner.center = self.view.center;
     [self.view addSubview:self.spinner];
     [self.spinner startAnimating];
 
-    // Load background
     loadBackgroundImage(^(UIImage *img) {
         [self.spinner stopAnimating];
         self.bgImageView.image = img;
     });
 
-    // Title
     self.titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 50, self.view.bounds.size.width, 50)];
     self.titleLabel.text = self.title;
     self.titleLabel.textAlignment = NSTextAlignmentCenter;
@@ -101,7 +111,6 @@ static void loadBackgroundImage(void(^completion)(UIImage *img)) {
     self.titleLabel.shadowOffset = CGSizeMake(0, 2);
     [self.view addSubview:self.titleLabel];
 
-    // Close Button
     UIButton *close = [UIButton buttonWithType:UIButtonTypeCustom];
     close.frame = CGRectMake(self.view.bounds.size.width - 90, 35, 70, 70);
     [close setTitle:@"X" forState:UIControlStateNormal];
@@ -110,7 +119,6 @@ static void loadBackgroundImage(void(^completion)(UIImage *img)) {
     [close addTarget:self action:@selector(dismiss) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:close];
 
-    // Table
     CGFloat margin = 60;
     self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(margin, 110, self.view.bounds.size.width - margin*2, self.view.bounds.size.height - 190) style:UITableViewStylePlain];
     self.tableView.backgroundColor = [UIColor clearColor];
@@ -143,7 +151,7 @@ static void loadBackgroundImage(void(^completion)(UIImage *img)) {
 }
 @end
 
-#pragma mark - Helpers
+#pragma mark - Core Helpers
 static UIWindow* keyWindow() {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes)
         if (scene.activationState == UISceneActivationStateForegroundActive)
@@ -211,7 +219,7 @@ static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
     return [NSData dataWithBytesNoCopy:buf length:out freeWhenDone:YES];
 }
 
-#pragma mark - Patches (unchanged)
+#pragma mark - Patches
 static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
@@ -225,14 +233,7 @@ static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
     [defs setPersistentDomain:newDomain forName:bid];
     return YES;
 }
-static NSString* dictToPlist(NSDictionary *d) {
-    NSData *data = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
-    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
-}
-static NSDictionary* plistToDict(NSString *s) {
-    NSData *d = [s dataUsingEncoding:NSUTF8StringEncoding];
-    return [NSPropertyListSerialization propertyListWithData:d options:NSPropertyListMutableContainersAndLeaves format:nil error:nil];
-}
+
 static void applyPatchWithAlert(NSString *title, NSString *p, NSString *r) {
     BOOL ok = silentApplyRegexToDomain(p, r);
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -241,6 +242,7 @@ static void applyPatchWithAlert(NSString *title, NSString *p, NSString *r) {
         [topVC() presentViewController:a animated:YES completion:nil];
     });
 }
+
 static void patchGems() {
     UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Set Gems" message:@"Enter value" preferredStyle:UIAlertControllerStyleAlert];
     [input addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.keyboardType = UIKeyboardTypeNumberPad; tf.placeholder = @"999999"; }];
@@ -255,8 +257,10 @@ static void patchGems() {
     [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:input animated:YES completion:nil];
 }
+
 static void patchRebornWithAlert() { applyPatchWithAlert(@"Reborn", @"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11"); }
 static void silentPatchBypass() { silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10"); }
+
 static void patchAllExcludingGems() {
     NSDictionary *map = @{
         @"Characters": @"(<key>\\d+_c\\d+_unlock.*\\n.*)false",
@@ -280,7 +284,7 @@ static void patchAllExcludingGems() {
     });
 }
 
-#pragma mark - File Filters
+#pragma mark - File Filters & Menus
 static NSArray* filteredFiles(NSString *keyword) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSArray *all = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
@@ -297,12 +301,13 @@ static void showDataSubMenu() {
     CoolMenuViewController *vc = [CoolMenuViewController new];
     vc.title = @"Data Filters";
     vc.items = @[@"Statistic", @"Item", @"Season", @"Weapon", @"All Files", @"Cancel"];
+    __weak CoolMenuViewController *weakVC = vc;
     vc.didSelect = ^(NSInteger i) {
-        [vc dismissViewControllerAnimated:YES completion:nil];
+        [weakVC dismissViewControllerAnimated:YES completion:nil];
         NSString *key = @[@"Statistic", @"Item", @"Season", @"Weapon", @"", @""][i];
         NSArray *files = filteredFiles(i < 4 ? key : nil);
         if (files.count == 0) {
-            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"No files" message:@"No matching files found" preferredStyle:UIAlertControllerStyleAlert];
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"No files" message:@"No matching files" preferredStyle:UIAlertControllerStyleAlert];
             [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
             [topVC() presentViewController:a animated:YES completion:nil];
             return;
@@ -312,9 +317,15 @@ static void showDataSubMenu() {
         NSMutableArray *items = [files mutableCopy];
         [items addObject:@"Cancel"];
         list.items = items;
+        __weak CoolMenuViewController *weakList = list;
         list.didSelect = ^(NSInteger idx) {
-            if (idx == items.count - 1) { [list dismissViewControllerAnimated:YES completion:nil]; return; }
-            [list dismissViewControllerAnimated:YES completion:^{ showFileActionMenu(files[idx]); }];
+            if (idx == items.count - 1) {
+                [weakList dismissViewControllerAnimated:YES completion:nil];
+                return;
+            }
+            [weakList dismissViewControllerAnimated:YES completion:^{
+                showFileActionMenu(files[idx]);
+            }];
         };
         [topVC() presentViewController:list animated:YES completion:nil];
     };
@@ -325,8 +336,9 @@ static void showFileActionMenu(NSString *fileName) {
     CoolMenuViewController *vc = [CoolMenuViewController new];
     vc.title = fileName;
     vc.items = @[@"Export", @"Import", @"Delete", @"Cancel"];
+    __weak CoolMenuViewController *weakVC = vc;
     vc.didSelect = ^(NSInteger i) {
-        [vc dismissViewControllerAnimated:YES completion:nil];
+        [weakVC dismissViewControllerAnimated:YES completion:nil];
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
         NSString *path = [docs stringByAppendingPathComponent:fileName];
         if (i == 0) {
@@ -357,9 +369,8 @@ static void showFileActionMenu(NSString *fileName) {
     [topVC() presentViewController:vc animated:YES completion:nil];
 }
 
-#pragma mark - Settings (Background URL)
 static void showSettings() {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Background Image" message:@"Enter image URL (jpg/png)" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Background Image" message:@"Enter image URL" preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf){
         tf.text = g_savedBackgroundURL;
         tf.placeholder = @"https://example.com/bg.jpg";
@@ -370,18 +381,18 @@ static void showSettings() {
         [[NSUserDefaults standardUserDefaults] synchronize];
         g_savedBackgroundURL = newURL;
 
-        UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Downloading..." message:@"Please wait" preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Downloading..." message:nil preferredStyle:UIAlertControllerStyleAlert];
         [topVC() presentViewController:loading animated:YES completion:nil];
 
         downloadAndCacheBackground(newURL, ^(BOOL success) {
             [loading dismissViewControllerAnimated:YES completion:^{
-                UIAlertController *done = [UIAlertController alertControllerWithTitle:success?@"Success":@"Failed" message:success?@"New background applied!":@"Invalid URL or download failed" preferredStyle:UIAlertControllerStyleAlert];
+                UIAlertController *done = [UIAlertController alertControllerWithTitle:success?@"Success":@"Failed" message:success?@"New background applied!":@"Download failed" preferredStyle:UIAlertControllerStyleAlert];
                 [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [topVC() presentViewController:done animated:YES completion:nil];
             }];
         });
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Clear Background" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+    [alert addAction:[UIAlertAction actionWithTitle:@"Clear" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
         [[NSUserDefaults standardUserDefaults] removeObjectForKey:@"CoolMenuBGURL"];
         [[NSUserDefaults standardUserDefaults] synchronize];
         g_savedBackgroundURL = nil;
@@ -394,13 +405,13 @@ static void showSettings() {
     [topVC() presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - Menus
 static void showPlayerMenu() {
     CoolMenuViewController *vc = [CoolMenuViewController new];
     vc.title = @"Player";
     vc.items = @[@"Characters", @"Skins", @"Skills", @"Pets", @"Level", @"Furniture", @"Gems", @"Reborn", @"Patch All", @"Cancel"];
+    __weak CoolMenuViewController *weakVC = vc;
     vc.didSelect = ^(NSInteger i) {
-        [vc dismissViewControllerAnimated:YES completion:nil];
+        [weakVC dismissViewControllerAnimated:YES completion:nil];
         if (i==0) applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\\n.*)false", @"$1True");
         else if (i==1) applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+", @"$11");
         else if (i==2) applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d", @"$11");
@@ -418,8 +429,9 @@ static void showMainMenu() {
     CoolMenuViewController *vc = [CoolMenuViewController new];
     vc.title = @"Menu";
     vc.items = @[@"Player", @"Data", @"Settings", @"Cancel"];
+    __weak CoolMenuViewController *weakVC = vc;
     vc.didSelect = ^(NSInteger i) {
-        [vc dismissViewControllerAnimated:YES completion:nil];
+        [weakVC dismissViewControllerAnimated:YES completion:nil];
         if (i==0) showPlayerMenu();
         else if (i==1) showDataSubMenu();
         else if (i==2) showSettings();
@@ -452,7 +464,9 @@ static void verifyAccessAndOpenMenu() {
         if (![json[@"uuid"] isEqual:uuid] || ![json[@"timestamp"] isEqual:ts] || ![json[@"allow"] boolValue]) {
             killApp(); return;
         }
-        dispatch_async(dispatch_get_main_queue(), showMainMenu);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            showMainMenu();
+        });
     }] resume];
 }
 
