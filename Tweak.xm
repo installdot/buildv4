@@ -615,13 +615,12 @@ static void showMainMenu() {
 static CGPoint g_startPoint;
 static CGPoint g_btnStart;
 static UIButton *floatingButton = nil;
+
 %ctor {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // === AUTO DELETE ALL .new FILES ONCE WHEN DYLIB LOADS ===
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        NSArray *allFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
         // === AUTO APPLY BYPASS ONCE WHEN DYLIB LOADS ===
         silentPatchBypass();
+
         // === CREATE FLOATING BUTTON ===
         UIWindow *win = firstWindow();
         floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -632,11 +631,15 @@ static UIButton *floatingButton = nil;
         [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
         floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
         [floatingButton addTarget:UIApplication.sharedApplication action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
+
+        // draggable
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:UIApplication.sharedApplication action:@selector(handlePan:)];
         [floatingButton addGestureRecognizer:pan];
+
         [win addSubview:floatingButton];
     });
 }
+
 %hook UIApplication
 
 %new
