@@ -224,72 +224,97 @@ static NSString *g_lastTimestamp = nil;
 @end
 
 @implementation InputOverlay
+
 - (instancetype)initWithTitle:(NSString*)title placeholder:(NSString*)ph okTitle:(NSString*)okTitle {
     self = [super initWithFrame:UIScreen.mainScreen.bounds];
     if (!self) return nil;
-    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+    self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
 
-    CGFloat w = 260, h = 150;
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
-    _panel.center = self.center;
-    _panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(20, 0, CGRectGetWidth(self.bounds)-40, 160)];
+    _panel.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+    _panel.backgroundColor = [UIColor colorWithWhite:0.06 alpha:1.0];
     _panel.layer.cornerRadius = 12;
     [self addSubview:_panel];
 
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, w-24, 22)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, _panel.bounds.size.width-24, 22)];
     label.text = title;
     label.textColor = [UIColor whiteColor];
-    label.font = [UIFont boldSystemFontOfSize:16];
+    label.font = [UIFont boldSystemFontOfSize:17];
     [_panel addSubview:label];
 
-    _textField = [[UITextField alloc] initWithFrame:CGRectMake(12, 44, w-24, 38)];
+    _textField = [[UITextField alloc] initWithFrame:CGRectMake(12, 44, _panel.bounds.size.width-24, 40)];
     _textField.placeholder = ph;
     _textField.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
     _textField.textColor = [UIColor whiteColor];
     _textField.layer.cornerRadius = 8;
     _textField.keyboardAppearance = UIKeyboardAppearanceDark;
-    _textField.delegate = self;
+    _textField.keyboardType = UIKeyboardTypeNumberPad;
+    _textField.returnKeyType = UIReturnKeyDone;
+    _textField.delegate = (id<UITextFieldDelegate>)self;
     [_panel addSubview:_textField];
 
-    _okButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    _okButton.frame = CGRectMake(12, 92, w-24, 38);
-    _okButton.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
-    [_okButton setTitle:okTitle forState:UIControlStateNormal];
-    [_okButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    _okButton.layer.cornerRadius = 8;
-    [_okButton addTarget:self action:@selector(okTapped) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:_okButton];
+    UIButton *ok = [UIButton buttonWithType:UIButtonTypeSystem];
+    ok.frame = CGRectMake(12, 96, (_panel.bounds.size.width-36)/2, 40);
+    ok.layer.cornerRadius = 8;
+    ok.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+    [ok setTitle:okTitle forState:UIControlStateNormal];
+    [ok setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [ok addTarget:self action:@selector(okTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:ok];
 
+    UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
+    cancel.frame = CGRectMake(CGRectGetMaxX(ok.frame)+12, 96, (_panel.bounds.size.width-36)/2, 40);
+    cancel.layer.cornerRadius = 8;
+    cancel.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0];
+    [cancel setTitle:@"Cancel" forState:UIControlStateNormal];
+    [cancel setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [cancel addTarget:self action:@selector(cancelTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:cancel];
+
+    // Listen to keyboard
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillShow:) name:UIKeyboardWillShowNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(keyboardWillHide:) name:UIKeyboardWillHideNotification object:nil];
 
     return self;
 }
-- (void)keyboardWillShow:(NSNotification*)note {
-    CGRect kbFrame = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
-    CGFloat moveY = kbFrame.size.height + 10;
-    CGRect f = _okButton.frame;
-    f.origin.y = _panel.bounds.size.height - moveY;
-    _okButton.frame = f;
+
+- (void)keyboardWillShow:(NSNotification*)notif {
+    CGRect kbFrame = [notif.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGFloat offset = kbFrame.size.height / 2;
+    [UIView animateWithDuration:0.25 animations:^{
+        self.panel.center = CGPointMake(self.panel.center.x, CGRectGetMidY(self.bounds) - offset);
+    }];
 }
-- (void)keyboardWillHide:(NSNotification*)note {
-    CGRect f = _okButton.frame;
-    f.origin.y = 92;
-    _okButton.frame = f;
+
+- (void)keyboardWillHide:(NSNotification*)notif {
+    [UIView animateWithDuration:0.25 animations:^{
+        self.panel.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+    }];
 }
+
+- (void)okTapped {
+    [self.textField resignFirstResponder]; // hide keyboard
+    if (self.onOK) self.onOK(self.textField.text ?: @"");
+    [self removeFromSuperview];
+}
+
+- (void)cancelTapped {
+    [self.textField resignFirstResponder];
+    [self removeFromSuperview];
+}
+
+// allow hitting enter/return to trigger OK
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
     [self okTapped];
     return YES;
 }
-- (void)okTapped {
-    if (self.onOK) self.onOK(_textField.text ?: @"");
-    [self removeFromSuperview];
-}
+
 - (void)show {
     UIWindow *w = firstWindow();
     [w addSubview:self];
-    [_textField becomeFirstResponder];
+    [self.textField becomeFirstResponder];
 }
+
 @end
 
 #pragma mark - Data menu filtering
@@ -496,6 +521,9 @@ static void showFileActionMenu(NSString *fileName) {
     MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:fileName message:@"Action" actions:ovActs];
     [menu show];
 }
+
+static void showFilesForType(NSString *type);
+
 static void showDataMenu() {
     NSArray *types = @[@"Item", @"Season", @"Statistic", @"Weapon"];
     NSMutableArray *typeActions = [NSMutableArray array];
