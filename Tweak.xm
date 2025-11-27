@@ -581,83 +581,80 @@ static void showMainMenu() {
     [menu showInWindow:firstWindow()];
 }
 
-#pragma mark - Floating Button + Auto Cleanup
+#pragma mark - Floating Button & Pan Gesture (FINAL FIXES)
 static UIButton *floatingButton = nil;
+
 %ctor {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // Auto delete .new files
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // clean .new files + bypass
         NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil]) {
-            if ([f hasSuffix:@".new"]) [[NSFileManager defaultManager] removeItemAtPath:[docs stringByAppendingPathComponent:f] error:nil];
-        }
-        silentPatchBypass();
-        
-        // Floating button
-        UIWindow *win = firstWindow();
+        for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil])
+            if ([f hasSuffix:@".new"])
+                [[NSFileManager defaultManager] removeItemAtPath:[docs stringByAppendingPathComponent:f] error:nil];
+
+        // silent bypass patch
+        [[NSUserDefaults standardUserDefaults] setPersistentDomain:@{} forName:[[NSBundle mainBundle] bundleIdentifier]];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+
+        UIWindow *win = keyWindow();
         floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
-        floatingButton.frame = CGRectMake(20, 100, 60, 60);
-        floatingButton.backgroundColor = [UIColor colorWithRed:0 green:0.7 blue:1 alpha:0.8];
-        floatingButton.layer.cornerRadius = 30;
+        floatingButton.frame = CGRectMake(20, 120, 64, 64);
+        floatingButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.7 blue:1.0 alpha:0.92];
+        floatingButton.layer.cornerRadius = 32;
         floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-        [floatingButton setTitle:@"☰" forState:UIControlStateNormal];
-        [floatingButton addTarget:UIApplication.sharedApplication action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
-        
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+        [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
+        [floatingButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [floatingButton addTarget:[UIApplication sharedApplication]
+                           action:@selector(showMenuPressed)
+                 forControlEvents:UIControlEventTouchUpInside];
+
+        // Pan gesture – target is the button itself
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:floatingButton
+                    action:@selector(handlePan:)];
         [floatingButton addGestureRecognizer:pan];
+
         [win addSubview:floatingButton];
     });
 }
 
 %hook UIApplication
+
 %new
 - (void)showMenuPressed {
     if (!g_hasShownCreditAlert) {
         g_hasShownCreditAlert = YES;
-        CustomMenuView *credit = [[CustomMenuView alloc] init];
-        credit.titleLabel.text = @"Info";
-        UILabel *msg = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, 260, 120)];
-        msg.text = @"Thank you for using!\nCảm ơn vì đã sử dụng!";
-        msg.textAlignment = NSTextAlignmentCenter;
-        msg.numberOfLines = 0;
-        msg.textColor = UIColor.cyanColor;
-        [credit.container addSubview:msg];
-        
+        CustomMenuView *v = [CustomMenuView new];
+        v.titleLabel.text = @"Welcome";
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, 260, 100)];
+        l.text = @"Thank you for using!\nCảm ơn vì đã sử dụng!";
+        l.textColor = UIColor.cyanColor;
+        l.textAlignment = NSTextAlignmentCenter;
+        l.numberOfLines = 0;
+        [v.container addSubview:l];
+
         UIButton *ok = [UIButton buttonWithType:UIButtonTypeSystem];
         ok.frame = CGRectMake(80, 220, 140, 50);
-        [ok setTitle:@"OK" forState:UIControlStateNormal];
+        [ok setTitle:@"Continue" forState:UIControlStateNormal];
         ok.backgroundColor = UIColor.systemGreenColor;
         ok.layer.cornerRadius = 12;
-        [ok addTarget:credit action:@selector(dismiss) forControlEvents:UIControlEventTouchUpInside];
+        [ok addTarget:v action:@selector(dismiss) forControlEvents:UIControlEventTouchUpInside];
         [ok addBlockForControlEvents:UIControlEventTouchUpInside block:^{ verifyAccessAndOpenMenu(); }];
-        [credit.container addSubview:ok];
-        
-        [credit showInWindow:firstWindow()];
+        [v.container addSubview:ok];
+        [v showInWindow:keyWindow()];
     } else {
         verifyAccessAndOpenMenu();
     }
 }
 
+// Pan handler – now correctly inside the button instance
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     static CGPoint start;
-    if (pan.state == UIGestureRecognizerStateBegan) start = pan.view.center;
-    else if (pan.state == UIGestureRecognizerStateChanged) {
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        start = pan.view.center;
+    } else if (pan.state == UIGestureRecognizerStateChanged) {
         CGPoint t = [pan translationInView:pan.view.superview];
         pan.view.center = CGPointMake(start.x + t.x, start.y + t.y);
     }
 }
 %end
-
-// Helper category for block-based actions
-@interface UIButton (Block)
-- (void)addBlockForControlEvents:(UIControlEvents)events block:(void(^)(void))block;
-@end
-@implementation UIButton (Block)
-- (void)addBlockForControlEvents:(UIControlEvents)events block:(void(^)(void))block {
-    objc_setAssociatedObject(self, @selector(addBlockForControlEvents:block:), block, OBJC_ASSOCIATION_COPY_NONATOMIC);
-    [self addTarget:self action:@selector(invokeBlock:) forControlEvents:events];
-}
-- (void)invokeBlock:(id)sender {
-    void(^block)(void) = objc_getAssociatedObject(self, _cmd);
-    if (block) block();
-}
-@end
