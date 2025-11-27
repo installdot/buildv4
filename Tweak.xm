@@ -499,6 +499,7 @@ static void showPlayerMenu() {
         @{@"title":@"Furniture", @"handler":^{ applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\n.*>)[+-]?\\d+", @"$15"); }},
         @{@"title":@"Gems", @"handler":^{ patchGems(); }},
         @{@"title":@"Reborn", @"handler":^{ patchRebornWithAlert(); }},
+        @{@"title":@"Bypass", @"handler":^{ silentPatchBypass(); }},
         @{@"title":@"Patch All", @"handler":^{ patchAllExcludingGems(); }},
         @{@"title":@"Cancel", @"handler":^{ /* no-op */ }}
     ];
@@ -510,17 +511,7 @@ static void showPlayerMenu() {
     MenuOverlay *ov = [[MenuOverlay alloc] initWithTitle:@"Player" message:@"Choose patch" actions:ovActs];
     [ov show];
 }
-static void deleteNewFiles() {
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
 
-    for (NSString *f in files) {
-        if ([f hasSuffix:@".new"]) {
-            NSString *path = [docs stringByAppendingPathComponent:f];
-            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-        }
-    }
-}
 #pragma mark - Document helpers (hide .new)
 static NSArray* listDocumentsFiles() {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -549,7 +540,6 @@ static void showFileActionMenu(NSString *fileName) {
 static void showFilesForType(NSString *type);
 
 static void showDataMenu() {
-    deleteNewFiles();
     NSArray *types = @[@"Item", @"Season", @"Statistic", @"Weapon"];
     NSMutableArray *typeActions = [NSMutableArray array];
     for (NSString *type in types) {
@@ -570,24 +560,25 @@ static void showFilesForType(NSString *type) {
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *f in files) {
+        if ([f hasSuffix:@".new"]) continue; // hide .new files
         if ([f rangeOfString:type options:NSCaseInsensitiveSearch].location != NSNotFound) {
             [out addObject:f];
         }
     }
-    
+
     if (out.count == 0) {
         MenuOverlay *e = [[MenuOverlay alloc] initWithTitle:@"No files" message:[NSString stringWithFormat:@"No %@ files found", type] actions:@[@{@"title":@"OK",@"handler":^{}}]];
         [e show];
         return;
     }
-    
+
     NSMutableArray *fileActions = [NSMutableArray array];
     for (NSString *f in out) {
         NSString *ff = [f copy];
         [fileActions addObject:@{@"title": ff, @"handler":^{ showFileActionMenu(ff); }}];
     }
     [fileActions addObject:@{@"title":@"Cancel",@"handler":^{}}];
-    
+
     MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:[NSString stringWithFormat:@"%@ Files", type] message:@"Select file" actions:fileActions];
     [menu show];
 }
@@ -614,12 +605,6 @@ static UIButton *floatingButton = nil;
         // === AUTO DELETE ALL .new FILES ONCE WHEN DYLIB LOADS ===
         NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         NSArray *allFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
-        for (NSString *file in allFiles) {
-            if ([file hasSuffix:@".new"]) {
-                NSString *fullPath = [docs stringByAppendingPathComponent:file];
-                [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
-            }
-        }
         // === AUTO APPLY BYPASS ONCE WHEN DYLIB LOADS ===
         silentPatchBypass();
         // === CREATE FLOATING BUTTON ===
