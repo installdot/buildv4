@@ -453,7 +453,7 @@ static void patchGems() {
         silentApplyRegexToDomain(re2, [NSString stringWithFormat:@"$1%ld", (long)v]);
 
         // Dismiss input automatically
-        [input dismiss];
+        [input removeFromSuperview];
     };
 
     [input show];
