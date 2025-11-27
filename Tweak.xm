@@ -568,13 +568,6 @@ static void showFileActionMenu(NSString *fileName) {
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
-    NSMutableArray *ovActs = [NSMutableArray array];
-    for (NSDictionary *a in actions) [ovActs addObject:@{@"title": a[@"title"], @"handler": a[@"handler"]}];
-
-    MenuOverlay *menu = [[MenuOverlay alloc] initWithTitle:fileName message:@"Action" actions:ovActs];
-    [menu show];
-}
-
 
 static void showFilesForType(NSString *type);
 
