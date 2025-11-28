@@ -120,6 +120,7 @@ static void killApp() {
 }
 #pragma mark - Save lastTimestamp for verification
 static NSString *g_lastTimestamp = nil;
+
 #pragma mark - Forward declarations for menus
 static void showMainMenu();
 static void showPlayerMenu();
@@ -205,7 +206,10 @@ static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
     return YES;
 }
 
-#pragma mark - Forward declare LMUIHelper interface
+#pragma mark - LMUIHelper interface
+
+static char kFileNameAssocKey;
+
 @interface LMUIHelper : NSObject
 @property (nonatomic, strong) UIView *currentOverlay;
 @property (nonatomic, strong) UIImage *backgroundImage;
@@ -233,7 +237,6 @@ static void applyPatchWithAlert(NSString *title, NSString *pattern, NSString *re
 }
 #pragma mark - Gems/Reborn/Bypass/PatchAll
 static void patchGems() {
-    // open custom UI for gem input
     [[LMUIHelper shared] showGemsInput];
 }
 static void patchRebornWithAlert() {
@@ -295,8 +298,6 @@ static void showMainMenu() {
 
 #pragma mark - LMUIHelper implementation
 
-static char kFileNameAssocKey;
-
 @implementation LMUIHelper
 
 + (instancetype)shared {
@@ -335,14 +336,16 @@ static char kFileNameAssocKey;
     UIView *overlay = [[UIView alloc] initWithFrame:win.bounds];
     overlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
     
-    CGFloat w = MIN(win.bounds.size.width - 40.0, 320.0);
-    CGFloat h = MIN(win.bounds.size.height - 160.0, 420.0);
+    CGFloat w = MIN(win.bounds.size.width - 40.0, 340.0);
+    CGFloat h = MIN(win.bounds.size.height - 140.0, 440.0);
     CGFloat x = (win.bounds.size.width - w) / 2.0;
     CGFloat y = (win.bounds.size.height - h) / 2.0;
     
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
-    panel.layer.cornerRadius = 16.0;
+    panel.layer.cornerRadius = 10.0;
     panel.clipsToBounds = YES;
+    panel.layer.borderWidth = 1.0;
+    panel.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.15] CGColor];
     
     if (self.backgroundImage) {
         UIImageView *bgView = [[UIImageView alloc] initWithFrame:panel.bounds];
@@ -353,30 +356,29 @@ static char kFileNameAssocKey;
         
         UIView *blurOverlay = [[UIView alloc] initWithFrame:panel.bounds];
         blurOverlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        blurOverlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+        blurOverlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
         [panel addSubview:blurOverlay];
     } else {
-        panel.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.20 alpha:0.95];
+        panel.backgroundColor = [UIColor colorWithRed:0.10 green:0.11 blue:0.16 alpha:0.98];
     }
     
-    // header bar
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 46)];
-    header.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 42)];
+    header.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
     [panel addSubview:header];
     
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 8, w - 80, 30)];
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 7, w - 80, 28)];
     titleLabel.text = title;
     titleLabel.textColor = [UIColor whiteColor];
-    titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    titleLabel.font = [UIFont boldSystemFontOfSize:17];
     [header addSubview:titleLabel];
     
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.frame = CGRectMake(w - 42, 8, 30, 30);
+    closeBtn.frame = CGRectMake(w - 40, 7, 28, 28);
     [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
-    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
     [closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    closeBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.30];
-    closeBtn.layer.cornerRadius = 8.0;
+    closeBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
+    closeBtn.layer.cornerRadius = 6.0;
     [closeBtn addTarget:self action:@selector(closeOverlay) forControlEvents:UIControlEventTouchUpInside];
     [header addSubview:closeBtn];
     
@@ -388,7 +390,18 @@ static char kFileNameAssocKey;
 }
 
 - (CGFloat)buttonsStartYInPanel:(UIView *)panel {
-    return 60.0;
+    return 52.0;
+}
+
+- (UIScrollView *)createScrollAreaInPanel:(UIView *)panel {
+    CGFloat top = 48.0;
+    CGFloat bottom = 10.0;
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, top, panel.bounds.size.width, panel.bounds.size.height - top - bottom)];
+    scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    scroll.alwaysBounceVertical = YES;
+    scroll.showsVerticalScrollIndicator = YES;
+    [panel addSubview:scroll];
+    return scroll;
 }
 
 - (UIButton *)addMenuButtonWithTitle:(NSString *)title
@@ -396,19 +409,22 @@ static char kFileNameAssocKey;
                                   y:(CGFloat *)yPtr
                               action:(SEL)sel {
     CGFloat y = *yPtr;
-    CGFloat margin = 18.0;
+    CGFloat margin = 14.0;
     CGFloat w = panel.bounds.size.width - margin * 2.0;
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.frame = CGRectMake(margin, y, w, 40);
-    btn.backgroundColor = [[UIColor colorWithRed:0.25 green:0.45 blue:0.85 alpha:1.0] colorWithAlphaComponent:0.9];
-    btn.layer.cornerRadius = 10.0;
+    UIColor *baseColor = [UIColor colorWithRed:0.25 green:0.55 blue:0.95 alpha:1.0];
+    btn.backgroundColor = [baseColor colorWithAlphaComponent:0.90];
+    btn.layer.cornerRadius = 8.0;
+    btn.layer.borderWidth = 1.0;
+    btn.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.12] CGColor];
     [btn setTitle:title forState:UIControlStateNormal];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [btn addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:btn];
     
-    *yPtr = y + 48.0;
+    *yPtr = y + 46.0;
     return btn;
 }
 
@@ -425,7 +441,7 @@ static char kFileNameAssocKey;
     UIView *panel = [self createOverlayWithTitle:title];
     if (!panel) return;
     CGFloat margin = 18.0;
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 70, panel.bounds.size.width - margin*2, panel.bounds.size.height - 90)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 60, panel.bounds.size.width - margin*2, panel.bounds.size.height - 80)];
     label.text = message;
     label.textColor = [UIColor whiteColor];
     label.font = [UIFont systemFontOfSize:15];
@@ -434,16 +450,19 @@ static char kFileNameAssocKey;
     [panel addSubview:label];
 }
 
-#pragma mark - Main menu
+#pragma mark - Main menu (scrollable)
 
 - (void)showMainMenu {
     UIView *panel = [self createOverlayWithTitle:@"Menu"];
     if (!panel) return;
-    CGFloat y = [self buttonsStartYInPanel:panel];
+    UIScrollView *scroll = [self createScrollAreaInPanel:panel];
+    CGFloat y = 12.0;
     
-    [self addMenuButtonWithTitle:@"Player" toView:panel y:&y action:@selector(mainPlayerTapped)];
-    [self addMenuButtonWithTitle:@"Data" toView:panel y:&y action:@selector(mainDataTapped)];
-    [self addMenuButtonWithTitle:@"Settings" toView:panel y:&y action:@selector(mainSettingsTapped)];
+    [self addMenuButtonWithTitle:@"Player"  toView:scroll y:&y action:@selector(mainPlayerTapped)];
+    [self addMenuButtonWithTitle:@"Data"    toView:scroll y:&y action:@selector(mainDataTapped)];
+    [self addMenuButtonWithTitle:@"Settings" toView:scroll y:&y action:@selector(mainSettingsTapped)];
+    
+    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
 }
 
 - (void)mainPlayerTapped {
@@ -459,22 +478,25 @@ static char kFileNameAssocKey;
     [self showSettings];
 }
 
-#pragma mark - Player menu
+#pragma mark - Player menu (scrollable)
 
 - (void)showPlayerMenu {
     UIView *panel = [self createOverlayWithTitle:@"Player"];
     if (!panel) return;
-    CGFloat y = [self buttonsStartYInPanel:panel];
+    UIScrollView *scroll = [self createScrollAreaInPanel:panel];
+    CGFloat y = 12.0;
     
-    [self addMenuButtonWithTitle:@"Characters" toView:panel y:&y action:@selector(playerCharactersTapped)];
-    [self addMenuButtonWithTitle:@"Skins" toView:panel y:&y action:@selector(playerSkinsTapped)];
-    [self addMenuButtonWithTitle:@"Skills" toView:panel y:&y action:@selector(playerSkillsTapped)];
-    [self addMenuButtonWithTitle:@"Pets" toView:panel y:&y action:@selector(playerPetsTapped)];
-    [self addMenuButtonWithTitle:@"Level" toView:panel y:&y action:@selector(playerLevelTapped)];
-    [self addMenuButtonWithTitle:@"Furniture" toView:panel y:&y action:@selector(playerFurnitureTapped)];
-    [self addMenuButtonWithTitle:@"Gems" toView:panel y:&y action:@selector(playerGemsTapped)];
-    [self addMenuButtonWithTitle:@"Reborn" toView:panel y:&y action:@selector(playerRebornTapped)];
-    [self addMenuButtonWithTitle:@"Patch All" toView:panel y:&y action:@selector(playerPatchAllTapped)];
+    [self addMenuButtonWithTitle:@"Characters" toView:scroll y:&y action:@selector(playerCharactersTapped)];
+    [self addMenuButtonWithTitle:@"Skins"      toView:scroll y:&y action:@selector(playerSkinsTapped)];
+    [self addMenuButtonWithTitle:@"Skills"     toView:scroll y:&y action:@selector(playerSkillsTapped)];
+    [self addMenuButtonWithTitle:@"Pets"       toView:scroll y:&y action:@selector(playerPetsTapped)];
+    [self addMenuButtonWithTitle:@"Level"      toView:scroll y:&y action:@selector(playerLevelTapped)];
+    [self addMenuButtonWithTitle:@"Furniture"  toView:scroll y:&y action:@selector(playerFurnitureTapped)];
+    [self addMenuButtonWithTitle:@"Gems"       toView:scroll y:&y action:@selector(playerGemsTapped)];
+    [self addMenuButtonWithTitle:@"Reborn"     toView:scroll y:&y action:@selector(playerRebornTapped)];
+    [self addMenuButtonWithTitle:@"Patch All"  toView:scroll y:&y action:@selector(playerPatchAllTapped)];
+    
+    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
 }
 
 - (void)playerCharactersTapped {
@@ -514,20 +536,28 @@ static char kFileNameAssocKey;
     patchAllExcludingGems();
 }
 
-#pragma mark - Gems input
+#pragma mark - Hide keyboard helper
+
+- (void)hideKeyboardTapped {
+    if (self.currentOverlay) {
+        [self.currentOverlay endEditing:YES];
+    }
+}
+
+#pragma mark - Gems input (with hide keyboard button)
 
 - (void)showGemsInput {
     UIView *panel = [self createOverlayWithTitle:@"Set Gems"];
     if (!panel) return;
     
     CGFloat margin = 18.0;
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 70, panel.bounds.size.width - margin*2, 20)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 56, panel.bounds.size.width - margin*2, 20)];
     label.text = @"Enter value";
     label.textColor = [UIColor whiteColor];
     label.font = [UIFont systemFontOfSize:14];
     [panel addSubview:label];
     
-    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(margin, 100, panel.bounds.size.width - margin*2, 34)];
+    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(margin, 80, panel.bounds.size.width - margin*2, 32)];
     tf.borderStyle = UITextBorderStyleRoundedRect;
     tf.keyboardType = UIKeyboardTypeNumberPad;
     tf.placeholder = @"0";
@@ -535,8 +565,18 @@ static char kFileNameAssocKey;
     tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     [panel addSubview:tf];
     
+    UIButton *hideKB = [UIButton buttonWithType:UIButtonTypeSystem];
+    hideKB.frame = CGRectMake(margin, 118, panel.bounds.size.width - margin*2, 28);
+    [hideKB setTitle:@"Hide Keyboard" forState:UIControlStateNormal];
+    [hideKB setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    hideKB.titleLabel.font = [UIFont systemFontOfSize:13];
+    hideKB.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
+    hideKB.layer.cornerRadius = 6.0;
+    [hideKB addTarget:self action:@selector(hideKeyboardTapped) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:hideKB];
+    
     UIButton *okBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    okBtn.frame = CGRectMake(margin, 150, panel.bounds.size.width - margin*2, 40);
+    okBtn.frame = CGRectMake(margin, 154, panel.bounds.size.width - margin*2, 40);
     [okBtn setTitle:@"OK" forState:UIControlStateNormal];
     [okBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     okBtn.backgroundColor = [UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95];
@@ -570,14 +610,16 @@ static char kFileNameAssocKey;
 - (void)showDataCategoryMenu {
     UIView *panel = [self createOverlayWithTitle:@"Data"];
     if (!panel) return;
-    CGFloat y = [self buttonsStartYInPanel:panel];
+    UIScrollView *scroll = [self createScrollAreaInPanel:panel];
+    CGFloat y = 12.0;
     
-    [self addMenuButtonWithTitle:@"Statistic" toView:panel y:&y action:@selector(dataStatisticTapped)];
-    [self addMenuButtonWithTitle:@"Item" toView:panel y:&y action:@selector(dataItemTapped)];
-    [self addMenuButtonWithTitle:@"Season" toView:panel y:&y action:@selector(dataSeasonTapped)];
-    [self addMenuButtonWithTitle:@"Weapon" toView:panel y:&y action:@selector(dataWeaponTapped)];
+    [self addMenuButtonWithTitle:@"Statistic" toView:scroll y:&y action:@selector(dataStatisticTapped)];
+    [self addMenuButtonWithTitle:@"Item"      toView:scroll y:&y action:@selector(dataItemTapped)];
+    [self addMenuButtonWithTitle:@"Season"    toView:scroll y:&y action:@selector(dataSeasonTapped)];
+    [self addMenuButtonWithTitle:@"Weapon"    toView:scroll y:&y action:@selector(dataWeaponTapped)];
+    [self addMenuButtonWithTitle:@"All Files" toView:scroll y:&y action:@selector(dataAllTapped)];
     
-    [self addMenuButtonWithTitle:@"All Files" toView:panel y:&y action:@selector(dataAllTapped)];
+    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
 }
 
 - (void)dataStatisticTapped {
@@ -626,26 +668,27 @@ static char kFileNameAssocKey;
     UIView *panel = [self createOverlayWithTitle:(category.length ? category : @"Documents")];
     if (!panel) return;
     
-    CGFloat margin = 12.0;
-    CGFloat top = 54.0;
-    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(margin, top, panel.bounds.size.width - margin*2, panel.bounds.size.height - top - 12.0)];
+    CGFloat margin = 10.0;
+    CGFloat top = 50.0;
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(margin, top, panel.bounds.size.width - margin*2, panel.bounds.size.height - top - 10.0)];
     scroll.alwaysBounceVertical = YES;
+    scroll.showsVerticalScrollIndicator = YES;
     [panel addSubview:scroll];
     
     CGFloat y = 0.0;
     for (NSString *name in filtered) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(0, y, scroll.bounds.size.width, 38);
+        btn.frame = CGRectMake(0, y, scroll.bounds.size.width, 36);
         btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
         [btn setTitle:name forState:UIControlStateNormal];
         [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:14];
+        btn.titleLabel.font = [UIFont systemFontOfSize:13];
         btn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
         btn.contentEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 10);
         objc_setAssociatedObject(btn, &kFileNameAssocKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [btn addTarget:self action:@selector(fileButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
         [scroll addSubview:btn];
-        y += 40.0;
+        y += 38.0;
     }
     scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y);
 }
@@ -661,11 +704,14 @@ static char kFileNameAssocKey;
 - (void)showFileActionMenuWithName:(NSString *)fileName {
     UIView *panel = [self createOverlayWithTitle:fileName];
     if (!panel) return;
-    CGFloat y = [self buttonsStartYInPanel:panel];
+    UIScrollView *scroll = [self createScrollAreaInPanel:panel];
+    CGFloat y = 12.0;
     
-    [self addMenuButtonWithTitle:@"Export" toView:panel y:&y action:@selector(fileExportTapped)];
-    [self addMenuButtonWithTitle:@"Import" toView:panel y:&y action:@selector(fileImportTapped)];
-    [self addMenuButtonWithTitle:@"Delete" toView:panel y:&y action:@selector(fileDeleteTapped)];
+    [self addMenuButtonWithTitle:@"Export" toView:scroll y:&y action:@selector(fileExportTapped)];
+    [self addMenuButtonWithTitle:@"Import" toView:scroll y:&y action:@selector(fileImportTapped)];
+    [self addMenuButtonWithTitle:@"Delete" toView:scroll y:&y action:@selector(fileDeleteTapped)];
+    
+    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
 }
 
 - (NSString *)currentFilePath {
@@ -694,21 +740,31 @@ static char kFileNameAssocKey;
     if (!panel) return;
     
     CGFloat margin = 12.0;
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 60, panel.bounds.size.width - margin*2, 18)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 54, panel.bounds.size.width - margin*2, 18)];
     label.text = @"Paste text to import";
     label.textColor = [UIColor whiteColor];
     label.font = [UIFont systemFontOfSize:14];
     [panel addSubview:label];
     
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(margin, 82, panel.bounds.size.width - margin*2, panel.bounds.size.height - 82 - 60)];
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(margin, 76, panel.bounds.size.width - margin*2, panel.bounds.size.height - 76 - 80)];
     tv.backgroundColor = [UIColor colorWithWhite:1 alpha:0.9];
     tv.font = [UIFont systemFontOfSize:13];
     tv.textColor = [UIColor blackColor];
     tv.layer.cornerRadius = 8.0;
     [panel addSubview:tv];
     
+    UIButton *hideKB = [UIButton buttonWithType:UIButtonTypeSystem];
+    hideKB.frame = CGRectMake(margin, CGRectGetMaxY(tv.frame) + 4, panel.bounds.size.width - margin*2, 26);
+    [hideKB setTitle:@"Hide Keyboard" forState:UIControlStateNormal];
+    [hideKB setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    hideKB.titleLabel.font = [UIFont systemFontOfSize:13];
+    hideKB.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
+    hideKB.layer.cornerRadius = 6.0;
+    [hideKB addTarget:self action:@selector(hideKeyboardTapped) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:hideKB];
+    
     UIButton *okBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    okBtn.frame = CGRectMake(margin, CGRectGetMaxY(tv.frame) + 6, panel.bounds.size.width - margin*2, 34);
+    okBtn.frame = CGRectMake(margin, CGRectGetMaxY(hideKB.frame) + 4, panel.bounds.size.width - margin*2, 34);
     okBtn.backgroundColor = [UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95];
     okBtn.layer.cornerRadius = 10.0;
     [okBtn setTitle:@"OK" forState:UIControlStateNormal];
@@ -757,20 +813,20 @@ static char kFileNameAssocKey;
     }
 }
 
-#pragma mark - Settings / Background
+#pragma mark - Settings / Background (with hide keyboard button)
 
 - (void)showSettings {
     UIView *panel = [self createOverlayWithTitle:@"Settings"];
     if (!panel) return;
     
     CGFloat margin = 16.0;
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 64, panel.bounds.size.width - margin*2, 18)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 54, panel.bounds.size.width - margin*2, 18)];
     label.text = @"Background image URL";
     label.textColor = [UIColor whiteColor];
     label.font = [UIFont systemFontOfSize:13];
     [panel addSubview:label];
     
-    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(margin, 86, panel.bounds.size.width - margin*2, 32)];
+    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(margin, 76, panel.bounds.size.width - margin*2, 32)];
     tf.borderStyle = UITextBorderStyleRoundedRect;
     tf.backgroundColor = [UIColor colorWithWhite:1 alpha:0.9];
     tf.keyboardType = UIKeyboardTypeURL;
@@ -780,8 +836,18 @@ static char kFileNameAssocKey;
     if (savedURL.length) tf.text = savedURL;
     [panel addSubview:tf];
     
+    UIButton *hideKB = [UIButton buttonWithType:UIButtonTypeSystem];
+    hideKB.frame = CGRectMake(margin, 112, panel.bounds.size.width - margin*2, 26);
+    [hideKB setTitle:@"Hide Keyboard" forState:UIControlStateNormal];
+    [hideKB setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    hideKB.titleLabel.font = [UIFont systemFontOfSize:13];
+    hideKB.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
+    hideKB.layer.cornerRadius = 6.0;
+    [hideKB addTarget:self action:@selector(hideKeyboardTapped) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:hideKB];
+    
     UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    saveBtn.frame = CGRectMake(margin, 128, panel.bounds.size.width - margin*2, 38);
+    saveBtn.frame = CGRectMake(margin, 144, panel.bounds.size.width - margin*2, 38);
     saveBtn.backgroundColor = [UIColor colorWithRed:0.25 green:0.55 blue:0.95 alpha:0.95];
     saveBtn.layer.cornerRadius = 10.0;
     [saveBtn setTitle:@"Save Background" forState:UIControlStateNormal];
@@ -791,7 +857,7 @@ static char kFileNameAssocKey;
     [panel addSubview:saveBtn];
     
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    clearBtn.frame = CGRectMake(margin, 174, panel.bounds.size.width - margin*2, 34);
+    clearBtn.frame = CGRectMake(margin, 188, panel.bounds.size.width - margin*2, 34);
     clearBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.4];
     clearBtn.layer.cornerRadius = 10.0;
     [clearBtn setTitle:@"Clear Background" forState:UIControlStateNormal];
@@ -877,7 +943,7 @@ static char kFileNameAssocKey;
     NSString *message = @"Thank you for using!\n"
                         @"Cảm ơn vì đã sử dụng!\n";
     CGFloat margin = 18.0;
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 70, panel.bounds.size.width - margin*2, panel.bounds.size.height - 120)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 60, panel.bounds.size.width - margin*2, panel.bounds.size.height - 110)];
     label.text = message;
     label.textColor = [UIColor whiteColor];
     label.font = [UIFont systemFontOfSize:15];
@@ -886,7 +952,7 @@ static char kFileNameAssocKey;
     [panel addSubview:label];
     
     UIButton *okBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    okBtn.frame = CGRectMake(margin, CGRectGetMaxY(label.frame) + 10, panel.bounds.size.width - margin*2, 38);
+    okBtn.frame = CGRectMake(margin, CGRectGetMaxY(label.frame) + 6, panel.bounds.size.width - margin*2, 36);
     okBtn.backgroundColor = [UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95];
     okBtn.layer.cornerRadius = 10.0;
     [okBtn setTitle:@"OK" forState:UIControlStateNormal];
@@ -942,15 +1008,16 @@ static UIButton *floatingButton = nil;
 %hook UIApplication
 %new
 - (void)showMenuPressed {
+    // Auto bypass every time menu is opened
+    silentPatchBypass();
+    
     if (!g_hasShownCreditAlert) {
         g_hasShownCreditAlert = YES;
         [[LMUIHelper shared] showCreditWithCompletion:^{
             verifyAccessAndOpenMenu();
-            silentPatchBypass();
         }];
     } else {
         verifyAccessAndOpenMenu();
-        silentPatchBypass();
     }
 }
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
