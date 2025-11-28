@@ -20,7 +20,7 @@ static NSString * const kBGImageFileName = @"lm_menu_bg.png";
 static NSData* dataFromHex(NSString *hex) {
     NSMutableData *d = [NSMutableData data];
     for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
-        NSRange r = NSMakeMakeRange(i, 2);
+        NSRange r = NSMakeRange(i, 2);
         NSString *byteStr = [hex substringWithRange:r];
         unsigned int byte = 0;
         [[NSScanner scannerWithString:byteStr] scanHexInt:&byte];
@@ -882,7 +882,7 @@ static void showMainMenu() {
 - (void)renderActiveTab {
     if (!self.contentView) return;
     [self.contentView.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-    [self.updateSidebarSelection];
+    [self updateSidebarSelection];
     
     if ([self.activeTab isEqualToString:@"Main"]) {
         [self renderMainTab];
