@@ -164,6 +164,7 @@ static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
 static char kFileNameAssocKey;
 static char kSidebarTabKey;
 static char kFullIDFieldKey;
+static char kImportTextViewKey;
 
 @interface LMUIHelper : NSObject <UITextFieldDelegate>
 @property (nonatomic, strong) UIView *currentOverlay;
@@ -971,7 +972,6 @@ static void showMainMenu() {
     applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+", @"$15");
 }
 - (void)playerGemsTapped {
-    [self closeOverlay];
     [self showGemsInput];
 }
 - (void)playerRebornTapped {
@@ -1280,12 +1280,53 @@ static void showMainMenu() {
     label.font = [UIFont systemFontOfSize:14];
     [panel addSubview:label];
     
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(margin, 76, panel.bounds.size.width - margin*2, panel.bounds.size.height - 76 - 80)];
+    // Base Y for text view (we may shift it down if we show clipboard bar)
+    CGFloat tvBaseY = 76.0;
+    CGFloat tvHeight = panel.bounds.size.height - tvBaseY - 80.0;
+    
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(margin, tvBaseY, panel.bounds.size.width - margin*2, tvHeight)];
     tv.backgroundColor = [UIColor colorWithWhite:1 alpha:0.9];
     tv.font = [UIFont systemFontOfSize:13];
     tv.textColor = [UIColor blackColor];
     tv.layer.cornerRadius = 8.0;
     [panel addSubview:tv];
+    
+    // If clipboard has text, show a "Paste from clipboard?" bar and auto-fill on accept
+    NSString *clip = UIPasteboard.generalPasteboard.string;
+    if (clip.length > 0) {
+        CGFloat barHeight = 26.0;
+        
+        // Move text view down a bit and reduce its height
+        CGRect tvFrame = tv.frame;
+        tvFrame.origin.y += barHeight + 4.0;
+        tvFrame.size.height -= (barHeight + 4.0);
+        tv.frame = tvFrame;
+        
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(margin, tvBaseY, panel.bounds.size.width - margin*2, barHeight)];
+        bar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
+        bar.layer.cornerRadius = 6.0;
+        
+        UILabel *barLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, bar.bounds.size.width - 90, barHeight - 8)];
+        barLabel.text = @"Paste from clipboard?";
+        barLabel.textColor = [UIColor whiteColor];
+        barLabel.font = [UIFont systemFontOfSize:12];
+        [bar addSubview:barLabel];
+        
+        UIButton *pasteBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        pasteBtn.frame = CGRectMake(bar.bounds.size.width - 70, 3, 62, barHeight - 6);
+        [pasteBtn setTitle:@"Paste" forState:UIControlStateNormal];
+        [pasteBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        pasteBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        pasteBtn.backgroundColor = [[UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95] colorWithAlphaComponent:0.9];
+        pasteBtn.layer.cornerRadius = 6.0;
+        
+        // Link the text view to this button so we can fill it when tapped
+        objc_setAssociatedObject(pasteBtn, &kImportTextViewKey, tv, OBJC_ASSOCIATION_ASSIGN);
+        [pasteBtn addTarget:self action:@selector(pasteClipboardIntoImportTextView:) forControlEvents:UIControlEventTouchUpInside];
+        
+        [bar addSubview:pasteBtn];
+        [panel addSubview:bar];
+    }
     
     UIButton *hideKB = [UIButton buttonWithType:UIButtonTypeSystem];
     hideKB.frame = CGRectMake(margin, CGRectGetMaxY(tv.frame) + 4, panel.bounds.size.width - margin*2, 26);
@@ -1340,6 +1381,16 @@ static void showMainMenu() {
     } else {
         [self showSimpleMessageWithTitle:@"Import Failed" message:err.localizedDescription ?: @"Unknown error"];
     }
+}
+
+- (void)pasteClipboardIntoImportTextView:(UIButton *)sender {
+    NSString *clip = UIPasteboard.generalPasteboard.string;
+    if (clip.length == 0) return;
+    
+    UITextView *tv = objc_getAssociatedObject(sender, &kImportTextViewKey);
+    if (!tv) return;
+    
+    tv.text = clip;
 }
 
 - (void)fileDeleteTapped {
