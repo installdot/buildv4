@@ -16,7 +16,7 @@ static NSString * const kBGImageFileName = @"lm_menu_bg.png";
 
 #pragma mark - Account manager constants
 
-static NSString * const kSdkStateKey        = @"SdkStateCache#1";
+static NSString * const kSdkStateKey         = @"SdkStateCache#1";
 static NSString * const kLMCurrentAccountKey = @"LM_Account_Current";
 static NSString * const kLMAccountsListKey   = @"LM_Account_List";
 
@@ -382,7 +382,29 @@ static void showMainMenu() {
 @implementation LMUIHelper
 
 + (instancetype)shared {
-    static LMUIHelper *shared;
+    static LMUIHelper *shared = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        shared = [[LMUIHelper alloc] init];
+        [shared loadBackgroundImageFromDisk];
+        
+        // Load stored accounts once
+        NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+        
+        id cur = [defs objectForKey:kLMCurrentAccountKey];
+        if ([cur isKindOfClass:[NSDictionary class]]) {
+            shared.currentAccount = (NSDictionary *)cur;
+        }
+        
+        id arr = [defs objectForKey:kLMAccountsListKey];
+        if ([arr isKindOfClass:[NSArray class]]) {
+            shared.savedAccounts = [arr mutableCopy];
+        } else {
+            shared.savedAccounts = [NSMutableArray array];
+        }
+    });
+    return shared;
+}
 
 dispatch_once(&onceToken, ^{
     shared = [[LMUIHelper alloc] init];
