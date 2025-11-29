@@ -1948,8 +1948,6 @@ dispatch_once(&onceToken, ^{
     if (completion) completion();
 }
 
-@end
-
 #pragma mark - Floating draggable button + AUTO CLEANUP & BYPASS
 static CGPoint g_startPoint;
 static CGPoint g_btnStart;
