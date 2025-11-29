@@ -1988,7 +1988,6 @@ static UIButton *floatingButton = nil;
 
 %hook UIApplication
 %new
-
 - (void)showMenuPressed {
     // Auto bypass every time menu is opened
     silentPatchBypass();
@@ -2018,4 +2017,6 @@ static UIButton *floatingButton = nil;
         btn.center = CGPointMake(g_btnStart.x + dx, g_btnStart.y + dy);
     }
 }
+
 %end
+// Add <- to go back, change Full to Accounts, remove full related stuff
