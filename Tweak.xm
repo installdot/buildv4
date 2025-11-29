@@ -76,6 +76,7 @@ static NSDictionary *extractAccountFromSdkStateJSON(NSString *json) {
 @class LMUIHelper;
 
 #pragma mark - Helpers
+
 static NSData* dataFromHex(NSString *hex) {
     NSMutableData *d = [NSMutableData data];
     for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
@@ -94,7 +95,9 @@ static NSString* base64Encode(NSData *d) {
 static NSData* base64Decode(NSString *s) {
     return [[NSData alloc] initWithBase64EncodedString:s options:0];
 }
+
 #pragma mark - AES-256-CBC encrypt/decrypt + HMAC-SHA256
+
 static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
     uint8_t ivBytes[16];
     arc4random_buf(ivBytes, sizeof(ivBytes));
@@ -121,6 +124,7 @@ static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
     [box appendData:hmacData];
     return box;
 }
+
 static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
     if (box.length < 16 + 32) return nil;
     NSData *iv = [box subdataWithRange:NSMakeRange(0,16)];
@@ -145,7 +149,9 @@ static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
     NSData *plain = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
     return plain;
 }
+
 #pragma mark - App UUID persistence
+
 static NSString* appUUID() {
     NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/uuid.txt"];
     NSError *err = nil;
@@ -156,7 +162,9 @@ static NSString* appUUID() {
     }
     return uuid;
 }
+
 #pragma mark - UI helpers
+
 static UIWindow* firstWindow() {
     for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if ([scene isKindOfClass:[UIWindowScene class]]) {
@@ -168,26 +176,31 @@ static UIWindow* firstWindow() {
     }
     return UIApplication.sharedApplication.windows.firstObject;
 }
+
 static UIViewController* topVC() {
     UIWindow *win = firstWindow();
     UIViewController *root = win.rootViewController;
     while (root.presentedViewController) root = root.presentedViewController;
     return root;
 }
+
 #pragma mark - Force close
+
 static void killApp() {
     exit(0);
 }
+
 #pragma mark - Save lastTimestamp for verification
+
 static NSString *g_lastTimestamp = nil;
 
 #pragma mark - Forward declarations for menus
+
 static void showMainMenu();
 static void showPlayerMenu();
-static void showDataMenu();
-static void showFileActionMenu(NSString *fileName);
 
 #pragma mark - Regex patch helpers
+
 static NSString* dictToPlist(NSDictionary *d) {
     NSError *err = nil;
     NSData *dat = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
@@ -220,11 +233,7 @@ static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
 
 #pragma mark - LMUIHelper interface
 
-static char kFileNameAssocKey;
 static char kSidebarTabKey;
-static char kFullIDFieldKey;
-static char kImportTextViewKey;
-static char kAccountIndexKey;
 static char kTokenLabelKey;
 static char kTokenVisibleKey;
 
@@ -239,25 +248,26 @@ static char kTokenVisibleKey;
 @property (nonatomic, strong) UIView *loadingOverlay;
 @property (nonatomic, strong) NSDictionary *currentAccount;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *savedAccounts;
+@property (nonatomic, assign) BOOL shouldExitOnBypassOk;
+
 + (instancetype)shared;
 - (void)showMainMenu;
 - (void)showPlayerMenu;
-- (void)showDataCategoryMenu;
-- (void)showFileActionMenuWithName:(NSString *)fileName;
+- (void)showSettings;
 - (void)showGemsInput;
 - (void)showSimpleMessageWithTitle:(NSString *)title message:(NSString *)message;
 - (void)showCreditWithCompletion:(void(^)(void))completion;
-- (void)showDataFilesForCategory:(NSString *)category;
-- (void)showSettings;
 - (void)backgroundUpdatedSuccess;
 - (void)backgroundUpdatedFailed:(NSString *)msg;
 - (void)hideKeyboardTapped;
 - (void)showTab:(NSString *)tabName;
 - (void)showLoadingWithMessage:(NSString *)msg;
 - (void)hideLoading;
+- (void)refreshAccountsFromSdkState;
 @end
 
 #pragma mark - Network: verify then open menu
+
 static void verifyAccessAndOpenMenu() {
     NSData *key = dataFromHex(kHexKey);
     NSData *hmacKey = dataFromHex(kHexHmacKey);
@@ -314,21 +324,23 @@ static void verifyAccessAndOpenMenu() {
 }
 
 #pragma mark - Patch helpers with new UI feedback
+
 static void applyPatchWithAlert(NSString *title, NSString *pattern, NSString *replacement) {
     BOOL ok = silentApplyRegexToDomain(pattern, replacement);
     [[LMUIHelper shared] showSimpleMessageWithTitle:(ok ? @"Success" : @"Failed")
                                             message:[NSString stringWithFormat:@"%@ %@", title, ok ? @"applied" : @"failed"]];
 }
-#pragma mark - Gems/Reborn/Bypass/PatchAll
+
+#pragma mark - Gems/Reborn/PatchAll
+
 static void patchGems() {
     [[LMUIHelper shared] showGemsInput];
 }
+
 static void patchRebornWithAlert() {
     applyPatchWithAlert(@"Reborn", @"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
 }
-static void silentPatchBypass() {
-    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
-}
+
 static void patchAllExcludingGems() {
     NSDictionary *map = @{
         @"Characters": @"(<key>\\d+_c\\d+_unlock.*\\n.*)false",
@@ -348,30 +360,13 @@ static void patchAllExcludingGems() {
         silentApplyRegexToDomain(pattern, rep);
     }
     silentApplyRegexToDomain(@"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
-    silentPatchBypass();
     [[LMUIHelper shared] showSimpleMessageWithTitle:@"Patch All" message:@"Applied (excluding Gems)"];
-}
-#pragma mark - Document helpers (hide .new)
-static NSArray* listDocumentsFiles() {
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSString *f in files) {
-        if (![f hasSuffix:@".new"]) [out addObject:f];
-    }
-    return out;
 }
 
 #pragma mark - Forwarding menus to LMUIHelper
 
 static void showPlayerMenu() {
     [[LMUIHelper shared] showPlayerMenu];
-}
-static void showDataMenu() {
-    [[LMUIHelper shared] showDataCategoryMenu];
-}
-static void showFileActionMenu(NSString *fileName) {
-    [[LMUIHelper shared] showFileActionMenuWithName:fileName];
 }
 static void showMainMenu() {
     [[LMUIHelper shared] showMainMenu];
@@ -405,7 +400,6 @@ static void showMainMenu() {
     });
     return shared;
 }
-
 
 - (NSString *)bgImagePath {
     NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
@@ -778,7 +772,12 @@ static void showMainMenu() {
     box.layer.borderWidth = 1.0;
     box.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.18] CGColor];
     
-    UIActivityIndicatorView *spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
+    UIActivityIndicatorView *spin;
+    if (@available(iOS 13.0, *)) {
+        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    } else {
+        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
+    }
     spin.center = CGPointMake(bw/2.0, bh/2.0 - 10);
     [spin startAnimating];
     [box addSubview:spin];
@@ -906,12 +905,11 @@ static void showMainMenu() {
         
         CGFloat yTabs = 8.0;
         NSArray *tabs = @[
-            @{@"title": @"Main",   @"key": @"Main"},
-            @{@"title": @"Player", @"key": @"Player"},
-            @{@"title": @"Data",   @"key": @"Data"},
-            @{@"title": @"Accounts",   @"key": @"Accounts"},
+            @{@"title": @"Main",     @"key": @"Main"},
+            @{@"title": @"Player",   @"key": @"Player"},
+            @{@"title": @"Accounts", @"key": @"Accounts"},
             @{@"title": @"Settings", @"key": @"Settings"},
-            @{@"title": @"Credit", @"key": @"Credit"}
+            @{@"title": @"Credit",   @"key": @"Credit"}
         ];
         for (NSDictionary *info in tabs) {
             UIButton *tb = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1085,9 +1083,8 @@ static void showMainMenu() {
     CGFloat y = 12.0;
     
     [self addMenuButtonWithTitle:@"Player"   toView:scroll y:&y action:@selector(mainPlayerTapped)];
-    [self addMenuButtonWithTitle:@"Data"     toView:scroll y:&y action:@selector(mainDataTapped)];
+    [self addMenuButtonWithTitle:@"Accounts" toView:scroll y:&y action:@selector(mainAccountsTapped)];
     [self addMenuButtonWithTitle:@"Settings" toView:scroll y:&y action:@selector(mainSettingsTapped)];
-    [self addMenuButtonWithTitle:@"Accounts"     toView:scroll y:&y action:@selector(mainAccountsTapped)];
     [self addMenuButtonWithTitle:@"Credit"   toView:scroll y:&y action:@selector(mainCreditTapped)];
     
     scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
@@ -1106,83 +1103,10 @@ static void showMainMenu() {
     [self addMenuButtonWithTitle:@"Furniture"  toView:scroll y:&y action:@selector(playerFurnitureTapped)];
     [self addMenuButtonWithTitle:@"Gems"       toView:scroll y:&y action:@selector(playerGemsTapped)];
     [self addMenuButtonWithTitle:@"Reborn"     toView:scroll y:&y action:@selector(playerRebornTapped)];
+    [self addMenuButtonWithTitle:@"Bypass"     toView:scroll y:&y action:@selector(playerBypassTapped)];
     [self addMenuButtonWithTitle:@"Patch All"  toView:scroll y:&y action:@selector(playerPatchAllTapped)];
     
     scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
-}
-
-- (void)renderDataRootTab {
-    UIScrollView *scroll = [self createScrollInContent];
-    if (!scroll) return;
-    CGFloat y = 12.0;
-    
-    [self addMenuButtonWithTitle:@"Statistic" toView:scroll y:&y action:@selector(dataStatisticTapped)];
-    [self addMenuButtonWithTitle:@"Item"      toView:scroll y:&y action:@selector(dataItemTapped)];
-    [self addMenuButtonWithTitle:@"Season"    toView:scroll y:&y action:@selector(dataSeasonTapped)];
-    [self addMenuButtonWithTitle:@"Weapon"    toView:scroll y:&y action:@selector(dataWeaponTapped)];
-    [self addMenuButtonWithTitle:@"All Files" toView:scroll y:&y action:@selector(dataAllTapped)];
-    
-    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
-}
-
-- (void)renderFullTab {
-    if (!self.contentView) return;
-    [self.contentView.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-    UIView *panel = self.contentView;
-    
-    CGFloat margin = 14.0;
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(margin, 16, panel.bounds.size.width - margin*2, 18)];
-    lbl.text = @"Full import by ID";
-    lbl.textColor = [UIColor whiteColor];
-    lbl.font = [UIFont boldSystemFontOfSize:14];
-    [panel addSubview:lbl];
-    
-    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(margin, 42, panel.bounds.size.width - margin*2, 36)];
-    box.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.3];
-    box.layer.cornerRadius = 8.0;
-    box.layer.borderWidth = 1.0;
-    box.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.18] CGColor];
-    [panel addSubview:box];
-    
-    UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(8, 3, box.bounds.size.width - 76, 30)];
-    tf.placeholder = @"ID";
-    tf.textColor = [UIColor whiteColor];
-    tf.backgroundColor = [UIColor clearColor];
-    tf.borderStyle = UITextBorderStyleNone;
-    tf.keyboardType = UIKeyboardTypeDefault;
-    tf.returnKeyType = UIReturnKeyDone;
-    tf.delegate = [LMUIHelper shared];
-    tf.autocorrectionType = UITextAutocorrectionTypeNo;
-    tf.spellCheckingType = UITextSpellCheckingTypeNo;
-    [box addSubview:tf];
-    
-    UIButton *importBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    importBtn.frame = CGRectMake(box.bounds.size.width - 68, 3, 60, 30);
-    importBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    CAGradientLayer *grad = [CAGradientLayer layer];
-    grad.frame = importBtn.bounds;
-    grad.colors = @[
-        (id)[UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95].CGColor,
-        (id)[UIColor colorWithRed:0.15 green:0.80 blue:0.55 alpha:0.95].CGColor
-    ];
-    grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint   = CGPointMake(1, 0.5);
-    [importBtn.layer insertSublayer:grad atIndex:0];
-    importBtn.layer.cornerRadius = 7.0;
-    importBtn.layer.masksToBounds = YES;
-    [importBtn setTitle:@"Import" forState:UIControlStateNormal];
-    [importBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    importBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    objc_setAssociatedObject(importBtn, &kFullIDFieldKey, tf, OBJC_ASSOCIATION_ASSIGN);
-    [importBtn addTarget:self action:@selector(fullImportButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [box addSubview:importBtn];
-    
-    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(margin, 84, panel.bounds.size.width - margin*2, 34)];
-    hint.text = @"Will fetch item/stat/season/weapon files for this ID,\nreplace and auto Patch All.";
-    hint.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-    hint.font = [UIFont systemFontOfSize:11];
-    hint.numberOfLines = 2;
-    [panel addSubview:hint];
 }
 
 - (void)renderSettingsTabContentInCurrentContentView {
@@ -1262,7 +1186,6 @@ static void showMainMenu() {
     circle.layer.cornerRadius = 40.0;
     circle.layer.masksToBounds = YES;
     
-    // simple "Discord-like" face
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, 38, 56, 16)];
     bar.backgroundColor = [UIColor whiteColor];
     bar.layer.cornerRadius = 8.0;
@@ -1298,14 +1221,12 @@ static void showMainMenu() {
 - (void)renderActiveTab {
     if (!self.contentView) return;
     [self.contentView.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-    [self updateSidebarSelection];
+    [self.updateSidebarSelection];
     
     if ([self.activeTab isEqualToString:@"Main"]) {
         [self renderMainTab];
     } else if ([self.activeTab isEqualToString:@"Player"]) {
         [self renderPlayerTab];
-    } else if ([self.activeTab isEqualToString:@"Data"]) {
-        [self renderDataRootTab];
     } else if ([self.activeTab isEqualToString:@"Accounts"]) {
         [self renderAccountsTab];
     } else if ([self.activeTab isEqualToString:@"Settings"]) {
@@ -1347,17 +1268,13 @@ static void showMainMenu() {
 - (void)showPlayerMenu {
     [self showTab:@"Player"];
 }
-- (void)showDataCategoryMenu {
-    [self showTab:@"Data"];
-}
 - (void)showSettings {
     [self showTab:@"Settings"];
 }
 
 - (void)mainPlayerTapped { [self showTab:@"Player"]; }
-- (void)mainDataTapped   { [self showTab:@"Data"]; }
-- (void)mainSettingsTapped { [self showTab:@"Settings"]; }
 - (void)mainAccountsTapped { [self showTab:@"Accounts"]; }
+- (void)mainSettingsTapped { [self showTab:@"Settings"]; }
 - (void)mainCreditTapped { [self showTab:@"Credit"]; }
 
 #pragma mark - Player actions
@@ -1396,6 +1313,60 @@ static void showMainMenu() {
 - (void)playerPatchAllTapped {
     [self closeOverlay];
     patchAllExcludingGems();
+}
+
+// NEW: Bypass button logic
+- (void)playerBypassTapped {
+    BOOL ok = silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
+    [self closeOverlay];
+    if (ok) {
+        [self showBypassSuccessAndExit];
+    } else {
+        [self showSimpleMessageWithTitle:@"Bypass" message:@"Bypass failed"];
+    }
+}
+
+#pragma mark - Bypass success UI
+
+- (void)showBypassSuccessAndExit {
+    self.shouldExitOnBypassOk = YES;
+    UIView *panel = [self createOverlayWithTitle:@"Bypass" withTabs:NO];
+    if (!panel) return;
+    
+    CGFloat margin = 18.0;
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 60, panel.bounds.size.width - margin*2, panel.bounds.size.height - 110)];
+    label.text = @"Bypass applied successfully.\nTap OK to close the game.";
+    label.textColor = [UIColor whiteColor];
+    label.font = [UIFont systemFontOfSize:15];
+    label.numberOfLines = 0;
+    label.textAlignment = NSTextAlignmentCenter;
+    [panel addSubview:label];
+    
+    UIButton *okBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    okBtn.frame = CGRectMake(margin, CGRectGetMaxY(label.frame) - 10, panel.bounds.size.width - margin*2, 36);
+    CAGradientLayer *grad = [CAGradientLayer layer];
+    grad.frame = okBtn.bounds;
+    grad.colors = @[
+        (id)[UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95].CGColor,
+        (id)[UIColor colorWithRed:0.15 green:0.80 blue:0.50 alpha:0.95].CGColor
+    ];
+    grad.startPoint = CGPointMake(0, 0.5);
+    grad.endPoint   = CGPointMake(1, 0.5);
+    [okBtn.layer insertSublayer:grad atIndex:0];
+    okBtn.layer.cornerRadius = 10.0;
+    okBtn.layer.masksToBounds = YES;
+    [okBtn setTitle:@"OK" forState:UIControlStateNormal];
+    [okBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    okBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [okBtn addTarget:self action:@selector(bypassOkTapped) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:okBtn];
+}
+
+- (void)bypassOkTapped {
+    [self closeOverlay];
+    if (self.shouldExitOnBypassOk) {
+        killApp();
+    }
 }
 
 #pragma mark - Gems input (no tabs)
@@ -1470,355 +1441,6 @@ static void showMainMenu() {
     
     [self closeOverlay];
     [self showSimpleMessageWithTitle:@"Gems Updated" message:[NSString stringWithFormat:@"%ld", (long)v]];
-}
-
-#pragma mark - Full import
-
-- (void)fullImportButtonTapped:(UIButton *)sender {
-    UITextField *tf = objc_getAssociatedObject(sender, &kFullIDFieldKey);
-    NSString *idStr = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (idStr.length == 0) {
-        [self showSimpleMessageWithTitle:@"Full Import" message:@"ID is empty"];
-        return;
-    }
-    [self runFullImportWithID:idStr];
-}
-
-- (void)runFullImportWithID:(NSString *)idStr {
-
-    [self showLoadingWithMessage:@"Importing..."];
-
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-
-    // Templates stay the same, we will replace the "id" part with the actual idStr
-    NSArray *configs = @[
-        @{@"template": @"item_data_id_.data",           @"param": @"item"},
-        @{@"template": @"statistic_id_.data",           @"param": @"stat"},
-        @{@"template": @"season_data_id_.data",         @"param": @"season"},
-        @{@"template": @"weapon_evolution_id_.data",    @"param": @"weapon"}
-    ];
-
-    __block NSString *errorMessage = nil;
-    dispatch_group_t group = dispatch_group_create();
-
-    for (NSDictionary *cfg in configs) {
-        NSString *templ = cfg[@"template"];
-        NSString *param = cfg[@"param"];
-
-        // Convert "item_data_id_.data" -> "item_data_{idStr}_.data"
-        NSString *fileName = templ;
-        NSRange r = [templ rangeOfString:@"id"];
-        if (r.location != NSNotFound) {
-            NSString *prefix = [templ substringToIndex:r.location];
-            NSString *suffix = [templ substringFromIndex:r.location + r.length];
-            fileName = [NSString stringWithFormat:@"%@%@%@", prefix, idStr, suffix];
-        }
-
-        NSString *path = [docs stringByAppendingPathComponent:fileName];
-
-        NSString *urlStr = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/datafile.php?data=%@", param];
-        NSURL *url = [NSURL URLWithString:urlStr];
-        if (!url) continue;
-
-        dispatch_group_enter(group);
-        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *error) {
-            if (error || !data) {
-                @synchronized (self) {
-                    if (!errorMessage) {
-                        errorMessage = [NSString stringWithFormat:@"Network error (%@)", param];
-                    }
-                }
-                dispatch_group_leave(group);
-                return;
-            }
-
-            NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-            if (!str) {
-                @synchronized (self) {
-                    if (!errorMessage) errorMessage = @"Invalid server response";
-                }
-                dispatch_group_leave(group);
-                return;
-            }
-
-            NSError *werr = nil;
-            BOOL ok = [str writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&werr];
-            if (!ok) {
-                @synchronized (self) {
-                    if (!errorMessage) errorMessage = [NSString stringWithFormat:@"Write failed (%@)", param];
-                }
-            }
-
-            dispatch_group_leave(group);
-        }];
-        [task resume];
-    }
-
-    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
-        [self hideLoading];
-        if (errorMessage) {
-            [self showSimpleMessageWithTitle:@"Full Import" message:errorMessage];
-        } else {
-            // After all 4 files done, run Patch All (excluding gems)
-            patchAllExcludingGems();
-        }
-    });
-}
-
-#pragma mark - Data menus / files
-
-- (void)dataStatisticTapped { [self showDataFilesForCategory:@"Statistic"]; }
-- (void)dataItemTapped      { [self showDataFilesForCategory:@"Item"]; }
-- (void)dataSeasonTapped    { [self showDataFilesForCategory:@"Season"]; }
-- (void)dataWeaponTapped    { [self showDataFilesForCategory:@"Weapon"]; }
-- (void)dataAllTapped       { [self showDataFilesForCategory:nil]; }
-
-- (void)showDataFilesForCategory:(NSString *)category {
-    if (!self.contentView) {
-        [self showTab:@"Data"];
-    }
-    if (!self.contentView) return;
-    
-    NSArray *files = listDocumentsFiles();
-    NSMutableArray *filtered = [NSMutableArray array];
-    if (category.length == 0) {
-        [filtered addObjectsFromArray:files];
-    } else {
-        for (NSString *f in files) {
-            if ([f rangeOfString:category options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                [filtered addObject:f];
-            }
-        }
-    }
-    
-    [self.contentView.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-    
-    if (filtered.count == 0) {
-        NSString *msg = category.length ? [NSString stringWithFormat:@"No files match '%@'", category] : @"Documents is empty";
-        UILabel *label = [[UILabel alloc] initWithFrame:self.contentView.bounds];
-        label.text = msg;
-        label.textColor = [UIColor whiteColor];
-        label.font = [UIFont systemFontOfSize:14];
-        label.textAlignment = NSTextAlignmentCenter;
-        label.numberOfLines = 0;
-        [self.contentView addSubview:label];
-        return;
-    }
-    
-    CGFloat margin = 10.0;
-    CGFloat top = 8.0;
-    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(margin, top, self.contentView.bounds.size.width - margin*2, self.contentView.bounds.size.height - top - 8.0)];
-    scroll.alwaysBounceVertical = YES;
-    scroll.showsVerticalScrollIndicator = YES;
-    [self.contentView addSubview:scroll];
-    
-    CGFloat y = 0.0;
-    for (NSString *name in filtered) {
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(0, y, scroll.bounds.size.width, 36);
-        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-        [btn setTitle:name forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:13];
-        btn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-        btn.contentEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 10);
-        objc_setAssociatedObject(btn, &kFileNameAssocKey, name, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [btn addTarget:self action:@selector(fileButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-        [scroll addSubview:btn];
-        y += 38.0;
-    }
-    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y);
-}
-
-- (void)fileButtonTapped:(UIButton *)sender {
-    NSString *name = objc_getAssociatedObject(sender, &kFileNameAssocKey);
-    if (!name) return;
-    self.currentFileName = name;
-    [self showFileActionMenuWithName:name];
-}
-
-- (void)showFileActionMenuWithName:(NSString *)fileName {
-    if (!self.contentView) {
-        self.activeTab = @"Data";
-        [self createOverlayWithTitle:@"Menu - Data"];
-    }
-    if (!self.contentView) return;
-    
-    [self.contentView.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-    
-    UIScrollView *scroll = [self createScrollInContent];
-    if (!scroll) return;
-    CGFloat y = 12.0;
-    
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 18)];
-    titleLabel.text = fileName;
-    titleLabel.textColor = [UIColor whiteColor];
-    titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [scroll addSubview:titleLabel];
-    y += 26.0;
-    
-    [self addMenuButtonWithTitle:@"Export" toView:scroll y:&y action:@selector(fileExportTapped)];
-    [self addMenuButtonWithTitle:@"Import" toView:scroll y:&y action:@selector(fileImportTapped)];
-    [self addMenuButtonWithTitle:@"Delete" toView:scroll y:&y action:@selector(fileDeleteTapped)];
-    
-    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
-}
-
-- (NSString *)currentFilePath {
-    if (!self.currentFileName) return nil;
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    return [docs stringByAppendingPathComponent:self.currentFileName];
-}
-
-- (void)fileExportTapped {
-    NSString *path = [self currentFilePath];
-    if (!path) return;
-    NSError *err = nil;
-    NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
-    [self closeOverlay];
-    if (txt) {
-        UIPasteboard.generalPasteboard.string = txt;
-        [self showSimpleMessageWithTitle:@"Exported" message:@"Copied to clipboard"];
-    } else {
-        [self showSimpleMessageWithTitle:@"Error" message:err.localizedDescription ?: @"Unknown error"];
-    }
-}
-
-- (void)fileImportTapped {
-    UIView *panel = [self createOverlayWithTitle:@"Import" withTabs:NO];
-    if (!panel) return;
-    
-    CGFloat margin = 12.0;
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 54, panel.bounds.size.width - margin*2, 18)];
-    label.text = @"Paste text to import";
-    label.textColor = [UIColor whiteColor];
-    label.font = [UIFont systemFontOfSize:14];
-    [panel addSubview:label];
-    
-    // Base Y for text view (we may shift it down if we show clipboard bar)
-    CGFloat tvBaseY = 76.0;
-    CGFloat tvHeight = panel.bounds.size.height - tvBaseY - 80.0;
-    
-    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(margin, tvBaseY, panel.bounds.size.width - margin*2, tvHeight)];
-    tv.backgroundColor = [UIColor colorWithWhite:1 alpha:0.9];
-    tv.font = [UIFont systemFontOfSize:13];
-    tv.textColor = [UIColor blackColor];
-    tv.layer.cornerRadius = 8.0;
-    [panel addSubview:tv];
-    
-    // If clipboard has text, show a "Paste from clipboard?" bar and auto-fill on accept
-    NSString *clip = UIPasteboard.generalPasteboard.string;
-    if (clip.length > 0) {
-        CGFloat barHeight = 26.0;
-        
-        // Move text view down a bit and reduce its height
-        CGRect tvFrame = tv.frame;
-        tvFrame.origin.y += barHeight + 4.0;
-        tvFrame.size.height -= (barHeight + 4.0);
-        tv.frame = tvFrame;
-        
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(margin, tvBaseY, panel.bounds.size.width - margin*2, barHeight)];
-        bar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.45];
-        bar.layer.cornerRadius = 6.0;
-        
-        UILabel *barLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, bar.bounds.size.width - 90, barHeight - 8)];
-        barLabel.text = @"Paste from clipboard?";
-        barLabel.textColor = [UIColor whiteColor];
-        barLabel.font = [UIFont systemFontOfSize:12];
-        [bar addSubview:barLabel];
-        
-        UIButton *pasteBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        pasteBtn.frame = CGRectMake(bar.bounds.size.width - 70, 3, 62, barHeight - 6);
-        [pasteBtn setTitle:@"Paste" forState:UIControlStateNormal];
-        [pasteBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        pasteBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-        pasteBtn.backgroundColor = [[UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95] colorWithAlphaComponent:0.9];
-        pasteBtn.layer.cornerRadius = 6.0;
-        
-        // Link the text view to this button so we can fill it when tapped
-        objc_setAssociatedObject(pasteBtn, &kImportTextViewKey, tv, OBJC_ASSOCIATION_ASSIGN);
-        [pasteBtn addTarget:self action:@selector(pasteClipboardIntoImportTextView:) forControlEvents:UIControlEventTouchUpInside];
-        
-        [bar addSubview:pasteBtn];
-        [panel addSubview:bar];
-    }
-    
-    UIButton *hideKB = [UIButton buttonWithType:UIButtonTypeSystem];
-    hideKB.frame = CGRectMake(margin, CGRectGetMaxY(tv.frame) + 4, panel.bounds.size.width - margin*2, 26);
-    [hideKB setTitle:@"Hide Keyboard" forState:UIControlStateNormal];
-    [hideKB setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    hideKB.titleLabel.font = [UIFont systemFontOfSize:13];
-    hideKB.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-    hideKB.layer.cornerRadius = 6.0;
-    [hideKB addTarget:self action:@selector(hideKeyboardTapped) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:hideKB];
-    
-    UIButton *okBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    okBtn.frame = CGRectMake(margin, CGRectGetMaxY(hideKB.frame) + 4, panel.bounds.size.width - margin*2, 34);
-    CAGradientLayer *grad = [CAGradientLayer layer];
-    grad.frame = okBtn.bounds;
-    grad.colors = @[
-        (id)[UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95].CGColor,
-        (id)[UIColor colorWithRed:0.15 green:0.80 blue:0.50 alpha:0.95].CGColor
-    ];
-    grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint   = CGPointMake(1, 0.5);
-    [okBtn.layer insertSublayer:grad atIndex:0];
-    okBtn.layer.cornerRadius = 10.0;
-    okBtn.layer.masksToBounds = YES;
-    [okBtn setTitle:@"OK" forState:UIControlStateNormal];
-    [okBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    okBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [okBtn addTarget:self action:@selector(fileImportOkPressed:) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:okBtn];
-}
-
-- (void)fileImportOkPressed:(UIButton *)sender {
-    UIView *panel = sender.superview;
-    UITextView *tv = nil;
-    for (UIView *v in panel.subviews) {
-        if ([v isKindOfClass:[UITextView class]]) {
-            tv = (UITextView *)v;
-            break;
-        }
-    }
-    NSString *txt = tv.text ?: @"";
-    NSString *path = [self currentFilePath];
-    [self closeOverlay];
-    if (!path) {
-        [self showSimpleMessageWithTitle:@"Import Failed" message:@"No file selected"];
-        return;
-    }
-    NSError *err = nil;
-    BOOL ok = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-    if (ok) {
-        [self showSimpleMessageWithTitle:@"Imported" message:@"Edit Applied\nLeave game to load new data\nThoát game để load data mới"];
-    } else {
-        [self showSimpleMessageWithTitle:@"Import Failed" message:err.localizedDescription ?: @"Unknown error"];
-    }
-}
-
-- (void)pasteClipboardIntoImportTextView:(UIButton *)sender {
-    NSString *clip = UIPasteboard.generalPasteboard.string;
-    if (clip.length == 0) return;
-    
-    UITextView *tv = objc_getAssociatedObject(sender, &kImportTextViewKey);
-    if (!tv) return;
-    
-    tv.text = clip;
-}
-
-- (void)fileDeleteTapped {
-    NSString *path = [self currentFilePath];
-    if (!path) return;
-    NSError *err = nil;
-    BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
-    [self closeOverlay];
-    if (ok) {
-        [self showSimpleMessageWithTitle:@"Deleted" message:@"File removed"];
-    } else {
-        [self showSimpleMessageWithTitle:@"Delete failed" message:err.localizedDescription ?: @"Unknown error"];
-    }
 }
 
 #pragma mark - Settings / Background result
@@ -1940,25 +1562,14 @@ static void showMainMenu() {
 
 @end
 
-#pragma mark - Floating draggable button + AUTO CLEANUP & BYPASS
+#pragma mark - Floating draggable button
+
 static CGPoint g_startPoint;
 static CGPoint g_btnStart;
 static UIButton *floatingButton = nil;
 
 %ctor {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // === AUTO DELETE ALL .new FILES ONCE WHEN DYLIB LOADS ===
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        NSArray *allFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil];
-        for (NSString *file in allFiles) {
-            if ([file hasSuffix:@".new"]) {
-                NSString *fullPath = [docs stringByAppendingPathComponent:file];
-                [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
-            }
-        }
-        // === AUTO APPLY BYPASS ONCE WHEN DYLIB LOADS ===
-        silentPatchBypass();
-        // === CREATE FLOATING BUTTON ===
         UIWindow *win = firstWindow();
         floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
         floatingButton.frame = CGRectMake(10, 50, 64, 40);
@@ -1977,11 +1588,9 @@ static UIButton *floatingButton = nil;
 }
 
 %hook UIApplication
+
 %new
 - (void)showMenuPressed {
-    // Auto bypass every time menu is opened
-    silentPatchBypass();
-    
     // Refresh account cache from SdkStateCache#1 every time menu is shown
     [[LMUIHelper shared] refreshAccountsFromSdkState];
     
@@ -1995,6 +1604,7 @@ static UIButton *floatingButton = nil;
     }
 }
 
+%new
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     UIButton *btn = (UIButton*)pan.view;
     if (pan.state == UIGestureRecognizerStateBegan) {
@@ -2009,4 +1619,3 @@ static UIButton *floatingButton = nil;
 }
 
 %end
-// Add <- to go back, change Full to Accounts, remove full related stuff
