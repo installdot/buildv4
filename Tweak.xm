@@ -1221,7 +1221,7 @@ static void showMainMenu() {
 - (void)renderActiveTab {
     if (!self.contentView) return;
     [self.contentView.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
-    [self.updateSidebarSelection];
+    [self updateSidebarSelection];
     
     if ([self.activeTab isEqualToString:@"Main"]) {
         [self renderMainTab];
