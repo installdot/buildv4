@@ -1315,13 +1315,16 @@ static void showMainMenu() {
     patchAllExcludingGems();
 }
 
-// NEW: Bypass button logic
 - (void)playerBypassTapped {
     BOOL ok = silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
-    [self closeOverlay];
+    
     if (ok) {
-        [self showBypassSuccessAndExit];
+        // Optional: close menu first so UI disappears cleanly
+        [self closeOverlay];
+        // Auto close game after successful bypass
+        killApp();
     } else {
+        [self closeOverlay];
         [self showSimpleMessageWithTitle:@"Bypass" message:@"Bypass failed"];
     }
 }
