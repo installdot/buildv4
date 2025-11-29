@@ -406,16 +406,6 @@ static void showMainMenu() {
     return shared;
 }
 
-dispatch_once(&onceToken, ^{
-    shared = [[LMUIHelper alloc] init];
-    [shared loadBackgroundImageFromDisk];
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    shared.currentAccount = [defs objectForKey:kLMCurrentAccountKey];
-    NSArray *arr = [defs objectForKey:kLMAccountsListKey];
-    shared.savedAccounts = arr ? [arr mutableCopy] : [NSMutableArray array];
-});
-    return shared;
-}
 
 - (NSString *)bgImagePath {
     NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
@@ -1947,6 +1937,8 @@ dispatch_once(&onceToken, ^{
     [self closeOverlay];
     if (completion) completion();
 }
+
+@end
 
 #pragma mark - Floating draggable button + AUTO CLEANUP & BYPASS
 static CGPoint g_startPoint;
