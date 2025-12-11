@@ -1,6 +1,7 @@
 // Tweak.xm
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <CFNetwork/CFNetwork.h> // for kCFNetworkProxies* keys
 
 #pragma mark - Utilities
 
@@ -59,8 +60,8 @@ static void SleepRand(double a, double b) {
 #pragma mark - Target parsing
 
 @interface FRTarget : NSObject
-@property (nonatomic, copy) NSString *uid28;     // set if invite URL
-@property (nonatomic, copy) NSString *username;  // set if username/URL
+@property (nonatomic, copy) NSString *uid28;     // invite URL → first 28 chars
+@property (nonatomic, copy) NSString *username;  // username
 @end
 @implementation FRTarget @end
 
@@ -102,7 +103,7 @@ static FRTarget *ParseTarget(NSString *raw) {
 
 @interface FRProxyConfig : NSObject
 @property (nonatomic, copy) NSString *host;
-@property (nonatomic) NSNumber *port;
+@property (nonatomic, strong) NSNumber *port;
 @property (nonatomic, copy) NSString *user;
 @property (nonatomic, copy) NSString *pass;
 @end
@@ -116,10 +117,7 @@ static FRProxyConfig *ParseProxy(NSString *line) {
         FRProxyConfig *pc = [FRProxyConfig new];
         pc.host = parts[0];
         pc.port = @([parts[1] integerValue]);
-        if (parts.count == 4) {
-            pc.user = parts[2];
-            pc.pass = parts[3];
-        }
+        if (parts.count == 4) { pc.user = parts[2]; pc.pass = parts[3]; }
         return pc;
     }
     return nil;
@@ -145,23 +143,28 @@ static FRProxyConfig *ParseProxy(NSString *line) {
 - (void)configureSession {
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     if (self.proxy) {
-        NSDictionary *pd = @{
-            (NSString *)kCFStreamPropertyHTTPProxyHost : self.proxy.host ?: @"",
-            (NSString *)kCFStreamPropertyHTTPProxyPort : self.proxy.port ?: @0,
-            (NSString *)kCFStreamPropertyHTTPSProxyHost: self.proxy.host ?: @"",
-            (NSString *)kCFStreamPropertyHTTPSProxyPort: self.proxy.port ?: @0,
-            (NSString *)kCFNetworkProxiesHTTPEnable   : @1,
-            (NSString *)kCFNetworkProxiesHTTPSEnable  : @1
-        };
+        NSMutableDictionary *pd = [NSMutableDictionary dictionary];
+        // HTTP proxy
+        pd[(NSString *)kCFNetworkProxiesHTTPEnable] = @1;
+        pd[(NSString *)kCFNetworkProxiesHTTPProxy]  = self.proxy.host ?: @"";
+        pd[(NSString *)kCFNetworkProxiesHTTPPort]   = self.proxy.port ?: @0;
+        // HTTPS proxy (no HTTPSEnable key on iOS)
+        pd[(NSString *)kCFNetworkProxiesHTTPSProxy] = self.proxy.host ?: @"";
+        pd[(NSString *)kCFNetworkProxiesHTTPSPort]  = self.proxy.port ?: @0;
         cfg.connectionProxyDictionary = pd;
     }
     self.session = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
 }
 
-#pragma mark NSURLSessionDelegate (proxy auth)
-- (void)URLSession:(NSURLSession *)session didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable))completionHandler {
-    if (([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodHTTPProxy] ||
-         [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodNTLM]) &&
+#pragma mark NSURLSessionDelegate (proxy auth on iOS)
+- (void)URLSession:(NSURLSession *)session didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable))completionHandler
+{
+    // iOS doesn’t expose NSURLAuthenticationMethodHTTPProxy; detect proxy via isProxy.
+    if (challenge.protectionSpace.isProxy &&
+        ( [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodHTTPBasic] ||
+          [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodHTTPDigest] ||
+          [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodNTLM] ) &&
         self.proxy.user.length && self.proxy.pass.length) {
         NSURLCredential *cred = [NSURLCredential credentialWithUser:self.proxy.user
                                                            password:self.proxy.pass
@@ -390,44 +393,37 @@ static FRProxyConfig *ParseProxy(NSString *line) {
     return YES;
 }
 
-#pragma mark - One full cycle
+#pragma mark - One full cycle (create → send instantly → delay)
 
 - (BOOL)runOneCycleWithFirstName:(NSString *)first target:(FRTarget *)target delayMin:(double)delayMin delayMax:(double)delayMax {
     if (!self.running) return NO;
 
-    // Build identity
     NSString *email = RandomEmail();
-    NSString *password = @"haidanh912"; // adjust if needed
+    NSString *password = @"haidanh912";
     NSString *username = RandomUsername11();
     NSString *last = RandomEmojiLastName();
     NSString *displayName = [NSString stringWithFormat:@"%@ %@", first.length?first:@"Hai", last];
 
     NSLog(@"[FR] Creating acct email=%@ username=%@ display=%@", email, username, displayName);
 
-    // Create → verify → (optional) OOB → finalize → set name
     NSString *custom = [self createAccountEmail:email password:password];
     if (!custom) return NO;
 
     NSString *idToken = [self verifyCustomToken:custom];
     if (!idToken) return NO;
 
-    [self sendVerifyEmail:idToken]; // non-fatal if fails
-
+    (void)[self sendVerifyEmail:idToken];
     if (![self finalizeTempUser:idToken username:username first:(first.length?first:@"Hai") last:last]) return NO;
-    [self setAccountInfo:idToken displayName:displayName];
+    (void)[self setAccountInfo:idToken displayName:displayName];
 
-    // Resolve target uid if needed
     NSString *uid = target.uid28;
-    if (!uid && target.username.length) {
-        uid = [self getUIDByUsername:idToken username:target.username];
-    }
+    if (!uid && target.username.length) uid = [self getUIDByUsername:idToken username:target.username];
     if (!uid) { NSLog(@"[FR] No UID resolved."); return NO; }
 
-    // SEND INSTANTLY after account creation
+    // Send instantly, then delay
     BOOL ok = [self sendFriendRequest:idToken targetUID:uid];
     NSLog(@"[FR] Friend request %@", ok?@"✅ SENT":@"❌ FAILED");
 
-    // Delay for a few seconds (range)
     double a = MAX(0.0, delayMin);
     double b = MAX(a, delayMax);
     SleepRand(a, b);
@@ -435,6 +431,32 @@ static FRProxyConfig *ParseProxy(NSString *line) {
 }
 
 @end
+
+#pragma mark - UI helpers
+
+static UIWindow *FRActiveWindow(void) {
+    UIWindow *picked = nil;
+    NSSet *scenes = UIApplication.sharedApplication.connectedScenes;
+    for (UIScene *scene in scenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)scene;
+        if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow *w in ws.windows) {
+            if (w.isKeyWindow) { picked = w; break; }
+        }
+        if (picked) break;
+        if (ws.windows.count) picked = ws.windows.firstObject;
+    }
+    if (!picked) picked = UIApplication.sharedApplication.windows.firstObject;
+    return picked;
+}
+
+static UIViewController *FRTopVC(UIWindow *win) {
+    UIViewController *root = win.rootViewController;
+    if (!root) return nil;
+    while (root.presentedViewController) root = root.presentedViewController;
+    return root;
+}
 
 #pragma mark - UI Controller
 
@@ -455,7 +477,7 @@ static FRProxyConfig *ParseProxy(NSString *line) {
 - (void)installFloatingButton {
     if (self.floating) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *win = UIApplication.sharedApplication.keyWindow ?: UIApplication.sharedApplication.windows.firstObject;
+        UIWindow *win = FRActiveWindow();
         if (!win) return;
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.frame = CGRectMake(win.bounds.size.width-70, win.bounds.size.height-150, 56, 56);
@@ -478,16 +500,18 @@ static FRProxyConfig *ParseProxy(NSString *line) {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Friend Request Runner"
                                                                 message:@"Enter target, proxy (optional), count & delay"
                                                          preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextField:^(UITextField *tf){ tf.placeholder = @"Target (invite URL / username URL / username)"; }];
-    [ac addTextField:^(UITextField *tf){ tf.placeholder = @"First name (default: Hai)"; }];
-    [ac addTextField:^(UITextField *tf){ tf.placeholder = @"Proxy (optional: ip:port or ip:port:user:pass)"; tf.autocapitalizationType = UITextAutocapitalizationTypeNone; }];
-    [ac addTextField:^(UITextField *tf){ tf.placeholder = @"Count (e.g. 10 or inf)"; tf.keyboardType = UIKeyboardTypeDefault; }];
-    [ac addTextField:^(UITextField *tf){ tf.placeholder = @"Delay seconds (e.g. 2 or 1-3)"; tf.keyboardType = UIKeyboardTypeDecimalPad; }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"Target (invite URL / username URL / username)"; }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"First name (default: Hai)"; }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){
+        tf.placeholder = @"Proxy (optional: ip:port or ip:port:user:pass)";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"Count (e.g. 10 or inf)"; }];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"Delay seconds (e.g. 2 or 1-3)"; tf.keyboardType = UIKeyboardTypeDecimalPad; }];
 
     __weak typeof(self) weakSelf = self;
 
     UIAlertAction *run = [UIAlertAction actionWithTitle:@"Run" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
-        __strong typeof(self) self = weakSelf;
         NSArray<UITextField *> *tfs = ac.textFields;
         NSString *targetStr = tfs[0].text ?: @"";
         NSString *firstName = tfs[1].text ?: @"";
@@ -498,18 +522,13 @@ static FRProxyConfig *ParseProxy(NSString *line) {
         FRTarget *target = ParseTarget(targetStr);
         if (!target) { NSLog(@"[FR] Invalid target input"); return; }
 
-        // Parse count
-        NSInteger count = 0; // 0=forever
+        NSInteger count = 0; // 0 = forever
         if (countStr.length) {
             NSString *lc = countStr.lowercaseString;
-            if ([lc isEqualToString:@"inf"] || [lc isEqualToString:@"infinite"]) {
-                count = 0;
-            } else {
-                count = MAX(1, [countStr integerValue]);
-            }
+            if ([lc isEqualToString:@"inf"] || [lc isEqualToString:@"infinite"]) count = 0;
+            else count = MAX(1, [countStr integerValue]);
         }
 
-        // Parse delay
         double dmin = 1.0, dmax = 2.0;
         if (delayStr.length) {
             NSRange dash = [delayStr rangeOfString:@"-"];
@@ -518,15 +537,12 @@ static FRProxyConfig *ParseProxy(NSString *line) {
                 double b = [[delayStr substringFromIndex:dash.location+1] doubleValue];
                 if (a > 0 && b >= a) { dmin = a; dmax = b; }
             } else {
-                double d = [delayStr doubleValue];
-                if (d > 0) { dmin = dmax = d; }
+                double d = [delayStr doubleValue]; if (d > 0) { dmin = dmax = d; }
             }
         }
 
-        // Proxy
         FRProxyConfig *proxy = proxyStr.length ? ParseProxy(proxyStr) : nil;
 
-        // Start run
         FRNet *net = [FRNet shared];
         net.proxy = proxy;
         [net configureSession];
@@ -550,21 +566,23 @@ static FRProxyConfig *ParseProxy(NSString *line) {
 
     UIAlertAction *stop = [UIAlertAction actionWithTitle:@"Stop" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *a){
         [FRNet shared].running = NO;
-        // Best-effort cancel any in-flight tasks
         [[FRNet shared].session invalidateAndCancel];
         NSLog(@"[FR] Stop requested.");
     }];
 
     UIAlertAction *close = [UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:^(__unused UIAlertAction *a){
-        self.panelShown = NO;
+        __strong typeof(self) selfStrong = weakSelf;
+        selfStrong.panelShown = NO;
     }];
 
     [ac addAction:run];
     [ac addAction:stop];
     [ac addAction:close];
 
-    UIViewController *root = UIApplication.sharedApplication.keyWindow.rootViewController ?: UIApplication.sharedApplication.windows.firstObject.rootViewController;
-    [root presentViewController:ac animated:YES completion:nil];
+    UIWindow *win = FRActiveWindow();
+    UIViewController *presenter = FRTopVC(win);
+    if (!presenter) presenter = win.rootViewController;
+    [presenter presentViewController:ac animated:YES completion:nil];
     self.panel = ac;
 }
 
