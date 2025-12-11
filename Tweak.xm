@@ -1,7 +1,6 @@
 // Tweak.xm
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <CFNetwork/CFNetwork.h> // for kCFNetworkProxies* keys
 
 #pragma mark - Utilities
 
@@ -99,35 +98,10 @@ static FRTarget *ParseTarget(NSString *raw) {
     return t;
 }
 
-#pragma mark - Proxy support
-
-@interface FRProxyConfig : NSObject
-@property (nonatomic, copy) NSString *host;
-@property (nonatomic, strong) NSNumber *port;
-@property (nonatomic, copy) NSString *user;
-@property (nonatomic, copy) NSString *pass;
-@end
-@implementation FRProxyConfig @end
-
-static FRProxyConfig *ParseProxy(NSString *line) {
-    NSString *s = [[line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
-    if (s.length == 0) return nil;
-    NSArray *parts = [s componentsSeparatedByString:@":"];
-    if (parts.count == 2 || parts.count == 4) {
-        FRProxyConfig *pc = [FRProxyConfig new];
-        pc.host = parts[0];
-        pc.port = @([parts[1] integerValue]);
-        if (parts.count == 4) { pc.user = parts[2]; pc.pass = parts[3]; }
-        return pc;
-    }
-    return nil;
-}
-
 #pragma mark - Networking manager
 
-@interface FRNet : NSObject <NSURLSessionDelegate>
+@interface FRNet : NSObject
 @property (nonatomic, strong) NSURLSession *session;
-@property (nonatomic, strong) FRProxyConfig *proxy;
 @property (nonatomic, copy) NSString *appCheckToken;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -142,40 +116,8 @@ static FRProxyConfig *ParseProxy(NSString *line) {
 
 - (void)configureSession {
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    if (self.proxy) {
-        NSMutableDictionary *pd = [NSMutableDictionary dictionary];
-        // HTTP proxy
-        pd[(NSString *)kCFNetworkProxiesHTTPEnable] = @1;
-        pd[(NSString *)kCFNetworkProxiesHTTPProxy]  = self.proxy.host ?: @"";
-        pd[(NSString *)kCFNetworkProxiesHTTPPort]   = self.proxy.port ?: @0;
-        // HTTPS proxy (no HTTPSEnable key on iOS)
-        pd[(NSString *)kCFNetworkProxiesHTTPSProxy] = self.proxy.host ?: @"";
-        pd[(NSString *)kCFNetworkProxiesHTTPSPort]  = self.proxy.port ?: @0;
-        cfg.connectionProxyDictionary = pd;
-    }
-    self.session = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
+    self.session = [NSURLSession sessionWithConfiguration:cfg];
 }
-
-#pragma mark NSURLSessionDelegate (proxy auth on iOS)
-- (void)URLSession:(NSURLSession *)session didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
- completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential * _Nullable))completionHandler
-{
-    // iOS doesn’t expose NSURLAuthenticationMethodHTTPProxy; detect proxy via isProxy.
-    if (challenge.protectionSpace.isProxy &&
-        ( [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodHTTPBasic] ||
-          [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodHTTPDigest] ||
-          [challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodNTLM] ) &&
-        self.proxy.user.length && self.proxy.pass.length) {
-        NSURLCredential *cred = [NSURLCredential credentialWithUser:self.proxy.user
-                                                           password:self.proxy.pass
-                                                        persistence:NSURLCredentialPersistenceForSession];
-        completionHandler(NSURLSessionAuthChallengeUseCredential, cred);
-        return;
-    }
-    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
-}
-
-#pragma mark - Helpers
 
 - (NSDictionary *)syncJSON:(NSURLRequest *)req status:(NSInteger *)outCode error:(NSError **)outErr {
     __block NSData *data = nil;
@@ -211,8 +153,6 @@ static FRProxyConfig *ParseProxy(NSString *line) {
     return req;
 }
 
-#pragma mark - API headers
-
 - (NSDictionary *)baseLocketHeaders {
     return @{
         @"accept": @"*/*",
@@ -241,7 +181,7 @@ static FRProxyConfig *ParseProxy(NSString *line) {
     };
 }
 
-#pragma mark - API calls (sync)
+#pragma mark - API calls
 
 - (NSString *)fetchAppCheckToken {
     NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:@"https://chillysilly.frfrnocap.men/lcapi.php"]];
@@ -261,29 +201,29 @@ static FRProxyConfig *ParseProxy(NSString *line) {
             @"password": pass,
             @"client_email_verif": @YES,
             @"analytics": @{
-                    @"ios_version": @"2.22.0.1",
-                    @"experiments": @{
-                        @"flag_18": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"1203"},
-                        @"flag_7":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"800"},
-                        @"flag_10": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"505"},
-                        @"flag_15": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"501"},
-                        @"flag_6":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"2000"},
-                        @"flag_23": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"500"},
-                        @"flag_14": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"502"},
-                        @"flag_25": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"76"},
-                        @"flag_4":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"43"},
-                        @"flag_9":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"11"},
-                        @"flag_3":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"600"},
-                        @"flag_16": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"303"},
-                        @"flag_22": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"1203"},
-                        @"flag_8":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"500"}
-                    },
-                    @"amplitude": @{
-                        @"device_id": @"391C19B6-8B49-4CDD-9DB0-7249ACCB8A28",
-                        @"session_id": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value", @"value": NowMillisStr()}
-                    },
-                    @"google_analytics": @{@"app_instance_id": @"FFB0AAA7EDC047E899B2E116D1BEDACD"},
-                    @"platform": @"ios"
+                @"ios_version": @"2.22.0.1",
+                @"experiments": @{
+                    @"flag_18": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"1203"},
+                    @"flag_7":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"800"},
+                    @"flag_10": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"505"},
+                    @"flag_15": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"501"},
+                    @"flag_6":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"2000"},
+                    @"flag_23": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"500"},
+                    @"flag_14": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"502"},
+                    @"flag_25": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"76"},
+                    @"flag_4":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"43"},
+                    @"flag_9":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"11"},
+                    @"flag_3":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"600"},
+                    @"flag_16": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"303"},
+                    @"flag_22": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"1203"},
+                    @"flag_8":  @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value",@"value":@"500"}
+                },
+                @"amplitude": @{
+                    @"device_id": @"391C19B6-8B49-4CDD-9DB0-7249ACCB8A28",
+                    @"session_id": @{@"@type":@"type.googleapis.com/google.protobuf.Int64Value", @"value": NowMillisStr()}
+                },
+                @"google_analytics": @{@"app_instance_id": @"FFB0AAA7EDC047E899B2E116D1BEDACD"},
+                @"platform": @"ios"
             },
             @"platform": @"ios"
         }
@@ -458,6 +398,35 @@ static UIViewController *FRTopVC(UIWindow *win) {
     return root;
 }
 
+static void FRShowWarningBanner(NSString *message) {
+    UIWindow *win = FRActiveWindow();
+    if (!win) return;
+
+    CGFloat topInset = 0;
+    if (@available(iOS 11.0, *)) {
+        topInset = win.safeAreaInsets.top;
+    }
+
+    UILabel *banner = [[UILabel alloc] initWithFrame:CGRectMake(10, topInset + 8, win.bounds.size.width - 20, 44)];
+    banner.backgroundColor = [UIColor colorWithRed:0.9 green:0.25 blue:0.2 alpha:0.95];
+    banner.textColor = [UIColor whiteColor];
+    banner.font = [UIFont boldSystemFontOfSize:13];
+    banner.textAlignment = NSTextAlignmentCenter;
+    banner.numberOfLines = 2;
+    banner.text = message;
+    banner.layer.cornerRadius = 8;
+    banner.layer.masksToBounds = YES;
+    banner.alpha = 0.0;
+    banner.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleBottomMargin;
+
+    [win addSubview:banner];
+    [UIView animateWithDuration:0.25 animations:^{ banner.alpha = 1.0; } completion:^(__unused BOOL finished){
+        [UIView animateWithDuration:0.25 delay:3.0 options:0 animations:^{ banner.alpha = 0.0; } completion:^(__unused BOOL done){
+            [banner removeFromSuperview];
+        }];
+    }];
+}
+
 #pragma mark - UI Controller
 
 @interface FRUI : NSObject
@@ -497,15 +466,14 @@ static UIViewController *FRTopVC(UIWindow *win) {
     if (self.panelShown) return;
     self.panelShown = YES;
 
+    // Show Vietnamese warning banner when the menu opens
+    FRShowWarningBanner(@"Bạn sẽ có để bị chặn ip trong vài phút nếu chạy nhiều và lâu ít delay. Nếu bị tự chịu");
+
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Friend Request Runner"
-                                                                message:@"Enter target, proxy (optional), count & delay"
+                                                                message:@"Enter target, count & delay"
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"Target (invite URL / username URL / username)"; }];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"First name (default: Hai)"; }];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){
-        tf.placeholder = @"Proxy (optional: ip:port or ip:port:user:pass)";
-        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    }];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"Count (e.g. 10 or inf)"; }];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.placeholder = @"Delay seconds (e.g. 2 or 1-3)"; tf.keyboardType = UIKeyboardTypeDecimalPad; }];
 
@@ -515,9 +483,8 @@ static UIViewController *FRTopVC(UIWindow *win) {
         NSArray<UITextField *> *tfs = ac.textFields;
         NSString *targetStr = tfs[0].text ?: @"";
         NSString *firstName = tfs[1].text ?: @"";
-        NSString *proxyStr  = tfs[2].text ?: @"";
-        NSString *countStr  = tfs[3].text ?: @"";
-        NSString *delayStr  = tfs[4].text ?: @"";
+        NSString *countStr  = tfs[2].text ?: @"";
+        NSString *delayStr  = tfs[3].text ?: @"";
 
         FRTarget *target = ParseTarget(targetStr);
         if (!target) { NSLog(@"[FR] Invalid target input"); return; }
@@ -541,10 +508,7 @@ static UIViewController *FRTopVC(UIWindow *win) {
             }
         }
 
-        FRProxyConfig *proxy = proxyStr.length ? ParseProxy(proxyStr) : nil;
-
         FRNet *net = [FRNet shared];
-        net.proxy = proxy;
         [net configureSession];
         net.appCheckToken = [net fetchAppCheckToken];
         if (!net.appCheckToken.length) { NSLog(@"[FR] No AppCheck token"); return; }
