@@ -36,8 +36,20 @@ static void writeLog(NSString *format, ...)
 
 %hookf(int, open, const char *path, int flags, ...)
 {
+    mode_t mode = 0;
+
+    if (flags & O_CREAT) {
+        va_list args;
+        va_start(args, flags);
+        mode = va_arg(args, int);
+        va_end(args);
+
+        writeLog(@"open() path=%s flags=0x%x mode=%o", path, flags, mode);
+        return %orig(path, flags, mode);
+    }
+
     writeLog(@"open() path=%s flags=0x%x", path, flags);
-    return %orig;
+    return %orig(path, flags);
 }
 
 %hookf(ssize_t, write, int fd, const void *buf, size_t count)
