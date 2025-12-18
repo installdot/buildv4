@@ -3,32 +3,34 @@
 #import <fcntl.h>
 #import <dlfcn.h>
 #import <spawn.h>
-#import <sys/stat.h>
+#import <stdarg.h>
 
-static NSString *logPath = nil;
+static NSString *gLogPath = nil;
 
-static void writeLog(NSString *format, ...)
+static void WriteLog(NSString *fmt, ...)
 {
     va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
 
-    NSString *final = [NSString stringWithFormat:@"[%@] %@\n",
-        [[NSDate date] description], msg];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                      [NSDate date], msg];
 
-    NSLog(@"%@", final);
+    NSLog(@"%@", line);
 
-    if (!logPath) return;
+    if (!gLogPath) return;
 
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
     if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:nil];
-        fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        [[NSFileManager defaultManager] createFileAtPath:gLogPath
+                                                contents:nil
+                                              attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
     }
 
     [fh seekToEndOfFile];
-    [fh writeData:[final dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
     [fh closeFile];
 }
 
@@ -36,38 +38,36 @@ static void writeLog(NSString *format, ...)
 
 %hookf(int, open, const char *path, int flags, ...)
 {
-    mode_t mode = 0;
-
     if (flags & O_CREAT) {
-        va_list args;
-        va_start(args, flags);
-        mode = va_arg(args, int);
-        va_end(args);
+        va_list ap;
+        va_start(ap, flags);
+        mode_t mode = va_arg(ap, int);
+        va_end(ap);
 
-        writeLog(@"open() path=%s flags=0x%x mode=%o", path, flags, mode);
+        WriteLog(@"open(path=%s flags=0x%x mode=%o)", path, flags, mode);
         return %orig(path, flags, mode);
     }
 
-    writeLog(@"open() path=%s flags=0x%x", path, flags);
+    WriteLog(@"open(path=%s flags=0x%x)", path, flags);
     return %orig(path, flags);
 }
 
-%hookf(ssize_t, write, int fd, const void *buf, size_t count)
+%hookf(ssize_t, write, int fd, const void *buf, size_t size)
 {
-    writeLog(@"write() fd=%d size=%zu", fd, count);
-    return %orig;
+    WriteLog(@"write(fd=%d size=%zu)", fd, size);
+    return %orig(fd, buf, size);
 }
 
 %hookf(int, rename, const char *oldp, const char *newp)
 {
-    writeLog(@"rename() %s -> %s", oldp, newp);
-    return %orig;
+    WriteLog(@"rename(%s -> %s)", oldp, newp);
+    return %orig(oldp, newp);
 }
 
 %hookf(int, unlink, const char *path)
 {
-    writeLog(@"unlink() %s", path);
-    return %orig;
+    WriteLog(@"unlink(%s)", path);
+    return %orig(path);
 }
 
 #pragma mark - NSFileManager hooks
@@ -76,55 +76,58 @@ static void writeLog(NSString *format, ...)
 
 - (BOOL)copyItemAtPath:(NSString *)src toPath:(NSString *)dst error:(NSError **)err
 {
-    writeLog(@"NSFileManager copy %@ -> %@", src, dst);
-    return %orig;
+    WriteLog(@"NSFileManager copy %@ -> %@", src, dst);
+    return %orig(src, dst, err);
 }
 
 - (BOOL)removeItemAtPath:(NSString *)path error:(NSError **)err
 {
-    writeLog(@"NSFileManager remove %@", path);
-    return %orig;
+    WriteLog(@"NSFileManager remove %@", path);
+    return %orig(path, err);
 }
 
-- (BOOL)createFileAtPath:(NSString *)path contents:(NSData *)data attributes:(NSDictionary *)attr
+- (BOOL)createFileAtPath:(NSString *)path
+                contents:(NSData *)data
+              attributes:(NSDictionary *)attr
 {
-    writeLog(@"NSFileManager create %@ size=%lu", path, (unsigned long)data.length);
-    return %orig;
+    WriteLog(@"NSFileManager create %@ size=%lu",
+             path, (unsigned long)data.length);
+    return %orig(path, data, attr);
 }
 
 %end
 
-#pragma mark - Process execution
+#pragma mark - process execution
 
 %hookf(int, system, const char *cmd)
 {
-    writeLog(@"system(): %s", cmd);
-    return %orig;
+    WriteLog(@"system(%s)", cmd);
+    return %orig(cmd);
 }
 
 %hookf(int, posix_spawn,
-    pid_t *pid,
-    const char *path,
-    const posix_spawn_file_actions_t *fa,
-    const posix_spawnattr_t *attr,
-    char *const argv[],
-    char *const envp[])
+       pid_t *pid,
+       const char *path,
+       const posix_spawn_file_actions_t *fa,
+       const posix_spawnattr_t *attr,
+       char *const argv[],
+       char *const envp[])
 {
-    writeLog(@"posix_spawn(): %s", path);
+    WriteLog(@"posix_spawn(%s)", path);
     if (argv) {
         for (int i = 0; argv[i]; i++) {
-            writeLog(@" argv[%d] = %s", i, argv[i]);
+            WriteLog(@" argv[%d]=%s", i, argv[i]);
         }
     }
-    return %orig;
+    return %orig(pid, path, fa, attr, argv, envp);
 }
 
 #pragma mark - dylib loading
 
 %hookf(void *, dlopen, const char *path, int mode)
 {
-    writeLog(@"dlopen(): %s", path);
-    return %orig;
+    WriteLog(@"dlopen(%s)", path);
+    return %orig(path, mode);
 }
 
 #pragma mark - ctor
@@ -132,11 +135,14 @@ static void writeLog(NSString *format, ...)
 %ctor
 {
     @autoreleasepool {
-        NSString *doc =
-            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        logPath = [doc stringByAppendingPathComponent:@"patch_trace.log"];
+        NSString *docs =
+            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                NSUserDomainMask,
+                                                YES).firstObject;
 
-        writeLog(@"==== PatchTrace dylib injected ====");
-        writeLog(@"Log file: %@", logPath);
+        gLogPath = [docs stringByAppendingPathComponent:@"patch_trace.log"];
+
+        WriteLog(@"===== PatchTrace injected =====");
+        WriteLog(@"Log file: %@", gLogPath);
     }
 }
