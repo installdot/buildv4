@@ -59,10 +59,10 @@ void showToggleButton() {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.frame = CGRectMake(0, 0, 60, 60);
         btn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.9];
-        btn.layer.cornerRadius = 30;
+        btn.layer.cornerRadius = 15;
         btn.layer.borderWidth = 2;
         btn.layer.borderColor = [UIColor whiteColor].CGColor;
-        [btn setTitle:@"📱" forState:UIControlStateNormal];
+        [btn setTitle:@"Mochi" forState:UIControlStateNormal];
         btn.titleLabel.font = [UIFont systemFontOfSize:28];
         [btn addTarget:btn action:@selector(handleToggleButton) forControlEvents:UIControlEventTouchUpInside];
         [toggleButton addSubview:btn];
@@ -438,7 +438,7 @@ void fetchUserInfo(NSString *userId) {
             capturedInfo[@"serverId"]];
 
         hideToggleButton();
-        updateInfoBox(@"Captured", message, YES);
+        updateInfoBox(@"Mochi•Teyvat", message, YES);
     }];
     [roleTask resume];
 }
