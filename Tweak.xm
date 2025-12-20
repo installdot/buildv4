@@ -5,19 +5,18 @@
 static BOOL isCapturing = NO;
 static BOOL hasShownInfo = NO;
 static UIWindow *statusWindow = nil;
+static NSDictionary *capturedInfo = nil;
 
-// Create persistent floating status box (smaller size)
+// Create persistent floating status box
 void createStatusBox() {
     if (statusWindow) return;
 
-    // Smaller frame: width 80% of screen, height 60
     statusWindow = [[UIWindow alloc] initWithFrame:CGRectMake(20, 80, UIScreen.mainScreen.bounds.size.width * 0.8, 60)];
     statusWindow.windowLevel = UIWindowLevelStatusBar + 1;
     statusWindow.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
     statusWindow.layer.cornerRadius = 12;
     statusWindow.layer.masksToBounds = YES;
 
-    // Modern scene handling
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
@@ -56,7 +55,6 @@ void removeStatusBox() {
     });
 }
 
-// Get top-most view controller
 UIViewController *topMostViewController() {
     UIWindow *window = nil;
 
@@ -82,6 +80,169 @@ UIViewController *topMostViewController() {
     return topVC;
 }
 
+// Redeem codes function
+void redeemCodes() {
+    if (!capturedInfo) {
+        updateStatusBox(@"No info captured yet");
+        return;
+    }
+
+    updateStatusBox(@"Fetching codes...");
+
+    // Fetch codes from API
+    NSURL *codeUrl = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/cfcode.php"];
+    NSMutableURLRequest *codeRequest = [NSMutableURLRequest requestWithURL:codeUrl];
+    codeRequest.HTTPMethod = @"GET";
+
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
+    
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:codeRequest completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) {
+            updateStatusBox(@"Failed to fetch codes");
+            return;
+        }
+
+        NSError *jsonError = nil;
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+        if (jsonError || !json[@"cfcode"]) {
+            updateStatusBox(@"Invalid code response");
+            return;
+        }
+
+        NSArray *allCodes = json[@"cfcode"];
+        if (allCodes.count == 0) {
+            updateStatusBox(@"No codes available");
+            return;
+        }
+
+        // Split codes into batches of 5
+        NSMutableArray *batches = [NSMutableArray array];
+        for (NSInteger i = 0; i < allCodes.count; i += 5) {
+            NSInteger end = MIN(i + 5, allCodes.count);
+            NSArray *batch = [allCodes subarrayWithRange:NSMakeRange(i, end - i)];
+            [batches addObject:batch];
+        }
+
+        // Redeem each batch
+        __block NSInteger currentBatch = 0;
+        __block NSInteger successCount = 0;
+        __block NSInteger failCount = 0;
+
+        void (^redeemNextBatch)(void);
+        redeemNextBatch = ^{
+            if (currentBatch >= batches.count) {
+                updateStatusBox([NSString stringWithFormat:@"Done! ✓%ld ✗%ld", (long)successCount, (long)failCount]);
+                return;
+            }
+
+            NSArray *batch = batches[currentBatch];
+            updateStatusBox([NSString stringWithFormat:@"Redeeming batch %ld/%ld", (long)(currentBatch + 1), (long)batches.count]);
+
+            NSDictionary *payload = @{
+                @"userId": capturedInfo[@"userId"],
+                @"serverId": capturedInfo[@"serverId"],
+                @"gameCode": @"A49",
+                @"roleId": capturedInfo[@"roleId"],
+                @"roleName": capturedInfo[@"roleName"],
+                @"level": capturedInfo[@"level"],
+                @"codes": batch
+            };
+
+            NSError *payloadError = nil;
+            NSData *payloadData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&payloadError];
+            if (payloadError) {
+                failCount += batch.count;
+                currentBatch++;
+                redeemNextBatch();
+                return;
+            }
+
+            NSURL *redeemUrl = [NSURL URLWithString:@"https://vgrapi-sea.vnggames.com/coordinator/api/v1/code/redeem-multiple"];
+            NSMutableURLRequest *redeemRequest = [NSMutableURLRequest requestWithURL:redeemUrl];
+            redeemRequest.HTTPMethod = @"POST";
+            redeemRequest.HTTPBody = payloadData;
+
+            [redeemRequest setValue:@"application/json" forHTTPHeaderField:@"content-type"];
+            [redeemRequest setValue:@"VN" forHTTPHeaderField:@"x-client-region"];
+            [redeemRequest setValue:@"application/json, text/plain, */*" forHTTPHeaderField:@"accept"];
+            [redeemRequest setValue:@"vi-VN,vi;q=0.9" forHTTPHeaderField:@"accept-language"];
+            [redeemRequest setValue:@"https://giftcode.vnggames.com" forHTTPHeaderField:@"origin"];
+            [redeemRequest setValue:@"https://giftcode.vnggames.com/" forHTTPHeaderField:@"referer"];
+            [redeemRequest setValue:[[NSUUID UUID] UUIDString] forHTTPHeaderField:@"x-request-id"];
+
+            NSURLSessionDataTask *redeemTask = [session dataTaskWithRequest:redeemRequest completionHandler:^(NSData *redeemData, NSURLResponse *redeemResponse, NSError *redeemError) {
+                if (!redeemError && redeemData) {
+                    NSError *resultError = nil;
+                    NSDictionary *result = [NSJSONSerialization JSONObjectWithData:redeemData options:0 error:&resultError];
+                    if (!resultError && result) {
+                        NSArray *results = result[@"data"];
+                        for (NSDictionary *r in results) {
+                            if ([r[@"status"] boolValue]) {
+                                successCount++;
+                            } else {
+                                failCount++;
+                            }
+                        }
+                    } else {
+                        failCount += batch.count;
+                    }
+                } else {
+                    failCount += batch.count;
+                }
+
+                currentBatch++;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    redeemNextBatch();
+                });
+            }];
+            [redeemTask resume];
+        };
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            redeemNextBatch();
+        });
+    }];
+    [task resume];
+}
+
+// Minimal hook - only intercept specific endpoint
+%hook NSURLSessionDataTask
+
+- (void)resume {
+    NSURLRequest *request = [self currentRequest];
+    if (!request) {
+        %orig;
+        return;
+    }
+
+    NSString *urlString = request.URL.absoluteString;
+
+    // Only hook the OAuth endpoint
+    if ([urlString hasPrefix:@"https://oauth.vnggames.app/oauth/v1/token"]) {
+        // Store original completion handler via associated object
+        void (^originalCompletion)(void) = ^{
+            %orig;
+        };
+
+        // Swizzle to capture response
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [NSThread sleepForTimeInterval:0.1];
+            
+            // Try to read response data (this is a simplified approach)
+            // In production, you'd use method swizzling on the completion handler
+            originalCompletion();
+        });
+
+        return;
+    }
+
+    %orig;
+}
+
+%end
+
+// Alternative approach: Hook at URLSession level with minimal intrusion
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
@@ -92,14 +253,12 @@ UIViewController *topMostViewController() {
     NSString *urlString = request.URL.absoluteString;
 
     if ([urlString hasPrefix:@"https://oauth.vnggames.app/oauth/v1/token"]) {
-        // Continuous monitoring: always reset on new request
         isCapturing = YES;
         hasShownInfo = NO;
         updateStatusBox(@"Capturing...");
 
         void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
-            // Call original without any app-side triggers
-            %orig(request, completionHandler);  // Ensure original behavior is preserved exactly
+            completionHandler(data, response, error);
 
             if (error || !data || hasShownInfo) return;
 
@@ -121,7 +280,6 @@ UIViewController *topMostViewController() {
             [roleRequest setValue:@"vi-VN,vi;q=0.9" forHTTPHeaderField:@"accept-language"];
             [roleRequest setValue:@"VN" forHTTPHeaderField:@"x-client-region"];
 
-            // Use a separate session to avoid triggering app detection
             NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
             NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
             NSURLSessionDataTask *roleTask = [session dataTaskWithRequest:roleRequest completionHandler:^(NSData *roleData, NSURLResponse *roleResponse, NSError *roleError) {
@@ -150,6 +308,15 @@ UIViewController *topMostViewController() {
                 NSString *level = roleInfo[@"level"] ?: @"Unknown";
                 NSString *serverId = roleInfo[@"serverId"] ?: @"101";
 
+                // Store info for redeem
+                capturedInfo = @{
+                    @"roleName": charName,
+                    @"roleId": roleId,
+                    @"userId": uid,
+                    @"level": level,
+                    @"serverId": serverId
+                };
+
                 NSString *message = [NSString stringWithFormat:
                     @"Name: %@\nRoleID: %@\nUserID: %@\nLvl: %@\nSvr: %@\nGame: A49",
                     charName, roleId, uid, level, serverId];
@@ -169,6 +336,12 @@ UIViewController *topMostViewController() {
                         UIPasteboard.generalPasteboard.string = message;
                     }];
 
+                    UIAlertAction *redeemAction = [UIAlertAction actionWithTitle:@"Redeem Codes"
+                                                                           style:UIAlertActionStyleDefault
+                                                                         handler:^(UIAlertAction * _Nonnull action) {
+                        redeemCodes();
+                    }];
+
                     UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"OK"
                                                                        style:UIAlertActionStyleDefault
                                                                      handler:^(UIAlertAction * _Nonnull action) {
@@ -176,22 +349,18 @@ UIViewController *topMostViewController() {
                     }];
 
                     [alert addAction:copyAction];
+                    [alert addAction:redeemAction];
                     [alert addAction:okAction];
 
                     UIViewController *topVC = topMostViewController();
                     if (topVC) {
                         [topVC presentViewController:alert animated:YES completion:nil];
                     }
-
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        removeStatusBox();
-                    });
                 });
             }];
             [roleTask resume];
         };
 
-        // Return orig with wrapped handler for interception without altering app flow
         return %orig(request, wrappedHandler);
     }
 
