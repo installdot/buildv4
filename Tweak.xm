@@ -1,244 +1,124 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
-#import <substrate.h>
-#import <dlfcn.h>
-#import <fcntl.h>
-#import <spawn.h>
-#import <stdarg.h>
-#import <sys/stat.h>
-#import <sys/types.h>
-#import <unistd.h>
+// Updated Tweak.xm - Now shows a popup alert on screen with the extracted character details
+// instead of just NSLog. Uses UIAlertController (modern iOS) presented from the top view controller.
 
-static NSString *gLogPath = nil;
+@interface UIViewController (TopMost)
++ (UIViewController *)topMostViewController;
+@end
 
-static void TraceLog(NSString *fmt, ...)
-{
-    @autoreleasepool {
-        va_list ap;
-        va_start(ap, fmt);
-        NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-        va_end(ap);
+@implementation UIViewController (TopMost)
 
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
-
-        // Console
-        NSLog(@"%@", line);
-
-        // File
-        if (!gLogPath) return;
-
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-        if (!fh) {
-            [[NSFileManager defaultManager] createFileAtPath:gLogPath contents:nil attributes:nil];
-            fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-            if (!fh) return;
-        }
-
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    }
-}
-
-/* ===================== C function hooks (MSHookFunction) ===================== */
-
-typedef int     (*open_t)(const char *path, int oflag, ...);
-typedef ssize_t (*write_t)(int fd, const void *buf, size_t count);
-typedef int     (*close_t)(int fd);
-typedef int     (*unlink_t)(const char *path);
-typedef int     (*rename_t)(const char *oldp, const char *newp);
-typedef int     (*mkdir_t)(const char *path, mode_t mode);
-typedef int     (*rmdir_t)(const char *path);
-typedef int     (*chmod_t)(const char *path, mode_t mode);
-typedef void *  (*dlopen_t)(const char *path, int mode);
-
-typedef int (*posix_spawn_t)(
-    pid_t *pid,
-    const char *path,
-    const posix_spawn_file_actions_t *file_actions,
-    const posix_spawnattr_t *attrp,
-    char *const argv[],
-    char *const envp[]
-);
-
-typedef int (*execve_t)(const char *path, char *const argv[], char *const envp[]);
-typedef int (*system_t)(const char *command); // DO NOT reference `system` symbol directly (SDK marks it unavailable)
-
-static open_t        orig_open = NULL;
-static write_t       orig_write = NULL;
-static close_t       orig_close = NULL;
-static unlink_t      orig_unlink = NULL;
-static rename_t      orig_rename = NULL;
-static mkdir_t       orig_mkdir = NULL;
-static rmdir_t       orig_rmdir = NULL;
-static chmod_t       orig_chmod = NULL;
-static dlopen_t      orig_dlopen = NULL;
-static posix_spawn_t orig_posix_spawn = NULL;
-static execve_t      orig_execve = NULL;
-static system_t      orig_system = NULL;
-
-static int my_open(const char *path, int flags, ...)
-{
-    if (flags & O_CREAT) {
-        va_list ap;
-        va_start(ap, flags);
-        mode_t mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-
-        TraceLog(@"open(path=%s flags=0x%x mode=%o)", path ? path : "(null)", flags, mode);
-        return orig_open ? orig_open(path, flags, mode) : -1;
-    }
-
-    TraceLog(@"open(path=%s flags=0x%x)", path ? path : "(null)", flags);
-    return orig_open ? orig_open(path, flags) : -1;
-}
-
-static ssize_t my_write(int fd, const void *buf, size_t count)
-{
-    TraceLog(@"write(fd=%d size=%zu)", fd, count);
-    return orig_write ? orig_write(fd, buf, count) : -1;
-}
-
-static int my_close(int fd)
-{
-    TraceLog(@"close(fd=%d)", fd);
-    return orig_close ? orig_close(fd) : -1;
-}
-
-static int my_unlink(const char *path)
-{
-    TraceLog(@"unlink(%s)", path ? path : "(null)");
-    return orig_unlink ? orig_unlink(path) : -1;
-}
-
-static int my_rename(const char *oldp, const char *newp)
-{
-    TraceLog(@"rename(%s -> %s)", oldp ? oldp : "(null)", newp ? newp : "(null)");
-    return orig_rename ? orig_rename(oldp, newp) : -1;
-}
-
-static int my_mkdir(const char *path, mode_t mode)
-{
-    TraceLog(@"mkdir(%s mode=%o)", path ? path : "(null)", mode);
-    return orig_mkdir ? orig_mkdir(path, mode) : -1;
-}
-
-static int my_rmdir(const char *path)
-{
-    TraceLog(@"rmdir(%s)", path ? path : "(null)");
-    return orig_rmdir ? orig_rmdir(path) : -1;
-}
-
-static int my_chmod(const char *path, mode_t mode)
-{
-    TraceLog(@"chmod(%s mode=%o)", path ? path : "(null)", mode);
-    return orig_chmod ? orig_chmod(path, mode) : -1;
-}
-
-static void *my_dlopen(const char *path, int mode)
-{
-    TraceLog(@"dlopen(%s)", path ? path : "(null)");
-    return orig_dlopen ? orig_dlopen(path, mode) : NULL;
-}
-
-static int my_posix_spawn(
-    pid_t *pid,
-    const char *path,
-    const posix_spawn_file_actions_t *file_actions,
-    const posix_spawnattr_t *attrp,
-    char *const argv[],
-    char *const envp[]
-) {
-    TraceLog(@"posix_spawn(%s)", path ? path : "(null)");
-    if (argv) {
-        for (int i = 0; argv[i]; i++) {
-            TraceLog(@"  argv[%d]=%s", i, argv[i]);
++ (UIViewController *)topMostViewController {
+    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+    if (!keyWindow) {
+        // Fallback to any window if keyWindow is nil (rare on modern iOS)
+        for (UIWindow *window in [UIApplication sharedApplication].windows) {
+            if (window.isKeyWindow) {
+                keyWindow = window;
+                break;
+            }
         }
     }
-    return orig_posix_spawn ? orig_posix_spawn(pid, path, file_actions, attrp, argv, envp) : -1;
-}
+    if (!keyWindow) return nil;
 
-static int my_execve(const char *path, char *const argv[], char *const envp[])
-{
-    TraceLog(@"execve(%s)", path ? path : "(null)");
-    if (argv) {
-        for (int i = 0; argv[i]; i++) {
-            TraceLog(@"  argv[%d]=%s", i, argv[i]);
-        }
+    UIViewController *topVC = keyWindow.rootViewController;
+    while (topVC.presentedViewController) {
+        topVC = topVC.presentedViewController;
     }
-    return orig_execve ? orig_execve(path, argv, envp) : -1;
+    return topVC;
 }
 
-static int my_system(const char *command)
-{
-    TraceLog(@"system(%s)", command ? command : "(null)");
-    return orig_system ? orig_system(command) : -1;
-}
+@end
 
-/* ===================== Objective-C hooks ===================== */
+%hook NSURLSession
 
-%hook NSFileManager
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    if (!completionHandler || !request || !request.URL) {
+        return %orig;
+    }
 
-- (BOOL)copyItemAtPath:(NSString *)src toPath:(NSString *)dst error:(NSError **)err
-{
-    TraceLog(@"NSFileManager copy %@ -> %@", src, dst);
-    return %orig(src, dst, err);
-}
+    NSString *urlString = request.URL.absoluteString;
 
-- (BOOL)moveItemAtPath:(NSString *)src toPath:(NSString *)dst error:(NSError **)err
-{
-    TraceLog(@"NSFileManager move %@ -> %@", src, dst);
-    return %orig(src, dst, err);
-}
+    // Intercept the OAuth token response
+    if ([urlString hasPrefix:@"https://oauth.vnggames.app/oauth/v1/token"]) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+            completionHandler(data, response, error); // Call original first
 
-- (BOOL)removeItemAtPath:(NSString *)path error:(NSError **)err
-{
-    TraceLog(@"NSFileManager remove %@", path);
-    return %orig(path, err);
-}
+            if (error || !data) return;
 
-- (BOOL)createFileAtPath:(NSString *)path contents:(NSData *)data attributes:(NSDictionary *)attr
-{
-    TraceLog(@"NSFileManager create %@ size=%lu", path, (unsigned long)data.length);
-    return %orig(path, data, attr);
+            NSError *jsonError = nil;
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+            if (jsonError || ![json[@"status"] boolValue]) return;
+
+            NSString *userId = json[@"userId"];
+            if (!userId || userId.length == 0) return;
+
+            // Trigger the second request
+            NSString *roleUrlStr = [NSString stringWithFormat:@"https://vgrapi-sea.vnggames.com/coordinator/api/v1/code/role?gameCode=A49&serverId=101&userIds=%@", userId];
+            NSURL *roleUrl = [NSURL URLWithString:roleUrlStr];
+            NSMutableURLRequest *roleRequest = [NSMutableURLRequest requestWithURL:roleUrl];
+            roleRequest.HTTPMethod = @"GET";
+            [roleRequest setValue:@"application/json, text/plain, */*" forHTTPHeaderField:@"accept"];
+            [roleRequest setValue:@"vi-VN,vi;q=0.9" forHTTPHeaderField:@"accept-language"];
+
+            NSURLSession *session = [NSURLSession sharedSession];
+            NSURLSessionDataTask *roleTask = [session dataTaskWithRequest:roleRequest completionHandler:^(NSData *roleData, NSURLResponse *roleResponse, NSError *roleError) {
+                if (roleError || !roleData) return;
+
+                NSError *roleJsonError = nil;
+                NSDictionary *roleJson = [NSJSONSerialization JSONObjectWithData:roleData options:0 error:&roleJsonError];
+                if (roleJsonError) return;
+
+                NSArray *dataArray = roleJson[@"data"];
+                if (![dataArray isKindOfClass:[NSArray class]] || dataArray.count == 0) return;
+
+                NSDictionary *roleInfo = dataArray[0];
+                NSString *charName = roleInfo[@"roleName"] ?: @"Unknown";
+                NSString *roleId = roleInfo[@"roleId"] ?: @"Unknown";
+                NSString *uid = roleInfo[@"userId"] ?: @"Unknown";
+                NSString *level = roleInfo[@"level"] ?: @"Unknown";
+                NSString *serverId = roleInfo[@"serverId"] ?: @"101";
+
+                // Build message string
+                NSString *message = [NSString stringWithFormat:
+                    @"Character name: %@\n"
+                    @"RoleID: %@\n"
+                    @"UserID: %@\n"
+                    @"Level: %@\n"
+                    @"ServerId: %@\n"
+                    @"gameCode: A49",
+                    charName, roleId, uid, level, serverId];
+
+                // Dispatch to main thread for UI
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIViewController *topVC = [UIViewController topMostViewController];
+                    if (!topVC) return;
+
+                    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Character Info Extracted"
+                                                                                   message:message
+                                                                            preferredStyle:UIAlertControllerStyleAlert];
+
+                    UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"OK"
+                                                                       style:UIAlertActionStyleDefault
+                                                                     handler:nil];
+                    [alert addAction:okAction];
+
+                    [topVC presentViewController:alert animated:YES completion:nil];
+                });
+            }];
+            [roleTask resume];
+        };
+
+        return %orig(request, wrappedHandler);
+    }
+
+    return %orig;
 }
 
 %end
 
-/* ===================== ctor ===================== */
-
-%ctor
-{
-    @autoreleasepool {
-        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        gLogPath = [docs stringByAppendingPathComponent:@"patch_trace.log"];
-
-        TraceLog(@"===== PatchTrace injected =====");
-        TraceLog(@"Log file: %@", gLogPath);
-
-        // File ops
-        MSHookFunction((void *)open,   (void *)my_open,   (void **)&orig_open);
-        MSHookFunction((void *)write,  (void *)my_write,  (void **)&orig_write);
-        MSHookFunction((void *)close,  (void *)my_close,  (void **)&orig_close);
-        MSHookFunction((void *)unlink, (void *)my_unlink, (void **)&orig_unlink);
-        MSHookFunction((void *)rename, (void *)my_rename, (void **)&orig_rename);
-        MSHookFunction((void *)mkdir,  (void *)my_mkdir,  (void **)&orig_mkdir);
-        MSHookFunction((void *)rmdir,  (void *)my_rmdir,  (void **)&orig_rmdir);
-        MSHookFunction((void *)chmod,  (void *)my_chmod,  (void **)&orig_chmod);
-
-        // Process + load
-        MSHookFunction((void *)posix_spawn, (void *)my_posix_spawn, (void **)&orig_posix_spawn);
-        MSHookFunction((void *)execve,      (void *)my_execve,      (void **)&orig_execve);
-        MSHookFunction((void *)dlopen,      (void *)my_dlopen,      (void **)&orig_dlopen);
-
-        // system() is "unavailable" in modern SDK headers — hook it only via dlsym (no direct symbol reference)
-        void *sysPtr = dlsym(RTLD_DEFAULT, "system");
-        if (sysPtr) {
-            MSHookFunction(sysPtr, (void *)my_system, (void **)&orig_system);
-            TraceLog(@"Hooked system() via dlsym");
-        } else {
-            TraceLog(@"system() symbol not found (OK)");
-        }
-    }
+%ctor {
+    %init;
 }
