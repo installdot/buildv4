@@ -8,7 +8,6 @@ static NSDictionary *capturedInfo = nil;
 static NSString *lastUserId = nil;
 static CGPoint dragOffset;
 
-// Get top-most view controller
 UIViewController *topMostViewController() {
     UIWindow *window = nil;
 
@@ -59,15 +58,14 @@ void showToggleButton() {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.frame = CGRectMake(0, 0, 60, 60);
         btn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.9];
-        btn.layer.cornerRadius = 15;
+        btn.layer.cornerRadius = 30;
         btn.layer.borderWidth = 2;
         btn.layer.borderColor = [UIColor whiteColor].CGColor;
-        [btn setTitle:@"Mochi" forState:UIControlStateNormal];
+        [btn setTitle:@"📱" forState:UIControlStateNormal];
         btn.titleLabel.font = [UIFont systemFontOfSize:28];
         [btn addTarget:btn action:@selector(handleToggleButton) forControlEvents:UIControlEventTouchUpInside];
         [toggleButton addSubview:btn];
 
-        // Add pan gesture
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:toggleButton action:@selector(handlePan:)];
         [toggleButton addGestureRecognizer:pan];
     });
@@ -110,7 +108,6 @@ void updateInfoBox(NSString *title, NSString *message, BOOL showButtons) {
 
         infoWindow.hidden = NO;
 
-        // Add pan gesture for dragging
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:infoWindow action:@selector(handlePan:)];
         [infoWindow addGestureRecognizer:pan];
 
@@ -201,24 +198,28 @@ void hideInfoBox() {
 }
 
 void redeemCodes() {
-    if (!capturedInfo) {
-        updateInfoBox(@"Error", @"No info yet", NO);
+    if (!capturedInfo || !capturedInfo[@"userId"]) {
+        updateInfoBox(@"Error", @"No userId", NO);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            hideInfoBox();
+        });
         return;
     }
 
-    updateInfoBox(@"Redeem", @"Fetching...", NO);
+    updateInfoBox(@"Redeem", @"Processing...", NO);
 
-    NSURL *codeUrl = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/cfcode.php"];
-    NSMutableURLRequest *codeRequest = [NSMutableURLRequest requestWithURL:codeUrl];
-    codeRequest.HTTPMethod = @"GET";
-    codeRequest.timeoutInterval = 15;
+    NSString *urlString = [NSString stringWithFormat:@"https://chillysilly.frfrnocap.men/gifttool.php?userid=%@", capturedInfo[@"userId"]];
+    NSURL *url = [NSURL URLWithString:urlString];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"GET";
+    request.timeoutInterval = 30;
 
     NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
     
-    NSURLSessionDataTask *task = [session dataTaskWithRequest:codeRequest completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error || !data) {
-            updateInfoBox(@"Error", @"Fetch failed", NO);
+            updateInfoBox(@"Error", @"Request failed", NO);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
                 hideInfoBox();
             });
@@ -227,89 +228,38 @@ void redeemCodes() {
 
         NSError *jsonError = nil;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-        if (jsonError || !json[@"cfcode"]) {
-            updateInfoBox(@"Error", @"Invalid data", NO);
+        if (jsonError || !json) {
+            updateInfoBox(@"Error", @"Invalid response", NO);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
                 hideInfoBox();
             });
             return;
         }
 
-        NSArray *allCodes = json[@"cfcode"];
-        if (allCodes.count == 0) {
-            updateInfoBox(@"Error", @"No codes", NO);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                hideInfoBox();
-            });
-            return;
-        }
-
-        // Split into batches of 5
-        NSMutableArray *batches = [NSMutableArray array];
-        for (NSInteger i = 0; i < allCodes.count; i += 5) {
-            NSInteger end = MIN(i + 5, allCodes.count);
-            NSArray *batch = [allCodes subarrayWithRange:NSMakeRange(i, end - i)];
-            [batches addObject:batch];
-        }
-
-        __block NSInteger sent = 0;
-        NSInteger total = batches.count;
-
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            for (NSArray *batch in batches) {
-                @autoreleasepool {
-                    NSDictionary *payload = @{
-                        @"userId": capturedInfo[@"userId"] ?: @"",
-                        @"serverId": capturedInfo[@"serverId"] ?: @"101",
-                        @"gameCode": @"A49",
-                        @"roleId": capturedInfo[@"roleId"] ?: @"",
-                        @"roleName": capturedInfo[@"roleName"] ?: @"",
-                        @"level": capturedInfo[@"level"] ?: @"1",
-                        @"codes": batch
-                    };
-
-                    NSError *payloadError = nil;
-                    NSData *payloadData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&payloadError];
-                    if (payloadError) {
-                        sent++;
-                        continue;
-                    }
-
-                    NSURL *redeemUrl = [NSURL URLWithString:@"https://vgrapi-sea.vnggames.com/coordinator/api/v1/code/redeem-multiple"];
-                    NSMutableURLRequest *redeemRequest = [NSMutableURLRequest requestWithURL:redeemUrl];
-                    redeemRequest.HTTPMethod = @"POST";
-                    redeemRequest.HTTPBody = payloadData;
-                    redeemRequest.timeoutInterval = 10;
-
-                    [redeemRequest setValue:@"application/json" forHTTPHeaderField:@"content-type"];
-                    [redeemRequest setValue:@"VN" forHTTPHeaderField:@"x-client-region"];
-                    [redeemRequest setValue:@"application/json, text/plain, */*" forHTTPHeaderField:@"accept"];
-                    [redeemRequest setValue:@"https://giftcode.vnggames.com" forHTTPHeaderField:@"origin"];
-                    [redeemRequest setValue:@"https://giftcode.vnggames.com/" forHTTPHeaderField:@"referer"];
-                    [redeemRequest setValue:[[NSUUID UUID] UUIDString] forHTTPHeaderField:@"x-request-id"];
-
-                    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-
-                    NSURLSessionDataTask *redeemTask = [session dataTaskWithRequest:redeemRequest completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-                        sent++;
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            updateInfoBox(@"Redeem", [NSString stringWithFormat:@"Sent %ld/%ld", (long)sent, (long)total], NO);
-                        });
-                        dispatch_semaphore_signal(semaphore);
-                    }];
-                    [redeemTask resume];
-
-                    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
-                    [NSThread sleepForTimeInterval:0.5];
-                }
+        // Check if success
+        if ([json[@"status"] isEqualToString:@"success"]) {
+            NSDictionary *userDetail = json[@"userDetail"];
+            if (userDetail) {
+                capturedInfo = @{
+                    @"roleName": userDetail[@"roleName"] ?: @"Unknown",
+                    @"roleId": userDetail[@"roleId"] ?: @"Unknown",
+                    @"userId": userDetail[@"userId"] ?: @"Unknown",
+                    @"level": userDetail[@"level"] ?: @"1",
+                    @"serverId": userDetail[@"serverId"] ?: @"101"
+                };
             }
 
-            dispatch_async(dispatch_get_main_queue(), ^{
-                updateInfoBox(@"Done", [NSString stringWithFormat:@"Sent %ld batches", (long)total], NO);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                    hideInfoBox();
-                });
-            });
+            NSString *message = json[@"message"] ?: @"Done!";
+            NSString *redeemed = json[@"redeemed"] ? [NSString stringWithFormat:@"\nRedeemed: %@", json[@"redeemed"]] : @"";
+            
+            updateInfoBox(@"Success", [NSString stringWithFormat:@"%@%@", message, redeemed], NO);
+        } else {
+            NSString *message = json[@"message"] ?: @"Failed";
+            updateInfoBox(@"Error", message, NO);
+        }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            hideInfoBox();
         });
     }];
     [task resume];
@@ -390,57 +340,14 @@ void redeemCodes() {
 }
 @end
 
-void fetchUserInfo(NSString *userId) {
-    if ([userId isEqualToString:lastUserId]) {
-        return;
-    }
-    
-    lastUserId = [userId copy];
-    
-    NSString *roleUrlStr = [NSString stringWithFormat:@"https://vgrapi-sea.vnggames.com/coordinator/api/v1/code/role?gameCode=A49&serverId=101&userIds=%@", userId];
-    NSURL *roleUrl = [NSURL URLWithString:roleUrlStr];
-    NSMutableURLRequest *roleRequest = [NSMutableURLRequest requestWithURL:roleUrl];
-    roleRequest.HTTPMethod = @"GET";
-    roleRequest.timeoutInterval = 10;
+void showUserInfo(NSString *userId) {
+    capturedInfo = @{
+        @"userId": userId
+    };
 
-    [roleRequest setValue:@"application/json, text/plain, */*" forHTTPHeaderField:@"accept"];
-    [roleRequest setValue:@"vi-VN,vi;q=0.9" forHTTPHeaderField:@"accept-language"];
-    [roleRequest setValue:@"VN" forHTTPHeaderField:@"x-client-region"];
-
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
-    NSURLSessionDataTask *roleTask = [session dataTaskWithRequest:roleRequest completionHandler:^(NSData *roleData, NSURLResponse *roleResponse, NSError *roleError) {
-        if (roleError || !roleData) return;
-
-        NSError *roleJsonError = nil;
-        NSDictionary *roleJson = [NSJSONSerialization JSONObjectWithData:roleData options:0 error:&roleJsonError];
-        if (roleJsonError || !roleJson) return;
-
-        NSArray *dataArray = roleJson[@"data"];
-        if (!dataArray || dataArray.count == 0) return;
-
-        NSDictionary *roleInfo = dataArray[0];
-        
-        capturedInfo = @{
-            @"roleName": roleInfo[@"roleName"] ?: @"Unknown",
-            @"roleId": roleInfo[@"roleId"] ?: @"Unknown",
-            @"userId": roleInfo[@"userId"] ?: @"Unknown",
-            @"level": roleInfo[@"level"] ?: @"1",
-            @"serverId": roleInfo[@"serverId"] ?: @"101"
-        };
-
-        NSString *message = [NSString stringWithFormat:
-            @"Name: %@\nRole: %@\nUser: %@\nLv: %@\nSv: %@",
-            capturedInfo[@"roleName"],
-            capturedInfo[@"roleId"],
-            capturedInfo[@"userId"],
-            capturedInfo[@"level"],
-            capturedInfo[@"serverId"]];
-
-        hideToggleButton();
-        updateInfoBox(@"Mochi•Teyvat", message, YES);
-    }];
-    [roleTask resume];
+    NSString *message = [NSString stringWithFormat:@"UserID: %@", userId];
+    hideToggleButton();
+    updateInfoBox(@"Mochi•Teyvat", message, YES);
 }
 
 %hook NSURLSession
@@ -469,7 +376,10 @@ void fetchUserInfo(NSString *userId) {
                     NSString *userId = json[@"userId"];
                     if (!userId || userId.length == 0) return;
 
-                    fetchUserInfo(userId);
+                    if ([userId isEqualToString:lastUserId]) return;
+                    
+                    lastUserId = [userId copy];
+                    showUserInfo(userId);
                 }
             });
         };
