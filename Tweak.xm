@@ -3,22 +3,24 @@
 #import <mach-o/dyld.h>
 
 // Anti-detection: Hide dylib from dyld_get_image_name
-static const char* (*original_dyld_get_image_name)(uint32_t) = NULL;
+typedef const char* (*dyld_get_image_name_t)(uint32_t);
+static dyld_get_image_name_t original_dyld_get_image_name = NULL;
 
 static const char* hooked_dyld_get_image_name(uint32_t index) {
     const char* name = original_dyld_get_image_name(index);
-    if (name && strstr(name, "APIBypass")) {
+    if (name && (strstr(name, "APIBypass") || strstr(name, "SystemFramework"))) {
         return NULL;
     }
     return name;
 }
 
 // Anti-detection: Hide from dladdr
-static int (*original_dladdr)(const void*, Dl_info*) = NULL;
+typedef int (*dladdr_t)(const void*, Dl_info*);
+static dladdr_t original_dladdr = NULL;
 
 static int hooked_dladdr(const void* addr, Dl_info* info) {
     int result = original_dladdr(addr, info);
-    if (result && info->dli_fname && strstr(info->dli_fname, "APIBypass")) {
+    if (result && info->dli_fname && (strstr(info->dli_fname, "APIBypass") || strstr(info->dli_fname, "SystemFramework"))) {
         return 0;
     }
     return result;
@@ -41,7 +43,7 @@ static int hooked_dladdr(const void* addr, Dl_info* info) {
     NSArray *original = %orig;
     NSMutableArray *filtered = [NSMutableArray array];
     for (NSString *path in original) {
-        if (![path containsString:@"APIBypass"]) {
+        if (![path containsString:@"APIBypass"] && ![path containsString:@"SystemFramework"]) {
             [filtered addObject:path];
         }
     }
@@ -56,14 +58,16 @@ static int hooked_dladdr(const void* addr, Dl_info* info) {
         // Hook dyld functions to hide our presence
         void *handle = dlopen(NULL, RTLD_NOW);
         if (handle) {
-            original_dyld_get_image_name = dlsym(handle, "dyld_get_image_name");
-            if (original_dyld_get_image_name) {
-                MSHookFunction(original_dyld_get_image_name, hooked_dyld_get_image_name, NULL);
+            void *sym1 = dlsym(handle, "dyld_get_image_name");
+            if (sym1) {
+                original_dyld_get_image_name = (dyld_get_image_name_t)sym1;
+                MSHookFunction((void *)sym1, (void *)hooked_dyld_get_image_name, (void **)NULL);
             }
             
-            original_dladdr = dlsym(handle, "dladdr");
-            if (original_dladdr) {
-                MSHookFunction(original_dladdr, hooked_dladdr, NULL);
+            void *sym2 = dlsym(handle, "dladdr");
+            if (sym2) {
+                original_dladdr = (dladdr_t)sym2;
+                MSHookFunction((void *)sym2, (void *)hooked_dladdr, (void **)NULL);
             }
         }
     }
