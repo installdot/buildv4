@@ -1,6 +1,7 @@
 #import <substrate.h>
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <dlfcn.h>
 
 // IL2CPP function pointer types
 typedef void* (*il2cpp_domain_get_assemblies_t)(void* domain, size_t* size);
@@ -161,7 +162,24 @@ static void hookIL2CPPMethods() {
 // Create UI overlay
 static void createUI() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+        UIWindow *keyWindow = nil;
+        
+        // iOS 13+ scene-based approach
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *window in scene.windows) {
+                        if (window.isKeyWindow) {
+                            keyWindow = window;
+                            break;
+                        }
+                    }
+                    if (keyWindow) break;
+                }
+            }
+        }
+        
+        // Fallback for iOS 12 and below
         if (!keyWindow) {
             for (UIWindow *window in [UIApplication sharedApplication].windows) {
                 if (window.isKeyWindow) {
