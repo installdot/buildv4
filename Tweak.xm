@@ -37,7 +37,7 @@ static UIScrollView *methodListView = nil;
 static NSMutableArray *logMessages = nil;
 static int tryUnlockCallCount = 0;
 static int hasBuyCallCount = 0;
-
+static void updateMethodList(void);
 // Add log message to screen
 static void addLog(NSString *message) {
     if (!logMessages) {
