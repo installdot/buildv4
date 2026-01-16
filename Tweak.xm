@@ -3,7 +3,7 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 
-// IL2CPP types
+// IL2CPP function pointer types
 typedef void* (*il2cpp_domain_get_assemblies_t)(void* domain, size_t* size);
 typedef void* (*il2cpp_domain_get_t)();
 typedef void* (*il2cpp_class_from_name_t)(void* image, const char* namespaze, const char* name);
@@ -11,7 +11,7 @@ typedef void* (*il2cpp_class_get_methods_t)(void* klass, void** iter);
 typedef const char* (*il2cpp_method_get_name_t)(void* method);
 typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
 
-// IL2CPP field functions
+// IL2CPP field access
 typedef void* (*il2cpp_class_get_field_from_name_t)(void* klass, const char* name);
 typedef void (*il2cpp_field_static_get_value_t)(void* field, void** out);
 
@@ -29,10 +29,10 @@ static void updateMethodList(void);
 static NSMutableArray<MethodInfo*> *foundMethods = nil;
 static UITextView *logView = nil;
 static UIScrollView *methodListView = nil;
+static NSMutableArray *logMessages = nil;
 static UIButton *rescanButton = nil;
 static UIButton *hideMethodListButton = nil;
 static UIButton *hideLogButton = nil;
-static NSMutableArray *logMessages = nil;
 
 static void* battlePassMethod = NULL;
 static void* battlePassClass = NULL;
@@ -47,37 +47,34 @@ static void addLog(NSString *message) {
     NSString *logEntry = [NSString stringWithFormat:@"[%@] %@", timestamp, message];
     [logMessages addObject:logEntry];
     if (logMessages.count > 100) [logMessages removeObjectAtIndex:0];
+
     dispatch_async(dispatch_get_main_queue(), ^{
         if (logView) {
             NSMutableString *text = [NSMutableString string];
             [text appendFormat:@"🎮 BattlePass Tweak\n"];
-            [text appendFormat:@"📊 Found Methods: %lu\n\n", (unsigned long)foundMethods.count];
+            [text appendFormat:@"📊 Total methods: %lu\n\n", (unsigned long)foundMethods.count];
             [text appendString:[logMessages componentsJoinedByString:@"\n"]];
             logView.text = text;
-            [logView scrollRangeToVisible:NSMakeRange(logView.text.length - 1, 1)];
+            [logView scrollRangeToVisible:NSMakeRange(logView.text.length-1,1)];
         }
     });
 }
 
-#pragma mark - Auto-fetch instance
+#pragma mark - Fetch Instance
 static void fetchBattlePassInstance(void) {
-    if (!battlePassClass) {
-        addLog(@"❌ Cannot fetch instance, class not found");
-        return;
-    }
-    il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
-    il2cpp_field_static_get_value_t il2cpp_field_static_get_value = dlsym(RTLD_DEFAULT, "il2cpp_field_static_get_value");
+    if (!battlePassClass) { addLog(@"❌ Cannot fetch instance, class not found"); return; }
+
+    il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = 
+        (il2cpp_class_get_field_from_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
+    il2cpp_field_static_get_value_t il2cpp_field_static_get_value = 
+        (il2cpp_field_static_get_value_t)dlsym(RTLD_DEFAULT, "il2cpp_field_static_get_value");
 
     if (!il2cpp_class_get_field_from_name || !il2cpp_field_static_get_value) {
-        addLog(@"❌ IL2CPP field functions not found");
-        return;
+        addLog(@"❌ IL2CPP field functions not found"); return;
     }
 
     void* instanceField = il2cpp_class_get_field_from_name(battlePassClass, "Instance");
-    if (!instanceField) {
-        addLog(@"❌ BattlePassData.Instance field not found");
-        return;
-    }
+    if (!instanceField) { addLog(@"❌ BattlePassData.Instance not found"); return; }
 
     void* instance = NULL;
     il2cpp_field_static_get_value(instanceField, &instance);
@@ -85,7 +82,7 @@ static void fetchBattlePassInstance(void) {
         battlePassInstance = instance;
         addLog(@"✅ BattlePassData instance fetched automatically!");
     } else {
-        addLog(@"❌ Failed to get BattlePassData instance");
+        addLog(@"❌ Failed to fetch BattlePassData instance");
     }
 }
 
@@ -95,17 +92,21 @@ static void callTryUnlockExample() {
         addLog(@"❌ Method or instance not found!");
         return;
     }
+
     int bpld = 1;
     int count = 1;
     NSString* source = @"true";
+
     bool (*methodPtr)(void*, int, int, void*) = (bool (*)(void*, int, int, void*))battlePassMethod;
     bool result = methodPtr(battlePassInstance, bpld, count, (__bridge void*)source);
+
     addLog([NSString stringWithFormat:@"📞 Called TryUnlockAdvancedBattlePass(bpld:%d, count:%d, source:%@) -> %@", bpld, count, source, result ? @"TRUE" : @"FALSE"]);
 }
 
 #pragma mark - Find method
 static void findTryUnlockMethod() {
     addLog(@"🔍 Searching for TryUnlockAdvancedBattlePass...");
+
     foundMethods = [NSMutableArray new];
     battlePassMethod = NULL;
     battlePassClass = NULL;
@@ -134,7 +135,7 @@ static void findTryUnlockMethod() {
         void* klass = il2cpp_class_from_name(image, "RGScript.Data", "BattlePassData");
         if (!klass) continue;
 
-        battlePassClass = klass; // save class pointer
+        battlePassClass = klass;
 
         void* iter = NULL;
         void* method;
@@ -144,7 +145,7 @@ static void findTryUnlockMethod() {
                 MethodInfo *info = [MethodInfo new];
                 info.name = [NSString stringWithUTF8String:name];
                 info.address = method;
-                [foundMethods addObject:info);
+                [foundMethods addObject:info];
                 battlePassMethod = method;
                 addLog(@"✅ Found TryUnlockAdvancedBattlePass!");
                 break;
@@ -155,28 +156,26 @@ static void findTryUnlockMethod() {
 
     addLog([NSString stringWithFormat:@"📊 Total methods found: %lu", (unsigned long)foundMethods.count]);
 
-    // Auto-fetch instance
     fetchBattlePassInstance();
-
     updateMethodList();
 }
 
-#pragma mark - Update UI list
+#pragma mark - Update UI
 static void updateMethodList() {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!methodListView) return;
-        for (UIView *sub in methodListView.subviews) [sub removeFromSuperview];
+        for (UIView *v in methodListView.subviews) [v removeFromSuperview];
 
         CGFloat y = 10;
-        CGFloat containerHeight = 40; // small
+        CGFloat containerHeight = 40;
         for (int i=0;i<foundMethods.count;i++) {
             MethodInfo *m = foundMethods[i];
-            UIView *container = [[UIView alloc] initWithFrame:CGRectMake(5, y, methodListView.frame.size.width-10, containerHeight)];
+            UIView *container = [[UIView alloc] initWithFrame:CGRectMake(5,y,methodListView.frame.size.width-10,containerHeight)];
             container.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.95];
             container.layer.cornerRadius = 5;
 
             UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(10,0,container.frame.size.width-20,20)];
-            nameLabel.text = [NSString stringWithFormat:@"%@\nAddr: 0x%lx", m.name, (unsigned long)m.address];
+            nameLabel.text = [NSString stringWithFormat:@"%@\nAddr:0x%lx", m.name, (unsigned long)m.address];
             nameLabel.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.3 alpha:1];
             nameLabel.font = [UIFont systemFontOfSize:10];
             nameLabel.numberOfLines = 2;
@@ -216,15 +215,13 @@ static void createUI() {
         if (!keyWindow) return;
 
         CGFloat screenWidth = keyWindow.bounds.size.width;
-        CGFloat boxWidth = (screenWidth-30)/2; // smaller
+        CGFloat boxWidth = (screenWidth-30)/2;
 
-        // Method list
         methodListView = [[UIScrollView alloc] initWithFrame:CGRectMake(10,100,boxWidth,150)];
         methodListView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.95];
         methodListView.layer.cornerRadius = 5;
         [keyWindow addSubview:methodListView];
 
-        // Log view
         logView = [[UITextView alloc] initWithFrame:CGRectMake(10,260,boxWidth,150)];
         logView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.95];
         logView.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.3 alpha:1];
@@ -250,7 +247,6 @@ static void createUI() {
         [hideLogButton addTarget:nil action:@selector(invokeHideLog:) forControlEvents:UIControlEventTouchUpInside];
         [keyWindow addSubview:hideLogButton];
 
-        // Rescan
         rescanButton = [UIButton buttonWithType:UIButtonTypeSystem];
         rescanButton.frame = CGRectMake(150,60,60,30);
         [rescanButton setTitle:@"Rescan" forState:UIControlStateNormal];
