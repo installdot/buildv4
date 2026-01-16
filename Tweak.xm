@@ -3,13 +3,16 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 
-// IL2CPP function pointer types
+// IL2CPP types
 typedef void* (*il2cpp_domain_get_assemblies_t)(void* domain, size_t* size);
 typedef void* (*il2cpp_domain_get_t)();
 typedef void* (*il2cpp_class_from_name_t)(void* image, const char* namespaze, const char* name);
 typedef void* (*il2cpp_class_get_methods_t)(void* klass, void** iter);
 typedef const char* (*il2cpp_method_get_name_t)(void* method);
 typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
+
+// Forward declarations
+static void updateMethodList(void);
 
 // Method info
 @interface MethodInfo : NSObject
@@ -19,11 +22,12 @@ typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
 @implementation MethodInfo @end
 
 // Globals
-static void updateMethodList(void);
 static NSMutableArray<MethodInfo*> *foundMethods = nil;
 static UITextView *logView = nil;
 static UIScrollView *methodListView = nil;
 static UIButton *rescanButton = nil;
+static UIButton *hideMethodListButton = nil;
+static UIButton *hideLogButton = nil;
 static NSMutableArray *logMessages = nil;
 static void* battlePassMethod = NULL;
 static void* battlePassInstance = NULL; // You need a valid instance
@@ -39,11 +43,14 @@ static void addLog(NSString *message) {
     if (logMessages.count > 100) [logMessages removeObjectAtIndex:0];
     dispatch_async(dispatch_get_main_queue(), ^{
         if (logView) {
-            logView.text = [logMessages componentsJoinedByString:@"\n"];
+            NSMutableString *text = [NSMutableString string];
+            [text appendFormat:@"🎮 BattlePass Tweak\n"];
+            [text appendFormat:@"📊 Found Methods: %lu\n\n", (unsigned long)foundMethods.count];
+            [text appendString:[logMessages componentsJoinedByString:@"\n"]];
+            logView.text = text;
             [logView scrollRangeToVisible:NSMakeRange(logView.text.length - 1, 1)];
         }
     });
-    NSLog(@"%@", logEntry);
 }
 
 #pragma mark - Call method
@@ -105,6 +112,7 @@ static void findTryUnlockMethod() {
         if (battlePassMethod) break;
     }
 
+    addLog([NSString stringWithFormat:@"📊 Total methods found: %lu", (unsigned long)foundMethods.count]);
     updateMethodList();
 }
 
@@ -115,67 +123,99 @@ static void updateMethodList() {
         for (UIView *sub in methodListView.subviews) [sub removeFromSuperview];
 
         CGFloat y = 10;
+        CGFloat containerHeight = 40; // half size
         for (int i=0;i<foundMethods.count;i++) {
             MethodInfo *m = foundMethods[i];
-            UIView *container = [[UIView alloc] initWithFrame:CGRectMake(5, y, methodListView.frame.size.width-10, 60)];
+            UIView *container = [[UIView alloc] initWithFrame:CGRectMake(5, y, methodListView.frame.size.width-10, containerHeight)];
             container.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.95];
-            container.layer.cornerRadius = 8;
+            container.layer.cornerRadius = 5;
 
-            UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(10,5,container.frame.size.width-20,20)];
-            nameLabel.text = m.name;
+            UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(10,0,container.frame.size.width-20,20)];
+            nameLabel.text = [NSString stringWithFormat:@"%@\nAddr: 0x%lx", m.name, (unsigned long)m.address];
             nameLabel.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.3 alpha:1];
-            nameLabel.font = [UIFont boldSystemFontOfSize:12];
+            nameLabel.font = [UIFont systemFontOfSize:10];
+            nameLabel.numberOfLines = 2;
             [container addSubview:nameLabel];
 
             UIButton *callBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            callBtn.frame = CGRectMake(10, 30, container.frame.size.width-20, 25);
+            callBtn.frame = CGRectMake(10,20,container.frame.size.width-20,18);
             [callBtn setTitle:@"▶ Call" forState:UIControlStateNormal];
             callBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.8 alpha:0.9];
-            callBtn.layer.cornerRadius = 5;
+            callBtn.layer.cornerRadius = 3;
             [callBtn addTarget:nil action:@selector(invokeCallTryUnlock:) forControlEvents:UIControlEventTouchUpInside];
             [container addSubview:callBtn];
 
             [methodListView addSubview:container];
-            y += 70;
+            y += containerHeight + 5;
         }
-
         methodListView.contentSize = CGSizeMake(methodListView.frame.size.width, y);
     });
 }
 
-#pragma mark - UI Creation
+#pragma mark - Create UI
 static void createUI() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+        UIWindow *keyWindow = nil;
+        if (@available(iOS 13.0, *)) {
+            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *window in scene.windows) {
+                        if (window.isKeyWindow) { keyWindow = window; break; }
+                    }
+                    if (keyWindow) break;
+                }
+            }
+        } else {
+            keyWindow = [UIApplication sharedApplication].keyWindow;
+        }
         if (!keyWindow) return;
-        CGFloat screenWidth = keyWindow.bounds.size.width;
-        CGFloat boxWidth = screenWidth-20;
 
-        methodListView = [[UIScrollView alloc] initWithFrame:CGRectMake(10,100,boxWidth,200)];
+        CGFloat screenWidth = keyWindow.bounds.size.width;
+        CGFloat boxWidth = (screenWidth-30)/2; // smaller half width
+
+        // Method list
+        methodListView = [[UIScrollView alloc] initWithFrame:CGRectMake(10,100,boxWidth,150)];
         methodListView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.95];
-        methodListView.layer.cornerRadius = 10;
-        methodListView.layer.borderWidth = 2;
-        methodListView.layer.borderColor = [UIColor colorWithRed:0.3 green:0.7 blue:0.9 alpha:1].CGColor;
+        methodListView.layer.cornerRadius = 5;
         [keyWindow addSubview:methodListView];
 
-        logView = [[UITextView alloc] initWithFrame:CGRectMake(10,310,boxWidth,200)];
+        // Log view
+        logView = [[UITextView alloc] initWithFrame:CGRectMake(10,260,boxWidth,150)];
         logView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.95];
         logView.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.3 alpha:1];
-        logView.font = [UIFont fontWithName:@"Menlo" size:9];
+        logView.font = [UIFont fontWithName:@"Menlo" size:8];
         logView.editable = NO;
-        logView.layer.cornerRadius = 10;
+        logView.layer.cornerRadius = 5;
         [keyWindow addSubview:logView];
 
+        // Hide buttons
+        hideMethodListButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        hideMethodListButton.frame = CGRectMake(10,60,60,30);
+        [hideMethodListButton setTitle:@"Hide List" forState:UIControlStateNormal];
+        hideMethodListButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.3 blue:0.3 alpha:0.9];
+        hideMethodListButton.layer.cornerRadius = 5;
+        [hideMethodListButton addTarget:nil action:@selector(invokeHideMethodList:) forControlEvents:UIControlEventTouchUpInside];
+        [keyWindow addSubview:hideMethodListButton];
+
+        hideLogButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        hideLogButton.frame = CGRectMake(80,60,60,30);
+        [hideLogButton setTitle:@"Hide Log" forState:UIControlStateNormal];
+        hideLogButton.backgroundColor = [UIColor colorWithRed:0.3 green:0.3 blue:0.8 alpha:0.9];
+        hideLogButton.layer.cornerRadius = 5;
+        [hideLogButton addTarget:nil action:@selector(invokeHideLog:) forControlEvents:UIControlEventTouchUpInside];
+        [keyWindow addSubview:hideLogButton];
+
+        // Rescan
         rescanButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        rescanButton.frame = CGRectMake(10, 520, 80, 40);
-        [rescanButton setTitle:@"🔄 Rescan" forState:UIControlStateNormal];
+        rescanButton.frame = CGRectMake(150,60,60,30);
+        [rescanButton setTitle:@"Rescan" forState:UIControlStateNormal];
         rescanButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.5 blue:0.2 alpha:0.9];
-        rescanButton.layer.cornerRadius = 8;
+        rescanButton.layer.cornerRadius = 5;
         [rescanButton addTarget:nil action:@selector(invokeRescan:) forControlEvents:UIControlEventTouchUpInside];
         [keyWindow addSubview:rescanButton];
 
-        // Make draggable
-        for (UIView *v in @[methodListView, logView, rescanButton]) {
+        // Draggable
+        for (UIView *v in @[methodListView, logView, hideMethodListButton, hideLogButton, rescanButton]) {
             UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
             [v addGestureRecognizer:pan];
         }
@@ -190,6 +230,10 @@ static void createUI() {
 - (void)invokeCallTryUnlock:(UIButton*)sender { callTryUnlockExample(); }
 %new
 - (void)invokeRescan:(UIButton*)sender { findTryUnlockMethod(); }
+%new
+- (void)invokeHideMethodList:(UIButton*)sender { methodListView.hidden = !methodListView.hidden; }
+%new
+- (void)invokeHideLog:(UIButton*)sender { logView.hidden = !logView.hidden; }
 %new
 - (void)handlePan:(UIPanGestureRecognizer*)gesture {
     UIView *view = gesture.view;
