@@ -19,6 +19,7 @@ typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
 @implementation MethodInfo @end
 
 // Globals
+static void updateMethodList(void);
 static NSMutableArray<MethodInfo*> *foundMethods = nil;
 static UITextView *logView = nil;
 static UIScrollView *methodListView = nil;
