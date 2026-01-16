@@ -22,6 +22,14 @@ typedef const char* (*il2cpp_image_get_name_t)(void* image);
 @implementation MethodInfo
 @end
 
+// Forward declarations
+static void updateMethodList(void); // ⚡ Forward declaration fixes compiler error
+static void hookMethod(MethodInfo *methodInfo);
+static void toggleHooks(UIButton *sender);
+static void toggleLogView(UIButton *sender);
+static void findIL2CPPMethods(void);
+static void createUI(void);
+
 // Original function pointers
 static bool (*orig_TryUnlockAdvancedBattlePass)(void* self, int bpld, int count, void* source);
 static bool (*orig_HasBuyAdvancedBattlePass)(void* self, int bpld);
@@ -32,17 +40,16 @@ static BOOL hooksEnabled = NO;
 static BOOL logViewVisible = YES;
 static UIButton *toggleButton = nil;
 static UIButton *logToggleButton = nil;
+static UIButton *rescanButton = nil;
 static UITextView *logView = nil;
 static UIScrollView *methodListView = nil;
 static NSMutableArray *logMessages = nil;
 static int tryUnlockCallCount = 0;
 static int hasBuyCallCount = 0;
-static void updateMethodList(void);
+
 // Add log message to screen
 static void addLog(NSString *message) {
-    if (!logMessages) {
-        logMessages = [NSMutableArray new];
-    }
+    if (!logMessages) logMessages = [NSMutableArray new];
     
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     [formatter setDateFormat:@"HH:mm:ss"];
@@ -51,9 +58,7 @@ static void addLog(NSString *message) {
     NSString *logEntry = [NSString stringWithFormat:@"[%@] %@", timestamp, message];
     [logMessages addObject:logEntry];
     
-    if (logMessages.count > 100) {
-        [logMessages removeObjectAtIndex:0];
-    }
+    if (logMessages.count > 100) [logMessages removeObjectAtIndex:0];
     
     dispatch_async(dispatch_get_main_queue(), ^{
         if (logView) {
@@ -68,7 +73,6 @@ static void addLog(NSString *message) {
 // Hooked TryUnlockAdvancedBattlePass
 static bool hook_TryUnlockAdvancedBattlePass(void* self, int bpld, int count, void* source) {
     tryUnlockCallCount++;
-    
     addLog(@"━━━━━━━━━━━━━━━━━━━━━━");
     addLog(@"📞 TryUnlock CALLED");
     addLog([NSString stringWithFormat:@"Call #%d | bpld:%d count:%d", tryUnlockCallCount, bpld, count]);
@@ -82,14 +86,12 @@ static bool hook_TryUnlockAdvancedBattlePass(void* self, int bpld, int count, vo
         addLog([NSString stringWithFormat:@"🔵 Original: %@", result ? @"TRUE" : @"FALSE"]);
     }
     addLog(@"━━━━━━━━━━━━━━━━━━━━━━");
-    
     return result;
 }
 
 // Hooked HasBuyAdvancedBattlePass
 static bool hook_HasBuyAdvancedBattlePass(void* self, int bpld) {
     hasBuyCallCount++;
-    
     addLog(@"━━━━━━━━━━━━━━━━━━━━━━");
     addLog(@"📞 HasBuy CALLED");
     addLog([NSString stringWithFormat:@"Call #%d | bpld:%d", hasBuyCallCount, bpld]);
@@ -103,7 +105,6 @@ static bool hook_HasBuyAdvancedBattlePass(void* self, int bpld) {
         addLog([NSString stringWithFormat:@"🔵 Original: %@", result ? @"TRUE" : @"FALSE"]);
     }
     addLog(@"━━━━━━━━━━━━━━━━━━━━━━");
-    
     return result;
 }
 
@@ -129,7 +130,6 @@ static void updateMethodList() {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!methodListView) return;
         
-        // Clear existing subviews
         for (UIView *subview in methodListView.subviews) {
             [subview removeFromSuperview];
         }
@@ -139,14 +139,12 @@ static void updateMethodList() {
         for (int i = 0; i < foundMethods.count; i++) {
             MethodInfo *methodInfo = foundMethods[i];
             
-            // Method container
             UIView *container = [[UIView alloc] initWithFrame:CGRectMake(5, yOffset, methodListView.frame.size.width - 10, 80)];
             container.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.95];
             container.layer.cornerRadius = 8;
             container.layer.borderWidth = 1;
             container.layer.borderColor = [UIColor colorWithRed:0.3 green:0.7 blue:0.9 alpha:1.0].CGColor;
             
-            // Method name label
             UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 5, container.frame.size.width - 20, 30)];
             nameLabel.text = methodInfo.name;
             nameLabel.textColor = [UIColor colorWithRed:0.3 green:1.0 blue:0.3 alpha:1.0];
@@ -155,14 +153,12 @@ static void updateMethodList() {
             nameLabel.adjustsFontSizeToFitWidth = YES;
             [container addSubview:nameLabel];
             
-            // Address label
             UILabel *addressLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 35, container.frame.size.width - 20, 15)];
             addressLabel.text = [NSString stringWithFormat:@"0x%lx", (unsigned long)methodInfo.address];
             addressLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
             addressLabel.font = [UIFont fontWithName:@"Menlo" size:10];
             [container addSubview:addressLabel];
             
-            // Hook button
             UIButton *hookButton = [UIButton buttonWithType:UIButtonTypeSystem];
             hookButton.frame = CGRectMake(10, 52, container.frame.size.width - 20, 25);
             hookButton.tag = i;
@@ -207,6 +203,7 @@ static void toggleLogView(UIButton *sender) {
     
     [UIView animateWithDuration:0.3 animations:^{
         logView.alpha = logViewVisible ? 1.0 : 0.0;
+        methodListView.alpha = logViewVisible ? 1.0 : 0.0; // hide method list too
     }];
     
     sender.backgroundColor = logViewVisible ? [UIColor colorWithRed:0.2 green:0.6 blue:0.8 alpha:0.9] : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
@@ -268,7 +265,6 @@ static void findIL2CPPMethods() {
             const char* methodName = il2cpp_method_get_name(method);
             if (!methodName) continue;
             
-            // Only track our target methods
             if (strcmp(methodName, "TryUnlockAdvancedBattlePass") == 0 || 
                 strcmp(methodName, "HasBuyAdvancedBattlePass") == 0) {
                 
@@ -281,7 +277,6 @@ static void findIL2CPPMethods() {
                 addLog([NSString stringWithFormat:@"✅ %s", methodName]);
             }
         }
-        
         break;
     }
     
@@ -371,18 +366,24 @@ static void createUI() {
         [logToggleButton addTarget:nil action:@selector(invokeLogToggle:) forControlEvents:UIControlEventTouchUpInside];
         [keyWindow addSubview:logToggleButton];
         
+        // Rescan button
+        rescanButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        rescanButton.frame = CGRectMake(150, 50, 80, 40);
+        [rescanButton setTitle:@"🔄 Rescan" forState:UIControlStateNormal];
+        [rescanButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        rescanButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        rescanButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.5 blue:0.2 alpha:0.9];
+        rescanButton.layer.cornerRadius = 8;
+        rescanButton.layer.borderWidth = 2;
+        rescanButton.layer.borderColor = [UIColor whiteColor].CGColor;
+        [rescanButton addTarget:nil action:@selector(invokeRescan:) forControlEvents:UIControlEventTouchUpInside];
+        [keyWindow addSubview:rescanButton];
+        
         // Make views draggable
-        UIPanGestureRecognizer *methodPan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
-        [methodListView addGestureRecognizer:methodPan];
-        
-        UIPanGestureRecognizer *logPan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
-        [logView addGestureRecognizer:logPan];
-        
-        UIPanGestureRecognizer *buttonPan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
-        [toggleButton addGestureRecognizer:buttonPan];
-        
-        UIPanGestureRecognizer *logButtonPan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
-        [logToggleButton addGestureRecognizer:logButtonPan];
+        for (UIView *v in @[methodListView, logView, toggleButton, logToggleButton, rescanButton]) {
+            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
+            [v addGestureRecognizer:pan];
+        }
         
         addLog(@"🎮 UI Ready!");
     });
@@ -391,22 +392,19 @@ static void createUI() {
 %hook UIView
 
 %new
-- (void)invokeToggle:(UIButton *)sender {
-    toggleHooks(sender);
-}
+- (void)invokeToggle:(UIButton *)sender { toggleHooks(sender); }
 
 %new
-- (void)invokeLogToggle:(UIButton *)sender {
-    toggleLogView(sender);
-}
+- (void)invokeLogToggle:(UIButton *)sender { toggleLogView(sender); }
 
 %new
 - (void)invokeHookMethod:(UIButton *)sender {
     NSInteger index = sender.tag;
-    if (index >= 0 && index < foundMethods.count) {
-        hookMethod(foundMethods[index]);
-    }
+    if (index >= 0 && index < foundMethods.count) hookMethod(foundMethods[index]);
 }
+
+%new
+- (void)invokeRescan:(UIButton *)sender { findIL2CPPMethods(); }
 
 %new
 - (void)handlePan:(UIPanGestureRecognizer *)gesture {
