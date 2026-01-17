@@ -1,293 +1,519 @@
-#import <substrate.h>
-#import <Foundation/Foundation.h>
+// Tweak.xm
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>
+#import <Foundation/Foundation.h>
+#import <CommonCrypto/CommonCrypto.h>
 
-// IL2CPP function pointer types
-typedef void* (*il2cpp_domain_get_assemblies_t)(void* domain, size_t* size);
-typedef void* (*il2cpp_domain_get_t)();
-typedef void* (*il2cpp_class_from_name_t)(void* image, const char* namespaze, const char* name);
-typedef void* (*il2cpp_class_get_methods_t)(void* klass, void** iter);
-typedef const char* (*il2cpp_method_get_name_t)(void* method);
-typedef void* (*il2cpp_assembly_get_image_t)(void* assembly);
+#pragma mark - CONFIG: set these to match server hex keys
+static NSString * const kHexKey = @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
+static NSString * const kHexHmacKey = @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE
+static NSString * const kServerURL = @"https://chillysilly.frfrnocap.men/iost.php";
+static BOOL g_hasShownCreditAlert = NO;
 
-// IL2CPP field access
-typedef void* (*il2cpp_class_get_field_from_name_t)(void* klass, const char* name);
-typedef void (*il2cpp_field_static_get_value_t)(void* field, void** out);
+#pragma mark - Helpers
 
-// Forward declaration
-static void updateMethodList(void);
+static NSData* dataFromHex(NSString *hex) {
+    NSMutableData *d = [NSMutableData data];
+    for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
+        NSRange r = NSMakeRange(i, 2);
+        NSString *byteStr = [hex substringWithRange:r];
+        unsigned int byte = 0;
+        [[NSScanner scannerWithString:byteStr] scanHexInt:&byte];
+        uint8_t b = (uint8_t)byte;
+        [d appendBytes:&b length:1];
+    }
+    return d;
+}
 
-// Method info
-@interface MethodInfo : NSObject
-@property (nonatomic, strong) NSString *name;
-@property (nonatomic, assign) void *address;
-@end
-@implementation MethodInfo @end
+static NSString* base64Encode(NSData *d) {
+    return [d base64EncodedStringWithOptions:0];
+}
+static NSData* base64Decode(NSString *s) {
+    return [[NSData alloc] initWithBase64EncodedString:s options:0];
+}
 
-// Globals
-static NSMutableArray<MethodInfo*> *foundMethods = nil;
-static UITextView *logView = nil;
-static UIScrollView *methodListView = nil;
-static NSMutableArray *logMessages = nil;
-static UIButton *rescanButton = nil;
-static UIButton *hideMethodListButton = nil;
-static UIButton *hideLogButton = nil;
+#pragma mark - AES-256-CBC encrypt/decrypt + HMAC-SHA256
 
-static void* battlePassMethod = NULL;
-static void* battlePassClass = NULL;
-static void* battlePassInstance = NULL;
+// returns box: iv(16) + cipher + hmac(32) as NSData
+static NSData* encryptPayload(NSData *plaintext, NSData *key, NSData *hmacKey) {
+    // generate IV
+    uint8_t ivBytes[16];
+    arc4random_buf(ivBytes, sizeof(ivBytes));
+    NSData *iv = [NSData dataWithBytes:ivBytes length:16];
 
-#pragma mark - Logging
-static void addLog(NSString *message) {
-    if (!logMessages) logMessages = [NSMutableArray new];
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"HH:mm:ss"];
-    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
-    NSString *logEntry = [NSString stringWithFormat:@"[%@] %@", timestamp, message];
-    [logMessages addObject:logEntry];
-    if (logMessages.count > 100) [logMessages removeObjectAtIndex:0];
+    // AES-256-CBC encrypt
+    size_t outlen = plaintext.length + kCCBlockSizeAES128;
+    void *outbuf = malloc(outlen);
+    size_t actualOut = 0;
+    CCCryptorStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                 key.bytes, key.length,
+                                 iv.bytes,
+                                 plaintext.bytes, plaintext.length,
+                                 outbuf, outlen, &actualOut);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    NSData *cipher = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (logView) {
-            NSMutableString *text = [NSMutableString string];
-            [text appendFormat:@"🎮 BattlePass Tweak\n"];
-            [text appendFormat:@"📊 Total methods: %lu\n\n", (unsigned long)foundMethods.count];
-            [text appendString:[logMessages componentsJoinedByString:@"\n"]];
-            logView.text = text;
-            [logView scrollRangeToVisible:NSMakeRange(logView.text.length-1,1)];
+    // compute HMAC over (iv || cipher)
+    NSMutableData *forHmac = [NSMutableData data];
+    [forHmac appendData:iv];
+    [forHmac appendData:cipher];
+    unsigned char hmac[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, hmac);
+    NSData *hmacData = [NSData dataWithBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
+
+    // compose box
+    NSMutableData *box = [NSMutableData data];
+    [box appendData:iv];
+    [box appendData:cipher];
+    [box appendData:hmacData];
+    return box;
+}
+
+static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
+    if (box.length < 16 + 32) return nil;
+    NSData *iv = [box subdataWithRange:NSMakeRange(0,16)];
+    NSData *hmac = [box subdataWithRange:NSMakeRange(box.length - 32, 32)];
+    NSData *cipher = [box subdataWithRange:NSMakeRange(16, box.length - 16 - 32)];
+
+    // verify hmac
+    NSMutableData *forHmac = [NSMutableData data];
+    [forHmac appendData:iv];
+    [forHmac appendData:cipher];
+    unsigned char calc[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, calc);
+    NSData *calcData = [NSData dataWithBytes:calc length:CC_SHA256_DIGEST_LENGTH];
+    if (![calcData isEqualToData:hmac]) return nil;
+
+    // decrypt
+    size_t outlen = cipher.length + kCCBlockSizeAES128;
+    void *outbuf = malloc(outlen);
+    size_t actualOut = 0;
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+                                 key.bytes, key.length,
+                                 iv.bytes,
+                                 cipher.bytes, cipher.length,
+                                 outbuf, outlen, &actualOut);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    NSData *plain = [NSData dataWithBytesNoCopy:outbuf length:actualOut freeWhenDone:YES];
+    return plain;
+}
+
+#pragma mark - App UUID persistence
+
+static NSString* appUUID() {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/uuid.txt"];
+    NSError *err = nil;
+    NSString *uuid = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+    if (!uuid || uuid.length == 0) {
+        uuid = [[NSUUID UUID] UUIDString];
+        [uuid writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    return uuid;
+}
+
+#pragma mark - UI helpers
+
+static UIWindow* firstWindow() {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) return w;
+            }
         }
-    });
+    }
+    return UIApplication.sharedApplication.windows.firstObject;
+}
+static UIViewController* topVC() {
+    UIWindow *win = firstWindow();
+    UIViewController *root = win.rootViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
+    return root;
 }
 
-#pragma mark - Fetch Instance
-static void fetchBattlePassInstance(void) {
-    if (!battlePassClass) { addLog(@"❌ Cannot fetch instance, class not found"); return; }
-
-    il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name = 
-        (il2cpp_class_get_field_from_name_t)dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
-    il2cpp_field_static_get_value_t il2cpp_field_static_get_value = 
-        (il2cpp_field_static_get_value_t)dlsym(RTLD_DEFAULT, "il2cpp_field_static_get_value");
-
-    if (!il2cpp_class_get_field_from_name || !il2cpp_field_static_get_value) {
-        addLog(@"❌ IL2CPP field functions not found"); return;
-    }
-
-    void* instanceField = il2cpp_class_get_field_from_name(battlePassClass, "Instance");
-    if (!instanceField) { addLog(@"❌ BattlePassData.Instance not found"); return; }
-
-    void* instance = NULL;
-    il2cpp_field_static_get_value(instanceField, &instance);
-    if (instance) {
-        battlePassInstance = instance;
-        addLog(@"✅ BattlePassData instance fetched automatically!");
-    } else {
-        addLog(@"❌ Failed to fetch BattlePassData instance");
-    }
+#pragma mark - Force close
+static void killApp() {
+    exit(0);
 }
 
-#pragma mark - Call method
-static void callTryUnlockExample() {
-    if (!battlePassMethod || !battlePassInstance) {
-        addLog(@"❌ Method or instance not found!");
+#pragma mark - Save lastTimestamp for verification
+static NSString *g_lastTimestamp = nil;
+
+#pragma mark - Network: verify then open menu
+
+// Forward declarations for existing menu functions
+static void showMainMenu();
+static void showPlayerMenu();
+static void showDataMenu();
+
+// Build JSON payload and send encrypted
+static void verifyAccessAndOpenMenu() {
+    NSData *key = dataFromHex(kHexKey);
+    NSData *hmacKey = dataFromHex(kHexHmacKey);
+    if (!key || key.length != 32 || !hmacKey || hmacKey.length != 32) {
+        // invalid keys
+        killApp();
         return;
     }
 
-    int bpld = 1;
-    int count = 1;
-    NSString* source = @"true";
+    NSString *uuid = appUUID();
+    NSString *timestamp = [NSString stringWithFormat:@"%lld", (long long)[[NSDate date] timeIntervalSince1970]];
+    g_lastTimestamp = timestamp; // store local copy for later verification
 
-    bool (*methodPtr)(void*, int, int, void*) = (bool (*)(void*, int, int, void*))battlePassMethod;
-    bool result = methodPtr(battlePassInstance, bpld, count, (__bridge void*)source);
+    NSDictionary *payload = @{@"uuid": uuid, @"timestamp": timestamp, @"encrypted": @"yes"};
+    NSData *plain = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
 
-    addLog([NSString stringWithFormat:@"📞 Called TryUnlockAdvancedBattlePass(bpld:%d, count:%d, source:%@) -> %@", bpld, count, source, result ? @"TRUE" : @"FALSE"]);
+    NSData *box = encryptPayload(plain, key, hmacKey);
+    if (!box) { killApp(); return; }
+
+    NSString *b64 = base64Encode(box);
+    NSDictionary *post = @{@"data": b64};
+    NSData *postData = [NSJSONSerialization dataWithJSONObject:post options:0 error:nil];
+
+    NSURL *url = [NSURL URLWithString:kServerURL];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 10.0;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody = postData;
+
+    NSURLSession *s = [NSURLSession sharedSession];
+    NSURLSessionDataTask *task = [s dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err){
+        if (err || !data) { killApp(); return; }
+
+        // parse server JSON: { data: "<base64>" }
+        NSDictionary *outer = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (!outer || !outer[@"data"]) { killApp(); return; }
+        NSString *respB64 = outer[@"data"];
+        NSData *respBox = base64Decode(respB64);
+        if (!respBox) { killApp(); return; }
+
+        NSData *plainResp = decryptAndVerify(respBox, key, hmacKey);
+        if (!plainResp) { killApp(); return; }
+
+        NSDictionary *respJSON = [NSJSONSerialization JSONObjectWithData:plainResp options:0 error:nil];
+        if (!respJSON) { killApp(); return; }
+
+        NSString *r_uuid = respJSON[@"uuid"];
+        NSString *r_ts = respJSON[@"timestamp"];
+        BOOL allow = [respJSON[@"allow"] boolValue];
+
+        // Security checks: must match exactly the sent uuid & timestamp and allow true
+        if (!r_uuid || ![r_uuid isEqualToString:uuid]) { killApp(); return; }
+        if (!r_ts || ![r_ts isEqualToString:g_lastTimestamp]) { killApp(); return; }
+        if (!allow) { killApp(); return; }
+
+        // OK — show menu on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            showMainMenu();
+        });
+    }];
+    [task resume];
 }
 
-#pragma mark - Find method
-static void findTryUnlockMethod() {
-    addLog(@"🔍 Searching for TryUnlockAdvancedBattlePass...");
+#pragma mark - Regex patch helpers (NSUserDefaults domain approach)
 
-    foundMethods = [NSMutableArray new];
-    battlePassMethod = NULL;
-    battlePassClass = NULL;
-    battlePassInstance = NULL;
-
-    void* handle = dlopen(NULL, RTLD_LAZY);
-    if (!handle) { addLog(@"❌ IL2CPP handle failed"); return; }
-
-    il2cpp_domain_get_t il2cpp_domain_get = (il2cpp_domain_get_t)dlsym(handle, "il2cpp_domain_get");
-    il2cpp_domain_get_assemblies_t il2cpp_domain_get_assemblies = (il2cpp_domain_get_assemblies_t)dlsym(handle, "il2cpp_domain_get_assemblies");
-    il2cpp_assembly_get_image_t il2cpp_assembly_get_image = (il2cpp_assembly_get_image_t)dlsym(handle, "il2cpp_assembly_get_image");
-    il2cpp_class_from_name_t il2cpp_class_from_name = (il2cpp_class_from_name_t)dlsym(handle, "il2cpp_class_from_name");
-    il2cpp_class_get_methods_t il2cpp_class_get_methods = (il2cpp_class_get_methods_t)dlsym(handle, "il2cpp_class_get_methods");
-    il2cpp_method_get_name_t il2cpp_method_get_name = (il2cpp_method_get_name_t)dlsym(handle, "il2cpp_method_get_name");
-
-    if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies || !il2cpp_assembly_get_image || !il2cpp_class_from_name || !il2cpp_class_get_methods || !il2cpp_method_get_name) {
-        addLog(@"❌ IL2CPP functions failed"); return;
-    }
-
-    void* domain = il2cpp_domain_get();
-    size_t assemblyCount = 0;
-    void** assemblies = (void**)il2cpp_domain_get_assemblies(domain, &assemblyCount);
-
-    for (size_t i=0;i<assemblyCount;i++) {
-        void* image = il2cpp_assembly_get_image(assemblies[i]);
-        void* klass = il2cpp_class_from_name(image, "RGScript.Data", "BattlePassData");
-        if (!klass) continue;
-
-        battlePassClass = klass;
-
-        void* iter = NULL;
-        void* method;
-        while ((method = il2cpp_class_get_methods(klass, &iter))) {
-            const char* name = il2cpp_method_get_name(method);
-            if (name && strcmp(name, "TryUnlockAdvancedBattlePass")==0) {
-                MethodInfo *info = [MethodInfo new];
-                info.name = [NSString stringWithUTF8String:name];
-                info.address = method;
-                [foundMethods addObject:info];
-                battlePassMethod = method;
-                addLog(@"✅ Found TryUnlockAdvancedBattlePass!");
-                break;
-            }
-        }
-        if (battlePassMethod) break;
-    }
-
-    addLog([NSString stringWithFormat:@"📊 Total methods found: %lu", (unsigned long)foundMethods.count]);
-
-    fetchBattlePassInstance();
-    updateMethodList();
+// Convert dict -> XML string
+static NSString* dictToPlist(NSDictionary *d) {
+    NSError *err = nil;
+    NSData *dat = [NSPropertyListSerialization dataWithPropertyList:d format:NSPropertyListXMLFormat_v1_0 options:0 error:&err];
+    if (!dat) return nil;
+    return [[NSString alloc] initWithData:dat encoding:NSUTF8StringEncoding];
+}
+static NSDictionary* plistToDict(NSString *plist) {
+    if (!plist) return nil;
+    NSData *dat = [plist dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *err = nil;
+    id obj = [NSPropertyListSerialization propertyListWithData:dat options:NSPropertyListMutableContainersAndLeaves format:NULL error:&err];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
-#pragma mark - Update UI
-static void updateMethodList() {
+static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+    NSString *plist = dictToPlist(domain);
+    if (!plist) return NO;
+    NSError *err = nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:&err];
+    if (!re) return NO;
+    NSString *modified = [re stringByReplacingMatchesInString:plist options:0 range:NSMakeRange(0, plist.length) withTemplate:replacement];
+    NSDictionary *newDomain = plistToDict(modified);
+    if (!newDomain) return NO;
+    [defs setPersistentDomain:newDomain forName:bid];
+    [defs synchronize];
+    return YES;
+}
+
+static void applyPatchWithAlert(NSString *title, NSString *pattern, NSString *replacement) {
+    BOOL ok = silentApplyRegexToDomain(pattern, replacement);
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!methodListView) return;
-        for (UIView *v in methodListView.subviews) [v removeFromSuperview];
-
-        CGFloat y = 10;
-        CGFloat containerHeight = 40;
-        for (int i=0;i<foundMethods.count;i++) {
-            MethodInfo *m = foundMethods[i];
-            UIView *container = [[UIView alloc] initWithFrame:CGRectMake(5,y,methodListView.frame.size.width-10,containerHeight)];
-            container.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.95];
-            container.layer.cornerRadius = 5;
-
-            UILabel *nameLabel = [[UILabel alloc] initWithFrame:CGRectMake(10,0,container.frame.size.width-20,20)];
-            nameLabel.text = [NSString stringWithFormat:@"%@\nAddr:0x%lx", m.name, (unsigned long)m.address];
-            nameLabel.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.3 alpha:1];
-            nameLabel.font = [UIFont systemFontOfSize:10];
-            nameLabel.numberOfLines = 2;
-            [container addSubview:nameLabel];
-
-            UIButton *callBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-            callBtn.frame = CGRectMake(10,20,container.frame.size.width-20,18);
-            [callBtn setTitle:@"▶ Call" forState:UIControlStateNormal];
-            callBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.8 alpha:0.9];
-            callBtn.layer.cornerRadius = 3;
-            [callBtn addTarget:nil action:@selector(invokeCallTryUnlock:) forControlEvents:UIControlEventTouchUpInside];
-            [container addSubview:callBtn];
-
-            [methodListView addSubview:container];
-            y += containerHeight + 5;
-        }
-        methodListView.contentSize = CGSizeMake(methodListView.frame.size.width, y);
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:(ok?@"Success":@"Failed")
+                                                                       message:[NSString stringWithFormat:@"%@ %@", title, ok?@"applied":@"failed"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:alert animated:YES completion:nil];
     });
 }
 
-#pragma mark - Create UI
-static void createUI() {
+#pragma mark - Gems/Reborn/Bypass/PatchAll
+
+static void patchGems() {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+    NSString *plist = dictToPlist(domain) ?: @"";
+
+    UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Set Gems" message:@"Enter value" preferredStyle:UIAlertControllerStyleAlert];
+    [input addTextFieldWithConfigurationHandler:^(UITextField *tf){ tf.keyboardType = UIKeyboardTypeNumberPad; tf.placeholder = @"0"; }];
+    [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSInteger v = [input.textFields.firstObject.text integerValue];
+        NSString *re1 = @"(<key>\\d+_gems</key>\\s*<integer>)\\d+";
+        NSString *re2 = @"(<key>\\d+_last_gems</key>\\s*<integer>)\\d+";
+        silentApplyRegexToDomain(re1, [NSString stringWithFormat:@"$1%ld", (long)v]);
+        silentApplyRegexToDomain(re2, [NSString stringWithFormat:@"$1%ld", (long)v]);
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Gems Updated" message:[NSString stringWithFormat:@"%ld", (long)v] preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+    [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:input animated:YES completion:nil];
+}
+
+static void patchRebornWithAlert() {
+    applyPatchWithAlert(@"Reborn", @"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
+}
+
+static void silentPatchBypass() {
+    silentApplyRegexToDomain(@"(<key>OpenNewtonJsonTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
+    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
+}
+
+static void patchAllExcludingGems() {
+    // characters, skins, skills, pets, level, furniture, reborn, bypass (no gems)
+    NSDictionary *map = @{
+        @"Characters": @"(<key>\\d+_c\\d+_unlock.*\\n.*)false",
+        @"Skins":      @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+",
+        @"Skills":     @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d",
+        @"Pets":       @"(<key>\\d+_p\\d+_unlock.*\\n.*)false",
+        @"Level":      @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+",
+        @"Furniture":  @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+"
+    };
+
+    for (NSString *k in map) {
+        NSString *pattern = map[k];
+        NSString *rep = @"$1";
+        // pattern-specific replacement:
+        if ([k isEqualToString:@"Characters"] || [k isEqualToString:@"Pets"]) rep = @"$1True";
+        else if ([k isEqualToString:@"Skins"] || [k isEqualToString:@"Skills"] ) rep = @"$11";
+        else if ([k isEqualToString:@"Level"]) rep = @"$18";
+        else if ([k isEqualToString:@"Furniture"]) rep = @"$15";
+        silentApplyRegexToDomain(pattern, rep);
+    }
+    // Reborn
+    silentApplyRegexToDomain(@"(<key>\\d+_reborn_card</key>\\s*<integer>)\\d+", @"$11");
+    // Bypass
+    silentPatchBypass();
+
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = nil;
-        if (@available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if (scene.activationState == UISceneActivationStateForegroundActive) {
-                    for (UIWindow *window in scene.windows) {
-                        if (window.isKeyWindow) { keyWindow = window; break; }
-                    }
-                    if (keyWindow) break;
-                }
-            }
-        } else {
-            keyWindow = [UIApplication sharedApplication].keyWindow;
-        }
-        if (!keyWindow) return;
-
-        CGFloat screenWidth = keyWindow.bounds.size.width;
-        CGFloat boxWidth = (screenWidth-30)/2;
-
-        methodListView = [[UIScrollView alloc] initWithFrame:CGRectMake(10,100,boxWidth,150)];
-        methodListView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.95];
-        methodListView.layer.cornerRadius = 5;
-        [keyWindow addSubview:methodListView];
-
-        logView = [[UITextView alloc] initWithFrame:CGRectMake(10,260,boxWidth,150)];
-        logView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.95];
-        logView.textColor = [UIColor colorWithRed:0.3 green:1 blue:0.3 alpha:1];
-        logView.font = [UIFont fontWithName:@"Menlo" size:8];
-        logView.editable = NO;
-        logView.layer.cornerRadius = 5;
-        [keyWindow addSubview:logView];
-
-        // Hide buttons
-        hideMethodListButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        hideMethodListButton.frame = CGRectMake(10,60,60,30);
-        [hideMethodListButton setTitle:@"Hide List" forState:UIControlStateNormal];
-        hideMethodListButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.3 blue:0.3 alpha:0.9];
-        hideMethodListButton.layer.cornerRadius = 5;
-        [hideMethodListButton addTarget:nil action:@selector(invokeHideMethodList:) forControlEvents:UIControlEventTouchUpInside];
-        [keyWindow addSubview:hideMethodListButton];
-
-        hideLogButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        hideLogButton.frame = CGRectMake(80,60,60,30);
-        [hideLogButton setTitle:@"Hide Log" forState:UIControlStateNormal];
-        hideLogButton.backgroundColor = [UIColor colorWithRed:0.3 green:0.3 blue:0.8 alpha:0.9];
-        hideLogButton.layer.cornerRadius = 5;
-        [hideLogButton addTarget:nil action:@selector(invokeHideLog:) forControlEvents:UIControlEventTouchUpInside];
-        [keyWindow addSubview:hideLogButton];
-
-        rescanButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        rescanButton.frame = CGRectMake(150,60,60,30);
-        [rescanButton setTitle:@"Rescan" forState:UIControlStateNormal];
-        rescanButton.backgroundColor = [UIColor colorWithRed:0.8 green:0.5 blue:0.2 alpha:0.9];
-        rescanButton.layer.cornerRadius = 5;
-        [rescanButton addTarget:nil action:@selector(invokeRescan:) forControlEvents:UIControlEventTouchUpInside];
-        [keyWindow addSubview:rescanButton];
-
-        // Draggable
-        for (UIView *v in @[methodListView, logView, hideMethodListButton, hideLogButton, rescanButton]) {
-            UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(handlePan:)];
-            [v addGestureRecognizer:pan];
-        }
-
-        addLog(@"🎮 UI Ready!");
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Patch All" message:@"Applied (excluding Gems)" preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
     });
 }
 
-#pragma mark - UIView hooks
-%hook UIView
-%new
-- (void)invokeCallTryUnlock:(UIButton*)sender { callTryUnlockExample(); }
-%new
-- (void)invokeRescan:(UIButton*)sender { findTryUnlockMethod(); }
-%new
-- (void)invokeHideMethodList:(UIButton*)sender { methodListView.hidden = !methodListView.hidden; }
-%new
-- (void)invokeHideLog:(UIButton*)sender { logView.hidden = !logView.hidden; }
-%new
-- (void)handlePan:(UIPanGestureRecognizer*)gesture {
-    UIView *view = gesture.view;
-    CGPoint t = [gesture translationInView:view.superview];
-    view.center = CGPointMake(view.center.x+t.x, view.center.y+t.y);
-    [gesture setTranslation:CGPointZero inView:view.superview];
+#pragma mark - Player menu
+
+static void showPlayerMenu() {
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Player" message:@"Choose patch" preferredStyle:UIAlertControllerStyleAlert];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Characters" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Characters", @"(<key>\\d+_c\\d+_unlock.*\\n.*)false", @"$1True");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Skins" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Skins", @"(<key>\\d+_c\\d+_skin\\d+.*\\n.*>)[+-]?\\d+", @"$11");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Skills" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Skills", @"(<key>\\d+_c_.*_skill_\\d_unlock.*\\n.*<integer>)\\d", @"$11");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Pets" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Pets", @"(<key>\\d+_p\\d+_unlock.*\\n.*)false", @"$1True");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Level" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Level", @"(<key>\\d+_c\\d+_level+.*\\n.*>)[+-]?\\d+", @"$18");
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Furniture" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        applyPatchWithAlert(@"Furniture", @"(<key>\\d+_furniture+_+.*\\n.*>)[+-]?\\d+", @"$15");
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Gems" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchGems();
+    }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Reborn" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchRebornWithAlert();
+    }]];
+    // Bypass is removed from menu; it runs silently before showing
+    [menu addAction:[UIAlertAction actionWithTitle:@"Patch All" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        patchAllExcludingGems();
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
 }
-%end
+
+#pragma mark - Document helpers (hide .new)
+
+static NSArray* listDocumentsFiles() {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:docs error:nil] ?: @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *f in files) {
+        if (![f hasSuffix:@".new"]) [out addObject:f];
+    }
+    return out;
+}
+
+static void showFileActionMenu(NSString *fileName) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [docs stringByAppendingPathComponent:fileName];
+
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:fileName message:@"Action" preferredStyle:UIAlertControllerStyleAlert];
+
+    // Export (copy contents to clipboard)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Export" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        NSString *txt = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&err];
+        if (txt) UIPasteboard.generalPasteboard.string = txt;
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(txt?@"Exported":@"Error") message:(txt?@"Copied to clipboard":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+
+    // Import (replace)
+    [menu addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+        UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Import" message:@"Paste text to import" preferredStyle:UIAlertControllerStyleAlert];
+        [input addTextFieldWithConfigurationHandler:nil];
+        [input addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *ok){
+            NSString *txt = input.textFields.firstObject.text ?: @"";
+            NSError *err = nil;
+            BOOL okw = [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+            UIAlertController *done = [UIAlertController alertControllerWithTitle:(okw?@"Imported":@"Import Failed") message:(okw?@"File overwritten":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+            [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [topVC() presentViewController:done animated:YES completion:nil];
+        }]];
+        [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [topVC() presentViewController:input animated:YES completion:nil];
+    }]];
+
+    // Delete
+    [menu addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a){
+        NSError *err = nil;
+        BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+        UIAlertController *done = [UIAlertController alertControllerWithTitle:(ok?@"Deleted":@"Delete failed") message:(ok?@"File removed":err.localizedDescription) preferredStyle:UIAlertControllerStyleAlert];
+        [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:done animated:YES completion:nil];
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
+}
+
+static void showDataMenu() {
+    NSArray *files = listDocumentsFiles();
+    if (files.count == 0) {
+        UIAlertController *e = [UIAlertController alertControllerWithTitle:@"No files" message:@"Documents is empty" preferredStyle:UIAlertControllerStyleAlert];
+        [e addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [topVC() presentViewController:e animated:YES completion:nil];
+        return;
+    }
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Documents" message:@"Select file" preferredStyle:UIAlertControllerStyleAlert];
+    for (NSString *f in files) {
+        [menu addAction:[UIAlertAction actionWithTitle:f style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){
+            showFileActionMenu(f);
+        }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
+}
+
+#pragma mark - Main Menu (runs silent bypass before showing)
+
+static void showMainMenu() {
+    // silent bypass
+    silentPatchBypass();
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu" message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Player" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showPlayerMenu(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Data" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a){ showDataMenu(); }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC() presentViewController:menu animated:YES completion:nil];
+}
+
+#pragma mark - Floating draggable button
+
+static CGPoint g_startPoint;
+static CGPoint g_btnStart;
+static UIButton *floatingButton = nil;
 
 %ctor {
-    addLog(@"🚀 Loading...");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0*NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        createUI();
-        findTryUnlockMethod();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIWindow *win = firstWindow();
+        floatingButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        floatingButton.frame = CGRectMake(10, 50, 40, 40);
+        floatingButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        floatingButton.layer.cornerRadius = 10;
+        floatingButton.tintColor = UIColor.whiteColor;
+        [floatingButton setTitle:@"Menu" forState:UIControlStateNormal];
+        floatingButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+
+        [floatingButton addTarget:UIApplication.sharedApplication action:@selector(showMenuPressed) forControlEvents:UIControlEventTouchUpInside];
+
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:UIApplication.sharedApplication action:@selector(handlePan:)];
+        [floatingButton addGestureRecognizer:pan];
+
+        [win addSubview:floatingButton];
     });
 }
+
+%hook UIApplication
+%new
+- (void)showMenuPressed {
+    // === ONE-TIME CREDIT ALERT ===
+    if (!g_hasShownCreditAlert) {
+        g_hasShownCreditAlert = YES;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *message = @"This dylib is made by mochiteyvat(Discord).\n"
+                                @"This is free dylib, if you bought this then u likely got scammed.\n"
+                                @"Đây là dylib được tạo bởi mochiteyvat(Discord).\n"
+                                @"Nếu bạn mua thì bạn đã bị dắt như bò!";
+
+            UIAlertController *credit = [UIAlertController alertControllerWithTitle:@"Info"
+                                                                            message:message
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+
+            [credit addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                // After user dismisses the credit alert → proceed to normal verification flow
+                verifyAccessAndOpenMenu();
+            }]];
+
+            UIViewController *root = topVC();
+            [root presentViewController:credit animated:YES completion:nil];
+        });
+    } else {
+        // Normal flow (already shown once this session)
+        verifyAccessAndOpenMenu();
+    }
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    UIButton *btn = (UIButton*)pan.view;
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        g_startPoint = [pan locationInView:btn.superview];
+        g_btnStart = btn.center;
+    } else if (pan.state == UIGestureRecognizerStateChanged) {
+        CGPoint pt = [pan locationInView:btn.superview];
+        CGFloat dx = pt.x - g_startPoint.x;
+        CGFloat dy = pt.y - g_startPoint.y;
+        btn.center = CGPointMake(g_btnStart.x + dx, g_btnStart.y + dy);
+    }
+}
+%end
