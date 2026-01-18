@@ -150,6 +150,50 @@ static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
     return plain;
 }
 
+#pragma mark - DES-CBC encrypt/decrypt
+
+static NSData *desKeyData = nil;
+static NSData *desIVData = nil;
+
+static void initDESKeyAndIV() {
+    if (!desKeyData) {
+        const char keyStr[8] = {'i', 'a', 'm', 'b', 'o', '\0', '\0', '\0'};
+        desKeyData = [NSData dataWithBytes:keyStr length:8];
+    }
+    if (!desIVData) {
+        const char ivStr[8] = {'A', 'h', 'b', 'o', 'o', 'l', '\0', '\0'};
+        desIVData = [NSData dataWithBytes:ivStr length:8];
+    }
+}
+
+static NSData* desEncrypt(NSData *plaintext) {
+    initDESKeyAndIV();
+    size_t outlen = plaintext.length + kCCBlockSizeDES;
+    void *outbuf = malloc(outlen);
+    size_t actual = 0;
+    CCCryptorStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmDES, kCCOptionPKCS7Padding,
+                                 desKeyData.bytes, kCCKeySizeDES,
+                                 desIVData.bytes,
+                                 plaintext.bytes, plaintext.length,
+                                 outbuf, outlen, &actual);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    return [NSData dataWithBytesNoCopy:outbuf length:actual freeWhenDone:YES];
+}
+
+static NSData* desDecrypt(NSData *ciphertext) {
+    initDESKeyAndIV();
+    size_t outlen = ciphertext.length + kCCBlockSizeDES;
+    void *outbuf = malloc(outlen);
+    size_t actual = 0;
+    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmDES, kCCOptionPKCS7Padding,
+                                 desKeyData.bytes, kCCKeySizeDES,
+                                 desIVData.bytes,
+                                 ciphertext.bytes, ciphertext.length,
+                                 outbuf, outlen, &actual);
+    if (st != kCCSuccess) { free(outbuf); return nil; }
+    return [NSData dataWithBytesNoCopy:outbuf length:actual freeWhenDone:YES];
+}
+
 #pragma mark - App UUID persistence
 
 static NSString* appUUID() {
@@ -264,6 +308,8 @@ static char kTokenVisibleKey;
 - (void)showLoadingWithMessage:(NSString *)msg;
 - (void)hideLoading;
 - (void)refreshAccountsFromSdkState;
+- (NSDictionary *)loadBPData;
+- (NSString *)bpFilePath;
 @end
 
 #pragma mark - Network: verify then open menu
@@ -404,6 +450,26 @@ static void showMainMenu() {
 - (NSString *)bgImagePath {
     NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
     return [lib stringByAppendingPathComponent:kBGImageFileName];
+}
+
+- (NSString *)bpFilePath {
+    id pid = self.currentAccount[@"playerId"] ?: self.currentAccount[@"userId"];
+    if (!pid) return nil;
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_id_%@.data", pid];
+    NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    return [lib stringByAppendingPathComponent:fileName];
+}
+
+- (NSDictionary *)loadBPData {
+    NSString *path = [self bpFilePath];
+    if (!path) return nil;
+    NSData *enc = [NSData dataWithContentsOfFile:path];
+    if (!enc) return nil;
+    NSData *plain = desDecrypt(enc);
+    if (!plain) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
+    if (![obj isKindOfClass:[NSDictionary class]]) return nil;
+    return obj;
 }
 
 - (BOOL)isAccountExpired:(NSDictionary *)acc {
@@ -908,6 +974,7 @@ static void showMainMenu() {
             @{@"title": @"Main",     @"key": @"Main"},
             @{@"title": @"Player",   @"key": @"Player"},
             @{@"title": @"Accounts", @"key": @"Accounts"},
+            @{@"title": @"BP",       @"key": @"BP"},
             @{@"title": @"Settings", @"key": @"Settings"},
             @{@"title": @"Credit",   @"key": @"Credit"}
         ];
@@ -1084,6 +1151,7 @@ static void showMainMenu() {
     
     [self addMenuButtonWithTitle:@"Player"   toView:scroll y:&y action:@selector(mainPlayerTapped)];
     [self addMenuButtonWithTitle:@"Accounts" toView:scroll y:&y action:@selector(mainAccountsTapped)];
+    [self addMenuButtonWithTitle:@"BP"       toView:scroll y:&y action:@selector(mainBPTapped)];
     [self addMenuButtonWithTitle:@"Settings" toView:scroll y:&y action:@selector(mainSettingsTapped)];
     [self addMenuButtonWithTitle:@"Credit"   toView:scroll y:&y action:@selector(mainCreditTapped)];
     
@@ -1107,6 +1175,123 @@ static void showMainMenu() {
     [self addMenuButtonWithTitle:@"Patch All"  toView:scroll y:&y action:@selector(playerPatchAllTapped)];
     
     scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
+}
+
+- (void)renderBPTab {
+    UIScrollView *scroll = [self createScrollInContent];
+    if (!scroll) return;
+    CGFloat y = 12.0;
+    
+    NSDictionary *bpDict = [self loadBPData];
+    if (!bpDict || bpDict[@"seasonData"].count == 0) {
+        UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 40)];
+        empty.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
+        empty.font = [UIFont systemFontOfSize:13];
+        empty.numberOfLines = 0;
+        empty.text = @"No Battle Pass data found.";
+        [scroll addSubview:empty];
+        scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 60);
+        return;
+    }
+    
+    NSArray *seasons = bpDict[@"seasonData"];
+    NSDictionary *season = seasons[0][@"Value"];
+    
+    NSString *curLevelStr = [NSString stringWithFormat:@"%@", season[@"curLevel"] ?: @"0"];
+    NSString *hasBuyStr = [season[@"hasBuy"] boolValue] ? @"True" : @"False";
+    
+    y = [self addKey:@"Current Level:" value:curLevelStr toView:scroll y:y];
+    y = [self addKey:@"Unlock:" value:hasBuyStr toView:scroll y:y];
+    
+    [self addMenuButtonWithTitle:@"Unlock BP" toView:scroll y:&y action:@selector(unlockBPTapped)];
+    [self addMenuButtonWithTitle:@"Max Level" toView:scroll y:&y action:@selector(maxLevelBPTapped)];
+    [self addMenuButtonWithTitle:@"Complete Quest" toView:scroll y:&y action:@selector(completeQuestBPTapped)];
+    
+    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
+}
+
+- (void)unlockBPTapped {
+    NSString *path = [self bpFilePath];
+    if (!path) return;
+    NSDictionary *bpDict = [self loadBPData];
+    if (!bpDict) return;
+    NSMutableArray *seasons = [bpDict[@"seasonData"] mutableCopy];
+    if (seasons.count == 0) return;
+    NSMutableDictionary *season = [seasons[0][@"Value"] mutableCopy];
+    season[@"hasBuy"] = @YES;
+    seasons[0][@"Value"] = season;
+    NSMutableDictionary *newDict = [bpDict mutableCopy];
+    newDict[@"seasonData"] = seasons;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:newDict options:0 error:nil];
+    if (!json) return;
+    NSData *enc = desEncrypt(json);
+    if (!enc) return;
+    [enc writeToFile:path atomically:YES];
+    [self showSimpleMessageWithTitle:@"BattlePass" message:@"Unlocked BattlePass"];
+    [self renderActiveTab];
+}
+
+- (void)maxLevelBPTapped {
+    NSString *path = [self bpFilePath];
+    if (!path) return;
+    NSDictionary *bpDict = [self loadBPData];
+    if (!bpDict) return;
+    NSMutableArray *seasons = [bpDict[@"seasonData"] mutableCopy];
+    if (seasons.count == 0) return;
+    NSMutableDictionary *season = [seasons[0][@"Value"] mutableCopy];
+    season[@"curLevel"] = @50;
+    seasons[0][@"Value"] = season;
+    NSMutableDictionary *newDict = [bpDict mutableCopy];
+    newDict[@"seasonData"] = seasons;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:newDict options:0 error:nil];
+    if (!json) return;
+    NSData *enc = desEncrypt(json);
+    if (!enc) return;
+    [enc writeToFile:path atomically:YES];
+    [self showSimpleMessageWithTitle:@"BattlePass" message:@"Max Level Applied"];
+    [self renderActiveTab];
+}
+
+- (void)completeQuestBPTapped {
+    NSString *path = [self bpFilePath];
+    if (!path) return;
+    NSDictionary *bpDict = [self loadBPData];
+    if (!bpDict) return;
+    NSMutableArray *seasons = [bpDict[@"seasonData"] mutableCopy];
+    if (seasons.count == 0) return;
+    NSMutableDictionary *season = [seasons[0][@"Value"] mutableCopy];
+    NSMutableArray *tasks = [season[@"seasonTaskData"] mutableCopy];
+    for (NSMutableDictionary *task in tasks) {
+        if ([task[@"Status"] isEqualToString:@"Progress"]) {
+            task[@"Status"] = @"Complete";
+            task[@"CurrentProgress"] = task[@"TargetProgress"];
+            task[@"CompleteTime"] = @((long long)[[NSDate date] timeIntervalSince1970] * 10000000LL); // Approximate ticks
+        }
+    }
+    season[@"seasonTaskData"] = tasks;
+    
+    NSMutableArray *weeklyLists = [season[@"weeklyTaskDataList"] mutableCopy];
+    for (NSMutableArray *week in weeklyLists) {
+        for (NSMutableDictionary *task in week) {
+            if ([task[@"Status"] isEqualToString:@"Progress"]) {
+                task[@"Status"] = @"Complete";
+                task[@"CurrentProgress"] = task[@"TargetProgress"];
+                task[@"CompleteTime"] = @((long long)[[NSDate date] timeIntervalSince1970] * 10000000LL);
+            }
+        }
+    }
+    season[@"weeklyTaskDataList"] = weeklyLists;
+    
+    seasons[0][@"Value"] = season;
+    NSMutableDictionary *newDict = [bpDict mutableCopy];
+    newDict[@"seasonData"] = seasons;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:newDict options:0 error:nil];
+    if (!json) return;
+    NSData *enc = desEncrypt(json);
+    if (!enc) return;
+    [enc writeToFile:path atomically:YES];
+    [self showSimpleMessageWithTitle:@"BattlePass" message:@"Quests Completed"];
+    [self renderActiveTab];
 }
 
 - (void)renderSettingsTabContentInCurrentContentView {
@@ -1229,6 +1414,8 @@ static void showMainMenu() {
         [self renderPlayerTab];
     } else if ([self.activeTab isEqualToString:@"Accounts"]) {
         [self renderAccountsTab];
+    } else if ([self.activeTab isEqualToString:@"BP"]) {
+        [self renderBPTab];
     } else if ([self.activeTab isEqualToString:@"Settings"]) {
         [self renderSettingsTabContentInCurrentContentView];
     } else if ([self.activeTab isEqualToString:@"Credit"]) {
@@ -1274,6 +1461,7 @@ static void showMainMenu() {
 
 - (void)mainPlayerTapped { [self showTab:@"Player"]; }
 - (void)mainAccountsTapped { [self showTab:@"Accounts"]; }
+- (void)mainBPTapped { [self showTab:@"BP"]; }
 - (void)mainSettingsTapped { [self showTab:@"Settings"]; }
 - (void)mainCreditTapped { [self showTab:@"Credit"]; }
 
