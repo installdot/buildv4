@@ -47,7 +47,41 @@ static NSNumber *getUserId(void) {
     return root[@"User"][@"Id"];
 }
 
-@class LMUIHelper;
+#pragma mark - LMUIHelper interface
+
+static char kSidebarTabKey;
+static char kTokenLabelKey;
+static char kTokenVisibleKey;
+
+@interface LMUIHelper : NSObject <UITextFieldDelegate>
+@property (nonatomic, strong) UIView *currentOverlay;
+@property (nonatomic, strong) UIView *contentView;
+@property (nonatomic, strong) UIView *sidebarView;
+@property (nonatomic, strong) UIImage *backgroundImage;
+@property (nonatomic, copy) void (^creditCompletion)(void);
+@property (nonatomic, strong) NSString *currentFileName;
+@property (nonatomic, strong) NSString *activeTab;
+@property (nonatomic, strong) UIView *loadingOverlay;
+@property (nonatomic, assign) BOOL shouldExitOnBypassOk;
+@property (nonatomic, strong) NSNumber *manualUserId;
+
++ (instancetype)shared;
+- (void)showMainMenu;
+- (void)showPlayerMenu;
+- (void)showSettings;
+- (void)showSimpleMessageWithTitle:(NSString *)title message:(NSString *)message;
+- (void)showCreditWithCompletion:(void(^)(void))completion;
+- (void)backgroundUpdatedSuccess;
+- (void)backgroundUpdatedFailed:(NSString *)msg;
+- (void)hideKeyboardTapped;
+- (void)showTab:(NSString *)tabName;
+- (void)showLoadingWithMessage:(NSString *)msg;
+- (void)hideLoading;
+- (void)showNotificationWithTitle:(NSString *)title message:(NSString *)message;
+- (CGFloat)addKey:(NSString *)key value:(NSString *)value toView:(UIView *)view y:(CGFloat)y;
+- (void)showGemsInput;
+- (void)loadBPWithId:(UIButton *)sender;
+@end
 
 #pragma mark - Helpers
 
@@ -269,39 +303,6 @@ static BOOL silentApplyRegexToDomain(NSString *pattern, NSString *replacement) {
     return YES;
 }
 
-#pragma mark - LMUIHelper interface
-
-static char kSidebarTabKey;
-static char kTokenLabelKey;
-static char kTokenVisibleKey;
-
-@interface LMUIHelper : NSObject <UITextFieldDelegate>
-@property (nonatomic, strong) UIView *currentOverlay;
-@property (nonatomic, strong) UIView *contentView;
-@property (nonatomic, strong) UIView *sidebarView;
-@property (nonatomic, strong) UIImage *backgroundImage;
-@property (nonatomic, copy) void (^creditCompletion)(void);
-@property (nonatomic, strong) NSString *currentFileName;
-@property (nonatomic, strong) NSString *activeTab;
-@property (nonatomic, strong) UIView *loadingOverlay;
-@property (nonatomic, assign) BOOL shouldExitOnBypassOk;
-
-+ (instancetype)shared;
-- (void)showMainMenu;
-- (void)showPlayerMenu;
-- (void)showSettings;
-- (void)showSimpleMessageWithTitle:(NSString *)title message:(NSString *)message;
-- (void)showCreditWithCompletion:(void(^)(void))completion;
-- (void)backgroundUpdatedSuccess;
-- (void)backgroundUpdatedFailed:(NSString *)msg;
-- (void)hideKeyboardTapped;
-- (void)showTab:(NSString *)tabName;
-- (void)showLoadingWithMessage:(NSString *)msg;
-- (void)hideLoading;
-- (void)showNotificationWithTitle:(NSString *)title message:(NSString *)message;
-- (CGFloat)addKey:(NSString *)key value:(NSString *)value toView:(UIView *)view y:(CGFloat)y;
-@end
-
 #pragma mark - Network: verify then open menu
 
 static void verifyAccessAndOpenMenu() {
@@ -448,12 +449,8 @@ static void showMainMenu() {
     box.layer.borderWidth = 1.0;
     box.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.18] CGColor];
     
-    UIActivityIndicatorView *spin;
-    if (@available(iOS 13.0, *)) {
-        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-    } else {
-        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
-    }
+    UIActivityIndicatorView *spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    spin.color = [UIColor whiteColor];
     spin.center = CGPointMake(bw/2.0, bh/2.0 - 10);
     [spin startAnimating];
     [box addSubview:spin];
@@ -521,7 +518,7 @@ static void showMainMenu() {
             (id)[UIColor colorWithRed:0.20 green:0.08 blue:0.25 alpha:1.0].CGColor
         ];
         grad.startPoint = CGPointMake(0, 0);
-        grad.endPoint   = CGPointMake(1, 1);
+        grad.endPoint = CGPointMake(1, 1);
         [panel.layer insertSublayer:grad atIndex:0];
         panel.backgroundColor = [UIColor clearColor];
     }
@@ -535,7 +532,7 @@ static void showMainMenu() {
         (id)[UIColor colorWithRed:0.75 green:0.35 blue:1.0 alpha:0.95].CGColor
     ];
     hgrad.startPoint = CGPointMake(0, 0.5);
-    hgrad.endPoint   = CGPointMake(1, 0.5);
+    hgrad.endPoint = CGPointMake(1, 0.5);
     [header.layer insertSublayer:hgrad atIndex:0];
     header.backgroundColor = [UIColor clearColor];
     [panel addSubview:header];
@@ -566,7 +563,7 @@ static void showMainMenu() {
             (id)[UIColor colorWithRed:0.08 green:0.10 blue:0.22 alpha:1.0].CGColor
         ];
         sgrad.startPoint = CGPointMake(0, 0);
-        sgrad.endPoint   = CGPointMake(0, 1);
+        sgrad.endPoint = CGPointMake(0, 1);
         [side.layer insertSublayer:sgrad atIndex:0];
         side.backgroundColor = [UIColor clearColor];
         [panel addSubview:side];
@@ -658,7 +655,7 @@ static void showMainMenu() {
                 (id)[UIColor colorWithRed:0.80 green:0.45 blue:1.0 alpha:1.0].CGColor
             ];
             grad.startPoint = CGPointMake(0, 0.5);
-            grad.endPoint   = CGPointMake(1, 0.5);
+            grad.endPoint = CGPointMake(1, 0.5);
             b.backgroundColor = [UIColor clearColor];
             NSArray *sublayers = [b.layer.sublayers copy];
             for (CALayer *l in sublayers) {
@@ -720,7 +717,7 @@ static void showMainMenu() {
         (id)[UIColor colorWithRed:0.65 green:0.40 blue:1.0 alpha:1.0].CGColor
     ];
     grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint   = CGPointMake(1, 0.5);
+    grad.endPoint = CGPointMake(1, 0.5);
     [btn.layer insertSublayer:grad atIndex:0];
     btn.layer.cornerRadius = 8.0;
     btn.layer.masksToBounds = YES;
@@ -817,48 +814,72 @@ static void showMainMenu() {
 }
 
 - (void)renderBPTab {
-    NSNumber *uid = getUserId();
+    UIScrollView *scroll = [self createScrollInContent];
+    if (!scroll) return;
+
+    NSNumber *uid = getUserId() ?: self.manualUserId;
     if (!uid) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
-        lbl.text = @"No user ID found";
+        CGFloat y = 12.0;
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 20)];
+        lbl.text = @"No user ID found. Enter ID:";
         lbl.textColor = [UIColor whiteColor];
-        [self.contentView addSubview:lbl];
+        [scroll addSubview:lbl];
+        y += 26.0;
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 32)];
+        tf.borderStyle = UITextBorderStyleRoundedRect;
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.backgroundColor = [UIColor whiteColor];
+        [scroll addSubview:tf];
+        y += 38.0;
+        [self addMenuButtonWithTitle:@"Load" toView:scroll y:&y action:@selector(loadBPWithId:)];
+        scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
         return;
     }
     NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
-    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
     if (!fileData) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
-        lbl.text = @"No BP file found";
+        CGFloat y = 12.0;
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 40)];
+        lbl.text = [NSString stringWithFormat:@"File not found for ID: %@. Enter new ID:", uid];
         lbl.textColor = [UIColor whiteColor];
-        [self.contentView addSubview:lbl];
+        lbl.numberOfLines = 0;
+        [scroll addSubview:lbl];
+        y += 46.0;
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 32)];
+        tf.borderStyle = UITextBorderStyleRoundedRect;
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.backgroundColor = [UIColor whiteColor];
+        [scroll addSubview:tf];
+        y += 38.0;
+        [self addMenuButtonWithTitle:@"Load" toView:scroll y:&y action:@selector(loadBPWithId:)];
+        scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
         return;
     }
     NSData *decrypted = decryptDES(fileData);
     if (!decrypted) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, scroll.bounds.size.width - 24, 20)];
         lbl.text = @"Decryption failed";
         lbl.textColor = [UIColor whiteColor];
-        [self.contentView addSubview:lbl];
+        [scroll addSubview:lbl];
         return;
     }
     NSError *err = nil;
     NSDictionary *bpDict = [NSJSONSerialization JSONObjectWithData:decrypted options:0 error:&err];
     if (err || !bpDict) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, scroll.bounds.size.width - 24, 20)];
         lbl.text = @"JSON parse failed";
         lbl.textColor = [UIColor whiteColor];
-        [self.contentView addSubview:lbl];
+        [scroll addSubview:lbl];
         return;
     }
     NSArray *seasonData = bpDict[@"seasonData"];
     if (seasonData.count == 0) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, scroll.bounds.size.width - 24, 20)];
         lbl.text = @"No season data";
         lbl.textColor = [UIColor whiteColor];
-        [self.contentView addSubview:lbl];
+        [scroll addSubview:lbl];
         return;
     }
     NSDictionary *value = seasonData[0][@"Value"];
@@ -866,7 +887,6 @@ static void showMainMenu() {
     BOOL hasBuy = [value[@"hasBuy"] boolValue];
     NSString *unlockStr = hasBuy ? @"True" : @"False";
     
-    UIScrollView *scroll = [self createScrollInContent];
     CGFloat y = 12.0;
     y = [self addKey:@"ID:" value:[NSString stringWithFormat:@"%@", uid] toView:scroll y:y];
     y = [self addKey:@"Current Level:" value:[NSString stringWithFormat:@"%@", curLevel] toView:scroll y:y];
@@ -921,7 +941,7 @@ static void showMainMenu() {
         (id)[UIColor colorWithRed:0.50 green:0.35 blue:1.0 alpha:0.95].CGColor
     ];
     grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint   = CGPointMake(1, 0.5);
+    grad.endPoint = CGPointMake(1, 0.5);
     [saveBtn.layer insertSublayer:grad atIndex:0];
     saveBtn.layer.cornerRadius = 10.0;
     saveBtn.layer.masksToBounds = YES;
@@ -1093,11 +1113,11 @@ static void showMainMenu() {
 #pragma mark - BP actions
 
 - (void)bpUnlockTapped {
-    NSNumber *uid = getUserId();
+    NSNumber *uid = getUserId() ?: self.manualUserId;
     if (!uid) return;
     NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
-    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
     if (!fileData) return;
     NSData *decrypted = decryptDES(fileData);
@@ -1117,11 +1137,11 @@ static void showMainMenu() {
 }
 
 - (void)bpMaxLevelTapped {
-    NSNumber *uid = getUserId();
+    NSNumber *uid = getUserId() ?: self.manualUserId;
     if (!uid) return;
     NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
-    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
     if (!fileData) return;
     NSData *decrypted = decryptDES(fileData);
@@ -1141,11 +1161,11 @@ static void showMainMenu() {
 }
 
 - (void)bpCompleteQuestTapped {
-    NSNumber *uid = getUserId();
+    NSNumber *uid = getUserId() ?: self.manualUserId;
     if (!uid) return;
     NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
-    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
     if (!fileData) return;
     NSData *decrypted = decryptDES(fileData);
@@ -1181,6 +1201,22 @@ static void showMainMenu() {
     [encrypted writeToFile:path atomically:YES];
     [self renderActiveTab];
     [self showNotificationWithTitle:@"BattlePass" message:@"Quests Completed"];
+}
+
+- (void)loadBPWithId:(UIButton *)sender {
+    UIScrollView *scroll = (UIScrollView *)sender.superview;
+    UITextField *tf = nil;
+    for (UIView *v in scroll.subviews) {
+        if ([v isKindOfClass:[UITextField class]]) {
+            tf = (UITextField *)v;
+            break;
+        }
+    }
+    NSString *idStr = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    long long idValue = [idStr longLongValue];
+    if (idValue == 0) return;
+    self.manualUserId = @(idValue);
+    [self renderActiveTab];
 }
 
 #pragma mark - Gems input (no tabs)
@@ -1227,7 +1263,7 @@ static void showMainMenu() {
         (id)[UIColor colorWithRed:0.15 green:0.80 blue:0.50 alpha:0.95].CGColor
     ];
     grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint   = CGPointMake(1, 0.5);
+    grad.endPoint = CGPointMake(1, 0.5);
     [okBtn.layer insertSublayer:grad atIndex:0];
     okBtn.layer.cornerRadius = 10.0;
     okBtn.layer.masksToBounds = YES;
@@ -1356,7 +1392,7 @@ static void showMainMenu() {
         (id)[UIColor colorWithRed:0.15 green:0.80 blue:0.50 alpha:0.95].CGColor
     ];
     grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint   = CGPointMake(1, 0.5);
+    grad.endPoint = CGPointMake(1, 0.5);
     [okBtn.layer insertSublayer:grad atIndex:0];
     okBtn.layer.cornerRadius = 10.0;
     okBtn.layer.masksToBounds = YES;
