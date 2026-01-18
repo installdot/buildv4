@@ -17,8 +17,6 @@ static NSString * const kBGImageFileName = @"lm_menu_bg.png";
 #pragma mark - Account manager constants
 
 static NSString * const kSdkStateKey         = @"SdkStateCache#1";
-static NSString * const kLMCurrentAccountKey = @"LM_Account_Current";
-static NSString * const kLMAccountsListKey   = @"LM_Account_List";
 
 #pragma mark - SdkState helpers
 
@@ -71,6 +69,21 @@ static NSDictionary *extractAccountFromSdkStateJSON(NSString *json) {
     acc[@"token"] = token;
     acc[@"raw"]   = json; // original string, used for Quick Login
     return acc;
+}
+
+static NSNumber *extractUserIdFromPlist() {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
+    NSString *plist = dictToPlist(domain);
+    if (!plist) return nil;
+    NSError *err = nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"\"User\":\\s*\\{\\s*\"Id\":\\s*(\\d+)" options:NSRegularExpressionCaseInsensitive error:&err];
+    if (!re) return nil;
+    NSTextCheckingResult *match = [re firstMatchInString:plist options:0 range:NSMakeRange(0, plist.length)];
+    if (!match || match.numberOfRanges < 2) return nil;
+    NSString *idStr = [plist substringWithRange:[match rangeAtIndex:1]];
+    return @([idStr integerValue]);
 }
 
 @class LMUIHelper;
@@ -291,7 +304,6 @@ static char kTokenVisibleKey;
 @property (nonatomic, strong) NSString *activeTab;
 @property (nonatomic, strong) UIView *loadingOverlay;
 @property (nonatomic, strong) NSDictionary *currentAccount;
-@property (nonatomic, strong) NSMutableArray<NSDictionary *> *savedAccounts;
 @property (nonatomic, assign) BOOL shouldExitOnBypassOk;
 
 + (instancetype)shared;
@@ -431,18 +443,6 @@ static void showMainMenu() {
         
         // Load stored accounts once
         NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-        
-        id cur = [defs objectForKey:kLMCurrentAccountKey];
-        if ([cur isKindOfClass:[NSDictionary class]]) {
-            shared.currentAccount = (NSDictionary *)cur;
-        }
-        
-        id arr = [defs objectForKey:kLMAccountsListKey];
-        if ([arr isKindOfClass:[NSArray class]]) {
-            shared.savedAccounts = [arr mutableCopy];
-        } else {
-            shared.savedAccounts = [NSMutableArray array];
-        }
     });
     return shared;
 }
@@ -453,11 +453,15 @@ static void showMainMenu() {
 }
 
 - (NSString *)bpFilePath {
-    id pid = self.currentAccount[@"playerId"] ?: self.currentAccount[@"userId"];
-    if (!pid) return nil;
-    NSString *fileName = [NSString stringWithFormat:@"bp_data_id_%@.data", pid];
-    NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    return [lib stringByAppendingPathComponent:fileName];
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:docs];
+    NSString *file;
+    while (file = [enumerator nextObject]) {
+        if ([file hasPrefix:@"bp_data_id_"] && [file hasSuffix:@".data"]) {
+            return [docs stringByAppendingPathComponent:file];
+        }
+    }
+    return nil;
 }
 
 - (NSDictionary *)loadBPData {
@@ -467,354 +471,9 @@ static void showMainMenu() {
     if (!enc) return nil;
     NSData *plain = desDecrypt(enc);
     if (!plain) return nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
+    id obj = [NSJSONSerialization JSONObjectWithData:plain options:0 error:&err];
     if (![obj isKindOfClass:[NSDictionary class]]) return nil;
     return obj;
-}
-
-- (BOOL)isAccountExpired:(NSDictionary *)acc {
-    NSString *expireStr = acc[@"expire"];
-    if (expireStr.length == 0) return NO;
-    
-    // Example format: "2025-12-03T12:34:37"
-    static NSDateFormatter *fmt;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        fmt = [[NSDateFormatter alloc] init];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        fmt.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss";
-    });
-    NSDate *date = [fmt dateFromString:expireStr];
-    if (!date) return NO;
-    
-    return ([date timeIntervalSinceNow] < 0);
-}
-
-#pragma mark - Accounts tab
-
-- (void)renderAccountsTab {
-    UIScrollView *scroll = [self createScrollInContent];
-    if (!scroll) return;
-    
-    CGFloat y = 12.0;
-    
-    // "<-" Back button to Main
-    UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    backBtn.frame = CGRectMake(12, y, 70, 26);
-    [backBtn setTitle:@"←" forState:UIControlStateNormal];
-    [backBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    backBtn.titleLabel.font = [UIFont systemFontOfSize:13];
-    backBtn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-    backBtn.layer.cornerRadius = 6.0;
-    [backBtn addTarget:self action:@selector(accountsBackTapped) forControlEvents:UIControlEventTouchUpInside];
-    [scroll addSubview:backBtn];
-    y += 34.0;
-    
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 20)];
-    title.textColor = [UIColor whiteColor];
-    title.font = [UIFont boldSystemFontOfSize:15];
-    title.text = @"You are logged!";
-    [scroll addSubview:title];
-    y += 24.0;
-    
-    NSDictionary *cur = self.currentAccount;
-    if (!cur) {
-        UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 40)];
-        empty.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-        empty.font = [UIFont systemFontOfSize:13];
-        empty.numberOfLines = 0;
-        empty.text = @"No active account found in SdkStateCache#1.";
-        [scroll addSubview:empty];
-        scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 60);
-        return;
-    }
-    
-    NSString *email  = cur[@"email"] ?: @"(null)";
-    NSString *token  = cur[@"token"] ?: @"";
-    NSString *expire = cur[@"expire"] ?: @"";
-    id pid           = cur[@"playerId"] ?: cur[@"userId"] ?: @(0);
-    NSString *pidStr = [NSString stringWithFormat:@"%@", pid];
-    
-    UILabel *curLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 18)];
-    curLabel.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-    curLabel.font = [UIFont systemFontOfSize:13];
-    curLabel.text = @"Current Account:";
-    [scroll addSubview:curLabel];
-    y += 22.0;
-    
-    // Email
-    y = [self addKey:@"Email:" value:email toView:scroll y:y];
-    // ID
-    y = [self addKey:@"ID:" value:pidStr toView:scroll y:y];
-    
-    // Token with eye
-    {
-        CGFloat margin = 12.0;
-        CGFloat rowH = 22.0;
-        UILabel *keyLbl = [[UILabel alloc] initWithFrame:CGRectMake(margin, y, 70, rowH)];
-        keyLbl.text = @"Token:";
-        keyLbl.textColor = [UIColor whiteColor];
-        keyLbl.font = [UIFont systemFontOfSize:13];
-        [scroll addSubview:keyLbl];
-        
-        CGFloat btnW = 34.0;
-        CGFloat valueW = scroll.bounds.size.width - margin*2 - 70 - btnW - 6;
-        UILabel *valLbl = [[UILabel alloc] initWithFrame:CGRectMake(margin + 70, y, valueW, rowH)];
-        valLbl.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-        valLbl.font = [UIFont systemFontOfSize:13];
-        valLbl.text = @"••••••••••";
-        [scroll addSubview:valLbl];
-        
-        UIButton *eye = [UIButton buttonWithType:UIButtonTypeSystem];
-        eye.frame = CGRectMake(CGRectGetMaxX(valLbl.frame) + 4, y - 1, btnW, rowH + 2);
-        [eye setTitle:@"<~>" forState:UIControlStateNormal];
-        [eye setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        eye.titleLabel.font = [UIFont systemFontOfSize:15];
-        eye.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-        eye.layer.cornerRadius = 6.0;
-        objc_setAssociatedObject(eye, &kTokenLabelKey, valLbl, OBJC_ASSOCIATION_ASSIGN);
-        objc_setAssociatedObject(eye, &kTokenVisibleKey, @(NO), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        // store full token string in label's accessibilityValue
-        valLbl.accessibilityValue = token;
-        [eye addTarget:self action:@selector(toggleTokenVisibility:) forControlEvents:UIControlEventTouchUpInside];
-        [scroll addSubview:eye];
-        
-        y += rowH + 8.0;
-    }
-    
-    // Expire
-    y = [self addKey:@"Expire Token:" value:expire toView:scroll y:y];
-    
-    // Saved accounts section
-    if (self.savedAccounts.count > 0) {
-        y += 10.0;
-        UILabel *savedTitle = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 18)];
-        savedTitle.text = @"Saved Accounts:";
-        savedTitle.textColor = [UIColor whiteColor];
-        savedTitle.font = [UIFont boldSystemFontOfSize:14];
-        [scroll addSubview:savedTitle];
-        y += 22.0;
-        
-        NSInteger idx = 0;
-        for (NSDictionary *acc in self.savedAccounts) {
-            y = [self addSavedAccount:acc index:idx toView:scroll y:y];
-            idx++;
-        }
-    }
-    
-    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 20.0);
-}
-
-- (CGFloat)addKey:(NSString *)key
-            value:(NSString *)value
-           toView:(UIView *)view
-               y:(CGFloat)y {
-    CGFloat margin = 12.0;
-    CGFloat rowH = 20.0;
-    
-    UILabel *k = [[UILabel alloc] initWithFrame:CGRectMake(margin, y, 110, rowH)];
-    k.text = key;
-    k.textColor = [UIColor whiteColor];
-    k.font = [UIFont systemFontOfSize:13];
-    [view addSubview:k];
-    
-    UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(margin + 110, y, view.bounds.size.width - margin*2 - 110, rowH)];
-    v.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-    v.font = [UIFont systemFontOfSize:13];
-    v.text = value ?: @"";
-    v.numberOfLines = 1;
-    [view addSubview:v];
-    
-    return y + rowH + 6.0;
-}
-
-- (CGFloat)addSavedAccount:(NSDictionary *)acc
-                     index:(NSInteger)index
-                    toView:(UIView *)view
-                         y:(CGFloat)y {
-    CGFloat margin = 12.0;
-    CGFloat width = view.bounds.size.width - margin*2;
-    
-    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(margin, y, width, 80)];
-    card.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.35];
-    card.layer.cornerRadius = 8.0;
-    
-    NSString *email  = acc[@"email"] ?: @"(null)";
-    id pid           = acc[@"playerId"] ?: acc[@"userId"] ?: @(0);
-    NSString *pidStr = [NSString stringWithFormat:@"%@", pid];
-    NSString *expire = acc[@"expire"] ?: @"";
-    
-    UILabel *line1 = [[UILabel alloc] initWithFrame:CGRectMake(8, 6, width - 16, 18)];
-    line1.textColor = [UIColor whiteColor];
-    line1.font = [UIFont boldSystemFontOfSize:13];
-    line1.text = [NSString stringWithFormat:@"%@", email];
-    [card addSubview:line1];
-    
-    UILabel *line2 = [[UILabel alloc] initWithFrame:CGRectMake(8, 24, width - 16, 16)];
-    line2.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-    line2.font = [UIFont systemFontOfSize:12];
-    line2.text = [NSString stringWithFormat:@"ID: %@ | Expire: %@", pidStr, expire];
-    [card addSubview:line2];
-    
-    // Buttons
-    CGFloat btnW = (width - 8*3) / 2.0;
-    UIButton *quick = [UIButton buttonWithType:UIButtonTypeSystem];
-    quick.frame = CGRectMake(8, 48, btnW, 24);
-    [quick setTitle:@"Quick Login" forState:UIControlStateNormal];
-    [quick setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    quick.titleLabel.font = [UIFont systemFontOfSize:12];
-    quick.backgroundColor = [[UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95] colorWithAlphaComponent:0.9];
-    quick.layer.cornerRadius = 6.0;
-    quick.tag = index;
-    [quick addTarget:self action:@selector(quickLoginTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:quick];
-    
-    UIButton *del = [UIButton buttonWithType:UIButtonTypeSystem];
-    del.frame = CGRectMake(8 + btnW + 8, 48, btnW, 24);
-    [del setTitle:@"Delete" forState:UIControlStateNormal];
-    [del setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    del.titleLabel.font = [UIFont systemFontOfSize:12];
-    del.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
-    del.layer.cornerRadius = 6.0;
-    del.tag = index;
-    [del addTarget:self action:@selector(deleteAccountTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:del];
-    
-    [view addSubview:card];
-    
-    return y + card.bounds.size.height + 8.0;
-}
-
-- (void)accountsBackTapped {
-    [self showTab:@"Main"];
-}
-
-- (void)quickLoginTapped:(UIButton *)sender {
-    NSInteger idx = sender.tag;
-    if (idx < 0 || idx >= self.savedAccounts.count) return;
-    NSDictionary *acc = self.savedAccounts[idx];
-    NSString *raw = acc[@"raw"];
-    if (raw.length == 0) return;
-    
-    // Write new SdkStateCache#1
-    setSdkStateJSONString(raw);
-    
-    // Move chosen account to current, remove from list
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    [defs setObject:acc forKey:kLMCurrentAccountKey];
-    NSMutableArray *list = [self.savedAccounts mutableCopy];
-    [list removeObjectAtIndex:idx];
-    [defs setObject:list forKey:kLMAccountsListKey];
-    [defs synchronize];
-    
-    self.currentAccount = acc;
-    self.savedAccounts = list;
-    
-    // Notify + auto close game
-    [self closeOverlay];
-    [self showSimpleMessageWithTitle:@"Account"
-                             message:@"Account switched.\nGame will now close."];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        killApp();
-    });
-}
-
-- (void)deleteAccountTapped:(UIButton *)sender {
-    NSInteger idx = sender.tag;
-    if (idx < 0 || idx >= self.savedAccounts.count) return;
-    NSMutableArray *list = [self.savedAccounts mutableCopy];
-    [list removeObjectAtIndex:idx];
-    self.savedAccounts = list;
-    
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    [defs setObject:list forKey:kLMAccountsListKey];
-    [defs synchronize];
-    
-    // Refresh the tab UI
-    if ([self.activeTab isEqualToString:@"Accounts"]) {
-        [self renderAccountsTab];
-    }
-}
-
-- (void)toggleTokenVisibility:(UIButton *)sender {
-    UILabel *label = objc_getAssociatedObject(sender, &kTokenLabelKey);
-    if (!label) return;
-    NSNumber *visNum = objc_getAssociatedObject(sender, &kTokenVisibleKey);
-    BOOL visible = visNum.boolValue;
-    visible = !visible;
-    objc_setAssociatedObject(sender, &kTokenVisibleKey, @(visible), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    NSString *token = label.accessibilityValue ?: @"";
-    if (visible) {
-        label.text = token;
-    } else {
-        label.text = @"••••••••••";
-    }
-}
-
-- (void)refreshAccountsFromSdkState {
-    NSString *json = currentSdkStateJSONString();
-    NSDictionary *newAcc = extractAccountFromSdkStateJSON(json);
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    
-    // Load stored
-    NSDictionary *storedCurrent = [defs objectForKey:kLMCurrentAccountKey];
-    NSMutableArray *storedList = [[defs objectForKey:kLMAccountsListKey] mutableCopy] ?: [NSMutableArray array];
-    
-    // Push old current into list if changed
-    if (storedCurrent && newAcc) {
-        BOOL changed = ![storedCurrent[@"token"] isEqual:newAcc[@"token"]] ||
-                       ![storedCurrent[@"playerId"] ?: @0 isEqual:newAcc[@"playerId"] ?: @0];
-        if (changed) {
-            BOOL already = NO;
-            for (NSDictionary *acc in storedList) {
-                if ([acc[@"token"] isEqual:storedCurrent[@"token"]]) {
-                    already = YES;
-                    break;
-                }
-            }
-            if (!already) {
-                [storedList addObject:storedCurrent];
-            }
-        }
-    }
-    
-    // Update current if we have a valid one
-    if (newAcc) {
-        [defs setObject:newAcc forKey:kLMCurrentAccountKey];
-        self.currentAccount = newAcc;
-    } else {
-        self.currentAccount = storedCurrent;
-    }
-    
-    // Remove expired accounts from list
-    NSMutableArray *pruned = [NSMutableArray array];
-    for (NSDictionary *acc in storedList) {
-        if (![self isAccountExpired:acc]) {
-            [pruned addObject:acc];
-        }
-    }
-    [defs setObject:pruned forKey:kLMAccountsListKey];
-    self.savedAccounts = pruned;
-    
-    // If current is expired, clear it
-    NSDictionary *cur = self.currentAccount;
-    if (cur && [self isAccountExpired:cur]) {
-        [defs removeObjectForKey:kLMCurrentAccountKey];
-        self.currentAccount = nil;
-    }
-    
-    [defs synchronize];
-}
-
-- (void)loadBackgroundImageFromDisk {
-    NSString *path = [self bgImagePath];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        if (data) {
-            self.backgroundImage = [UIImage imageWithData:data];
-        }
-    }
 }
 
 #pragma mark - Loading overlay
@@ -973,7 +632,6 @@ static void showMainMenu() {
         NSArray *tabs = @[
             @{@"title": @"Main",     @"key": @"Main"},
             @{@"title": @"Player",   @"key": @"Player"},
-            @{@"title": @"Accounts", @"key": @"Accounts"},
             @{@"title": @"BP",       @"key": @"BP"},
             @{@"title": @"Settings", @"key": @"Settings"},
             @{@"title": @"Credit",   @"key": @"Credit"}
@@ -1080,6 +738,9 @@ static void showMainMenu() {
     if (!tab) return;
     if ([tab isEqualToString:self.activeTab]) return;
     [self showTab:tab];
+    if ([tab isEqualToString:@"BP"]) {
+        [self playerBypassTapped];
+    }
 }
 
 #pragma mark - Common helpers
@@ -1150,7 +811,6 @@ static void showMainMenu() {
     CGFloat y = 12.0;
     
     [self addMenuButtonWithTitle:@"Player"   toView:scroll y:&y action:@selector(mainPlayerTapped)];
-    [self addMenuButtonWithTitle:@"Accounts" toView:scroll y:&y action:@selector(mainAccountsTapped)];
     [self addMenuButtonWithTitle:@"BP"       toView:scroll y:&y action:@selector(mainBPTapped)];
     [self addMenuButtonWithTitle:@"Settings" toView:scroll y:&y action:@selector(mainSettingsTapped)];
     [self addMenuButtonWithTitle:@"Credit"   toView:scroll y:&y action:@selector(mainCreditTapped)];
@@ -1423,8 +1083,6 @@ static void showMainMenu() {
         [self renderMainTab];
     } else if ([self.activeTab isEqualToString:@"Player"]) {
         [self renderPlayerTab];
-    } else if ([self.activeTab isEqualToString:@"Accounts"]) {
-        [self renderAccountsTab];
     } else if ([self.activeTab isEqualToString:@"BP"]) {
         [self renderBPTab];
     } else if ([self.activeTab isEqualToString:@"Settings"]) {
@@ -1471,7 +1129,6 @@ static void showMainMenu() {
 }
 
 - (void)mainPlayerTapped { [self showTab:@"Player"]; }
-- (void)mainAccountsTapped { [self showTab:@"Accounts"]; }
 - (void)mainBPTapped { [self showTab:@"BP"]; }
 - (void)mainSettingsTapped { [self showTab:@"Settings"]; }
 - (void)mainCreditTapped { [self showTab:@"Credit"]; }
@@ -1518,10 +1175,7 @@ static void showMainMenu() {
     BOOL ok = silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
     
     if (ok) {
-        // Optional: close menu first so UI disappears cleanly
-        [self closeOverlay];
-        // Auto close game after successful bypass
-        killApp();
+        [self showSimpleMessageWithTitle:@"Bypass" message:@"Bypass applied successfully."];
     } else {
         [self closeOverlay];
         [self showSimpleMessageWithTitle:@"Bypass" message:@"Bypass failed"];
