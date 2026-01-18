@@ -1,3 +1,4 @@
+```objective-c
 // Tweak.xm
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -1183,7 +1184,18 @@ static void showMainMenu() {
     CGFloat y = 12.0;
     
     NSDictionary *bpDict = [self loadBPData];
-    if (!bpDict || bpDict[@"seasonData"].count == 0) {
+    if (!bpDict) {
+        UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 40)];
+        empty.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
+        empty.font = [UIFont systemFontOfSize:13];
+        empty.numberOfLines = 0;
+        empty.text = @"No Battle Pass data found.";
+        [scroll addSubview:empty];
+        scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 60);
+        return;
+    }
+    NSArray *seasonData = bpDict[@"seasonData"];
+    if (seasonData.count == 0) {
         UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 40)];
         empty.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
         empty.font = [UIFont systemFontOfSize:13];
@@ -1194,7 +1206,7 @@ static void showMainMenu() {
         return;
     }
     
-    NSArray *seasons = bpDict[@"seasonData"];
+    NSArray *seasons = seasonData;
     NSDictionary *season = seasons[0][@"Value"];
     
     NSString *curLevelStr = [NSString stringWithFormat:@"%@", season[@"curLevel"] ?: @"0"];
@@ -1810,3 +1822,4 @@ static UIButton *floatingButton = nil;
 }
 
 %end
+```
