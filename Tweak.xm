@@ -1,4 +1,3 @@
-```objective-c
 // Tweak.xm
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -843,7 +842,7 @@ static void showMainMenu() {
     if (@available(iOS 13.0, *)) {
         spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
     } else {
-        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
+        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
     }
     spin.center = CGPointMake(bw/2.0, bh/2.0 - 10);
     [spin startAnimating];
@@ -1822,4 +1821,3 @@ static UIButton *floatingButton = nil;
 }
 
 %end
-```
