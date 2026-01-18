@@ -563,7 +563,7 @@ static void showMainMenu() {
             (id)[UIColor colorWithRed:0.08 green:0.10 blue:0.22 alpha:1.0].CGColor
         ];
         sgrad.startPoint = CGPointMake(0, 0);
-        sgrad.endPoint = CGPointMake(0, 1);
+        sgrad.endPoint   = CGPointMake(0, 1);
         [side.layer insertSublayer:sgrad atIndex:0];
         side.backgroundColor = [UIColor clearColor];
         [panel addSubview:side];
@@ -835,7 +835,7 @@ static void showMainMenu() {
         scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
         return;
     }
-    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld_.data", (long long)uid.integerValue];
     NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
@@ -1115,7 +1115,7 @@ static void showMainMenu() {
 - (void)bpUnlockTapped {
     NSNumber *uid = getUserId() ?: self.manualUserId;
     if (!uid) return;
-    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld_.data", (long long)uid.integerValue];
     NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
@@ -1139,7 +1139,7 @@ static void showMainMenu() {
 - (void)bpMaxLevelTapped {
     NSNumber *uid = getUserId() ?: self.manualUserId;
     if (!uid) return;
-    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld_.data", (long long)uid.integerValue];
     NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
@@ -1163,7 +1163,7 @@ static void showMainMenu() {
 - (void)bpCompleteQuestTapped {
     NSNumber *uid = getUserId() ?: self.manualUserId;
     if (!uid) return;
-    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld_.data", (long long)uid.integerValue];
     NSString *docDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [docDir stringByAppendingPathComponent:fileName];
     NSData *fileData = [NSData dataWithContentsOfFile:path];
@@ -1392,7 +1392,7 @@ static void showMainMenu() {
         (id)[UIColor colorWithRed:0.15 green:0.80 blue:0.50 alpha:0.95].CGColor
     ];
     grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint = CGPointMake(1, 0.5);
+    grad.endPoint   = CGPointMake(1, 0.5);
     [okBtn.layer insertSublayer:grad atIndex:0];
     okBtn.layer.cornerRadius = 10.0;
     okBtn.layer.masksToBounds = YES;
