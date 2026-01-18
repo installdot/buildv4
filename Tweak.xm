@@ -14,17 +14,13 @@ static BOOL g_hasShownCreditAlert = NO;
 static NSString * const kBGImageURLDefaultsKey = @"LM_MenuBGURL";
 static NSString * const kBGImageFileName = @"lm_menu_bg.png";
 
-#pragma mark - Account manager constants
-
-static NSString * const kSdkStateKey         = @"SdkStateCache#1";
-
 #pragma mark - SdkState helpers
 
 static NSString *currentSdkStateJSONString(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
     NSDictionary *domain = [defs persistentDomainForName:bid];
-    id val = domain[kSdkStateKey];
+    id val = domain[@"SdkStateCache#1"];
     if (![val isKindOfClass:[NSString class]]) return nil;
     return (NSString *)val;
 }
@@ -34,13 +30,13 @@ static void setSdkStateJSONString(NSString *json) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
     NSMutableDictionary *domain = [[defs persistentDomainForName:bid] mutableCopy] ?: [NSMutableDictionary dictionary];
-    domain[kSdkStateKey] = json;
+    domain[@"SdkStateCache#1"] = json;
     [defs setPersistentDomain:domain forName:bid];
     [defs synchronize];
 }
 
-/// Flatten the JSON in SdkStateCache#1 into a simple account dict we can store.
-static NSDictionary *extractAccountFromSdkStateJSON(NSString *json) {
+static NSNumber *getUserId(void) {
+    NSString *json = currentSdkStateJSONString();
     if (json.length == 0) return nil;
     NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
     if (!data) return nil;
@@ -48,42 +44,7 @@ static NSDictionary *extractAccountFromSdkStateJSON(NSString *json) {
     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
     if (!obj || ![obj isKindOfClass:[NSDictionary class]]) return nil;
     NSDictionary *root = (NSDictionary *)obj;
-    
-    NSDictionary *user    = root[@"User"];
-    NSDictionary *session = root[@"Session"];
-    if (![user isKindOfClass:[NSDictionary class]] || ![session isKindOfClass:[NSDictionary class]]) return nil;
-    
-    NSString *email    = user[@"Email"];
-    NSNumber *userId   = user[@"Id"];
-    NSNumber *playerId = user[@"PlayerId"];
-    NSString *token    = session[@"Token"];
-    NSString *expire   = session[@"Expire"];
-    
-    if (token.length == 0) return nil;
-    
-    NSMutableDictionary *acc = [NSMutableDictionary dictionary];
-    if (email)    acc[@"email"]    = email;
-    if (userId)   acc[@"userId"]   = userId;
-    if (playerId) acc[@"playerId"] = playerId;
-    if (expire)   acc[@"expire"]   = expire;
-    acc[@"token"] = token;
-    acc[@"raw"]   = json; // original string, used for Quick Login
-    return acc;
-}
-
-static NSNumber *extractUserIdFromPlist() {
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    NSDictionary *domain = [defs persistentDomainForName:bid] ?: @{};
-    NSString *plist = dictToPlist(domain);
-    if (!plist) return nil;
-    NSError *err = nil;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"\"User\":\\s*\\{\\s*\"Id\":\\s*(\\d+)" options:NSRegularExpressionCaseInsensitive error:&err];
-    if (!re) return nil;
-    NSTextCheckingResult *match = [re firstMatchInString:plist options:0 range:NSMakeRange(0, plist.length)];
-    if (!match || match.numberOfRanges < 2) return nil;
-    NSString *idStr = [plist substringWithRange:[match rangeAtIndex:1]];
-    return @([idStr integerValue]);
+    return root[@"User"][@"Id"];
 }
 
 @class LMUIHelper;
@@ -165,46 +126,66 @@ static NSData* decryptAndVerify(NSData *box, NSData *key, NSData *hmacKey) {
 
 #pragma mark - DES-CBC encrypt/decrypt
 
-static NSData *desKeyData = nil;
-static NSData *desIVData = nil;
-
-static void initDESKeyAndIV() {
-    if (!desKeyData) {
-        const char keyStr[8] = {'i', 'a', 'm', 'b', 'o', '\0', '\0', '\0'};
-        desKeyData = [NSData dataWithBytes:keyStr length:8];
+static NSData *desKey(void) {
+    NSMutableData *key = [@"iambo" dataUsingEncoding:NSUTF8StringEncoding].mutableCopy;
+    while (key.length < 8) {
+        uint8_t zero = 0;
+        [key appendBytes:&zero length:1];
     }
-    if (!desIVData) {
-        const char ivStr[8] = {'A', 'h', 'b', 'o', 'o', 'l', '\0', '\0'};
-        desIVData = [NSData dataWithBytes:ivStr length:8];
+    return key;
+}
+
+static NSData *desIV(void) {
+    NSMutableData *iv = [@"Ahbool" dataUsingEncoding:NSUTF8StringEncoding].mutableCopy;
+    while (iv.length < 8) {
+        uint8_t zero = 0;
+        [iv appendBytes:&zero length:1];
+    }
+    return iv;
+}
+
+static NSData *decryptDES(NSData *ciphertext) {
+    NSData *key = desKey();
+    NSData *iv = desIV();
+    size_t outLength = ciphertext.length + kCCBlockSizeDES;
+    NSMutableData *plaintext = [NSMutableData dataWithLength:outLength];
+    size_t actualOut = 0;
+    CCCryptorStatus status = CCCrypt(kCCDecrypt,
+                                     kCCAlgorithmDES,
+                                     kCCOptionPKCS7Padding,
+                                     key.bytes, kCCKeySizeDES,
+                                     iv.bytes,
+                                     ciphertext.bytes, ciphertext.length,
+                                     plaintext.mutableBytes, plaintext.length,
+                                     &actualOut);
+    if (status == kCCSuccess) {
+        plaintext.length = actualOut;
+        return plaintext;
+    } else {
+        return nil;
     }
 }
 
-static NSData* desEncrypt(NSData *plaintext) {
-    initDESKeyAndIV();
-    size_t outlen = plaintext.length + kCCBlockSizeDES;
-    void *outbuf = malloc(outlen);
-    size_t actual = 0;
-    CCCryptorStatus st = CCCrypt(kCCEncrypt, kCCAlgorithmDES, kCCOptionPKCS7Padding,
-                                 desKeyData.bytes, kCCKeySizeDES,
-                                 desIVData.bytes,
-                                 plaintext.bytes, plaintext.length,
-                                 outbuf, outlen, &actual);
-    if (st != kCCSuccess) { free(outbuf); return nil; }
-    return [NSData dataWithBytesNoCopy:outbuf length:actual freeWhenDone:YES];
-}
-
-static NSData* desDecrypt(NSData *ciphertext) {
-    initDESKeyAndIV();
-    size_t outlen = ciphertext.length + kCCBlockSizeDES;
-    void *outbuf = malloc(outlen);
-    size_t actual = 0;
-    CCCryptorStatus st = CCCrypt(kCCDecrypt, kCCAlgorithmDES, kCCOptionPKCS7Padding,
-                                 desKeyData.bytes, kCCKeySizeDES,
-                                 desIVData.bytes,
-                                 ciphertext.bytes, ciphertext.length,
-                                 outbuf, outlen, &actual);
-    if (st != kCCSuccess) { free(outbuf); return nil; }
-    return [NSData dataWithBytesNoCopy:outbuf length:actual freeWhenDone:YES];
+static NSData *encryptDES(NSData *plaintext) {
+    NSData *key = desKey();
+    NSData *iv = desIV();
+    size_t outLength = ((plaintext.length + kCCBlockSizeDES - 1) / kCCBlockSizeDES) * kCCBlockSizeDES;
+    NSMutableData *ciphertext = [NSMutableData dataWithLength:outLength];
+    size_t actualOut = 0;
+    CCCryptorStatus status = CCCrypt(kCCEncrypt,
+                                     kCCAlgorithmDES,
+                                     kCCOptionPKCS7Padding,
+                                     key.bytes, kCCKeySizeDES,
+                                     iv.bytes,
+                                     plaintext.bytes, plaintext.length,
+                                     ciphertext.mutableBytes, ciphertext.length,
+                                     &actualOut);
+    if (status == kCCSuccess) {
+        ciphertext.length = actualOut;
+        return ciphertext;
+    } else {
+        return nil;
+    }
 }
 
 #pragma mark - App UUID persistence
@@ -303,14 +284,12 @@ static char kTokenVisibleKey;
 @property (nonatomic, strong) NSString *currentFileName;
 @property (nonatomic, strong) NSString *activeTab;
 @property (nonatomic, strong) UIView *loadingOverlay;
-@property (nonatomic, strong) NSDictionary *currentAccount;
 @property (nonatomic, assign) BOOL shouldExitOnBypassOk;
 
 + (instancetype)shared;
 - (void)showMainMenu;
 - (void)showPlayerMenu;
 - (void)showSettings;
-- (void)showGemsInput;
 - (void)showSimpleMessageWithTitle:(NSString *)title message:(NSString *)message;
 - (void)showCreditWithCompletion:(void(^)(void))completion;
 - (void)backgroundUpdatedSuccess;
@@ -319,9 +298,8 @@ static char kTokenVisibleKey;
 - (void)showTab:(NSString *)tabName;
 - (void)showLoadingWithMessage:(NSString *)msg;
 - (void)hideLoading;
-- (void)refreshAccountsFromSdkState;
-- (NSDictionary *)loadBPData;
-- (NSString *)bpFilePath;
+- (void)showNotificationWithTitle:(NSString *)title message:(NSString *)message;
+- (CGFloat)addKey:(NSString *)key value:(NSString *)value toView:(UIView *)view y:(CGFloat)y;
 @end
 
 #pragma mark - Network: verify then open menu
@@ -440,9 +418,6 @@ static void showMainMenu() {
     dispatch_once(&onceToken, ^{
         shared = [[LMUIHelper alloc] init];
         [shared loadBackgroundImageFromDisk];
-        
-        // Load stored accounts once
-        NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
     });
     return shared;
 }
@@ -450,30 +425,6 @@ static void showMainMenu() {
 - (NSString *)bgImagePath {
     NSString *lib = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
     return [lib stringByAppendingPathComponent:kBGImageFileName];
-}
-
-- (NSString *)bpFilePath {
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:docs];
-    NSString *file;
-    while (file = [enumerator nextObject]) {
-        if ([file hasPrefix:@"bp_data_id_"] && [file hasSuffix:@".data"]) {
-            return [docs stringByAppendingPathComponent:file];
-        }
-    }
-    return nil;
-}
-
-- (NSDictionary *)loadBPData {
-    NSString *path = [self bpFilePath];
-    if (!path) return nil;
-    NSData *enc = [NSData dataWithContentsOfFile:path];
-    if (!enc) return nil;
-    NSData *plain = desDecrypt(enc);
-    if (!plain) return nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:plain options:0 error:&err];
-    if (![obj isKindOfClass:[NSDictionary class]]) return nil;
-    return obj;
 }
 
 #pragma mark - Loading overlay
@@ -501,7 +452,7 @@ static void showMainMenu() {
     if (@available(iOS 13.0, *)) {
         spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
     } else {
-        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
     }
     spin.center = CGPointMake(bw/2.0, bh/2.0 - 10);
     [spin startAnimating];
@@ -738,9 +689,6 @@ static void showMainMenu() {
     if (!tab) return;
     if ([tab isEqualToString:self.activeTab]) return;
     [self showTab:tab];
-    if ([tab isEqualToString:@"BP"]) {
-        [self playerBypassTapped];
-    }
 }
 
 #pragma mark - Common helpers
@@ -803,6 +751,37 @@ static void showMainMenu() {
     return NO;
 }
 
+#pragma mark - Notification
+
+- (void)showNotificationWithTitle:(NSString *)title message:(NSString *)message {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    UIViewController *vc = topVC();
+    [vc presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - Add key value
+
+- (CGFloat)addKey:(NSString *)key value:(NSString *)value toView:(UIView *)view y:(CGFloat)y {
+    CGFloat margin = 12.0;
+    CGFloat rowH = 20.0;
+    
+    UILabel *k = [[UILabel alloc] initWithFrame:CGRectMake(margin, y, 110, rowH)];
+    k.text = key;
+    k.textColor = [UIColor whiteColor];
+    k.font = [UIFont systemFontOfSize:13];
+    [view addSubview:k];
+    
+    UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(margin + 110, y, view.bounds.size.width - margin*2 - 110, rowH)];
+    v.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
+    v.font = [UIFont systemFontOfSize:13];
+    v.text = value ?: @"";
+    v.numberOfLines = 1;
+    [view addSubview:v];
+    
+    return y + rowH + 6.0;
+}
+
 #pragma mark - Tab renderers
 
 - (void)renderMainTab {
@@ -838,131 +817,64 @@ static void showMainMenu() {
 }
 
 - (void)renderBPTab {
-    UIScrollView *scroll = [self createScrollInContent];
-    if (!scroll) return;
-    CGFloat y = 12.0;
-    
-    NSDictionary *bpDict = [self loadBPData];
-    if (!bpDict) {
-        UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 40)];
-        empty.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-        empty.font = [UIFont systemFontOfSize:13];
-        empty.numberOfLines = 0;
-        empty.text = @"No Battle Pass data found.";
-        [scroll addSubview:empty];
-        scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 60);
+    NSNumber *uid = getUserId();
+    if (!uid) {
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        lbl.text = @"No user ID found";
+        lbl.textColor = [UIColor whiteColor];
+        [self.contentView addSubview:lbl];
+        return;
+    }
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSData *fileData = [NSData dataWithContentsOfFile:path];
+    if (!fileData) {
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        lbl.text = @"No BP file found";
+        lbl.textColor = [UIColor whiteColor];
+        [self.contentView addSubview:lbl];
+        return;
+    }
+    NSData *decrypted = decryptDES(fileData);
+    if (!decrypted) {
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        lbl.text = @"Decryption failed";
+        lbl.textColor = [UIColor whiteColor];
+        [self.contentView addSubview:lbl];
+        return;
+    }
+    NSError *err = nil;
+    NSDictionary *bpDict = [NSJSONSerialization JSONObjectWithData:decrypted options:0 error:&err];
+    if (err || !bpDict) {
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        lbl.text = @"JSON parse failed";
+        lbl.textColor = [UIColor whiteColor];
+        [self.contentView addSubview:lbl];
         return;
     }
     NSArray *seasonData = bpDict[@"seasonData"];
     if (seasonData.count == 0) {
-        UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(12, y, scroll.bounds.size.width - 24, 40)];
-        empty.textColor = [UIColor colorWithWhite:0.9 alpha:1.0];
-        empty.font = [UIFont systemFontOfSize:13];
-        empty.numberOfLines = 0;
-        empty.text = @"No Battle Pass data found.";
-        [scroll addSubview:empty];
-        scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 60);
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, self.contentView.bounds.size.width - 24, 20)];
+        lbl.text = @"No season data";
+        lbl.textColor = [UIColor whiteColor];
+        [self.contentView addSubview:lbl];
         return;
     }
+    NSDictionary *value = seasonData[0][@"Value"];
+    NSNumber *curLevel = value[@"curLevel"];
+    BOOL hasBuy = [value[@"hasBuy"] boolValue];
+    NSString *unlockStr = hasBuy ? @"True" : @"False";
     
-    NSArray *seasons = seasonData;
-    NSDictionary *season = seasons[0][@"Value"];
-    
-    NSString *curLevelStr = [NSString stringWithFormat:@"%@", season[@"curLevel"] ?: @"0"];
-    NSString *hasBuyStr = [season[@"hasBuy"] boolValue] ? @"True" : @"False";
-    
-    y = [self addKey:@"Current Level:" value:curLevelStr toView:scroll y:y];
-    y = [self addKey:@"Unlock:" value:hasBuyStr toView:scroll y:y];
-    
-    [self addMenuButtonWithTitle:@"Unlock BP" toView:scroll y:&y action:@selector(unlockBPTapped)];
-    [self addMenuButtonWithTitle:@"Max Level" toView:scroll y:&y action:@selector(maxLevelBPTapped)];
-    [self addMenuButtonWithTitle:@"Complete Quest" toView:scroll y:&y action:@selector(completeQuestBPTapped)];
-    
+    UIScrollView *scroll = [self createScrollInContent];
+    CGFloat y = 12.0;
+    y = [self addKey:@"ID:" value:[NSString stringWithFormat:@"%@", uid] toView:scroll y:y];
+    y = [self addKey:@"Current Level:" value:[NSString stringWithFormat:@"%@", curLevel] toView:scroll y:y];
+    y = [self addKey:@"Unlock:" value:unlockStr toView:scroll y:y];
+    [self addMenuButtonWithTitle:@"Unlock BP" toView:scroll y:&y action:@selector(bpUnlockTapped)];
+    [self addMenuButtonWithTitle:@"Max Level" toView:scroll y:&y action:@selector(bpMaxLevelTapped)];
+    [self addMenuButtonWithTitle:@"Complete Quest" toView:scroll y:&y action:@selector(bpCompleteQuestTapped)];
     scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
-}
-
-- (void)unlockBPTapped {
-    NSString *path = [self bpFilePath];
-    if (!path) return;
-    NSDictionary *bpDict = [self loadBPData];
-    if (!bpDict) return;
-    NSMutableArray *seasons = [bpDict[@"seasonData"] mutableCopy];
-    if (seasons.count == 0) return;
-    NSMutableDictionary *season = [seasons[0][@"Value"] mutableCopy];
-    season[@"hasBuy"] = @YES;
-    seasons[0][@"Value"] = season;
-    NSMutableDictionary *newDict = [bpDict mutableCopy];
-    newDict[@"seasonData"] = seasons;
-    NSData *json = [NSJSONSerialization dataWithJSONObject:newDict options:0 error:nil];
-    if (!json) return;
-    NSData *enc = desEncrypt(json);
-    if (!enc) return;
-    [enc writeToFile:path atomically:YES];
-    [self showSimpleMessageWithTitle:@"BattlePass" message:@"Unlocked BattlePass"];
-    [self renderActiveTab];
-}
-
-- (void)maxLevelBPTapped {
-    NSString *path = [self bpFilePath];
-    if (!path) return;
-    NSDictionary *bpDict = [self loadBPData];
-    if (!bpDict) return;
-    NSMutableArray *seasons = [bpDict[@"seasonData"] mutableCopy];
-    if (seasons.count == 0) return;
-    NSMutableDictionary *season = [seasons[0][@"Value"] mutableCopy];
-    season[@"curLevel"] = @50;
-    seasons[0][@"Value"] = season;
-    NSMutableDictionary *newDict = [bpDict mutableCopy];
-    newDict[@"seasonData"] = seasons;
-    NSData *json = [NSJSONSerialization dataWithJSONObject:newDict options:0 error:nil];
-    if (!json) return;
-    NSData *enc = desEncrypt(json);
-    if (!enc) return;
-    [enc writeToFile:path atomically:YES];
-    [self showSimpleMessageWithTitle:@"BattlePass" message:@"Max Level Applied"];
-    [self renderActiveTab];
-}
-
-- (void)completeQuestBPTapped {
-    NSString *path = [self bpFilePath];
-    if (!path) return;
-    NSDictionary *bpDict = [self loadBPData];
-    if (!bpDict) return;
-    NSMutableArray *seasons = [bpDict[@"seasonData"] mutableCopy];
-    if (seasons.count == 0) return;
-    NSMutableDictionary *season = [seasons[0][@"Value"] mutableCopy];
-    NSMutableArray *tasks = [season[@"seasonTaskData"] mutableCopy];
-    for (NSMutableDictionary *task in tasks) {
-        if ([task[@"Status"] isEqualToString:@"Progress"]) {
-            task[@"Status"] = @"Complete";
-            task[@"CurrentProgress"] = task[@"TargetProgress"];
-            task[@"CompleteTime"] = @((long long)[[NSDate date] timeIntervalSince1970] * 10000000LL); // Approximate ticks
-        }
-    }
-    season[@"seasonTaskData"] = tasks;
-    
-    NSMutableArray *weeklyLists = [season[@"weeklyTaskDataList"] mutableCopy];
-    for (NSMutableArray *week in weeklyLists) {
-        for (NSMutableDictionary *task in week) {
-            if ([task[@"Status"] isEqualToString:@"Progress"]) {
-                task[@"Status"] = @"Complete";
-                task[@"CurrentProgress"] = task[@"TargetProgress"];
-                task[@"CompleteTime"] = @((long long)[[NSDate date] timeIntervalSince1970] * 10000000LL);
-            }
-        }
-    }
-    season[@"weeklyTaskDataList"] = weeklyLists;
-    
-    seasons[0][@"Value"] = season;
-    NSMutableDictionary *newDict = [bpDict mutableCopy];
-    newDict[@"seasonData"] = seasons;
-    NSData *json = [NSJSONSerialization dataWithJSONObject:newDict options:0 error:nil];
-    if (!json) return;
-    NSData *enc = desEncrypt(json);
-    if (!enc) return;
-    [enc writeToFile:path atomically:YES];
-    [self showSimpleMessageWithTitle:@"BattlePass" message:@"Quests Completed"];
-    [self renderActiveTab];
 }
 
 - (void)renderSettingsTabContentInCurrentContentView {
@@ -1099,6 +1011,9 @@ static void showMainMenu() {
     NSString *title = [NSString stringWithFormat:@"Menu - %@", tabName];
     [self createOverlayWithTitle:title];
     [self renderActiveTab];
+    if ([tabName isEqualToString:@"BP"]) {
+        [self playerBypassTapped];
+    }
 }
 
 #pragma mark - Simple message (no tabs)
@@ -1172,57 +1087,100 @@ static void showMainMenu() {
 }
 
 - (void)playerBypassTapped {
-    BOOL ok = silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
-    
-    if (ok) {
-        [self showSimpleMessageWithTitle:@"Bypass" message:@"Bypass applied successfully."];
-    } else {
-        [self closeOverlay];
-        [self showSimpleMessageWithTitle:@"Bypass" message:@"Bypass failed"];
-    }
+    silentApplyRegexToDomain(@"(<key>OpenRijTest_\\d+</key>\\s*<integer>)\\d+", @"$10");
 }
 
-#pragma mark - Bypass success UI
+#pragma mark - BP actions
 
-- (void)showBypassSuccessAndExit {
-    self.shouldExitOnBypassOk = YES;
-    UIView *panel = [self createOverlayWithTitle:@"Bypass" withTabs:NO];
-    if (!panel) return;
-    
-    CGFloat margin = 18.0;
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 60, panel.bounds.size.width - margin*2, panel.bounds.size.height - 110)];
-    label.text = @"Bypass applied successfully.\nTap OK to close the game.";
-    label.textColor = [UIColor whiteColor];
-    label.font = [UIFont systemFontOfSize:15];
-    label.numberOfLines = 0;
-    label.textAlignment = NSTextAlignmentCenter;
-    [panel addSubview:label];
-    
-    UIButton *okBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    okBtn.frame = CGRectMake(margin, CGRectGetMaxY(label.frame) - 10, panel.bounds.size.width - margin*2, 36);
-    CAGradientLayer *grad = [CAGradientLayer layer];
-    grad.frame = okBtn.bounds;
-    grad.colors = @[
-        (id)[UIColor colorWithRed:0.25 green:0.65 blue:0.35 alpha:0.95].CGColor,
-        (id)[UIColor colorWithRed:0.15 green:0.80 blue:0.50 alpha:0.95].CGColor
-    ];
-    grad.startPoint = CGPointMake(0, 0.5);
-    grad.endPoint   = CGPointMake(1, 0.5);
-    [okBtn.layer insertSublayer:grad atIndex:0];
-    okBtn.layer.cornerRadius = 10.0;
-    okBtn.layer.masksToBounds = YES;
-    [okBtn setTitle:@"OK" forState:UIControlStateNormal];
-    [okBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    okBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [okBtn addTarget:self action:@selector(bypassOkTapped) forControlEvents:UIControlEventTouchUpInside];
-    [panel addSubview:okBtn];
+- (void)bpUnlockTapped {
+    NSNumber *uid = getUserId();
+    if (!uid) return;
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSData *fileData = [NSData dataWithContentsOfFile:path];
+    if (!fileData) return;
+    NSData *decrypted = decryptDES(fileData);
+    if (!decrypted) return;
+    NSError *err = nil;
+    NSMutableDictionary *bpDict = [NSJSONSerialization JSONObjectWithData:decrypted options:NSJSONReadingMutableContainers error:&err];
+    if (err || !bpDict) return;
+    NSMutableArray *seasonData = bpDict[@"seasonData"];
+    if (seasonData.count == 0) return;
+    NSMutableDictionary *value = seasonData[0][@"Value"];
+    value[@"hasBuy"] = @YES;
+    NSData *newJson = [NSJSONSerialization dataWithJSONObject:bpDict options:0 error:nil];
+    NSData *encrypted = encryptDES(newJson);
+    [encrypted writeToFile:path atomically:YES];
+    [self renderActiveTab];
+    [self showNotificationWithTitle:@"BattlePass" message:@"Unlocked BattlePass"];
 }
 
-- (void)bypassOkTapped {
-    [self closeOverlay];
-    if (self.shouldExitOnBypassOk) {
-        killApp();
+- (void)bpMaxLevelTapped {
+    NSNumber *uid = getUserId();
+    if (!uid) return;
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSData *fileData = [NSData dataWithContentsOfFile:path];
+    if (!fileData) return;
+    NSData *decrypted = decryptDES(fileData);
+    if (!decrypted) return;
+    NSError *err = nil;
+    NSMutableDictionary *bpDict = [NSJSONSerialization JSONObjectWithData:decrypted options:NSJSONReadingMutableContainers error:&err];
+    if (err || !bpDict) return;
+    NSMutableArray *seasonData = bpDict[@"seasonData"];
+    if (seasonData.count == 0) return;
+    NSMutableDictionary *value = seasonData[0][@"Value"];
+    value[@"curLevel"] = @50;
+    NSData *newJson = [NSJSONSerialization dataWithJSONObject:bpDict options:0 error:nil];
+    NSData *encrypted = encryptDES(newJson);
+    [encrypted writeToFile:path atomically:YES];
+    [self renderActiveTab];
+    [self showNotificationWithTitle:@"BattlePass" message:@"Max Level Applied"];
+}
+
+- (void)bpCompleteQuestTapped {
+    NSNumber *uid = getUserId();
+    if (!uid) return;
+    NSString *fileName = [NSString stringWithFormat:@"bp_data_%lld.data", (long long)uid.integerValue];
+    NSString *libDir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [libDir stringByAppendingPathComponent:fileName];
+    NSData *fileData = [NSData dataWithContentsOfFile:path];
+    if (!fileData) return;
+    NSData *decrypted = decryptDES(fileData);
+    if (!decrypted) return;
+    NSError *err = nil;
+    NSMutableDictionary *bpDict = [NSJSONSerialization JSONObjectWithData:decrypted options:NSJSONReadingMutableContainers error:&err];
+    if (err || !bpDict) return;
+    NSMutableArray *seasonData = bpDict[@"seasonData"];
+    if (seasonData.count == 0) return;
+    NSMutableDictionary *value = seasonData[0][@"Value"];
+    NSMutableArray *seasonTaskData = value[@"seasonTaskData"];
+    for (NSMutableDictionary *task in seasonTaskData) {
+        if ([task[@"Status"] isEqualToString:@"Progress"]) {
+            task[@"Status"] = @"Complete";
+            task[@"CurrentProgress"] = task[@"TargetProgress"];
+            long long start = [task[@"StartTime"] longLongValue];
+            task[@"CompleteTime"] = @(start + 1);
+        }
     }
+    NSMutableArray *weeklyTaskDataList = value[@"weeklyTaskDataList"];
+    for (NSMutableArray *week in weeklyTaskDataList) {
+        for (NSMutableDictionary *task in week) {
+            if ([task[@"Status"] isEqualToString:@"Progress"]) {
+                task[@"Status"] = @"Complete";
+                task[@"CurrentProgress"] = task[@"TargetProgress"];
+                long long start = [task[@"StartTime"] longLongValue];
+                task[@"CompleteTime"] = @(start + 1);
+            }
+        }
+    }
+    NSData *newJson = [NSJSONSerialization dataWithJSONObject:bpDict options:0 error:nil];
+    NSData *encrypted = encryptDES(newJson);
+    [encrypted writeToFile:path atomically:YES];
+    [self renderActiveTab];
+    [self showNotificationWithTitle:@"BattlePass" message:@"Quests Completed"];
 }
 
 #pragma mark - Gems input (no tabs)
@@ -1416,6 +1374,16 @@ static void showMainMenu() {
     if (completion) completion();
 }
 
+- (void)loadBackgroundImageFromDisk {
+    NSString *path = [self bgImagePath];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (data) {
+            self.backgroundImage = [UIImage imageWithData:data];
+        }
+    }
+}
+
 @end
 
 #pragma mark - Floating draggable button
@@ -1447,9 +1415,6 @@ static UIButton *floatingButton = nil;
 
 %new
 - (void)showMenuPressed {
-    // Refresh account cache from SdkStateCache#1 every time menu is shown
-    [[LMUIHelper shared] refreshAccountsFromSdkState];
-    
     if (!g_hasShownCreditAlert) {
         g_hasShownCreditAlert = YES;
         [[LMUIHelper shared] showCreditWithCompletion:^{
