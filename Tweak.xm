@@ -865,36 +865,21 @@ static void showMainMenu() {
         [scroll addSubview:lbl];
         return;
     }
-    NSError *err = nil;
-    NSDictionary *bpDict = [NSJSONSerialization JSONObjectWithData:decrypted options:0 error:&err];
-    if (err || !bpDict) {
+    NSString *rawString = [[NSString alloc] initWithData:decrypted encoding:NSUTF8StringEncoding];
+    if (!rawString) {
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, scroll.bounds.size.width - 24, 20)];
-        lbl.text = @"JSON parse failed";
+        lbl.text = @"Failed to decode string";
         lbl.textColor = [UIColor whiteColor];
         [scroll addSubview:lbl];
         return;
     }
-    NSArray *seasonData = bpDict[@"seasonData"];
-    if (seasonData.count == 0) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, scroll.bounds.size.width - 24, 20)];
-        lbl.text = @"No season data";
-        lbl.textColor = [UIColor whiteColor];
-        [scroll addSubview:lbl];
-        return;
-    }
-    NSDictionary *value = seasonData[0][@"Value"];
-    NSNumber *curLevel = value[@"curLevel"];
-    BOOL hasBuy = [value[@"hasBuy"] boolValue];
-    NSString *unlockStr = hasBuy ? @"True" : @"False";
-    
-    CGFloat y = 12.0;
-    y = [self addKey:@"ID:" value:[NSString stringWithFormat:@"%@", uid] toView:scroll y:y];
-    y = [self addKey:@"Current Level:" value:[NSString stringWithFormat:@"%@", curLevel] toView:scroll y:y];
-    y = [self addKey:@"Unlock:" value:unlockStr toView:scroll y:y];
-    [self addMenuButtonWithTitle:@"Unlock BP" toView:scroll y:&y action:@selector(bpUnlockTapped)];
-    [self addMenuButtonWithTitle:@"Max Level" toView:scroll y:&y action:@selector(bpMaxLevelTapped)];
-    [self addMenuButtonWithTitle:@"Complete Quest" toView:scroll y:&y action:@selector(bpCompleteQuestTapped)];
-    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, y + 12.0);
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 12, scroll.bounds.size.width - 24, 200)];
+    lbl.text = rawString;
+    lbl.textColor = [UIColor whiteColor];
+    lbl.numberOfLines = 0;
+    lbl.font = [UIFont systemFontOfSize:12];
+    [scroll addSubview:lbl];
+    scroll.contentSize = CGSizeMake(scroll.bounds.size.width, 220.0);
 }
 
 - (void)renderSettingsTabContentInCurrentContentView {
