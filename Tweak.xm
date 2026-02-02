@@ -1,123 +1,169 @@
 #import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
+#import <substrate.h>
+#import <fcntl.h>
+#import <sys/stat.h>
 
-#define TARGET_URL @"api.locketcamera.com/fetchUserV2"
+static NSString *allowedHome;
+static NSString *allowedBundle;
+static BOOL enabled = YES;
 
-static UIButton *stopButton;
-static BOOL capturing = YES;
+#pragma mark - Helper
 
-// uid -> "First Last"
-static NSMutableDictionary<NSString *, NSString *> *capturedUsers;
+static NSString *actionFromFlags(int flags) {
+    if (flags & O_WRONLY) return @"WRITE";
+    if (flags & O_RDWR)   return @"READ + WRITE";
+    return @"READ";
+}
 
-#pragma mark - Export
+static void showAlert(NSString *method, NSString *action, NSString *path) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *msg = [NSString stringWithFormat:
+            @"Method : %@\nAction : %@\nPath   : %@",
+            method, action, path];
 
-void exportToClipboard(void) {
-    NSMutableString *output = [NSMutableString string];
+        UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"Sandbox Blocked"
+                                            message:msg
+                                     preferredStyle:UIAlertControllerStyleAlert];
 
-    [output appendFormat:@"Captured Users: %lu\n\n",
-        (unsigned long)capturedUsers.count];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
 
-    for (NSString *uid in capturedUsers) {
-        [output appendFormat:@"%@ | %@\n", uid, capturedUsers[uid]];
+        UIWindow *win = UIApplication.sharedApplication.keyWindow;
+        UIViewController *vc = win.rootViewController;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        [vc presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+static BOOL checkPath(const char *cpath,
+                      NSString *method,
+                      NSString *action) {
+    if (!enabled || !cpath) return YES;
+
+    NSString *path = [NSString stringWithUTF8String:cpath];
+
+    if ([path hasPrefix:allowedHome]) return YES;
+    if ([path hasPrefix:allowedBundle]) return YES;
+
+    showAlert(method, action, path);
+    errno = EACCES;
+    return NO;
+}
+
+#pragma mark - libc hooks
+
+static int (*orig_open)(const char *, int, ...);
+static int hooked_open(const char *path, int flags, ...) {
+    if (!checkPath(path, @"open()", actionFromFlags(flags)))
+        return -1;
+    return orig_open(path, flags);
+}
+
+static int (*orig_openat)(int, const char *, int, ...);
+static int hooked_openat(int fd, const char *path, int flags, ...) {
+    if (!checkPath(path, @"openat()", actionFromFlags(flags)))
+        return -1;
+    return orig_openat(fd, path, flags);
+}
+
+static FILE *(*orig_fopen)(const char *, const char *);
+static FILE *hooked_fopen(const char *path, const char *mode) {
+    NSString *action = strchr(mode, 'w') ? @"WRITE" : @"READ";
+    if (!checkPath(path, @"fopen()", action))
+        return NULL;
+    return orig_fopen(path, mode);
+}
+
+static int (*orig_access)(const char *, int);
+static int hooked_access(const char *path, int mode) {
+    if (!checkPath(path, @"access()", @"CHECK PERMISSION"))
+        return -1;
+    return orig_access(path, mode);
+}
+
+static int (*orig_stat)(const char *, struct stat *);
+static int hooked_stat(const char *path, struct stat *buf) {
+    if (!checkPath(path, @"stat()", @"FILE INFO"))
+        return -1;
+    return orig_stat(path, buf);
+}
+
+static int (*orig_lstat)(const char *, struct stat *);
+static int hooked_lstat(const char *path, struct stat *buf) {
+    if (!checkPath(path, @"lstat()", @"FILE INFO"))
+        return -1;
+    return orig_lstat(path, buf);
+}
+
+#pragma mark - Foundation hooks
+
+%hook NSFileManager
+
+- (NSArray *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error {
+    if (!checkPath(path.UTF8String,
+                   @"NSFileManager contentsOfDirectoryAtPath",
+                   @"LIST DIRECTORY")) {
+        if (error)
+            *error = [NSError errorWithDomain:NSPOSIXErrorDomain
+                                         code:EACCES
+                                     userInfo:nil];
+        return nil;
     }
-
-    UIPasteboard.generalPasteboard.string = output;
-
-    UIAlertController *alert =
-      [UIAlertController alertControllerWithTitle:@"Capture Stopped"
-                                          message:[NSString stringWithFormat:
-                                            @"Total captured: %lu\n\nCopied to clipboard.",
-                                            (unsigned long)capturedUsers.count]
-                                   preferredStyle:UIAlertControllerStyleAlert];
-
-    UIWindow *w = UIApplication.sharedApplication.keyWindow;
-    [w.rootViewController presentViewController:alert animated:YES completion:nil];
+    return %orig;
 }
 
-#pragma mark - Button
-
-void stopCapture(void) {
-    capturing = NO;
-    exportToClipboard();
-    stopButton.hidden = YES;
+- (BOOL)fileExistsAtPath:(NSString *)path {
+    if (!checkPath(path.UTF8String,
+                   @"NSFileManager fileExistsAtPath",
+                   @"CHECK EXISTS"))
+        return NO;
+    return %orig;
 }
 
-void addButton(void) {
-    UIWindow *window = UIApplication.sharedApplication.keyWindow;
-    if (!window || stopButton) return;
+%end
 
-    stopButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    stopButton.frame = CGRectMake(20, 150, 180, 44);
-    stopButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
-    stopButton.layer.cornerRadius = 8;
-
-    [stopButton setTitle:@"Stop & Copy" forState:UIControlStateNormal];
-    [stopButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-
-    [stopButton addTarget:nil
-                   action:@selector(stopButtonPressed)
-         forControlEvents:UIControlEventTouchUpInside];
-
-    [window addSubview:stopButton];
-}
-
-%hook UIApplication
-- (void)applicationDidBecomeActive:(UIApplication *)application {
-    %orig;
-    addButton();
+%hook NSData
++ (instancetype)dataWithContentsOfFile:(NSString *)path {
+    if (!checkPath(path.UTF8String,
+                   @"NSData dataWithContentsOfFile",
+                   @"READ FILE"))
+        return nil;
+    return %orig;
 }
 %end
 
-@interface NSObject (StopButton)
-- (void)stopButtonPressed;
-@end
-
-@implementation NSObject (StopButton)
-- (void)stopButtonPressed {
-    stopCapture();
+%hook NSString
++ (instancetype)stringWithContentsOfFile:(NSString *)path
+                                encoding:(NSStringEncoding)enc
+                                   error:(NSError **)error {
+    if (!checkPath(path.UTF8String,
+                   @"NSString stringWithContentsOfFile",
+                   @"READ TEXT")) {
+        if (error)
+            *error = [NSError errorWithDomain:NSPOSIXErrorDomain
+                                         code:EACCES
+                                     userInfo:nil];
+        return nil;
+    }
+    return %orig;
 }
-@end
-
-#pragma mark - Network Hook
-
-%hook NSURLSession
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-
-    void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) =
-    ^(NSData *data, NSURLResponse *response, NSError *error) {
-
-        if (capturing &&
-            data &&
-            [request.URL.absoluteString containsString:TARGET_URL]) {
-
-            NSDictionary *json =
-              [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-
-            NSDictionary *dataObj = json[@"result"][@"data"];
-
-            if ([dataObj isKindOfClass:NSDictionary.class]) {
-                NSString *uid = dataObj[@"uid"];
-                NSString *first = dataObj[@"first_name"] ?: @"";
-                NSString *last = dataObj[@"last_name"] ?: @"";
-
-                if (uid.length > 0 && !capturedUsers[uid]) {
-                    capturedUsers[uid] =
-                      [NSString stringWithFormat:@"%@ %@", first, last];
-                }
-            }
-        }
-
-        completionHandler(data, response, error);
-    };
-
-    return %orig(request, wrappedHandler);
-}
-
 %end
 
 #pragma mark - Init
 
 %ctor {
-    capturedUsers = [NSMutableDictionary dictionary];
+    @autoreleasepool {
+        allowedHome   = NSHomeDirectory();
+        allowedBundle = [NSBundle mainBundle].bundlePath;
+
+        MSHookFunction(open,    hooked_open,    (void **)&orig_open);
+        MSHookFunction(openat, hooked_openat, (void **)&orig_openat);
+        MSHookFunction(fopen,  hooked_fopen,  (void **)&orig_fopen);
+        MSHookFunction(access, hooked_access, (void **)&orig_access);
+        MSHookFunction(stat,   hooked_stat,   (void **)&orig_stat);
+        MSHookFunction(lstat,  hooked_lstat,  (void **)&orig_lstat);
+    }
 }
