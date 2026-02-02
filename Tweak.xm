@@ -6,14 +6,18 @@
 
 static NSString *allowedHome;
 static NSString *allowedBundle;
-static BOOL enabled = YES;
 
-#pragma mark - Helper
+#pragma mark - Scene-safe Alert
 
-static NSString *actionFromFlags(int flags) {
-    if (flags & O_WRONLY) return @"WRITE";
-    if (flags & O_RDWR)   return @"READ + WRITE";
-    return @"READ";
+static UIWindow *getKeyWindow(void) {
+    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *window in scene.windows) {
+                if (window.isKeyWindow) return window;
+            }
+        }
+    }
+    return nil;
 }
 
 static void showAlert(NSString *method, NSString *action, NSString *path) {
@@ -31,17 +35,21 @@ static void showAlert(NSString *method, NSString *action, NSString *path) {
                                                   style:UIAlertActionStyleDefault
                                                 handler:nil]];
 
-        UIWindow *win = UIApplication.sharedApplication.keyWindow;
+        UIWindow *win = getKeyWindow();
         UIViewController *vc = win.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
+        while (vc.presentedViewController)
+            vc = vc.presentedViewController;
+
         [vc presentViewController:alert animated:YES completion:nil];
     });
 }
 
+#pragma mark - Path Check
+
 static BOOL checkPath(const char *cpath,
                       NSString *method,
                       NSString *action) {
-    if (!enabled || !cpath) return YES;
+    if (!cpath) return YES;
 
     NSString *path = [NSString stringWithUTF8String:cpath];
 
@@ -51,6 +59,12 @@ static BOOL checkPath(const char *cpath,
     showAlert(method, action, path);
     errno = EACCES;
     return NO;
+}
+
+static NSString *actionFromFlags(int flags) {
+    if (flags & O_WRONLY) return @"WRITE";
+    if (flags & O_RDWR)   return @"READ + WRITE";
+    return @"READ";
 }
 
 #pragma mark - libc hooks
@@ -98,60 +112,6 @@ static int hooked_lstat(const char *path, struct stat *buf) {
     return orig_lstat(path, buf);
 }
 
-#pragma mark - Foundation hooks
-
-%hook NSFileManager
-
-- (NSArray *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error {
-    if (!checkPath(path.UTF8String,
-                   @"NSFileManager contentsOfDirectoryAtPath",
-                   @"LIST DIRECTORY")) {
-        if (error)
-            *error = [NSError errorWithDomain:NSPOSIXErrorDomain
-                                         code:EACCES
-                                     userInfo:nil];
-        return nil;
-    }
-    return %orig;
-}
-
-- (BOOL)fileExistsAtPath:(NSString *)path {
-    if (!checkPath(path.UTF8String,
-                   @"NSFileManager fileExistsAtPath",
-                   @"CHECK EXISTS"))
-        return NO;
-    return %orig;
-}
-
-%end
-
-%hook NSData
-+ (instancetype)dataWithContentsOfFile:(NSString *)path {
-    if (!checkPath(path.UTF8String,
-                   @"NSData dataWithContentsOfFile",
-                   @"READ FILE"))
-        return nil;
-    return %orig;
-}
-%end
-
-%hook NSString
-+ (instancetype)stringWithContentsOfFile:(NSString *)path
-                                encoding:(NSStringEncoding)enc
-                                   error:(NSError **)error {
-    if (!checkPath(path.UTF8String,
-                   @"NSString stringWithContentsOfFile",
-                   @"READ TEXT")) {
-        if (error)
-            *error = [NSError errorWithDomain:NSPOSIXErrorDomain
-                                         code:EACCES
-                                     userInfo:nil];
-        return nil;
-    }
-    return %orig;
-}
-%end
-
 #pragma mark - Init
 
 %ctor {
@@ -159,11 +119,11 @@ static int hooked_lstat(const char *path, struct stat *buf) {
         allowedHome   = NSHomeDirectory();
         allowedBundle = [NSBundle mainBundle].bundlePath;
 
-        MSHookFunction(open,    hooked_open,    (void **)&orig_open);
-        MSHookFunction(openat, hooked_openat, (void **)&orig_openat);
-        MSHookFunction(fopen,  hooked_fopen,  (void **)&orig_fopen);
-        MSHookFunction(access, hooked_access, (void **)&orig_access);
-        MSHookFunction(stat,   hooked_stat,   (void **)&orig_stat);
-        MSHookFunction(lstat,  hooked_lstat,  (void **)&orig_lstat);
+        MSHookFunction((void *)open,    (void *)hooked_open,    (void **)&orig_open);
+        MSHookFunction((void *)openat, (void *)hooked_openat, (void **)&orig_openat);
+        MSHookFunction((void *)fopen,  (void *)hooked_fopen,  (void **)&orig_fopen);
+        MSHookFunction((void *)access, (void *)hooked_access, (void **)&orig_access);
+        MSHookFunction((void *)stat,   (void *)hooked_stat,   (void **)&orig_stat);
+        MSHookFunction((void *)lstat,  (void *)hooked_lstat,  (void **)&orig_lstat);
     }
 }
