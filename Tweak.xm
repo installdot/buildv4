@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <signal.h>
 #import <unistd.h>
+#import <objc/runtime.h>
 
 static NSString *HOME() { return NSHomeDirectory(); }
 static NSString *DOCS() { return [HOME() stringByAppendingPathComponent:@"Documents"]; }
@@ -33,10 +34,16 @@ static void runMode1_SaveModifyClose() {
         NSString *plist = [PREFS() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
         NSString *txt   = [PREFS() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
 
-        if (![fm fileExistsAtPath:accFile]) return;
+        if (![fm fileExistsAtPath:accFile]) {
+            NSLog(@"[M1] ERROR: acc.txt not found!");
+            return;
+        }
 
         NSString *content = [NSString stringWithContentsOfFile:accFile encoding:NSUTF8StringEncoding error:nil];
-        if (!content) return;
+        if (!content) {
+            NSLog(@"[M1] ERROR: Could not read acc.txt!");
+            return;
+        }
 
         NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
         NSMutableArray *valid = [NSMutableArray arrayWithCapacity:lines.count];
@@ -45,11 +52,19 @@ static void runMode1_SaveModifyClose() {
             if (trimmed.length > 0 && [[trimmed componentsSeparatedByString:@"|"] count] == 4)
                 [valid addObject:trimmed];
         }
-        if (valid.count == 0) return;
+        
+        if (valid.count == 0) {
+            NSLog(@"[M1] ERROR: No valid accounts found!");
+            return;
+        }
+
+        NSLog(@"[M1] Found %lu valid accounts", (unsigned long)valid.count);
 
         NSString *line = valid[arc4random_uniform((uint32_t)valid.count)];
         NSArray *p = [line componentsSeparatedByString:@"|"];
         NSString *email = p[0], *pass = p[1], *uid = p[2], *token = p[3];
+
+        NSLog(@"[M1] Processing account: %@", email);
 
         NSArray *files = @[@"item_data_1_.data", @"season_data_1_.data", @"statistic_1_.data",
                           @"weapon_evolution_data_1_.data", @"bp_data_1_.data", @"misc_data_1_.data"];
@@ -85,11 +100,36 @@ static void runMode1_SaveModifyClose() {
         [fm removeItemAtPath:accFile error:nil];
         [fm moveItemAtPath:tmpFile toPath:accFile error:nil];
 
+        NSLog(@"[M1] Processing complete, closing app...");
         saveAndCloseApp();
     }
 }
 
-// METHOD 1: Hook UIViewController viewDidAppear
+// Block-based action helper
+@interface UIControl (BlockAction)
+- (void)addActionForControlEvents:(UIControlEvents)controlEvents withBlock:(void (^)(void))block;
+@end
+
+@implementation UIControl (BlockAction)
+
+- (void)addActionForControlEvents:(UIControlEvents)controlEvents withBlock:(void (^)(void))block {
+    // Store the block
+    objc_setAssociatedObject(self, @selector(handleActionBlock:), [block copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    
+    // Add target-action
+    [self addTarget:self action:@selector(handleActionBlock:) forControlEvents:controlEvents];
+}
+
+- (void)handleActionBlock:(id)sender {
+    void (^block)(void) = objc_getAssociatedObject(self, _cmd);
+    if (block) {
+        block();
+    }
+}
+
+@end
+
+// METHOD: MOST RELIABLE - Block-based action
 %hook UIViewController
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -97,39 +137,87 @@ static void runMode1_SaveModifyClose() {
     
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 800 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            if (globalButton) return;
+            if (globalButton) {
+                NSLog(@"[M1] Button already exists, skipping...");
+                return;
+            }
             
             UIWindow *keyWindow = self.view.window;
             if (!keyWindow) {
                 for (UIWindow *window in [UIApplication sharedApplication].windows) {
-                    if (window.isKeyWindow || window.windowLevel == UIWindowLevelNormal) {
+                    if (window.rootViewController != nil) {
                         keyWindow = window;
                         break;
                     }
                 }
             }
             
+            if (!keyWindow) {
+                keyWindow = [UIApplication sharedApplication].keyWindow;
+            }
+            
             if (keyWindow) {
+                NSLog(@"[M1] Creating button on window: %@", keyWindow);
+                
                 globalButton = [UIButton buttonWithType:UIButtonTypeCustom];
-                globalButton.frame = CGRectMake(20, 120, 52, 52);
-                globalButton.layer.cornerRadius = 26;
-                globalButton.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.85];
+                globalButton.frame = CGRectMake(20, 120, 56, 56);
+                globalButton.layer.cornerRadius = 28;
+                globalButton.backgroundColor = [[UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0] colorWithAlphaComponent:0.9];
                 globalButton.tag = 99999;
                 
                 [globalButton setTitle:@"M1" forState:UIControlStateNormal];
-                globalButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+                globalButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+                [globalButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
                 
                 globalButton.layer.shadowColor = [UIColor blackColor].CGColor;
-                globalButton.layer.shadowOffset = CGSizeMake(0, 2);
-                globalButton.layer.shadowRadius = 4;
-                globalButton.layer.shadowOpacity = 0.3;
+                globalButton.layer.shadowOffset = CGSizeMake(0, 3);
+                globalButton.layer.shadowRadius = 5;
+                globalButton.layer.shadowOpacity = 0.4;
+                globalButton.layer.borderWidth = 2.5;
+                globalButton.layer.borderColor = [UIColor whiteColor].CGColor;
                 
-                [globalButton addTarget:nil action:@selector(runM1) forControlEvents:UIControlEventTouchUpInside];
+                // CRITICAL FIX: Use block-based action (most reliable)
+                [globalButton addActionForControlEvents:UIControlEventTouchUpInside withBlock:^{
+                    NSLog(@"[M1] ===== BUTTON CLICKED! =====");
+                    
+                    // Visual feedback
+                    globalButton.transform = CGAffineTransformMakeScale(0.9, 0.9);
+                    globalButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.9];
+                    
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                                   dispatch_get_main_queue(), ^{
+                        globalButton.transform = CGAffineTransformIdentity;
+                        globalButton.backgroundColor = [[UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:1.0] colorWithAlphaComponent:0.9];
+                    });
+                    
+                    // Run the main function
+                    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                        NSLog(@"[M1] Starting Mode1 process...");
+                        runMode1_SaveModifyClose();
+                    });
+                }];
+                
+                // Additional touch handlers for debugging
+                [globalButton addTarget:globalButton 
+                                action:@selector(touchDown:) 
+                      forControlEvents:UIControlEventTouchDown];
+                
+                // Ensure button is fully interactive
+                globalButton.userInteractionEnabled = YES;
+                globalButton.exclusiveTouch = NO;
+                keyWindow.userInteractionEnabled = YES;
                 
                 [keyWindow addSubview:globalButton];
                 [keyWindow bringSubviewToFront:globalButton];
+                
+                NSLog(@"[M1] ===== BUTTON ADDED SUCCESSFULLY! =====");
+                NSLog(@"[M1] Button frame: %@", NSStringFromCGRect(globalButton.frame));
+                NSLog(@"[M1] Button superview: %@", globalButton.superview);
+                NSLog(@"[M1] Button userInteractionEnabled: %d", globalButton.userInteractionEnabled);
+            } else {
+                NSLog(@"[M1] ERROR: No window found!");
             }
         });
     });
@@ -137,14 +225,13 @@ static void runMode1_SaveModifyClose() {
 
 %end
 
-@interface UIResponder (M1)
-- (void)runM1;
-@end
+// Debug method
+%hook UIButton
 
-@implementation UIResponder (M1)
-- (void)runM1 {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        runMode1_SaveModifyClose();
-    });
+- (void)touchDown:(id)sender {
+    if (self.tag == 99999) {
+        NSLog(@"[M1] TouchDown detected on button!");
+    }
 }
-@end
+
+%end
