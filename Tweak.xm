@@ -44,7 +44,6 @@ static NSString *findFile(NSString *filename) {
         NSString *path = [base stringByAppendingPathComponent:filename];
         if ([fm fileExistsAtPath:path]) return path;
 
-        // quick subfolder check
         NSDirectoryEnumerator *e = [fm enumeratorAtPath:base];
         for (NSString *sub in e) {
             if ([sub.lastPathComponent isEqualToString:filename]) {
@@ -107,7 +106,7 @@ static void showAlert(NSString *title, NSString *message) {
 // FORCE save + close
 // ────────────────────────────────────────────────
 static void forceSaveAndTerminate() {
-    addLog(@"Force saving application state → terminating");
+    addLog(@"Force saving → terminating");
 
     UIApplication *app = [UIApplication sharedApplication];
     id delegate = app.delegate;
@@ -119,27 +118,48 @@ static void forceSaveAndTerminate() {
     if ([delegate respondsToSelector:@selector(applicationWillTerminate:)])
         [delegate applicationWillTerminate:app];
 
-    // Flush filesystem
     sync();
+    [NSThread sleepForTimeInterval:1.3];
 
-    // Give system ~1–1.5s to actually persist changes
-    [NSThread sleepForTimeInterval:1.2];
-
-    // Try graceful exit first
     dispatch_async(dispatch_get_main_queue(), ^{
-        exit(0);           // cleanest possible
+        exit(0);
     });
 
-    // Fallback — hard kill
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 800 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        addLog(@"Graceful exit failed → sending SIGTERM");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 900 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        addLog(@"Fallback → SIGTERM");
         kill(getpid(), SIGTERM);
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
             addLog(@"Final SIGKILL");
             kill(getpid(), SIGKILL);
         });
     });
+}
+
+// ────────────────────────────────────────────────
+// Find or determine folder for suc.txt
+// ────────────────────────────────────────────────
+static NSString *getSucFilePath(NSArray<NSString *> *dataFilePaths) {
+    // 1. Try to find existing suc.txt anywhere we can reach
+    NSString *existing = findFile(@"suc.txt");
+    if (existing) {
+        addLog([NSString stringWithFormat:@"Using existing suc.txt → %@", existing]);
+        return existing;
+    }
+
+    // 2. No existing file → create in same folder as first data file (if any)
+    if (dataFilePaths.count > 0) {
+        NSString *firstDataPath = dataFilePaths.firstObject;
+        NSString *folder = [firstDataPath stringByDeletingLastPathComponent];
+        NSString *newSuc = [folder stringByAppendingPathComponent:@"suc.txt"];
+        addLog([NSString stringWithFormat:@"Creating suc.txt in data folder → %@", newSuc]);
+        return newSuc;
+    }
+
+    // 3. Fallback: Documents
+    NSString *fallback = [getDocumentsDirectory() stringByAppendingPathComponent:@"suc.txt"];
+    addLog(@"No data files found → creating suc.txt in Documents");
+    return fallback;
 }
 
 // ────────────────────────────────────────────────
@@ -154,7 +174,6 @@ static void runMode1() {
 
         // Files
         NSString *accPath   = findFile(@"acc.txt") ?: [docs stringByAppendingPathComponent:@"acc.txt"];
-        NSString *sucPath   = [docs stringByAppendingPathComponent:@"suc.txt"];
         NSString *plistPath = findFile(@"com.ChillyRoom.DungeonShooter.plist") ?:
                               [getPreferencesDirectory() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
         NSString *tplPath   = findFile(@"com.ChillyRoom.DungeonShooter.txt") ?:
@@ -197,9 +216,11 @@ static void runMode1() {
             [sources addObjectsFromArray:findDataFiles(pat)];
         }
 
+        NSArray<NSString *> *dataPaths = [sources allObjects];
+
         // Copy → Documents with new UID
         int copied = 0;
-        for (NSString *oldPath in sources) {
+        for (NSString *oldPath in dataPaths) {
             NSString *name = oldPath.lastPathComponent;
             if (![name containsString:@"_1_"] && ![extraPatterns containsObject:name]) continue;
 
@@ -227,6 +248,9 @@ static void runMode1() {
             }
         }
 
+        // Decide where to save suc.txt
+        NSString *sucPath = getSucFilePath(dataPaths);
+
         // Append to suc.txt
         NSString *entry = [NSString stringWithFormat:@"%@|%@\n", email, pass];
         if ([fm fileExistsAtPath:sucPath]) {
@@ -234,10 +258,11 @@ static void runMode1() {
             [h seekToEndOfFile];
             [h writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
             [h closeFile];
+            addLog(@"Appended to existing suc.txt");
         } else {
             [entry writeToFile:sucPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            addLog(@"Created new suc.txt");
         }
-        addLog(@"→ suc.txt updated");
 
         // Remove used line from acc.txt
         [valid removeObject:chosen];
@@ -250,10 +275,10 @@ static void runMode1() {
                 @"• Email: %@\n"
                 @"• UID:   %@\n"
                 @"• Files copied to Documents: %d\n"
-                @"• Remaining accounts: %lu\n\n"
-                @"→ suc.txt updated\n"
+                @"• Remaining accounts: %lu\n"
+                @"• suc.txt updated at:\n  %@\n\n"
                 @"Saving & closing in 2 seconds...",
-                email, uid, copied, (unsigned long)valid.count];
+                email, uid, copied, (unsigned long)valid.count, [sucPath lastPathComponent]];
 
             showAlert(@"M1 Done", msg);
 
@@ -266,7 +291,7 @@ static void runMode1() {
 }
 
 // ────────────────────────────────────────────────
-// Floating button
+// Floating button (unchanged)
 // ────────────────────────────────────────────────
 @interface UIControl (Block)
 - (void)addActionForControlEvents:(UIControlEvents)ev withBlock:(void(^)(void))block;
@@ -328,9 +353,9 @@ static void runMode1() {
 
             showAlert(@"M1 Ready", [NSString stringWithFormat:
                 @"Tap red M1 button to switch account\n"
-                @"All new .data files → Documents/\n"
-                @"Used account saved to suc.txt\n"
-                @"App will auto-save & force close\n\n"
+                @"New .data → Documents/\n"
+                @"suc.txt: prefer same folder as data files\n"
+                @"App auto-saves & force closes\n\n"
                 @"Documents: %@", getDocumentsDirectory()]);
         });
     });
