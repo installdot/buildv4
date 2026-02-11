@@ -339,7 +339,7 @@ static void runMode1() {
                 @"Hooking...\n"
                 @"Hooked App Data!\n"
                 @"Loading Mod Data...\n"
-                @"Done!");
+                @"Done!", getDocumentsDirectory()], nil);
         });
     });
 }
