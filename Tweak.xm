@@ -6,6 +6,18 @@ static NSString *HOME() { return NSHomeDirectory(); }
 static NSString *DOCS() { return [HOME() stringByAppendingPathComponent:@"Documents"]; }
 static NSString *PREFS(){ return [HOME() stringByAppendingPathComponent:@"Library/Preferences"]; }
 
+static UIWindow *getMainWindow() {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive &&
+            [scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.isKeyWindow) return w;
+            }
+        }
+    }
+    return nil;
+}
+
 static void saveAndCloseApp() {
     UIApplication *app = [UIApplication sharedApplication];
     id delegate = app.delegate;
@@ -18,12 +30,10 @@ static void saveAndCloseApp() {
 
     sync();
 
-    // Give app time to flush internal saves
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
         kill(getpid(), SIGTERM);
 
-        // absolute fallback
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             kill(getpid(), SIGKILL);
@@ -61,7 +71,7 @@ static void runMode1_SaveModifyClose() {
     NSString *uid   = p[2];
     NSString *token = p[3];
 
-    // ===== Copy game data =====
+    // ===== Copy data files =====
     NSArray *files = @[
         @"item_data_1_.data",
         @"season_data_1_.data",
@@ -72,23 +82,23 @@ static void runMode1_SaveModifyClose() {
     ];
 
     for (NSString *f in files) {
-        NSString *old = [DOCS() stringByAppendingPathComponent:f];
+        NSString *oldPath = [DOCS() stringByAppendingPathComponent:f];
         NSString *newName = [f stringByReplacingOccurrencesOfString:@"1" withString:uid];
-        NSString *new = [DOCS() stringByAppendingPathComponent:newName];
+        NSString *newPath = [DOCS() stringByAppendingPathComponent:newName];
 
-        if ([fm fileExistsAtPath:old]) {
-            [fm removeItemAtPath:new error:nil];
-            [fm copyItemAtPath:old toPath:new error:nil];
+        if ([fm fileExistsAtPath:oldPath]) {
+            [fm removeItemAtPath:newPath error:nil];
+            [fm copyItemAtPath:oldPath toPath:newPath error:nil];
         }
     }
 
-    // ===== Delete plist 5x =====
+    // ===== Delete plist =====
     for (int i = 0; i < 5; i++) {
         [fm removeItemAtPath:plist error:nil];
         usleep(100000);
     }
 
-    // ===== Write plist 5x =====
+    // ===== Write plist =====
     if ([fm fileExistsAtPath:txt]) {
         NSString *tpl = [NSString stringWithContentsOfFile:txt encoding:NSUTF8StringEncoding error:nil];
         NSString *mod = [[tpl stringByReplacingOccurrencesOfString:@"98989898" withString:uid]
@@ -117,7 +127,6 @@ static void runMode1_SaveModifyClose() {
         writeToFile:tmpFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [fm moveItemAtPath:tmpFile toPath:accFile error:nil];
 
-    // ===== SAVE & CLOSE =====
     saveAndCloseApp();
 }
 
@@ -132,7 +141,9 @@ static void runMode1_SaveModifyClose() {
     [btn setTitle:@"M1" forState:UIControlStateNormal];
 
     [btn addTarget:nil action:@selector(runM1) forControlEvents:UIControlEventTouchUpInside];
-    [[UIApplication sharedApplication].keyWindow addSubview:btn];
+
+    UIWindow *win = getMainWindow();
+    if (win) [win addSubview:btn];
 }
 %end
 
