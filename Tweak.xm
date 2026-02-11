@@ -26,7 +26,7 @@ static NSString *getCachesDirectory() {
 }
 
 // ────────────────────────────────────────────────
-// File search helpers (unchanged)
+// File search helpers - ENHANCED
 // ────────────────────────────────────────────────
 static NSString *findFile(NSString *filename) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -37,7 +37,8 @@ static NSString *findFile(NSString *filename) {
         NSTemporaryDirectory(),
         [getLibraryDirectory() stringByAppendingPathComponent:@"Application Support"],
         [[NSBundle mainBundle] bundlePath],
-        [[NSBundle mainBundle] resourcePath]
+        [[NSBundle mainBundle] resourcePath],
+        getPreferencesDirectory()
     ];
 
     for (NSString *base in bases) {
@@ -106,10 +107,48 @@ static void showAlert(NSString *title, NSString *message, void (^completion)(voi
 }
 
 // ────────────────────────────────────────────────
-// FORCE save + close — no delays
+// FORCE PLIST SYNCHRONIZATION
+// ────────────────────────────────────────────────
+static void forcePlistSync(NSString *plistPath) {
+    addLog(@"Starting FORCE plist synchronization");
+    
+    // Method 1: CFPreferences sync
+    CFStringRef appID = CFSTR("com.ChillyRoom.DungeonShooter");
+    CFPreferencesAppSynchronize(appID);
+    addLog(@"CFPreferences synchronized");
+    
+    // Method 2: NSUserDefaults sync
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    addLog(@"NSUserDefaults synchronized");
+    
+    // Method 3: Direct file system sync
+    sync();
+    addLog(@"File system synced");
+    
+    // Method 4: Touch the file to ensure modification time is updated
+    NSDictionary *attrs = @{NSFileModificationDate: [NSDate date]};
+    [[NSFileManager defaultManager] setAttributes:attrs ofItemAtPath:plistPath error:nil];
+    
+    // Method 5: Verify the file exists and is readable
+    if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
+        NSDictionary *check = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        if (check) {
+            addLog([NSString stringWithFormat:@"Plist verified readable with %lu keys", (unsigned long)check.count]);
+        } else {
+            addLog(@"WARNING: Plist not readable after write!");
+        }
+    }
+}
+
+// ────────────────────────────────────────────────
+// FORCE save + close — with proper plist sync
 // ────────────────────────────────────────────────
 static void forceSaveAndTerminate() {
     addLog(@"Force saving → immediate terminate");
+
+    // Extra sync before app delegate calls
+    sync();
+    CFPreferencesAppSynchronize(CFSTR("com.ChillyRoom.DungeonShooter"));
 
     UIApplication *app = [UIApplication sharedApplication];
     id delegate = app.delegate;
@@ -121,9 +160,14 @@ static void forceSaveAndTerminate() {
     if ([delegate respondsToSelector:@selector(applicationWillTerminate:)])
         [delegate applicationWillTerminate:app];
 
+    // Final sync
     sync();
+    CFPreferencesAppSynchronize(CFSTR("com.ChillyRoom.DungeonShooter"));
+    
+    // Small delay to ensure writes complete
+    usleep(500000); // 0.5 seconds
 
-    exit(0);           // cleanest
+    exit(0);
 
     // fallback (rarely reached)
     kill(getpid(), SIGTERM);
@@ -147,7 +191,7 @@ static NSString *getSucFilePath(NSString *accPath) {
 }
 
 // ────────────────────────────────────────────────
-// Main logic — M1 mode
+// Main logic — M1 mode - ENHANCED
 // ────────────────────────────────────────────────
 static void runMode1() {
     @autoreleasepool {
@@ -155,12 +199,46 @@ static void runMode1() {
 
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *docs = getDocumentsDirectory();
+        NSString *prefs = getPreferencesDirectory();
 
         NSString *accPath   = findFile(@"acc.txt") ?: [docs stringByAppendingPathComponent:@"acc.txt"];
-        NSString *plistPath = findFile(@"com.ChillyRoom.DungeonShooter.plist") ?:
-                              [getPreferencesDirectory() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
-        NSString *tplPath   = findFile(@"com.ChillyRoom.DungeonShooter.txt") ?:
-                              [docs stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
+        NSString *plistPath = [prefs stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
+        
+        // Search for DungeonShooter.txt EVERYWHERE
+        NSString *tplPath = findFile(@"com.ChillyRoom.DungeonShooter.txt");
+        
+        if (!tplPath) {
+            addLog(@"DungeonShooter.txt not found in standard locations, searching deeper...");
+            // Deep search in all possible locations
+            NSArray *searchPaths = @[
+                getDocumentsDirectory(),
+                getLibraryDirectory(),
+                getCachesDirectory(),
+                NSTemporaryDirectory(),
+                [[NSBundle mainBundle] bundlePath],
+                [[NSBundle mainBundle] resourcePath],
+                NSHomeDirectory()
+            ];
+            
+            for (NSString *searchPath in searchPaths) {
+                NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:searchPath];
+                for (NSString *file in enumerator) {
+                    if ([file.lastPathComponent isEqualToString:@"com.ChillyRoom.DungeonShooter.txt"]) {
+                        tplPath = [searchPath stringByAppendingPathComponent:file];
+                        addLog([NSString stringWithFormat:@"Found template at: %@", tplPath]);
+                        break;
+                    }
+                }
+                if (tplPath) break;
+            }
+        }
+        
+        if (!tplPath) {
+            tplPath = [docs stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
+            addLog([NSString stringWithFormat:@"Using fallback template path: %@", tplPath]);
+        } else {
+            addLog([NSString stringWithFormat:@"Using template from: %@", tplPath]);
+        }
 
         // Read accounts
         NSError *err = nil;
@@ -215,19 +293,37 @@ static void runMode1() {
             }
         }
 
-        // Update plist
+        // Update plist - ENHANCED with forced sync
         if ([fm fileExistsAtPath:tplPath]) {
             NSString *tpl = [NSString stringWithContentsOfFile:tplPath encoding:NSUTF8StringEncoding error:nil];
             if (tpl) {
                 NSString *updated = [[tpl stringByReplacingOccurrencesOfString:@"98989898" withString:uid]
                                      stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
+                
+                // Remove old plist
                 [fm removeItemAtPath:plistPath error:nil];
+                addLog(@"Old plist removed");
+                
+                // Write new plist
                 if ([updated writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
-                    addLog(@"Plist updated");
+                    addLog([NSString stringWithFormat:@"Plist written to: %@", plistPath]);
+                    
+                    // FORCE synchronization
+                    forcePlistSync(plistPath);
+                    
+                    // Set proper permissions
+                    NSDictionary *attrs = @{NSFilePosixPermissions: @0644};
+                    [fm setAttributes:attrs ofItemAtPath:plistPath error:nil];
+                    
+                    addLog(@"Plist update COMPLETE with forced sync");
                 } else {
                     addLog([NSString stringWithFormat:@"Plist write failed: %@", err.localizedDescription]);
                 }
+            } else {
+                addLog(@"Could not read template file");
             }
+        } else {
+            addLog([NSString stringWithFormat:@"Template file not found at: %@", tplPath]);
         }
 
         // ─── Save to suc.txt ───────────────────────────────────────
@@ -275,6 +371,10 @@ static void runMode1() {
         [valid removeObject:chosen];
         [[valid componentsJoinedByString:@"\n"] writeToFile:accPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
+        // Final sync before showing alert
+        sync();
+        forcePlistSync(plistPath);
+
         // Final message
         NSString *msg = [NSString stringWithFormat:
             @"Done!\n\n"
@@ -291,7 +391,7 @@ static void runMode1() {
     }
 }
 
-// Floating button (your last version)
+// Floating button
 @interface UIControl (Block)
 - (void)addActionForControlEvents:(UIControlEvents)ev withBlock:(void(^)(void))block;
 @end
