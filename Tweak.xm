@@ -7,7 +7,7 @@ static UIButton *globalButton = nil;
 static NSMutableString *debugLog = nil;
 
 // ────────────────────────────────────────────────
-// Directory helpers
+// Directory helpers (unchanged)
 // ────────────────────────────────────────────────
 static NSString *getDocumentsDirectory() {
     return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -26,7 +26,7 @@ static NSString *getCachesDirectory() {
 }
 
 // ────────────────────────────────────────────────
-// File search helpers
+// File search helpers (unchanged)
 // ────────────────────────────────────────────────
 static NSString *findFile(NSString *filename) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -123,33 +123,25 @@ static void forceSaveAndTerminate() {
 
     sync();
 
-    // Try cleanest exit first
-    exit(0);
+    exit(0);           // cleanest
 
-    // Fallback (almost never reached)
+    // fallback (rarely reached)
     kill(getpid(), SIGTERM);
     kill(getpid(), SIGKILL);
 }
 
 // ────────────────────────────────────────────────
-// Get suc.txt path = same folder as acc.txt
+// suc.txt path = same folder as acc.txt + fallback
 // ────────────────────────────────────────────────
 static NSString *getSucFilePath(NSString *accPath) {
-    if (!accPath) {
-        NSString *fallback = [getDocumentsDirectory() stringByAppendingPathComponent:@"suc.txt"];
-        addLog(@"No acc.txt path → suc.txt in Documents");
-        return fallback;
+    NSString *targetFolder = getDocumentsDirectory(); // default fallback
+
+    if (accPath) {
+        targetFolder = [accPath stringByDeletingLastPathComponent];
     }
 
-    NSString *accFolder = [accPath stringByDeletingLastPathComponent];
-    NSString *sucPath = [accFolder stringByAppendingPathComponent:@"suc.txt"];
-
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:sucPath]) {
-        addLog([NSString stringWithFormat:@"Using existing suc.txt → %@", sucPath]);
-    } else {
-        addLog([NSString stringWithFormat:@"Will create suc.txt in same folder as acc.txt → %@", sucPath]);
-    }
+    NSString *sucPath = [targetFolder stringByAppendingPathComponent:@"suc.txt"];
+    addLog([NSString stringWithFormat:@"Target suc.txt location: %@", sucPath]);
 
     return sucPath;
 }
@@ -164,7 +156,6 @@ static void runMode1() {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSString *docs = getDocumentsDirectory();
 
-        // Files
         NSString *accPath   = findFile(@"acc.txt") ?: [docs stringByAppendingPathComponent:@"acc.txt"];
         NSString *plistPath = findFile(@"com.ChillyRoom.DungeonShooter.plist") ?:
                               [getPreferencesDirectory() stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
@@ -175,7 +166,7 @@ static void runMode1() {
         NSError *err = nil;
         NSString *accContent = [NSString stringWithContentsOfFile:accPath encoding:NSUTF8StringEncoding error:&err];
         if (!accContent || err) {
-            showAlert(@"Error", [NSString stringWithFormat:@"Cannot read acc.txt\n%@", err.localizedDescription ?: @"Unknown error"], nil);
+            showAlert(@"Error", [NSString stringWithFormat:@"Cannot read acc.txt\n%@", err.localizedDescription ?: @"Unknown"], nil);
             return;
         }
 
@@ -190,29 +181,26 @@ static void runMode1() {
         }
 
         if (valid.count == 0) {
-            showAlert(@"Error", @"No valid accounts found in acc.txt\nFormat: email|pass|uid|token", nil);
+            showAlert(@"Error", @"No valid accounts in acc.txt (email|pass|uid|token)", nil);
             return;
         }
 
-        // Pick random account
+        // Pick random
         NSString *chosen = valid[arc4random_uniform((uint32_t)valid.count)];
         NSArray *parts = [chosen componentsSeparatedByString:@"|"];
         NSString *email = parts[0], *pass = parts[1], *uid = parts[2], *token = parts[3];
 
-        addLog([NSString stringWithFormat:@"Selected → %@ (UID: %@)", email, uid]);
+        addLog([NSString stringWithFormat:@"Using: %@ (UID: %@)", email, uid]);
 
-        // Find data files to duplicate
+        // Copy data files to Documents
         NSMutableSet *sources = [NSMutableSet setWithArray:findDataFiles(@"_data_1_.data")];
-        NSArray *extraPatterns = @[@"item_data", @"season_data", @"statistic", @"weapon_evolution", @"bp_data", @"misc_data"];
-        for (NSString *pat in extraPatterns) {
-            [sources addObjectsFromArray:findDataFiles(pat)];
-        }
+        NSArray *extra = @[@"item_data", @"season_data", @"statistic", @"weapon_evolution", @"bp_data", @"misc_data"];
+        for (NSString *pat in extra) [sources addObjectsFromArray:findDataFiles(pat)];
 
-        // Copy → Documents with new UID
         int copied = 0;
         for (NSString *oldPath in sources) {
             NSString *name = oldPath.lastPathComponent;
-            if (![name containsString:@"_1_"] && ![extraPatterns containsObject:name]) continue;
+            if (![name containsString:@"_1_"] && ![extra containsObject:name]) continue;
 
             NSString *newName = [name stringByReplacingOccurrencesOfString:@"_1_" withString:[NSString stringWithFormat:@"_%@_", uid]];
             NSString *newPath = [docs stringByAppendingPathComponent:newName];
@@ -221,52 +209,81 @@ static void runMode1() {
 
             if ([fm copyItemAtPath:oldPath toPath:newPath error:&err]) {
                 copied++;
-                addLog([NSString stringWithFormat:@"→ %@", newName]);
+                addLog([NSString stringWithFormat:@"Copied → %@", newName]);
+            } else if (err) {
+                addLog([NSString stringWithFormat:@"Copy failed: %@ → %@", name, err.localizedDescription]);
             }
         }
 
-        // Update plist from template
+        // Update plist
         if ([fm fileExistsAtPath:tplPath]) {
             NSString *tpl = [NSString stringWithContentsOfFile:tplPath encoding:NSUTF8StringEncoding error:nil];
             if (tpl) {
                 NSString *updated = [[tpl stringByReplacingOccurrencesOfString:@"98989898" withString:uid]
                                      stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
-
                 [fm removeItemAtPath:plistPath error:nil];
-                [updated writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                addLog(@"Plist updated");
+                if ([updated writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
+                    addLog(@"Plist updated");
+                } else {
+                    addLog([NSString stringWithFormat:@"Plist write failed: %@", err.localizedDescription]);
+                }
             }
         }
 
-        // suc.txt in same folder as acc.txt
+        // ─── Save to suc.txt ───────────────────────────────────────
         NSString *sucPath = getSucFilePath(accPath);
-
-        // Append or create suc.txt
         NSString *entry = [NSString stringWithFormat:@"%@|%@\n", email, pass];
+        BOOL writeSuccess = NO;
+
         if ([fm fileExistsAtPath:sucPath]) {
             NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:sucPath];
-            [h seekToEndOfFile];
-            [h writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
-            [h closeFile];
-            addLog(@"Appended to suc.txt");
+            if (h) {
+                [h seekToEndOfFile];
+                NSData *data = [entry dataUsingEncoding:NSUTF8StringEncoding];
+                @try {
+                    [h writeData:data];
+                    writeSuccess = YES;
+                    addLog(@"Appended to suc.txt");
+                } @catch (NSException *e) {
+                    addLog([NSString stringWithFormat:@"Append exception: %@", e.reason]);
+                }
+                [h closeFile];
+            } else {
+                addLog(@"Cannot open suc.txt for append");
+            }
         } else {
-            [entry writeToFile:sucPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            addLog(@"Created suc.txt");
+            if ([entry writeToFile:sucPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
+                writeSuccess = YES;
+                addLog(@"Created suc.txt");
+            } else {
+                addLog([NSString stringWithFormat:@"Create suc.txt failed: %@", err.localizedDescription]);
+            }
         }
 
-        // Remove used line from acc.txt
+        // Fallback write if failed
+        if (!writeSuccess) {
+            NSString *fallbackPath = [docs stringByAppendingPathComponent:@"suc.txt"];
+            if ([entry writeToFile:fallbackPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
+                addLog([NSString stringWithFormat:@"Fallback save to Documents/suc.txt"]);
+                sucPath = fallbackPath;
+            } else {
+                addLog([NSString stringWithFormat:@"Even fallback save failed: %@", err.localizedDescription]);
+            }
+        }
+
+        // Remove used account
         [valid removeObject:chosen];
         [[valid componentsJoinedByString:@"\n"] writeToFile:accPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        // Show result & close immediately after alert is acknowledged
+        // Final message
         NSString *msg = [NSString stringWithFormat:
-            @"Account switched\n\n"
-            @"• Email: %@\n"
-            @"• UID:   %@\n"
-            @"• Remaining accounts: %lu\n"
-            @"• Good!\n\n"
-            @"Saving & closing now...",
-            email, uid, copied, (unsigned long)valid.count, [sucPath stringByDeletingLastPathComponent]];
+            @"Done!\n\n"
+            @"Email: %@\n"
+            @"UID:   %@\n"
+            @"Files copied: %d\n"
+            @"Remaining: %lu\n\n"
+            @"Saving & closing...",
+            email, uid, copied, (unsigned long)valid.count];
 
         showAlert(@"Auto-Mod Done", msg, ^{
             forceSaveAndTerminate();
@@ -274,9 +291,7 @@ static void runMode1() {
     }
 }
 
-// ────────────────────────────────────────────────
-// Floating button
-// ────────────────────────────────────────────────
+// Floating button (your last version)
 @interface UIControl (Block)
 - (void)addActionForControlEvents:(UIControlEvents)ev withBlock:(void(^)(void))block;
 @end
@@ -333,13 +348,9 @@ static void runMode1() {
             [win addSubview:globalButton];
             [win bringSubviewToFront:globalButton];
 
-            addLog(@"M1 button created");
+            addLog(@"M button created");
 
-            showAlert(@"Auto-Mod Hook", [NSString stringWithFormat:
-                @"Hooking...\n"
-                @"Hooked App Data!\n"
-                @"Loading Mod Data...\n"
-                @"Done!", getDocumentsDirectory()], nil);
+            showAlert(@"Auto-Mod Hook", @"Hooking...\nHooked App Data!\nLoading Mod Data...\nDone!", nil);
         });
     });
 }
