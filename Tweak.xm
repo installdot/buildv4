@@ -86,14 +86,17 @@ static void addLog(NSString *msg) {
     [debugLog appendFormat:@"[%@] %@\n", ts, msg];
 }
 
-static void showAlert(NSString *title, NSString *message) {
+static void showAlert(NSString *title, NSString *message, void (^completion)(void)) {
     addLog([NSString stringWithFormat:@"Alert: %@ — %@", title, message]);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                        message:message
                                                                 preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            if (completion) completion();
+        }]];
 
         UIViewController *top = [UIApplication sharedApplication].keyWindow.rootViewController;
         while (top.presentedViewController) top = top.presentedViewController;
@@ -103,10 +106,10 @@ static void showAlert(NSString *title, NSString *message) {
 }
 
 // ────────────────────────────────────────────────
-// FORCE save + close
+// FORCE save + close — no delays
 // ────────────────────────────────────────────────
 static void forceSaveAndTerminate() {
-    addLog(@"Force saving → terminating");
+    addLog(@"Force saving → immediate terminate");
 
     UIApplication *app = [UIApplication sharedApplication];
     id delegate = app.delegate;
@@ -119,47 +122,36 @@ static void forceSaveAndTerminate() {
         [delegate applicationWillTerminate:app];
 
     sync();
-    [NSThread sleepForTimeInterval:1.3];
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        exit(0);
-    });
+    // Try cleanest exit first
+    exit(0);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 900 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        addLog(@"Fallback → SIGTERM");
-        kill(getpid(), SIGTERM);
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            addLog(@"Final SIGKILL");
-            kill(getpid(), SIGKILL);
-        });
-    });
+    // Fallback (almost never reached)
+    kill(getpid(), SIGTERM);
+    kill(getpid(), SIGKILL);
 }
 
 // ────────────────────────────────────────────────
-// Find or determine folder for suc.txt
+// Get suc.txt path = same folder as acc.txt
 // ────────────────────────────────────────────────
-static NSString *getSucFilePath(NSArray<NSString *> *dataFilePaths) {
-    // 1. Try to find existing suc.txt anywhere we can reach
-    NSString *existing = findFile(@"suc.txt");
-    if (existing) {
-        addLog([NSString stringWithFormat:@"Using existing suc.txt → %@", existing]);
-        return existing;
+static NSString *getSucFilePath(NSString *accPath) {
+    if (!accPath) {
+        NSString *fallback = [getDocumentsDirectory() stringByAppendingPathComponent:@"suc.txt"];
+        addLog(@"No acc.txt path → suc.txt in Documents");
+        return fallback;
     }
 
-    // 2. No existing file → create in same folder as first data file (if any)
-    if (dataFilePaths.count > 0) {
-        NSString *firstDataPath = dataFilePaths.firstObject;
-        NSString *folder = [firstDataPath stringByDeletingLastPathComponent];
-        NSString *newSuc = [folder stringByAppendingPathComponent:@"suc.txt"];
-        addLog([NSString stringWithFormat:@"Creating suc.txt in data folder → %@", newSuc]);
-        return newSuc;
+    NSString *accFolder = [accPath stringByDeletingLastPathComponent];
+    NSString *sucPath = [accFolder stringByAppendingPathComponent:@"suc.txt"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:sucPath]) {
+        addLog([NSString stringWithFormat:@"Using existing suc.txt → %@", sucPath]);
+    } else {
+        addLog([NSString stringWithFormat:@"Will create suc.txt in same folder as acc.txt → %@", sucPath]);
     }
 
-    // 3. Fallback: Documents
-    NSString *fallback = [getDocumentsDirectory() stringByAppendingPathComponent:@"suc.txt"];
-    addLog(@"No data files found → creating suc.txt in Documents");
-    return fallback;
+    return sucPath;
 }
 
 // ────────────────────────────────────────────────
@@ -183,7 +175,7 @@ static void runMode1() {
         NSError *err = nil;
         NSString *accContent = [NSString stringWithContentsOfFile:accPath encoding:NSUTF8StringEncoding error:&err];
         if (!accContent || err) {
-            showAlert(@"Error", [NSString stringWithFormat:@"Cannot read acc.txt\n%@", err.localizedDescription ?: @"Unknown error"]);
+            showAlert(@"Error", [NSString stringWithFormat:@"Cannot read acc.txt\n%@", err.localizedDescription ?: @"Unknown error"], nil);
             return;
         }
 
@@ -198,7 +190,7 @@ static void runMode1() {
         }
 
         if (valid.count == 0) {
-            showAlert(@"Error", @"No valid accounts found in acc.txt\nFormat: email|pass|uid|token");
+            showAlert(@"Error", @"No valid accounts found in acc.txt\nFormat: email|pass|uid|token", nil);
             return;
         }
 
@@ -216,11 +208,9 @@ static void runMode1() {
             [sources addObjectsFromArray:findDataFiles(pat)];
         }
 
-        NSArray<NSString *> *dataPaths = [sources allObjects];
-
         // Copy → Documents with new UID
         int copied = 0;
-        for (NSString *oldPath in dataPaths) {
+        for (NSString *oldPath in sources) {
             NSString *name = oldPath.lastPathComponent;
             if (![name containsString:@"_1_"] && ![extraPatterns containsObject:name]) continue;
 
@@ -248,50 +238,44 @@ static void runMode1() {
             }
         }
 
-        // Decide where to save suc.txt
-        NSString *sucPath = getSucFilePath(dataPaths);
+        // suc.txt in same folder as acc.txt
+        NSString *sucPath = getSucFilePath(accPath);
 
-        // Append to suc.txt
+        // Append or create suc.txt
         NSString *entry = [NSString stringWithFormat:@"%@|%@\n", email, pass];
         if ([fm fileExistsAtPath:sucPath]) {
             NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:sucPath];
             [h seekToEndOfFile];
             [h writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
             [h closeFile];
-            addLog(@"Appended to existing suc.txt");
+            addLog(@"Appended to suc.txt");
         } else {
             [entry writeToFile:sucPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            addLog(@"Created new suc.txt");
+            addLog(@"Created suc.txt");
         }
 
         // Remove used line from acc.txt
         [valid removeObject:chosen];
         [[valid componentsJoinedByString:@"\n"] writeToFile:accPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        // Show result & force close
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSString *msg = [NSString stringWithFormat:
-                @"Account switched\n\n"
-                @"• Email: %@\n"
-                @"• UID:   %@\n"
-                @"• Files copied to Documents: %d\n"
-                @"• Remaining accounts: %lu\n"
-                @"• suc.txt updated at:\n  %@\n\n"
-                @"Saving & closing in 2 seconds...",
-                email, uid, copied, (unsigned long)valid.count, [sucPath lastPathComponent]];
+        // Show result & close immediately after alert is acknowledged
+        NSString *msg = [NSString stringWithFormat:
+            @"Account switched\n\n"
+            @"• Email: %@\n"
+            @"• UID:   %@\n"
+            @"• Remaining accounts: %lu\n"
+            @"• Good!\n\n"
+            @"Saving & closing now...",
+            email, uid, copied, (unsigned long)valid.count, [sucPath stringByDeletingLastPathComponent]];
 
-            showAlert(@"M1 Done", msg);
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2200 * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), ^{
-                forceSaveAndTerminate();
-            });
+        showAlert(@"Auto-Mod Done", msg, ^{
+            forceSaveAndTerminate();
         });
     }
 }
 
 // ────────────────────────────────────────────────
-// Floating button (unchanged)
+// Floating button
 // ────────────────────────────────────────────────
 @interface UIControl (Block)
 - (void)addActionForControlEvents:(UIControlEvents)ev withBlock:(void(^)(void))block;
@@ -330,7 +314,7 @@ static void runMode1() {
             globalButton.frame = CGRectMake(20, 120, 56, 56);
             globalButton.layer.cornerRadius = 28;
             globalButton.backgroundColor = [UIColor colorWithRed:0.95 green:0.15 blue:0.15 alpha:0.94];
-            [globalButton setTitle:@"M1" forState:UIControlStateNormal];
+            [globalButton setTitle:@"M" forState:UIControlStateNormal];
             globalButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
             globalButton.layer.shadowColor = UIColor.blackColor.CGColor;
             globalButton.layer.shadowOffset = CGSizeMake(0, 3);
@@ -351,12 +335,11 @@ static void runMode1() {
 
             addLog(@"M1 button created");
 
-            showAlert(@"M1 Ready", [NSString stringWithFormat:
-                @"Tap red M1 button to switch account\n"
-                @"New .data → Documents/\n"
-                @"suc.txt: prefer same folder as data files\n"
-                @"App auto-saves & force closes\n\n"
-                @"Documents: %@", getDocumentsDirectory()]);
+            showAlert(@"Auto-Mod Hook", [NSString stringWithFormat:
+                @"Hooking...\n"
+                @"Hooked App Data!\n"
+                @"Loading Mod Data...\n"
+                @"Done!");
         });
     });
 }
