@@ -1,9 +1,11 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 
 // Store captured user data
 static NSMutableArray *capturedUsers = nil;
 static NSString *authToken = nil;
+static UIButton *menuButton = nil;
 
 // Menu view controller interface
 @interface LocketMenuViewController : UIViewController <UITableViewDelegate, UITableViewDataSource, UISearchBarDelegate>
@@ -31,6 +33,16 @@ static NSString *authToken = nil;
     titleLabel.font = [UIFont boldSystemFontOfSize:20];
     [self.view addSubview:titleLabel];
     
+    // Status label
+    UILabel *statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 90, self.view.bounds.size.width - 40, 20)];
+    statusLabel.text = [NSString stringWithFormat:@"👥 %lu users captured | %@ Token", 
+                       (unsigned long)capturedUsers.count,
+                       authToken ? @"✓" : @"✗"];
+    statusLabel.textAlignment = NSTextAlignmentCenter;
+    statusLabel.font = [UIFont systemFontOfSize:12];
+    statusLabel.textColor = [UIColor grayColor];
+    [self.view addSubview:statusLabel];
+    
     // Close button
     UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
     closeButton.frame = CGRectMake(self.view.bounds.size.width - 60, 50, 50, 44);
@@ -40,22 +52,29 @@ static NSString *authToken = nil;
     
     // Login button
     self.loginButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.loginButton.frame = CGRectMake(20, 100, self.view.bounds.size.width - 40, 44);
-    [self.loginButton setTitle:authToken ? @"Token: Set ✓" : @"Login to Set Token" forState:UIControlStateNormal];
-    self.loginButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.5 blue:1.0 alpha:1.0];
+    self.loginButton.frame = CGRectMake(20, 120, self.view.bounds.size.width - 40, 44);
+    
+    if (authToken) {
+        [self.loginButton setTitle:@"✓ Token Auto-Captured" forState:UIControlStateNormal];
+        self.loginButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.8 blue:0.2 alpha:1.0];
+    } else {
+        [self.loginButton setTitle:@"Manual Login (or wait for auto-capture)" forState:UIControlStateNormal];
+        self.loginButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.5 blue:1.0 alpha:1.0];
+    }
+    
     [self.loginButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.loginButton.layer.cornerRadius = 8;
     [self.loginButton addTarget:self action:@selector(showLoginPrompt) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.loginButton];
     
     // Search bar
-    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 154, self.view.bounds.size.width, 56)];
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 174, self.view.bounds.size.width, 56)];
     self.searchBar.placeholder = @"Search by username or name...";
     self.searchBar.delegate = self;
     [self.view addSubview:self.searchBar];
     
     // Table view
-    CGFloat tableY = 210;
+    CGFloat tableY = 230;
     CGFloat tableHeight = self.view.bounds.size.height - tableY - 80;
     self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableY, self.view.bounds.size.width, tableHeight) style:UITableViewStylePlain];
     self.tableView.delegate = self;
@@ -137,7 +156,8 @@ static NSString *authToken = nil;
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             if (json[@"idToken"]) {
                 authToken = json[@"idToken"];
-                [self.loginButton setTitle:@"Token: Set ✓" forState:UIControlStateNormal];
+                [self.loginButton setTitle:@"✓ Token Set (Manual Login)" forState:UIControlStateNormal];
+                self.loginButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.8 blue:0.2 alpha:1.0];
                 [self showAlert:@"Success" message:@"Login successful! Token saved."];
             } else {
                 [self showAlert:@"Error" message:@"Login failed. Check credentials."];
@@ -301,30 +321,26 @@ static NSString *authToken = nil;
 
 @end
 
-// Hook into NSURLSession to intercept requests
-%hook NSURLSessionDataTask
+// Swizzle method to capture network responses
+static void (*original_completion)(id, SEL, NSData*, NSURLResponse*, NSError*);
 
-- (void)resume {
-    NSURLRequest *request = [self currentRequest];
-    if ([request.URL.absoluteString containsString:@"api.locketcamera.com/fetchUserV2"]) {
-        // Store original completion handler
-        id originalDelegate = [self delegate];
-        
-        // Create a wrapper to intercept the response
-        NSURLSession *session = [self valueForKey:@"session"];
-        NSURLSessionDataTask *newTask = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            if (data && !error) {
-                @try {
-                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                    if (json[@"result"][@"data"]) {
-                        NSDictionary *userData = json[@"result"][@"data"];
-                        
-                        // Initialize array if needed
+void custom_completion(id self, SEL _cmd, NSData *data, NSURLResponse *response, NSError *error) {
+    @try {
+        if (data && !error && response) {
+            NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+            NSString *urlString = httpResponse.URL.absoluteString;
+            
+            // Capture fetchUserV2 responses
+            if ([urlString containsString:@"api.locketcamera.com/fetchUserV2"]) {
+                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if (json[@"result"][@"data"]) {
+                    NSDictionary *userData = json[@"result"][@"data"];
+                    
+                    dispatch_async(dispatch_get_main_queue(), ^{
                         if (!capturedUsers) {
                             capturedUsers = [NSMutableArray array];
                         }
                         
-                        // Check if user already exists
                         NSString *uid = userData[@"uid"];
                         BOOL exists = NO;
                         for (NSDictionary *existing in capturedUsers) {
@@ -334,80 +350,228 @@ static NSString *authToken = nil;
                             }
                         }
                         
-                        if (!exists) {
+                        if (!exists && uid) {
                             [capturedUsers addObject:userData];
-                            NSLog(@"[Locket Tweak] Captured user: %@ %@", userData[@"first_name"], userData[@"last_name"]);
+                            NSLog(@"[Locket Tweak] Captured user: %@ %@ (@%@)", 
+                                  userData[@"first_name"], userData[@"last_name"], userData[@"username"]);
                         }
-                    }
-                } @catch (NSException *exception) {
-                    NSLog(@"[Locket Tweak] Error parsing response: %@", exception);
+                    });
                 }
             }
-        }];
-        
-        [newTask resume];
-        return;
+            
+            // Capture authentication token from verifyPassword
+            if ([urlString containsString:@"identitytoolkit/v3/relyingparty/verifyPassword"]) {
+                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if (json[@"idToken"]) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        authToken = json[@"idToken"];
+                        NSLog(@"[Locket Tweak] Captured auth token automatically!");
+                        
+                        // Update button title if it exists
+                        if (menuButton) {
+                            // We'll update it when menu opens
+                        }
+                    });
+                }
+            }
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Locket Tweak] Error in completion handler: %@", exception);
     }
     
-    %orig;
+    // Call original completion
+    if (original_completion) {
+        original_completion(self, _cmd, data, response, error);
+    }
+}
+
+// Hook NSURLSessionTask completion handler
+%hook __NSCFLocalDataTask
+
+- (id)initWithOriginalRequest:(NSURLRequest *)request ident:(NSUInteger)ident taskGroup:(id)group {
+    id result = %orig;
+    return result;
 }
 
 %end
 
-// Add button to open menu
-%hook UIWindow
+// Better approach: Hook the session delegate methods
+%hook NSURLSession
 
-- (void)didAddSubview:(UIView *)subview {
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *data, NSURLResponse *response, NSError *error))completionHandler {
+    
+    void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+        @try {
+            if (data && !error && response) {
+                NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+                NSString *urlString = httpResponse.URL.absoluteString;
+                
+                // Capture fetchUserV2 responses
+                if ([urlString containsString:@"api.locketcamera.com/fetchUserV2"]) {
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if (json[@"result"][@"data"]) {
+                        NSDictionary *userData = json[@"result"][@"data"];
+                        
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (!capturedUsers) {
+                                capturedUsers = [NSMutableArray array];
+                            }
+                            
+                            NSString *uid = userData[@"uid"];
+                            BOOL exists = NO;
+                            for (NSDictionary *existing in capturedUsers) {
+                                if ([existing[@"uid"] isEqualToString:uid]) {
+                                    exists = YES;
+                                    break;
+                                }
+                            }
+                            
+                            if (!exists && uid) {
+                                [capturedUsers addObject:userData];
+                                NSLog(@"[Locket Tweak] Captured user: %@ %@ (@%@)", 
+                                      userData[@"first_name"], userData[@"last_name"], userData[@"username"]);
+                            }
+                        });
+                    }
+                }
+                
+                // Capture authentication token from verifyPassword
+                if ([urlString containsString:@"identitytoolkit/v3/relyingparty/verifyPassword"]) {
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if (json[@"idToken"]) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            authToken = json[@"idToken"];
+                            NSLog(@"[Locket Tweak] ✓ Auto-captured auth token from login!");
+                        });
+                    }
+                }
+            }
+        } @catch (NSException *exception) {
+            NSLog(@"[Locket Tweak] Error capturing response: %@", exception);
+        }
+        
+        // Call original completion handler
+        if (completionHandler) {
+            completionHandler(data, response, error);
+        }
+    };
+    
+    return %orig(request, wrappedHandler);
+}
+
+%end
+
+// Add button to open menu - safer approach
+%hook UIViewController
+
+- (void)viewDidAppear:(BOOL)animated {
     %orig;
     
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // Create floating button
-        UIButton *menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        menuButton.frame = CGRectMake(20, 100, 60, 60);
-        menuButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.9];
-        menuButton.layer.cornerRadius = 30;
-        menuButton.layer.shadowColor = [UIColor blackColor].CGColor;
-        menuButton.layer.shadowOffset = CGSizeMake(0, 2);
-        menuButton.layer.shadowOpacity = 0.3;
-        menuButton.layer.shadowRadius = 4;
-        [menuButton setTitle:@"🔧" forState:UIControlStateNormal];
-        menuButton.titleLabel.font = [UIFont systemFontOfSize:30];
-        
-        [menuButton addTarget:menuButton action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
-        
-        // Make it draggable
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:menuButton action:@selector(handlePan:)];
-        [menuButton addGestureRecognizer:pan];
-        
-        [self addSubview:menuButton];
-        menuButton.layer.zPosition = 999;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            @try {
+                UIWindow *window = [UIApplication sharedApplication].keyWindow;
+                if (!window) {
+                    window = [UIApplication sharedApplication].windows.firstObject;
+                }
+                
+                if (window && !menuButton) {
+                    // Create floating button
+                    menuButton = [UIButton buttonWithType:UIButtonTypeCustom];
+                    menuButton.frame = CGRectMake(20, 100, 60, 60);
+                    menuButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.9];
+                    menuButton.layer.cornerRadius = 30;
+                    menuButton.layer.shadowColor = [UIColor blackColor].CGColor;
+                    menuButton.layer.shadowOffset = CGSizeMake(0, 2);
+                    menuButton.layer.shadowOpacity = 0.3;
+                    menuButton.layer.shadowRadius = 4;
+                    [menuButton setTitle:@"🔧" forState:UIControlStateNormal];
+                    menuButton.titleLabel.font = [UIFont systemFontOfSize:30];
+                    
+                    [menuButton addTarget:menuButton action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
+                    
+                    // Make it draggable
+                    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:menuButton action:@selector(handlePan:)];
+                    [menuButton addGestureRecognizer:pan];
+                    
+                    [window addSubview:menuButton];
+                    menuButton.layer.zPosition = 999;
+                    
+                    NSLog(@"[Locket Tweak] Menu button created successfully");
+                }
+            } @catch (NSException *exception) {
+                NSLog(@"[Locket Tweak] Error creating button: %@", exception);
+            }
+        });
     });
 }
 
 %new
 - (void)openMenu {
-    UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
-    while (rootVC.presentedViewController) {
-        rootVC = rootVC.presentedViewController;
+    @try {
+        UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+        while (rootVC.presentedViewController) {
+            rootVC = rootVC.presentedViewController;
+        }
+        
+        if (rootVC) {
+            LocketMenuViewController *menuVC = [[LocketMenuViewController alloc] init];
+            menuVC.modalPresentationStyle = UIModalPresentationFullScreen;
+            [rootVC presentViewController:menuVC animated:YES completion:nil];
+            NSLog(@"[Locket Tweak] Menu opened");
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Locket Tweak] Error opening menu: %@", exception);
     }
-    
-    LocketMenuViewController *menuVC = [[LocketMenuViewController alloc] init];
-    menuVC.modalPresentationStyle = UIModalPresentationFullScreen;
-    [rootVC presentViewController:menuVC animated:YES completion:nil];
 }
 
 %new
 - (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    UIButton *button = (UIButton *)gesture.view;
-    CGPoint translation = [gesture translationInView:self];
-    button.center = CGPointMake(button.center.x + translation.x, button.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:self];
+    @try {
+        UIButton *button = (UIButton *)gesture.view;
+        UIWindow *window = [UIApplication sharedApplication].keyWindow;
+        
+        CGPoint translation = [gesture translationInView:window];
+        button.center = CGPointMake(button.center.x + translation.x, button.center.y + translation.y);
+        [gesture setTranslation:CGPointZero inView:window];
+        
+        if (gesture.state == UIGestureRecognizerStateEnded) {
+            // Snap to edges
+            CGFloat screenWidth = window.bounds.size.width;
+            CGFloat screenHeight = window.bounds.size.height;
+            
+            CGPoint center = button.center;
+            if (center.x < screenWidth / 2) {
+                center.x = 40;
+            } else {
+                center.x = screenWidth - 40;
+            }
+            
+            if (center.y < 80) center.y = 80;
+            if (center.y > screenHeight - 80) center.y = screenHeight - 80;
+            
+            [UIView animateWithDuration:0.3 animations:^{
+                button.center = center;
+            }];
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[Locket Tweak] Error in pan gesture: %@", exception);
+    }
 }
 
 %end
 
 %ctor {
-    NSLog(@"[Locket Tweak] Loaded successfully!");
-    capturedUsers = [NSMutableArray array];
+    @try {
+        NSLog(@"[Locket Tweak] ===== INITIALIZING =====");
+        capturedUsers = [NSMutableArray array];
+        authToken = nil;
+        NSLog(@"[Locket Tweak] ✓ Loaded successfully!");
+        NSLog(@"[Locket Tweak] ✓ Auto-capturing enabled for:");
+        NSLog(@"[Locket Tweak]   - fetchUserV2 (user data)");
+        NSLog(@"[Locket Tweak]   - verifyPassword (auth token)");
+    } @catch (NSException *exception) {
+        NSLog(@"[Locket Tweak] ERROR in constructor: %@", exception);
+    }
 }
