@@ -1,458 +1,413 @@
 #import <UIKit/UIKit.h>
-#import <signal.h>
-#import <unistd.h>
-#import <objc/runtime.h>
+#import <Foundation/Foundation.h>
 
-static UIButton *globalButton = nil;
-static NSMutableString *debugLog = nil;
+// Store captured user data
+static NSMutableArray *capturedUsers = nil;
+static NSString *authToken = nil;
 
-// ────────────────────────────────────────────────
-// Directory helpers (unchanged)
-// ────────────────────────────────────────────────
-static NSString *getDocumentsDirectory() {
-    return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+// Menu view controller interface
+@interface LocketMenuViewController : UIViewController <UITableViewDelegate, UITableViewDataSource, UISearchBarDelegate>
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, strong) UIButton *deleteButton;
+@property (nonatomic, strong) UIButton *loginButton;
+@property (nonatomic, strong) NSMutableArray *filteredUsers;
+@property (nonatomic, strong) NSMutableDictionary *selectedUsers;
+@end
+
+@implementation LocketMenuViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    
+    self.view.backgroundColor = [UIColor colorWithWhite:0.95 alpha:1.0];
+    self.selectedUsers = [NSMutableDictionary dictionary];
+    self.filteredUsers = [capturedUsers mutableCopy];
+    
+    // Title label
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 50, self.view.bounds.size.width, 44)];
+    titleLabel.text = @"Locket Friends Manager";
+    titleLabel.textAlignment = NSTextAlignmentCenter;
+    titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    [self.view addSubview:titleLabel];
+    
+    // Close button
+    UIButton *closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeButton.frame = CGRectMake(self.view.bounds.size.width - 60, 50, 50, 44);
+    [closeButton setTitle:@"Close" forState:UIControlStateNormal];
+    [closeButton addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:closeButton];
+    
+    // Login button
+    self.loginButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.loginButton.frame = CGRectMake(20, 100, self.view.bounds.size.width - 40, 44);
+    [self.loginButton setTitle:authToken ? @"Token: Set ✓" : @"Login to Set Token" forState:UIControlStateNormal];
+    self.loginButton.backgroundColor = [UIColor colorWithRed:0.0 green:0.5 blue:1.0 alpha:1.0];
+    [self.loginButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.loginButton.layer.cornerRadius = 8;
+    [self.loginButton addTarget:self action:@selector(showLoginPrompt) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.loginButton];
+    
+    // Search bar
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 154, self.view.bounds.size.width, 56)];
+    self.searchBar.placeholder = @"Search by username or name...";
+    self.searchBar.delegate = self;
+    [self.view addSubview:self.searchBar];
+    
+    // Table view
+    CGFloat tableY = 210;
+    CGFloat tableHeight = self.view.bounds.size.height - tableY - 80;
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, tableY, self.view.bounds.size.width, tableHeight) style:UITableViewStylePlain];
+    self.tableView.delegate = self;
+    self.tableView.dataSource = self;
+    [self.tableView registerClass:[UITableViewCell class] forCellReuseIdentifier:@"UserCell"];
+    [self.view addSubview:self.tableView];
+    
+    // Delete button
+    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deleteButton.frame = CGRectMake(20, self.view.bounds.size.height - 70, self.view.bounds.size.width - 40, 50);
+    [self.deleteButton setTitle:@"Delete Unselected Friends" forState:UIControlStateNormal];
+    self.deleteButton.backgroundColor = [UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:1.0];
+    [self.deleteButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.deleteButton.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    self.deleteButton.layer.cornerRadius = 10;
+    [self.deleteButton addTarget:self action:@selector(deleteUnselectedFriends) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.deleteButton];
 }
 
-static NSString *getLibraryDirectory() {
-    return NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+- (void)closeMenu {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
-static NSString *getPreferencesDirectory() {
-    return [getLibraryDirectory() stringByAppendingPathComponent:@"Preferences"];
+- (void)showLoginPrompt {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Login to Locket"
+                                                                   message:@"Enter your credentials"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"Email";
+        textField.keyboardType = UIKeyboardTypeEmailAddress;
+    }];
+    
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"Password";
+        textField.secureTextEntry = YES;
+    }];
+    
+    UIAlertAction *loginAction = [UIAlertAction actionWithTitle:@"Login" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *email = alert.textFields[0].text;
+        NSString *password = alert.textFields[1].text;
+        [self loginWithEmail:email password:password];
+    }];
+    
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    
+    [alert addAction:loginAction];
+    [alert addAction:cancelAction];
+    
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
-static NSString *getCachesDirectory() {
-    return NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-}
-
-// ────────────────────────────────────────────────
-// File search helpers - ENHANCED
-// ────────────────────────────────────────────────
-static NSString *findFile(NSString *filename) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *bases = @[
-        getDocumentsDirectory(),
-        getLibraryDirectory(),
-        getCachesDirectory(),
-        NSTemporaryDirectory(),
-        [getLibraryDirectory() stringByAppendingPathComponent:@"Application Support"],
-        [[NSBundle mainBundle] bundlePath],
-        [[NSBundle mainBundle] resourcePath],
-        getPreferencesDirectory()
-    ];
-
-    for (NSString *base in bases) {
-        NSString *path = [base stringByAppendingPathComponent:filename];
-        if ([fm fileExistsAtPath:path]) return path;
-
-        NSDirectoryEnumerator *e = [fm enumeratorAtPath:base];
-        for (NSString *sub in e) {
-            if ([sub.lastPathComponent isEqualToString:filename]) {
-                return [base stringByAppendingPathComponent:sub];
+- (void)loginWithEmail:(NSString *)email password:(NSString *)password {
+    NSURL *url = [NSURL URLWithString:@"https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=AIzaSyCQngaaXQIfJaH0aS2l7REgIjD7nL431So"];
+    
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    [request setValue:@"application/json" forHTTPHeaderField:@"content-type"];
+    [request setValue:@"*/*" forHTTPHeaderField:@"accept"];
+    [request setValue:@"iOS/FirebaseSDK/10.23.1/FirebaseCore-iOS" forHTTPHeaderField:@"x-client-version"];
+    [request setValue:@"com.locket.Locket" forHTTPHeaderField:@"x-ios-bundle-identifier"];
+    
+    NSDictionary *payload = @{
+        @"email": email,
+        @"password": password,
+        @"clientType": @"CLIENT_TYPE_IOS",
+        @"returnSecureToken": @YES
+    };
+    
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error) {
+                [self showAlert:@"Error" message:[NSString stringWithFormat:@"Login failed: %@", error.localizedDescription]];
+                return;
             }
-        }
-    }
-    return nil;
-}
-
-static NSArray<NSString *> *findDataFiles(NSString *pattern) {
-    NSMutableArray *found = [NSMutableArray array];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *roots = @[getDocumentsDirectory(), getLibraryDirectory(), getCachesDirectory()];
-
-    for (NSString *root in roots) {
-        NSDirectoryEnumerator *e = [fm enumeratorAtPath:root];
-        for (NSString *path in e) {
-            if ([path containsString:pattern]) {
-                [found addObject:[root stringByAppendingPathComponent:path]];
-            }
-        }
-    }
-    return found;
-}
-
-// ────────────────────────────────────────────────
-// Logging & UI
-// ────────────────────────────────────────────────
-static void initDebugLog() {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ debugLog = [NSMutableString string]; });
-}
-
-static void addLog(NSString *msg) {
-    initDebugLog();
-    NSString *ts = [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                                   dateStyle:NSDateFormatterNoStyle
-                                                   timeStyle:NSDateFormatterMediumStyle];
-    [debugLog appendFormat:@"[%@] %@\n", ts, msg];
-}
-
-static void showAlert(NSString *title, NSString *message, void (^completion)(void)) {
-    addLog([NSString stringWithFormat:@"Alert: %@ — %@", title, message]);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-                                                                       message:message
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction *action) {
-            if (completion) completion();
-        }]];
-
-        UIViewController *top = [UIApplication sharedApplication].keyWindow.rootViewController;
-        while (top.presentedViewController) top = top.presentedViewController;
-
-        if (top) [top presentViewController:alert animated:YES completion:nil];
-    });
-}
-
-// ────────────────────────────────────────────────
-// FORCE PLIST SYNCHRONIZATION
-// ────────────────────────────────────────────────
-static void forcePlistSync(NSString *plistPath) {
-    addLog(@"Starting FORCE plist synchronization");
-    
-    // Method 1: CFPreferences sync
-    CFStringRef appID = CFSTR("com.ChillyRoom.DungeonShooter");
-    CFPreferencesAppSynchronize(appID);
-    addLog(@"CFPreferences synchronized");
-    
-    // Method 2: NSUserDefaults sync
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    addLog(@"NSUserDefaults synchronized");
-    
-    // Method 3: Direct file system sync
-    sync();
-    addLog(@"File system synced");
-    
-    // Method 4: Touch the file to ensure modification time is updated
-    NSDictionary *attrs = @{NSFileModificationDate: [NSDate date]};
-    [[NSFileManager defaultManager] setAttributes:attrs ofItemAtPath:plistPath error:nil];
-    
-    // Method 5: Verify the file exists and is readable
-    if ([[NSFileManager defaultManager] fileExistsAtPath:plistPath]) {
-        NSDictionary *check = [NSDictionary dictionaryWithContentsOfFile:plistPath];
-        if (check) {
-            addLog([NSString stringWithFormat:@"Plist verified readable with %lu keys", (unsigned long)check.count]);
-        } else {
-            addLog(@"WARNING: Plist not readable after write!");
-        }
-    }
-}
-
-// ────────────────────────────────────────────────
-// FORCE save + close — with proper plist sync
-// ────────────────────────────────────────────────
-static void forceSaveAndTerminate() {
-    addLog(@"Force saving → immediate terminate");
-
-    // Extra sync before app delegate calls
-    sync();
-    CFPreferencesAppSynchronize(CFSTR("com.ChillyRoom.DungeonShooter"));
-
-    UIApplication *app = [UIApplication sharedApplication];
-    id delegate = app.delegate;
-
-    if ([delegate respondsToSelector:@selector(applicationWillResignActive:)])
-        [delegate applicationWillResignActive:app];
-    if ([delegate respondsToSelector:@selector(applicationDidEnterBackground:)])
-        [delegate applicationDidEnterBackground:app];
-    if ([delegate respondsToSelector:@selector(applicationWillTerminate:)])
-        [delegate applicationWillTerminate:app];
-
-    // Final sync
-    sync();
-    CFPreferencesAppSynchronize(CFSTR("com.ChillyRoom.DungeonShooter"));
-    
-    // Small delay to ensure writes complete
-    usleep(500000); // 0.5 seconds
-
-    exit(0);
-
-    // fallback (rarely reached)
-    kill(getpid(), SIGTERM);
-    kill(getpid(), SIGKILL);
-}
-
-// ────────────────────────────────────────────────
-// suc.txt path = same folder as acc.txt + fallback
-// ────────────────────────────────────────────────
-static NSString *getSucFilePath(NSString *accPath) {
-    NSString *targetFolder = getDocumentsDirectory(); // default fallback
-
-    if (accPath) {
-        targetFolder = [accPath stringByDeletingLastPathComponent];
-    }
-
-    NSString *sucPath = [targetFolder stringByAppendingPathComponent:@"suc.txt"];
-    addLog([NSString stringWithFormat:@"Target suc.txt location: %@", sucPath]);
-
-    return sucPath;
-}
-
-// ────────────────────────────────────────────────
-// Main logic — M1 mode - ENHANCED
-// ────────────────────────────────────────────────
-static void runMode1() {
-    @autoreleasepool {
-        addLog(@"╔══════════════ M1 START ══════════════╗");
-
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *docs = getDocumentsDirectory();
-        NSString *prefs = getPreferencesDirectory();
-
-        NSString *accPath   = findFile(@"acc.txt") ?: [docs stringByAppendingPathComponent:@"acc.txt"];
-        NSString *plistPath = [prefs stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.plist"];
-        
-        // Search for DungeonShooter.txt EVERYWHERE
-        NSString *tplPath = findFile(@"com.ChillyRoom.DungeonShooter.txt");
-        
-        if (!tplPath) {
-            addLog(@"DungeonShooter.txt not found in standard locations, searching deeper...");
-            // Deep search in all possible locations
-            NSArray *searchPaths = @[
-                getDocumentsDirectory(),
-                getLibraryDirectory(),
-                getCachesDirectory(),
-                NSTemporaryDirectory(),
-                [[NSBundle mainBundle] bundlePath],
-                [[NSBundle mainBundle] resourcePath],
-                NSHomeDirectory()
-            ];
             
-            for (NSString *searchPath in searchPaths) {
-                NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:searchPath];
-                for (NSString *file in enumerator) {
-                    if ([file.lastPathComponent isEqualToString:@"com.ChillyRoom.DungeonShooter.txt"]) {
-                        tplPath = [searchPath stringByAppendingPathComponent:file];
-                        addLog([NSString stringWithFormat:@"Found template at: %@", tplPath]);
-                        break;
-                    }
-                }
-                if (tplPath) break;
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if (json[@"idToken"]) {
+                authToken = json[@"idToken"];
+                [self.loginButton setTitle:@"Token: Set ✓" forState:UIControlStateNormal];
+                [self showAlert:@"Success" message:@"Login successful! Token saved."];
+            } else {
+                [self showAlert:@"Error" message:@"Login failed. Check credentials."];
             }
+        });
+    }] resume];
+}
+
+- (void)deleteUnselectedFriends {
+    if (!authToken) {
+        [self showAlert:@"Error" message:@"Please login first to get authorization token"];
+        return;
+    }
+    
+    NSMutableArray *toDelete = [NSMutableArray array];
+    for (NSDictionary *user in self.filteredUsers) {
+        NSString *uid = user[@"uid"];
+        if (![self.selectedUsers[uid] boolValue]) {
+            [toDelete addObject:user];
+        }
+    }
+    
+    if (toDelete.count == 0) {
+        [self showAlert:@"Info" message:@"No users to delete. All are selected."];
+        return;
+    }
+    
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Confirm Deletion"
+                                                                     message:[NSString stringWithFormat:@"Delete %lu friend(s)?", (unsigned long)toDelete.count]
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    
+    UIAlertAction *deleteAction = [UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self performBatchDelete:toDelete];
+    }];
+    
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+    
+    [confirm addAction:deleteAction];
+    [confirm addAction:cancelAction];
+    
+    [self presentViewController:confirm animated:YES completion:nil];
+}
+
+- (void)performBatchDelete:(NSArray *)users {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSInteger successCount = 0;
+        NSInteger failCount = 0;
+        
+        for (NSDictionary *user in users) {
+            NSString *uid = user[@"uid"];
+            if ([self deleteFriendWithUID:uid]) {
+                successCount++;
+            } else {
+                failCount++;
+            }
+            [NSThread sleepForTimeInterval:0.5]; // Rate limiting
         }
         
-        if (!tplPath) {
-            tplPath = [docs stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
-            addLog([NSString stringWithFormat:@"Using fallback template path: %@", tplPath]);
-        } else {
-            addLog([NSString stringWithFormat:@"Using template from: %@", tplPath]);
-        }
-
-        // Read accounts
-        NSError *err = nil;
-        NSString *accContent = [NSString stringWithContentsOfFile:accPath encoding:NSUTF8StringEncoding error:&err];
-        if (!accContent || err) {
-            showAlert(@"Error", [NSString stringWithFormat:@"Cannot read acc.txt\n%@", err.localizedDescription ?: @"Unknown"], nil);
-            return;
-        }
-
-        NSArray<NSString *> *lines = [accContent componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-        NSMutableArray<NSString *> *valid = [NSMutableArray array];
-
-        for (NSString *line in lines) {
-            NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (t.length > 0 && [t componentsSeparatedByString:@"|"].count == 4) {
-                [valid addObject:t];
-            }
-        }
-
-        if (valid.count == 0) {
-            showAlert(@"Error", @"No valid accounts in acc.txt (email|pass|uid|token)", nil);
-            return;
-        }
-
-        // Pick random
-        NSString *chosen = valid[arc4random_uniform((uint32_t)valid.count)];
-        NSArray *parts = [chosen componentsSeparatedByString:@"|"];
-        NSString *email = parts[0], *pass = parts[1], *uid = parts[2], *token = parts[3];
-
-        addLog([NSString stringWithFormat:@"Using: %@ (UID: %@)", email, uid]);
-
-        // Copy data files to Documents
-        NSMutableSet *sources = [NSMutableSet setWithArray:findDataFiles(@"_data_1_.data")];
-        NSArray *extra = @[@"item_data", @"season_data", @"statistic", @"weapon_evolution", @"bp_data", @"misc_data"];
-        for (NSString *pat in extra) [sources addObjectsFromArray:findDataFiles(pat)];
-
-        int copied = 0;
-        for (NSString *oldPath in sources) {
-            NSString *name = oldPath.lastPathComponent;
-            if (![name containsString:@"_1_"] && ![extra containsObject:name]) continue;
-
-            NSString *newName = [name stringByReplacingOccurrencesOfString:@"_1_" withString:[NSString stringWithFormat:@"_%@_", uid]];
-            NSString *newPath = [docs stringByAppendingPathComponent:newName];
-
-            [fm removeItemAtPath:newPath error:nil];
-
-            if ([fm copyItemAtPath:oldPath toPath:newPath error:&err]) {
-                copied++;
-                addLog([NSString stringWithFormat:@"Copied → %@", newName]);
-            } else if (err) {
-                addLog([NSString stringWithFormat:@"Copy failed: %@ → %@", name, err.localizedDescription]);
-            }
-        }
-
-        // Update plist - ENHANCED with forced sync
-        if ([fm fileExistsAtPath:tplPath]) {
-            NSString *tpl = [NSString stringWithContentsOfFile:tplPath encoding:NSUTF8StringEncoding error:nil];
-            if (tpl) {
-                NSString *updated = [[tpl stringByReplacingOccurrencesOfString:@"98989898" withString:uid]
-                                     stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:token];
-                
-                // Remove old plist
-                [fm removeItemAtPath:plistPath error:nil];
-                addLog(@"Old plist removed");
-                
-                // Write new plist
-                if ([updated writeToFile:plistPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
-                    addLog([NSString stringWithFormat:@"Plist written to: %@", plistPath]);
-                    
-                    // FORCE synchronization
-                    forcePlistSync(plistPath);
-                    
-                    // Set proper permissions
-                    NSDictionary *attrs = @{NSFilePosixPermissions: @0644};
-                    [fm setAttributes:attrs ofItemAtPath:plistPath error:nil];
-                    
-                    addLog(@"Plist update COMPLETE with forced sync");
-                } else {
-                    addLog([NSString stringWithFormat:@"Plist write failed: %@", err.localizedDescription]);
-                }
-            } else {
-                addLog(@"Could not read template file");
-            }
-        } else {
-            addLog([NSString stringWithFormat:@"Template file not found at: %@", tplPath]);
-        }
-
-        // ─── Save to suc.txt ───────────────────────────────────────
-        NSString *sucPath = getSucFilePath(accPath);
-        NSString *entry = [NSString stringWithFormat:@"%@|%@\n", email, pass];
-        BOOL writeSuccess = NO;
-
-        if ([fm fileExistsAtPath:sucPath]) {
-            NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:sucPath];
-            if (h) {
-                [h seekToEndOfFile];
-                NSData *data = [entry dataUsingEncoding:NSUTF8StringEncoding];
-                @try {
-                    [h writeData:data];
-                    writeSuccess = YES;
-                    addLog(@"Appended to suc.txt");
-                } @catch (NSException *e) {
-                    addLog([NSString stringWithFormat:@"Append exception: %@", e.reason]);
-                }
-                [h closeFile];
-            } else {
-                addLog(@"Cannot open suc.txt for append");
-            }
-        } else {
-            if ([entry writeToFile:sucPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
-                writeSuccess = YES;
-                addLog(@"Created suc.txt");
-            } else {
-                addLog([NSString stringWithFormat:@"Create suc.txt failed: %@", err.localizedDescription]);
-            }
-        }
-
-        // Fallback write if failed
-        if (!writeSuccess) {
-            NSString *fallbackPath = [docs stringByAppendingPathComponent:@"suc.txt"];
-            if ([entry writeToFile:fallbackPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
-                addLog([NSString stringWithFormat:@"Fallback save to Documents/suc.txt"]);
-                sucPath = fallbackPath;
-            } else {
-                addLog([NSString stringWithFormat:@"Even fallback save failed: %@", err.localizedDescription]);
-            }
-        }
-
-        // Remove used account
-        [valid removeObject:chosen];
-        [[valid componentsJoinedByString:@"\n"] writeToFile:accPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-        // Final sync before showing alert
-        sync();
-        forcePlistSync(plistPath);
-
-        // Final message
-        NSString *msg = [NSString stringWithFormat:
-            @"Done!\n\n"
-            @"Email: %@\n"
-            @"UID:   %@\n"
-            @"Files copied: %d\n"
-            @"Remaining: %lu\n\n"
-            @"Saving & closing...",
-            email, uid, copied, (unsigned long)valid.count];
-
-        showAlert(@"Auto-Mod Done", msg, ^{
-            forceSaveAndTerminate();
-        });
-    }
-}
-
-// Floating button
-@interface UIControl (Block)
-- (void)addActionForControlEvents:(UIControlEvents)ev withBlock:(void(^)(void))block;
-@end
-
-@implementation UIControl (Block)
-- (void)addActionForControlEvents:(UIControlEvents)ev withBlock:(void(^)(void))block {
-    objc_setAssociatedObject(self, @selector(blockAction:), [block copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
-    [self addTarget:self action:@selector(blockAction:) forControlEvents:ev];
-}
-- (void)blockAction:(id)sender {
-    void (^b)(void) = objc_getAssociatedObject(self, _cmd);
-    if (b) b();
-}
-@end
-
-%hook UIViewController
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-
-    static dispatch_once_t token;
-    dispatch_once(&token, ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 700 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (globalButton) return;
-
-            UIWindow *win = [UIApplication sharedApplication].keyWindow;
-            if (!win || !win.rootViewController) {
-                for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                    if (w.rootViewController) { win = w; break; }
-                }
-            }
-            if (!win) return;
-
-            globalButton = [UIButton buttonWithType:UIButtonTypeCustom];
-            globalButton.frame = CGRectMake(20, 120, 56, 56);
-            globalButton.layer.cornerRadius = 28;
-            globalButton.backgroundColor = [UIColor colorWithRed:0.95 green:0.15 blue:0.15 alpha:0.94];
-            [globalButton setTitle:@"M" forState:UIControlStateNormal];
-            globalButton.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-            globalButton.layer.shadowColor = UIColor.blackColor.CGColor;
-            globalButton.layer.shadowOffset = CGSizeMake(0, 3);
-            globalButton.layer.shadowRadius = 5;
-            globalButton.layer.shadowOpacity = 0.5;
-
-            [globalButton addActionForControlEvents:UIControlEventTouchUpInside withBlock:^{
-                globalButton.enabled = NO;
-                globalButton.backgroundColor = UIColor.darkGrayColor;
-
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                    runMode1();
-                });
-            }];
-
-            [win addSubview:globalButton];
-            [win bringSubviewToFront:globalButton];
-
-            addLog(@"M button created");
-
-            showAlert(@"Auto-Mod Hook", @"Hooking...\nHooked App Data!\nLoading Mod Data...\nDone!", nil);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlert:@"Deletion Complete" 
+                   message:[NSString stringWithFormat:@"Success: %ld\nFailed: %ld", (long)successCount, (long)failCount]];
+            [self.tableView reloadData];
         });
     });
+}
+
+- (BOOL)deleteFriendWithUID:(NSString *)uid {
+    NSURL *url = [NSURL URLWithString:@"https://api.locketcamera.com/deleteFriendRequest"];
+    
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    [request setValue:@"application/json" forHTTPHeaderField:@"content-type"];
+    [request setValue:@"*/*" forHTTPHeaderField:@"accept"];
+    [request setValue:[NSString stringWithFormat:@"Bearer %@", authToken] forHTTPHeaderField:@"authorization"];
+    
+    NSDictionary *payload = @{
+        @"data": @{
+            @"direction": @"incoming",
+            @"user_uid": uid
+        }
+    };
+    
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    
+    __block BOOL success = NO;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (!error && data) {
+            success = YES;
+        }
+        dispatch_semaphore_signal(semaphore);
+    }] resume];
+    
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    return success;
+}
+
+- (void)showAlert:(NSString *)title message:(NSString *)message {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+// UITableView DataSource
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.filteredUsers.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"UserCell" forIndexPath:indexPath];
+    
+    NSDictionary *user = self.filteredUsers[indexPath.row];
+    NSString *uid = user[@"uid"];
+    NSString *firstName = user[@"first_name"] ?: @"";
+    NSString *lastName = user[@"last_name"] ?: @"";
+    NSString *username = user[@"username"] ?: @"";
+    
+    cell.textLabel.text = [NSString stringWithFormat:@"%@ %@ (@%@)", firstName, lastName, username];
+    cell.textLabel.numberOfLines = 2;
+    cell.textLabel.font = [UIFont systemFontOfSize:14];
+    
+    // Checkbox accessory
+    BOOL isSelected = [self.selectedUsers[uid] boolValue];
+    cell.accessoryType = isSelected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    
+    NSDictionary *user = self.filteredUsers[indexPath.row];
+    NSString *uid = user[@"uid"];
+    
+    BOOL currentState = [self.selectedUsers[uid] boolValue];
+    self.selectedUsers[uid] = @(!currentState);
+    
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+// UISearchBar Delegate
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    if (searchText.length == 0) {
+        self.filteredUsers = [capturedUsers mutableCopy];
+    } else {
+        NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(NSDictionary *user, NSDictionary *bindings) {
+            NSString *firstName = [user[@"first_name"] lowercaseString] ?: @"";
+            NSString *lastName = [user[@"last_name"] lowercaseString] ?: @"";
+            NSString *username = [user[@"username"] lowercaseString] ?: @"";
+            NSString *search = [searchText lowercaseString];
+            
+            return [firstName containsString:search] || [lastName containsString:search] || [username containsString:search];
+        }];
+        
+        self.filteredUsers = [[capturedUsers filteredArrayUsingPredicate:predicate] mutableCopy];
+    }
+    
+    [self.tableView reloadData];
+}
+
+@end
+
+// Hook into NSURLSession to intercept requests
+%hook NSURLSessionDataTask
+
+- (void)resume {
+    NSURLRequest *request = [self currentRequest];
+    if ([request.URL.absoluteString containsString:@"api.locketcamera.com/fetchUserV2"]) {
+        // Store original completion handler
+        id originalDelegate = [self delegate];
+        
+        // Create a wrapper to intercept the response
+        NSURLSession *session = [self valueForKey:@"session"];
+        NSURLSessionDataTask *newTask = [session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (data && !error) {
+                @try {
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if (json[@"result"][@"data"]) {
+                        NSDictionary *userData = json[@"result"][@"data"];
+                        
+                        // Initialize array if needed
+                        if (!capturedUsers) {
+                            capturedUsers = [NSMutableArray array];
+                        }
+                        
+                        // Check if user already exists
+                        NSString *uid = userData[@"uid"];
+                        BOOL exists = NO;
+                        for (NSDictionary *existing in capturedUsers) {
+                            if ([existing[@"uid"] isEqualToString:uid]) {
+                                exists = YES;
+                                break;
+                            }
+                        }
+                        
+                        if (!exists) {
+                            [capturedUsers addObject:userData];
+                            NSLog(@"[Locket Tweak] Captured user: %@ %@", userData[@"first_name"], userData[@"last_name"]);
+                        }
+                    }
+                } @catch (NSException *exception) {
+                    NSLog(@"[Locket Tweak] Error parsing response: %@", exception);
+                }
+            }
+        }];
+        
+        [newTask resume];
+        return;
+    }
+    
+    %orig;
 }
 
 %end
+
+// Add button to open menu
+%hook UIWindow
+
+- (void)didAddSubview:(UIView *)subview {
+    %orig;
+    
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // Create floating button
+        UIButton *menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        menuButton.frame = CGRectMake(20, 100, 60, 60);
+        menuButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.9];
+        menuButton.layer.cornerRadius = 30;
+        menuButton.layer.shadowColor = [UIColor blackColor].CGColor;
+        menuButton.layer.shadowOffset = CGSizeMake(0, 2);
+        menuButton.layer.shadowOpacity = 0.3;
+        menuButton.layer.shadowRadius = 4;
+        [menuButton setTitle:@"🔧" forState:UIControlStateNormal];
+        menuButton.titleLabel.font = [UIFont systemFontOfSize:30];
+        
+        [menuButton addTarget:menuButton action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
+        
+        // Make it draggable
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:menuButton action:@selector(handlePan:)];
+        [menuButton addGestureRecognizer:pan];
+        
+        [self addSubview:menuButton];
+        menuButton.layer.zPosition = 999;
+    });
+}
+
+%new
+- (void)openMenu {
+    UIViewController *rootVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+    while (rootVC.presentedViewController) {
+        rootVC = rootVC.presentedViewController;
+    }
+    
+    LocketMenuViewController *menuVC = [[LocketMenuViewController alloc] init];
+    menuVC.modalPresentationStyle = UIModalPresentationFullScreen;
+    [rootVC presentViewController:menuVC animated:YES completion:nil];
+}
+
+%new
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
+    UIButton *button = (UIButton *)gesture.view;
+    CGPoint translation = [gesture translationInView:self];
+    button.center = CGPointMake(button.center.x + translation.x, button.center.y + translation.y);
+    [gesture setTranslation:CGPointZero inView:self];
+}
+
+%end
+
+%ctor {
+    NSLog(@"[Locket Tweak] Loaded successfully!");
+    capturedUsers = [NSMutableArray array];
+}
