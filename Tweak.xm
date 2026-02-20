@@ -194,7 +194,7 @@ static int runUnlockInDefaults(NSString *type) {
 
 + (void)showInView:(UIView *)parentView onDone:(void(^)(NSString *))doneBlock {
     SKUnlockSheet *sheet = [[SKUnlockSheet alloc] initWithFrame:parentView.bounds];
-    sheet._doneBlock = doneBlock;
+    sheet->_doneBlock = doneBlock;
     sheet.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [parentView addSubview:sheet];
     sheet.alpha = 0;
@@ -515,25 +515,22 @@ static int runUnlockInDefaults(NSString *type) {
     if (overlap <= 0) return;
 
     NSTimeInterval dur = [n.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-    UIViewAnimationCurve curve = [n.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
-    [UIView beginAnimations:nil context:nil];
-    [UIView setAnimationDuration:dur];
-    [UIView setAnimationCurve:curve];
-    // Pull buttons up so they're just above the keyboard
+    NSInteger rawCurve = [n.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+    UIViewAnimationOptions opts = (UIViewAnimationOptions)(rawCurve << 16) | UIViewAnimationOptionBeginFromCurrentState;
     self.bottomConstraint.constant = -(overlap + 8);
-    [self.view layoutIfNeeded];
-    [UIView commitAnimations];
+    [UIView animateWithDuration:dur delay:0 options:opts animations:^{
+        [self.view layoutIfNeeded];
+    } completion:nil];
 }
 
 - (void)keyboardWillHide:(NSNotification *)n {
     NSTimeInterval dur = [n.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-    UIViewAnimationCurve curve = [n.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
-    [UIView beginAnimations:nil context:nil];
-    [UIView setAnimationDuration:dur];
-    [UIView setAnimationCurve:curve];
+    NSInteger rawCurve = [n.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
+    UIViewAnimationOptions opts = (UIViewAnimationOptions)(rawCurve << 16) | UIViewAnimationOptionBeginFromCurrentState;
     self.bottomConstraint.constant = -14;
-    [self.view layoutIfNeeded];
-    [UIView commitAnimations];
+    [UIView animateWithDuration:dur delay:0 options:opts animations:^{
+        [self.view layoutIfNeeded];
+    } completion:nil];
 }
 
 - (UIButton *)mkBtn:(NSString *)t bg:(UIColor *)c {
