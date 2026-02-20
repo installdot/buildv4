@@ -5,6 +5,28 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+
+// UIButton block-based tap handler (avoids target/selector boilerplate for inline closures)
+@interface UIButton (SKActionBlock)
+- (void)sk_setActionBlock:(void(^)(void))block;
+@end
+
+@implementation UIButton (SKActionBlock)
+static char kSKActionBlockKey;
+- (void)sk_setActionBlock:(void(^)(void))block {
+    objc_setAssociatedObject(self, &kSKActionBlockKey,
+        [block copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    [self removeTarget:self action:@selector(sk_invokeActionBlock)
+      forControlEvents:UIControlEventTouchUpInside];
+    [self addTarget:self action:@selector(sk_invokeActionBlock)
+   forControlEvents:UIControlEventTouchUpInside];
+}
+- (void)sk_invokeActionBlock {
+    void (^block)(void) = objc_getAssociatedObject(self, &kSKActionBlockKey);
+    if (block) block();
+}
+@end
 
 #pragma mark - Keys / Storage
 
@@ -82,16 +104,48 @@ static void applyAccount(NSDictionary *acc) {
         [ud setObject:raw forKey:@"SdkStateCache#1"];
     }
 
-    // Replace old PlayerId across all NSUserDefaults string values
+    // Serialize ALL of NSUserDefaults to plist XML text, replace every occurrence
+    // of the old player ID (in both keys and values of any type), then parse back
+    // and write every changed or renamed key back into NSUserDefaults.
     if (oldPlayerId.length > 0 && ![oldPlayerId isEqualToString:@"0"]) {
-        NSDictionary *all = [ud dictionaryRepresentation];
-        for (NSString *key in all) {
-            id val = all[key];
-            if (![val isKindOfClass:[NSString class]]) continue;
-            NSString *s = (NSString *)val;
-            if (![s containsString:oldPlayerId]) continue;
-            [ud setObject:[s stringByReplacingOccurrencesOfString:oldPlayerId withString:newUid]
-                   forKey:key];
+        NSDictionary *snapshot = [ud dictionaryRepresentation];
+
+        NSError *serErr = nil;
+        NSData *plistData = [NSPropertyListSerialization
+            dataWithPropertyList:snapshot
+            format:NSPropertyListXMLFormat_v1_0
+            options:0 error:&serErr];
+
+        if (!serErr && plistData) {
+            NSString *xml = [[NSString alloc] initWithData:plistData
+                                                  encoding:NSUTF8StringEncoding];
+            NSString *patched = [xml stringByReplacingOccurrencesOfString:oldPlayerId
+                                                               withString:newUid];
+            if (![patched isEqualToString:xml]) {
+                NSError *parseErr = nil;
+                NSDictionary *newSnap = [NSPropertyListSerialization
+                    propertyListWithData:[patched dataUsingEncoding:NSUTF8StringEncoding]
+                    options:NSPropertyListMutableContainersAndLeaves
+                    format:nil error:&parseErr];
+
+                if (!parseErr && newSnap) {
+                    // Remove keys whose names contained the old ID (they get re-added below
+                    // under the new name from newSnap)
+                    for (NSString *oldKey in snapshot) {
+                        if ([oldKey containsString:oldPlayerId]) {
+                            [ud removeObjectForKey:oldKey];
+                        }
+                    }
+                    // Write all keys that are new or changed
+                    for (NSString *key in newSnap) {
+                        id oldVal = snapshot[key];
+                        id newVal = newSnap[key];
+                        if (!oldVal || ![oldVal isEqual:newVal]) {
+                            [ud setObject:newVal forKey:key];
+                        }
+                    }
+                }
+            }
         }
     }
     [ud synchronize];
@@ -658,6 +712,208 @@ forRowAtIndexPath:(NSIndexPath *)ip {
         [tv reloadData];
     else
         [tv deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+
+// Row tap — show inline Apply / Remove action card
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    NSMutableArray *list = getSaved();
+    if (ip.row >= (NSInteger)list.count) return;
+    NSDictionary *acc = list[ip.row];
+    [self showAccountActionForAccount:acc atRow:ip.row];
+}
+
+- (void)showAccountActionForAccount:(NSDictionary *)acc atRow:(NSInteger)row {
+    // Build a small floating card anchored on the panel's superview
+    UIView *parent = self.superview ?: [self topVC].view;
+    if (!parent) return;
+
+    // Dim backdrop — tap to dismiss
+    UIView *backdrop = [[UIView alloc] initWithFrame:parent.bounds];
+    backdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
+    backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [parent addSubview:backdrop];
+
+    // Card
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor     = [UIColor colorWithRed:0.10 green:0.10 blue:0.14 alpha:1];
+    card.layer.cornerRadius  = 12;
+    card.layer.shadowColor   = UIColor.blackColor.CGColor;
+    card.layer.shadowOpacity = 0.65;
+    card.layer.shadowRadius  = 10;
+    card.layer.shadowOffset  = CGSizeMake(0, 4);
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [parent addSubview:card];
+
+    // Header — email
+    UILabel *header = [UILabel new];
+    header.text          = acc[@"email"];
+    header.textColor     = UIColor.whiteColor;
+    header.font          = [UIFont boldSystemFontOfSize:13];
+    header.textAlignment = NSTextAlignmentCenter;
+    header.numberOfLines = 1;
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:header];
+
+    // Sub — uid
+    UILabel *sub = [UILabel new];
+    sub.text          = [NSString stringWithFormat:@"uid: %@", acc[@"uid"]];
+    sub.textColor     = [UIColor colorWithWhite:0.52 alpha:1];
+    sub.font          = [UIFont systemFontOfSize:11];
+    sub.textAlignment = NSTextAlignmentCenter;
+    sub.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:sub];
+
+    // Separator
+    UIView *sep = [[UIView alloc] init];
+    sep.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    sep.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:sep];
+
+    // Apply button
+    UIButton *applyBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [applyBtn setTitle:@"Apply this account" forState:UIControlStateNormal];
+    [applyBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [applyBtn setTitleColor:[UIColor colorWithWhite:0.75 alpha:1]
+                   forState:UIControlStateHighlighted];
+    applyBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
+    applyBtn.backgroundColor  = [UIColor colorWithRed:0.18 green:0.62 blue:0.38 alpha:1];
+    applyBtn.layer.cornerRadius = 9;
+    applyBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:applyBtn];
+
+    // Remove button
+    UIButton *removeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [removeBtn setTitle:@"Remove" forState:UIControlStateNormal];
+    [removeBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [removeBtn setTitleColor:[UIColor colorWithWhite:0.75 alpha:1]
+                    forState:UIControlStateHighlighted];
+    removeBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
+    removeBtn.backgroundColor  = [UIColor colorWithRed:0.68 green:0.18 blue:0.18 alpha:1];
+    removeBtn.layer.cornerRadius = 9;
+    removeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:removeBtn];
+
+    // Cancel button
+    UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [cancelBtn setTitle:@"Cancel" forState:UIControlStateNormal];
+    [cancelBtn setTitleColor:[UIColor colorWithWhite:0.60 alpha:1] forState:UIControlStateNormal];
+    [cancelBtn setTitleColor:UIColor.whiteColor forState:UIControlStateHighlighted];
+    cancelBtn.titleLabel.font  = [UIFont systemFontOfSize:12];
+    cancelBtn.backgroundColor  = [UIColor colorWithWhite:0.16 alpha:1];
+    cancelBtn.layer.cornerRadius = 9;
+    cancelBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cancelBtn];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [card.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
+        [card.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
+        [card.widthAnchor constraintEqualToConstant:260],
+        [header.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
+        [header.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [header.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [sub.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:4],
+        [sub.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [sub.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [sep.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:12],
+        [sep.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:0],
+        [sep.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:0],
+        [sep.heightAnchor constraintEqualToConstant:1],
+        [applyBtn.topAnchor constraintEqualToAnchor:sep.bottomAnchor constant:12],
+        [applyBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [applyBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [applyBtn.heightAnchor constraintEqualToConstant:44],
+        [removeBtn.topAnchor constraintEqualToAnchor:applyBtn.bottomAnchor constant:8],
+        [removeBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [removeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [removeBtn.heightAnchor constraintEqualToConstant:44],
+        [cancelBtn.topAnchor constraintEqualToAnchor:removeBtn.bottomAnchor constant:8],
+        [cancelBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [cancelBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [cancelBtn.heightAnchor constraintEqualToConstant:36],
+        [card.bottomAnchor constraintEqualToAnchor:cancelBtn.bottomAnchor constant:14],
+    ]];
+
+    // Dismiss helper
+    void (^dismiss)(void) = ^{
+        [UIView animateWithDuration:0.15 animations:^{
+            backdrop.alpha = 0;
+            card.alpha     = 0;
+        } completion:^(BOOL _) {
+            [backdrop removeFromSuperview];
+            [card removeFromSuperview];
+        }];
+    };
+
+    // Backdrop tap — store dismiss block via associated object so the gesture target can call it
+    objc_setAssociatedObject(backdrop, "dismissBlock",
+        [dismiss copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(actionBackdropTapped:)];
+    bgTap.cancelsTouchesInView = NO;
+    [backdrop addGestureRecognizer:bgTap];
+
+    // Apply
+    [applyBtn sk_setActionBlock:^{
+        dismiss();
+        // Move account to "removed" pool then apply
+        NSMutableArray *list = getSaved();
+        if (row >= (NSInteger)list.count) return;
+        NSDictionary *a = list[row];
+        NSMutableArray *rem = getRemoved();
+        [list removeObjectAtIndex:row];
+        [rem addObject:a];
+        writeSaved(list);
+        writeRemoved(rem);
+        applyAccount(a);
+        [self.table reloadData];
+        [self refreshInfo];
+        NSString *tok = a[@"token"];
+        NSString *msg = [NSString stringWithFormat:
+            @"Applied
+
+Email : %@
+UID   : %@
+Token : %@...
+
+IDs replaced globally
+NSUserDefaults patched
+
+Remaining: %lu
+Closing app...",
+            a[@"email"], a[@"uid"],
+            [tok substringToIndex:MIN((NSUInteger)10, tok.length)],
+            (unsigned long)list.count];
+        [self showToast:msg success:YES exit:YES];
+    }];
+
+    // Remove
+    [removeBtn sk_setActionBlock:^{
+        dismiss();
+        NSMutableArray *list = getSaved();
+        if (row >= (NSInteger)list.count) return;
+        [list removeObjectAtIndex:row];
+        writeSaved(list);
+        [self.table reloadData];
+        [self showToast:@"Account removed." success:NO exit:NO];
+    }];
+
+    // Cancel
+    [cancelBtn sk_setActionBlock:^{ dismiss(); }];
+
+    // Animate in
+    card.alpha     = 0;
+    backdrop.alpha = 0;
+    [UIView animateWithDuration:0.18 animations:^{
+        backdrop.alpha = 1;
+        card.alpha     = 1;
+    }];
+}
+
+- (void)actionBackdropTapped:(UITapGestureRecognizer *)g {
+    UIView *bd = g.view;
+    void (^dismiss)(void) = objc_getAssociatedObject(bd, "dismissBlock");
+    if (dismiss) dismiss();
 }
 
 - (void)dismissKeyboard { [self.tv resignFirstResponder]; }
