@@ -870,17 +870,7 @@ forRowAtIndexPath:(NSIndexPath *)ip {
         [self refreshInfo];
         NSString *tok = a[@"token"];
         NSString *msg = [NSString stringWithFormat:
-            @"Applied
-
-Email : %@
-UID   : %@
-Token : %@...
-
-IDs replaced globally
-NSUserDefaults patched
-
-Remaining: %lu
-Closing app...",
+            @"Applied\n\nEmail : %@\nUID   : %@\nToken : %@...\n\nIDs replaced globally\nNSUserDefaults patched\n\nRemaining: %lu\nClosing app...",
             a[@"email"], a[@"uid"],
             [tok substringToIndex:MIN((NSUInteger)10, tok.length)],
             (unsigned long)list.count];
