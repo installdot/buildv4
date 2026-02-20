@@ -63,32 +63,77 @@ static NSDictionary *parseLine(NSString *line) {
 #pragma mark - Account Switch
 
 static void applyAccount(NSDictionary *acc) {
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSString *newToken = acc[@"token"];
     NSString *newUid   = acc[@"uid"];
+    NSString *newToken = acc[@"token"];
     NSString *newEmail = acc[@"email"];
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 
-    NSString *oldPlayerId = @"";
+    // ── 1. Locate the template plist text file ────────────────────────────
+    NSString *prefsDir  = [NSHomeDirectory()
+                           stringByAppendingPathComponent:@"Library/Preferences"];
+    NSString *txtPath   = [prefsDir
+                           stringByAppendingPathComponent:
+                           @"com.ChillyRoom.DungeonShooter.txt"];
+
+    NSError  *readErr   = nil;
+    NSString *xmlSource = [NSString stringWithContentsOfFile:txtPath
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:&readErr];
+    if (readErr || !xmlSource.length) {
+        NSLog(@"[SKPanel] applyAccount – could not read template: %@", readErr);
+        return;
+    }
+
+    // ── 2. Token + UID substitution ───────────────────────────────────────
+    //    Replace every "anhhaideptrai"  →  newToken
+    //    Replace every "98989898"       →  newUid
+    NSString *patched = [xmlSource
+        stringByReplacingOccurrencesOfString:@"anhhaideptrai"
+                                  withString:newToken];
+    patched = [patched
+        stringByReplacingOccurrencesOfString:@"98989898"
+                                  withString:newUid];
+
+    // ── 3. Parse the patched XML back into a dictionary ───────────────────
+    NSData   *patchedData = [patched dataUsingEncoding:NSUTF8StringEncoding];
+    NSError  *parseErr    = nil;
+    NSDictionary *newSnap = [NSPropertyListSerialization
+        propertyListWithData:patchedData
+                     options:NSPropertyListMutableContainersAndLeaves
+                      format:nil
+                       error:&parseErr];
+
+    if (parseErr || ![newSnap isKindOfClass:[NSDictionary class]]) {
+        NSLog(@"[SKPanel] applyAccount – plist parse failed: %@", parseErr);
+        return;
+    }
+
+    // ── 4. Wipe every existing key then write the full new snapshot ───────
+    //    (Removes stale keys that no longer exist in the template)
+    NSDictionary *current = [ud dictionaryRepresentation];
+    for (NSString *oldKey in current) {
+        [ud removeObjectForKey:oldKey];
+    }
+    for (NSString *key in newSnap) {
+        [ud setObject:newSnap[key] forKey:key];
+    }
+
+    // ── 5. Patch SdkStateCache#1 with email / uid / token ────────────────
+    //    (Keep the session block coherent in case the game reads it directly)
     NSString *raw = [ud stringForKey:@"SdkStateCache#1"];
     if (raw) {
-        NSError *rxErr = nil;
-        NSRegularExpression *idRx = [NSRegularExpression
-            regularExpressionWithPattern:@"\"PlayerId\"\\s*:\\s*(\\d+)"
-            options:0 error:&rxErr];
-        if (!rxErr) {
-            NSTextCheckingResult *m = [idRx firstMatchInString:raw options:0
-                                                         range:NSMakeRange(0, raw.length)];
-            if (m && m.numberOfRanges > 1)
-                oldPlayerId = [raw substringWithRange:[m rangeAtIndex:1]];
-        }
-        NSError *err = nil;
+        NSError *jsonErr = nil;
         NSMutableDictionary *root = [[NSJSONSerialization
             JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding]
-            options:NSJSONReadingMutableContainers error:&err] mutableCopy];
-        if (!err && root) {
-            NSMutableDictionary *user    = [root[@"User"]    mutableCopy] ?: [NSMutableDictionary new];
-            NSMutableDictionary *session = [root[@"Session"] mutableCopy] ?: [NSMutableDictionary new];
-            NSMutableDictionary *legacy  = [user[@"LegacyGateway"] mutableCopy] ?: [NSMutableDictionary new];
+            options:NSJSONReadingMutableContainers
+            error:&jsonErr] mutableCopy];
+        if (!jsonErr && root) {
+            NSMutableDictionary *user    = [root[@"User"]    mutableCopy]
+                                            ?: [NSMutableDictionary new];
+            NSMutableDictionary *session = [root[@"Session"] mutableCopy]
+                                            ?: [NSMutableDictionary new];
+            NSMutableDictionary *legacy  = [user[@"LegacyGateway"] mutableCopy]
+                                            ?: [NSMutableDictionary new];
             legacy[@"token"]       = newToken;
             user[@"LegacyGateway"] = legacy;
             user[@"Email"]         = newEmail;
@@ -96,64 +141,26 @@ static void applyAccount(NSDictionary *acc) {
             session[@"Token"]      = newToken;
             root[@"User"]          = user;
             root[@"Session"]       = session;
-            NSData *out = [NSJSONSerialization dataWithJSONObject:root
-                options:NSJSONWritingPrettyPrinted error:&err];
-            if (!err && out)
-                raw = [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding];
-        }
-        [ud setObject:raw forKey:@"SdkStateCache#1"];
-    }
 
-    // Serialize ALL of NSUserDefaults to plist XML text, replace every occurrence
-    // of the old player ID (in both keys and values of any type), then parse back
-    // and write every changed or renamed key back into NSUserDefaults.
-    if (oldPlayerId.length > 0 && ![oldPlayerId isEqualToString:@"0"]) {
-        NSDictionary *snapshot = [ud dictionaryRepresentation];
-
-        NSError *serErr = nil;
-        NSData *plistData = [NSPropertyListSerialization
-            dataWithPropertyList:snapshot
-            format:NSPropertyListXMLFormat_v1_0
-            options:0 error:&serErr];
-
-        if (!serErr && plistData) {
-            NSString *xml = [[NSString alloc] initWithData:plistData
-                                                  encoding:NSUTF8StringEncoding];
-            NSString *patched = [xml stringByReplacingOccurrencesOfString:oldPlayerId
-                                                               withString:newUid];
-            if (![patched isEqualToString:xml]) {
-                NSError *parseErr = nil;
-                NSDictionary *newSnap = [NSPropertyListSerialization
-                    propertyListWithData:[patched dataUsingEncoding:NSUTF8StringEncoding]
-                    options:NSPropertyListMutableContainersAndLeaves
-                    format:nil error:&parseErr];
-
-                if (!parseErr && newSnap) {
-                    // Remove keys whose names contained the old ID (they get re-added below
-                    // under the new name from newSnap)
-                    for (NSString *oldKey in snapshot) {
-                        if ([oldKey containsString:oldPlayerId]) {
-                            [ud removeObjectForKey:oldKey];
-                        }
-                    }
-                    // Write all keys that are new or changed
-                    for (NSString *key in newSnap) {
-                        id oldVal = snapshot[key];
-                        id newVal = newSnap[key];
-                        if (!oldVal || ![oldVal isEqual:newVal]) {
-                            [ud setObject:newVal forKey:key];
-                        }
-                    }
-                }
-            }
+            NSData *out = [NSJSONSerialization
+                dataWithJSONObject:root
+                options:NSJSONWritingPrettyPrinted
+                error:&jsonErr];
+            if (!jsonErr && out)
+                [ud setObject:[[NSString alloc] initWithData:out
+                                                    encoding:NSUTF8StringEncoding]
+                       forKey:@"SdkStateCache#1"];
         }
     }
+
     [ud synchronize];
 
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+    // ── 6. Back-up save files under the new uid ───────────────────────────
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *t in @[@"bp_data",@"item_data",@"misc_data",
-                          @"season_data",@"statistic_data",@"weapon_evolution_data"]) {
+    for (NSString *t in @[@"bp_data", @"item_data", @"misc_data",
+                          @"season_data", @"statistic_data", @"weapon_evolution_data"]) {
         NSString *src = [docs stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@_1_.data", t]];
         NSString *dst = [docs stringByAppendingPathComponent:
@@ -800,7 +807,6 @@ forRowAtIndexPath:(NSIndexPath *)ip {
         @"Copied %lu account(s) to clipboard.", (unsigned long)rem.count]
             success:YES exit:NO];
 }
-
 
 // ── Toast ────────────────────────────────────────────────────────────────
 
