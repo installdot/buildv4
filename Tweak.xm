@@ -404,6 +404,7 @@ static const CGFloat kActionsContentH  = 200;
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [super dealloc];
 }
 
 // ── Tab bar ──────────────────────────────────────────────────────────────
