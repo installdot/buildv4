@@ -165,234 +165,6 @@ static void applyAccount(NSDictionary *acc) {
     }
 }
 
-#pragma mark - Unlock (NSUserDefaults)
-
-static int runUnlockInDefaults(NSString *type) {
-    NSUserDefaults *ud  = [NSUserDefaults standardUserDefaults];
-    NSDictionary   *all = [ud dictionaryRepresentation];
-    NSString *pattern, *tmpl;
-
-    if ([type isEqualToString:@"Characters"]) {
-        pattern = @"(\"\\d+_c\\d+_unlock[^\"]*\"\\s*:\\s*)false";
-        tmpl    = @"${1}true";
-    } else if ([type isEqualToString:@"Skins"]) {
-        pattern = @"(\"\\d+_c\\d+_skin\\d+[^\"]*\"\\s*:\\s*)[+-]?\\d+";
-        tmpl    = @"${1}1";
-    } else if ([type isEqualToString:@"Skills"]) {
-        pattern = @"(\"\\d+_c_[^\"]*_skill_\\d_unlock[^\"]*\"\\s*:\\s*)\\d";
-        tmpl    = @"${1}1";
-    } else if ([type isEqualToString:@"Pets"]) {
-        pattern = @"(\"\\d+_p\\d+_unlock[^\"]*\"\\s*:\\s*)false";
-        tmpl    = @"${1}true";
-    } else {
-        return 0;
-    }
-
-    NSError *rxErr = nil;
-    NSRegularExpression *rx = [NSRegularExpression
-        regularExpressionWithPattern:pattern
-        options:NSRegularExpressionDotMatchesLineSeparators
-        error:&rxErr];
-    if (rxErr || !rx) return 0;
-
-    int changed = 0;
-    for (NSString *key in all) {
-        id val = all[key];
-        if (![val isKindOfClass:[NSString class]]) continue;
-        NSString *s = (NSString *)val;
-        NSArray *matches = [rx matchesInString:s options:0 range:NSMakeRange(0, s.length)];
-        if (!matches.count) continue;
-        NSMutableString *ms = [s mutableCopy];
-        for (NSTextCheckingResult *m in matches.reverseObjectEnumerator) {
-            NSString *rep = [rx replacementStringForResult:m
-                                                  inString:ms offset:0 template:tmpl];
-            [ms replaceCharactersInRange:m.range withString:rep];
-        }
-        if (![ms isEqualToString:s]) {
-            [ud setObject:ms forKey:key];
-            changed++;
-        }
-    }
-    [ud synchronize];
-    return changed;
-}
-
-#pragma mark - Unlock Sheet (custom overlay, no UIAlertController)
-
-@interface SKUnlockSheet : UIView
-+ (void)showInView:(UIView *)parentView onDone:(void(^)(void))doneBlock;
-@end
-
-@implementation SKUnlockSheet {
-    UIView *_card;
-    UILabel *_statusLabel;
-    UIActivityIndicatorView *_spinner;
-    void (^_doneBlock)(void);
-}
-
-+ (void)showInView:(UIView *)parentView onDone:(void(^)(void))doneBlock {
-    SKUnlockSheet *sheet = [[SKUnlockSheet alloc] initWithFrame:parentView.bounds];
-    sheet->_doneBlock = doneBlock;
-    sheet.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [parentView addSubview:sheet];
-    sheet.alpha = 0;
-    [UIView animateWithDuration:0.2 animations:^{ sheet.alpha = 1; }];
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
-
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(dismiss)];
-    tap.cancelsTouchesInView = NO;
-    [self addGestureRecognizer:tap];
-
-    _card = [[UIView alloc] init];
-    _card.backgroundColor     = [UIColor colorWithRed:0.10 green:0.10 blue:0.13 alpha:1];
-    _card.layer.cornerRadius  = 14;
-    _card.layer.shadowColor   = UIColor.blackColor.CGColor;
-    _card.layer.shadowOpacity = 0.7;
-    _card.layer.shadowRadius  = 12;
-    _card.layer.shadowOffset  = CGSizeMake(0, 4);
-    _card.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:_card];
-
-    UIView *guard = [[UIView alloc] init];
-    guard.translatesAutoresizingMaskIntoConstraints = NO;
-    [_card addSubview:guard];
-    [guard addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(cardTapped)]];
-
-    UILabel *title = [UILabel new];
-    title.text = @"Unlock";
-    title.textColor = UIColor.whiteColor;
-    title.font = [UIFont boldSystemFontOfSize:17];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    [_card addSubview:title];
-
-    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    [closeBtn setTitle:@"X" forState:UIControlStateNormal];
-    [closeBtn setTitleColor:[UIColor colorWithWhite:0.65 alpha:1] forState:UIControlStateNormal];
-    [closeBtn setTitleColor:UIColor.whiteColor forState:UIControlStateHighlighted];
-    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [closeBtn addTarget:self action:@selector(dismiss)
-       forControlEvents:UIControlEventTouchUpInside];
-    [_card addSubview:closeBtn];
-
-    NSArray *types  = @[@"Characters", @"Skins", @"Skills", @"Pets"];
-    NSArray *colors = @[
-        [UIColor colorWithRed:0.18 green:0.52 blue:1.00 alpha:1],
-        [UIColor colorWithRed:0.18 green:0.76 blue:0.38 alpha:1],
-        [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1],
-        [UIColor colorWithRed:0.72 green:0.22 blue:0.90 alpha:1]
-    ];
-    UIStackView *stack = [[UIStackView alloc] init];
-    stack.axis    = UILayoutConstraintAxisVertical;
-    stack.spacing = 10;
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [_card addSubview:stack];
-    for (NSUInteger i = 0; i < types.count; i++) {
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        [btn setTitle:types[i] forState:UIControlStateNormal];
-        [btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor colorWithWhite:0.75 alpha:1]
-                  forState:UIControlStateHighlighted];
-        btn.backgroundColor    = colors[i];
-        btn.titleLabel.font    = [UIFont boldSystemFontOfSize:14];
-        btn.layer.cornerRadius = 9;
-        btn.tag = (NSInteger)i;
-        [btn addTarget:self action:@selector(typeTapped:)
-      forControlEvents:UIControlEventTouchUpInside];
-        [stack addArrangedSubview:btn];
-        [btn.heightAnchor constraintEqualToConstant:46].active = YES;
-    }
-
-    _statusLabel = [UILabel new];
-    _statusLabel.text          = @"";
-    _statusLabel.textColor     = [UIColor colorWithRed:0.4 green:1 blue:0.55 alpha:1];
-    _statusLabel.font          = [UIFont systemFontOfSize:12];
-    _statusLabel.textAlignment = NSTextAlignmentCenter;
-    _statusLabel.numberOfLines = 0;
-    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [_card addSubview:_statusLabel];
-
-    _spinner = [[UIActivityIndicatorView alloc]
-        initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-    _spinner.color = UIColor.whiteColor;
-    _spinner.hidesWhenStopped = YES;
-    _spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [_card addSubview:_spinner];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [guard.topAnchor    constraintEqualToAnchor:_card.topAnchor],
-        [guard.bottomAnchor constraintEqualToAnchor:_card.bottomAnchor],
-        [guard.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor],
-        [guard.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor],
-        [_card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [_card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-        [_card.widthAnchor constraintEqualToConstant:270],
-        [title.topAnchor constraintEqualToAnchor:_card.topAnchor constant:18],
-        [title.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor  constant:44],
-        [title.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-44],
-        [closeBtn.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
-        [closeBtn.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-14],
-        [closeBtn.widthAnchor  constraintEqualToConstant:32],
-        [closeBtn.heightAnchor constraintEqualToConstant:32],
-        [stack.topAnchor     constraintEqualToAnchor:title.bottomAnchor constant:16],
-        [stack.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor  constant:16],
-        [stack.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-16],
-        [_statusLabel.topAnchor     constraintEqualToAnchor:stack.bottomAnchor constant:12],
-        [_statusLabel.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor  constant:12],
-        [_statusLabel.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-12],
-        [_spinner.topAnchor      constraintEqualToAnchor:_statusLabel.bottomAnchor constant:8],
-        [_spinner.centerXAnchor  constraintEqualToAnchor:_card.centerXAnchor],
-        [_card.bottomAnchor constraintEqualToAnchor:_spinner.bottomAnchor constant:20],
-    ]];
-    return self;
-}
-
-- (void)cardTapped {}
-
-- (void)typeTapped:(UIButton *)sender {
-    NSArray *types = @[@"Characters", @"Skins", @"Skills", @"Pets"];
-    if (sender.tag >= (NSInteger)types.count) return;
-    NSString *type = types[sender.tag];
-    _statusLabel.text = @"Running...";
-    _statusLabel.textColor = [UIColor colorWithWhite:0.8 alpha:1];
-    [_spinner startAnimating];
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        int n = runUnlockInDefaults(type);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self->_spinner stopAnimating];
-            if (n > 0) {
-                self->_statusLabel.textColor =
-                    [UIColor colorWithRed:0.4 green:1 blue:0.55 alpha:1];
-                self->_statusLabel.text = [NSString stringWithFormat:
-                    @"Modified %d key(s).\nRestart app to apply.", n];
-            } else {
-                self->_statusLabel.textColor =
-                    [UIColor colorWithRed:1 green:0.5 blue:0.35 alpha:1];
-                self->_statusLabel.text =
-                    @"No matching keys found.\nLaunch the game at least once first.";
-            }
-        });
-    });
-}
-
-- (void)dismiss {
-    [UIView animateWithDuration:0.18 animations:^{ self.alpha = 0; }
-                     completion:^(BOOL _) {
-        if (self->_doneBlock) self->_doneBlock();
-        [self removeFromSuperview];
-    }];
-}
-
-@end
-
 #pragma mark - SKPanel (tabbed, no modal)
 
 typedef NS_ENUM(NSInteger, SKPanelTab) {
@@ -404,7 +176,7 @@ typedef NS_ENUM(NSInteger, SKPanelTab) {
 static const CGFloat kPanelWidth       = 282;
 static const CGFloat kTabBarHeight     = 44;
 static const CGFloat kAccountsContentH = 330;
-static const CGFloat kActionsContentH  = 200;
+static const CGFloat kActionsContentH  = 148;
 
 @interface SKPanel : UIView <UITableViewDataSource, UITableViewDelegate>
 // Tab bar buttons
@@ -956,15 +728,14 @@ forRowAtIndexPath:(NSIndexPath *)ip {
     [p addSubview:self.infoLabel];
     [self refreshInfo];
 
-    NSArray *titles = @[@"Edit  (apply random)", @"Export used accounts", @"Unlock..."];
+    NSArray *titles = @[@"Edit  (apply random)", @"Export used accounts"];
     NSArray *colors = @[
         [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1],
-        [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1],
-        [UIColor colorWithRed:0.70 green:0.20 blue:0.90 alpha:1]
+        [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1]
     ];
-    SEL sels[3] = { @selector(tapEdit), @selector(tapExport), @selector(tapUnlock) };
+    SEL sels[2] = { @selector(tapEdit), @selector(tapExport) };
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
         b.frame = CGRectMake(pad, 28 + i * 52, w, 44);
         b.backgroundColor = colors[i];
@@ -1030,10 +801,6 @@ forRowAtIndexPath:(NSIndexPath *)ip {
             success:YES exit:NO];
 }
 
-- (void)tapUnlock {
-    UIView *root = [self topVC].view ?: self.superview;
-    [SKUnlockSheet showInView:root onDone:^{ [self refreshInfo]; }];
-}
 
 // ── Toast ────────────────────────────────────────────────────────────────
 
