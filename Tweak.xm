@@ -1,17 +1,17 @@
-// tweak.xm — Soul Knight Account Manager v6
+// tweak.xm — Soul Knight Account Manager v7
 // iOS 14+ | Theos/Logos | ARC
-// Panel has two inline tabs: [Accounts] [Actions]
-// Tapping a tab expands/collapses the panel in-place — no modal VCs
+// Single Actions panel — no Accounts tab
+// Edit button fetches one account from remote API then applies it
+// Exported accounts stored in a dedicated plist file (NOT NSUserDefaults)
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-// UIButton block-based tap handler (avoids target/selector boilerplate for inline closures)
+// ── UIButton block helper ─────────────────────────────────────────────────────
 @interface UIButton (SKActionBlock)
 - (void)sk_setActionBlock:(void(^)(void))block;
 @end
-
 @implementation UIButton (SKActionBlock)
 static char kSKActionBlockKey;
 - (void)sk_setActionBlock:(void(^)(void))block {
@@ -23,32 +23,29 @@ static char kSKActionBlockKey;
    forControlEvents:UIControlEventTouchUpInside];
 }
 - (void)sk_invokeActionBlock {
-    void (^block)(void) = objc_getAssociatedObject(self, &kSKActionBlockKey);
-    if (block) block();
+    void (^b)(void) = objc_getAssociatedObject(self, &kSKActionBlockKey);
+    if (b) b();
 }
 @end
 
-#pragma mark - Keys / Storage
+#pragma mark - Export storage (separate plist file — survives full UD wipe)
 
-#define kSaved   @"__SKSavedAccounts__"
-#define kRemoved @"__SKRemovedAccounts__"
-
-static NSMutableArray *getSaved(void) {
-    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:kSaved];
+// Stored at Library/Preferences/SKAccountExports.plist
+// Completely separate from NSUserDefaults — never touched by applyAccount.
+static NSString *exportsPath(void) {
+    return [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Library/Preferences/SKAccountExports.plist"];
+}
+static NSMutableArray *getExports(void) {
+    NSArray *a = [NSArray arrayWithContentsOfFile:exportsPath()];
     return a ? [a mutableCopy] : [NSMutableArray new];
 }
-static void writeSaved(NSArray *a) {
-    [[NSUserDefaults standardUserDefaults] setObject:a forKey:kSaved];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+static void writeExports(NSArray *a) {
+    [a writeToFile:exportsPath() atomically:YES];
 }
-static NSMutableArray *getRemoved(void) {
-    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:kRemoved];
-    return a ? [a mutableCopy] : [NSMutableArray new];
-}
-static void writeRemoved(NSArray *a) {
-    [[NSUserDefaults standardUserDefaults] setObject:a forKey:kRemoved];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
+
+#pragma mark - Line parser
+
 static NSDictionary *parseLine(NSString *line) {
     NSArray *p = [line componentsSeparatedByString:@"|"];
     if (p.count < 4) return nil;
@@ -60,7 +57,7 @@ static NSDictionary *parseLine(NSString *line) {
     };
 }
 
-#pragma mark - Account Switch
+#pragma mark - Account Apply
 
 static void applyAccount(NSDictionary *acc) {
     NSString *newUid   = acc[@"uid"];
@@ -68,72 +65,54 @@ static void applyAccount(NSDictionary *acc) {
     NSString *newEmail = acc[@"email"];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 
-    // ── 1. Locate the template plist text file ────────────────────────────
-    NSString *prefsDir  = [NSHomeDirectory()
-                           stringByAppendingPathComponent:@"Library/Preferences"];
-    NSString *txtPath   = [prefsDir
-                           stringByAppendingPathComponent:
-                           @"com.ChillyRoom.DungeonShooter.txt"];
+    // ── 1. Read template plist txt (never written to) ──────────────────────
+    NSString *txtPath = [[NSHomeDirectory()
+        stringByAppendingPathComponent:@"Library/Preferences"]
+        stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
 
-    NSError  *readErr   = nil;
-    NSString *xmlSource = [NSString stringWithContentsOfFile:txtPath
-                                                    encoding:NSUTF8StringEncoding
-                                                       error:&readErr];
-    if (readErr || !xmlSource.length) {
-        NSLog(@"[SKPanel] applyAccount – could not read template: %@", readErr);
+    NSError  *readErr  = nil;
+    NSString *xmlSrc   = [NSString stringWithContentsOfFile:txtPath
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:&readErr];
+    if (readErr || !xmlSrc.length) {
+        NSLog(@"[SKPanel] applyAccount – template read error: %@", readErr);
         return;
     }
 
-    // ── 2. Token + UID substitution ───────────────────────────────────────
-    //    Replace every "anhhaideptrai"  →  newToken
-    //    Replace every "98989898"       →  newUid
-    NSString *patched = [xmlSource
-        stringByReplacingOccurrencesOfString:@"anhhaideptrai"
-                                  withString:newToken];
+    // ── 2. Replace placeholder token + uid ────────────────────────────────
+    NSString *patched = [xmlSrc
+        stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:newToken];
     patched = [patched
-        stringByReplacingOccurrencesOfString:@"98989898"
-                                  withString:newUid];
+        stringByReplacingOccurrencesOfString:@"98989898" withString:newUid];
 
-    // ── 3. Parse the patched XML back into a dictionary ───────────────────
-    NSData   *patchedData = [patched dataUsingEncoding:NSUTF8StringEncoding];
-    NSError  *parseErr    = nil;
+    // ── 3. Parse patched XML → dictionary ─────────────────────────────────
+    NSError *parseErr = nil;
     NSDictionary *newSnap = [NSPropertyListSerialization
-        propertyListWithData:patchedData
+        propertyListWithData:[patched dataUsingEncoding:NSUTF8StringEncoding]
                      options:NSPropertyListMutableContainersAndLeaves
                       format:nil
                        error:&parseErr];
-
     if (parseErr || ![newSnap isKindOfClass:[NSDictionary class]]) {
         NSLog(@"[SKPanel] applyAccount – plist parse failed: %@", parseErr);
         return;
     }
 
-    // ── 4. Wipe every existing key then write the full new snapshot ───────
-    //    (Removes stale keys that no longer exist in the template)
+    // ── 4. Wipe NSUserDefaults, write fresh snapshot ───────────────────────
     NSDictionary *current = [ud dictionaryRepresentation];
-    for (NSString *oldKey in current) {
-        [ud removeObjectForKey:oldKey];
-    }
-    for (NSString *key in newSnap) {
-        [ud setObject:newSnap[key] forKey:key];
-    }
+    for (NSString *k in current) [ud removeObjectForKey:k];
+    for (NSString *k in newSnap) [ud setObject:newSnap[k] forKey:k];
 
-    // ── 5. Patch SdkStateCache#1 with email / uid / token ────────────────
-    //    (Keep the session block coherent in case the game reads it directly)
+    // ── 5. Patch SdkStateCache#1 JSON ─────────────────────────────────────
     NSString *raw = [ud stringForKey:@"SdkStateCache#1"];
     if (raw) {
-        NSError *jsonErr = nil;
+        NSError *je = nil;
         NSMutableDictionary *root = [[NSJSONSerialization
             JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding]
-            options:NSJSONReadingMutableContainers
-            error:&jsonErr] mutableCopy];
-        if (!jsonErr && root) {
-            NSMutableDictionary *user    = [root[@"User"]    mutableCopy]
-                                            ?: [NSMutableDictionary new];
-            NSMutableDictionary *session = [root[@"Session"] mutableCopy]
-                                            ?: [NSMutableDictionary new];
-            NSMutableDictionary *legacy  = [user[@"LegacyGateway"] mutableCopy]
-                                            ?: [NSMutableDictionary new];
+            options:NSJSONReadingMutableContainers error:&je] mutableCopy];
+        if (!je && root) {
+            NSMutableDictionary *user    = [root[@"User"]    mutableCopy] ?: [NSMutableDictionary new];
+            NSMutableDictionary *session = [root[@"Session"] mutableCopy] ?: [NSMutableDictionary new];
+            NSMutableDictionary *legacy  = [user[@"LegacyGateway"] mutableCopy] ?: [NSMutableDictionary new];
             legacy[@"token"]       = newToken;
             user[@"LegacyGateway"] = legacy;
             user[@"Email"]         = newEmail;
@@ -141,26 +120,22 @@ static void applyAccount(NSDictionary *acc) {
             session[@"Token"]      = newToken;
             root[@"User"]          = user;
             root[@"Session"]       = session;
-
-            NSData *out = [NSJSONSerialization
-                dataWithJSONObject:root
-                options:NSJSONWritingPrettyPrinted
-                error:&jsonErr];
-            if (!jsonErr && out)
-                [ud setObject:[[NSString alloc] initWithData:out
-                                                    encoding:NSUTF8StringEncoding]
+            NSData *out = [NSJSONSerialization dataWithJSONObject:root
+                options:NSJSONWritingPrettyPrinted error:&je];
+            if (!je && out)
+                [ud setObject:[[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding]
                        forKey:@"SdkStateCache#1"];
         }
     }
 
     [ud synchronize];
 
-    // ── 6. Back-up save files under the new uid ───────────────────────────
+    // ── 6. Back-up save files under new uid ───────────────────────────────
     NSString *docs = NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *t in @[@"bp_data", @"item_data", @"misc_data",
-                          @"season_data", @"statistic_data", @"weapon_evolution_data"]) {
+    for (NSString *t in @[@"bp_data",@"item_data",@"misc_data",
+                          @"season_data",@"statistic_data",@"weapon_evolution_data"]) {
         NSString *src = [docs stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@_1_.data", t]];
         NSString *dst = [docs stringByAppendingPathComponent:
@@ -172,40 +147,111 @@ static void applyAccount(NSDictionary *acc) {
     }
 }
 
-#pragma mark - SKPanel (tabbed, no modal)
+#pragma mark - Remote fetch
 
-typedef NS_ENUM(NSInteger, SKPanelTab) {
-    SKPanelTabNone     = 0,
-    SKPanelTabAccounts = 1,
-    SKPanelTabActions  = 2,
-};
+static NSData *buildMultipartBody(void) {
+    NSString *boundary = @"----WebKitFormBoundaryfGWYLKxAiP6gsfSo";
+    NSMutableString *s = [NSMutableString new];
+    void (^field)(NSString *, NSString *) = ^(NSString *name, NSString *val) {
+        [s appendFormat:@"--%@\r\n", boundary];
+        [s appendFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", name];
+        [s appendFormat:@"%@\r\n", val];
+    };
+    field(@"action",   @"check");
+    field(@"limit",    @"1");
+    field(@"parallel", @"10");
+    [s appendFormat:@"--%@--\r\n", boundary];
+    return [s dataUsingEncoding:NSUTF8StringEncoding];
+}
 
-static const CGFloat kPanelWidth       = 282;
-static const CGFloat kTabBarHeight     = 44;
-static const CGFloat kAccountsContentH = 330;
-static const CGFloat kActionsContentH  = 148;
+// Fetches one account from the remote server.
+// completion called on main queue with parsed dict (or nil + errMsg on failure).
+static void fetchRemoteAccount(void (^completion)(NSDictionary *acc, NSString *errMsg)) {
+    NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/ccacc.php"];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+        timeoutInterval:20];
+    req.HTTPMethod = @"POST";
 
-@interface SKPanel : UIView <UITableViewDataSource, UITableViewDelegate>
-// Tab bar buttons
-@property (nonatomic, strong) UIButton    *tabAccounts;
-@property (nonatomic, strong) UIButton    *tabActions;
-// Accounts pane
-@property (nonatomic, strong) UIView      *accountsPane;
-@property (nonatomic, strong) UITableView *table;
-@property (nonatomic, strong) UITextView  *tv;
-// Actions pane
-@property (nonatomic, strong) UIView      *actionsPane;
-@property (nonatomic, strong) UILabel     *infoLabel;
-// State
-@property (nonatomic, assign) SKPanelTab  activeTab;
-@property (nonatomic, assign) CGPoint     preKeyboardCenter;
-@property (nonatomic, assign) BOOL        keyboardVisible;
+    NSString *boundary = @"----WebKitFormBoundaryfGWYLKxAiP6gsfSo";
+    [req setValue:[NSString stringWithFormat:
+        @"multipart/form-data; boundary=%@", boundary]
+       forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"*/*"               forHTTPHeaderField:@"Accept"];
+    [req setValue:@"vi-VN,vi;q=0.9"   forHTTPHeaderField:@"Accept-Language"];
+    [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
+    [req setValue:@"cors"              forHTTPHeaderField:@"Sec-Fetch-Mode"];
+    [req setValue:@"same-origin"       forHTTPHeaderField:@"Sec-Fetch-Site"];
+    [req setValue:@"empty"             forHTTPHeaderField:@"Sec-Fetch-Dest"];
+    [req setValue:@"https://chillysilly.frfrnocap.men"
+       forHTTPHeaderField:@"Origin"];
+    [req setValue:@"https://chillysilly.frfrnocap.men/ccacc.php"
+       forHTTPHeaderField:@"Referer"];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) "
+                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+       forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"PHPSESSID=883a6ee3b496cc69822e2144d57cc886; "
+                   "token=cf54cf6152d9ae63b1daccc7af669a1d"
+       forHTTPHeaderField:@"Cookie"];
+
+    req.HTTPBody = buildMultipartBody();
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
+
+    [[session dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (err || !data) {
+                completion(nil, err.localizedDescription ?: @"Network error");
+                return;
+            }
+            NSError *je = nil;
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data
+                options:0 error:&je];
+            if (je || ![json isKindOfClass:[NSDictionary class]]) {
+                NSString *raw = [[NSString alloc] initWithData:data
+                    encoding:NSUTF8StringEncoding] ?: @"Bad response";
+                completion(nil, raw);
+                return;
+            }
+            NSArray *lines = json[@"lines"];
+            if (!lines.count) {
+                completion(nil, @"No accounts returned\n(file may be empty)");
+                return;
+            }
+            NSDictionary *acc = parseLine(lines[0]);
+            if (!acc) {
+                completion(nil, [NSString stringWithFormat:
+                    @"Could not parse line:\n%@", lines[0]]);
+                return;
+            }
+            // Attach remaining count as extra display info
+            NSMutableDictionary *m = [acc mutableCopy];
+            NSNumber *rem = json[@"remaining_in_file"];
+            if (rem) m[@"remaining"] = [rem stringValue];
+            completion([m copy], nil);
+        });
+    }] resume];
+}
+
+#pragma mark - SKPanel
+
+static const CGFloat kPanelW   = 266;
+static const CGFloat kBarH     = 44;
+static const CGFloat kContentH = 136;
+
+@interface SKPanel : UIView
+@property (nonatomic, strong) UIView   *contentPane;
+@property (nonatomic, strong) UILabel  *infoLabel;
+@property (nonatomic, strong) UIButton *editBtn;
+@property (nonatomic, assign) BOOL     expanded;
 @end
 
 @implementation SKPanel
 
 - (instancetype)init {
-    self = [super initWithFrame:CGRectMake(0, 0, kPanelWidth, kTabBarHeight)];
+    self = [super initWithFrame:CGRectMake(0, 0, kPanelW, kBarH)];
     if (!self) return nil;
 
     self.clipsToBounds      = NO;
@@ -217,334 +263,215 @@ static const CGFloat kActionsContentH  = 148;
     self.layer.shadowOffset  = CGSizeMake(0, 3);
     self.layer.zPosition     = 9999;
 
-    [self buildTabBar];
-    [self buildAccountsPane];
-    [self buildActionsPane];
+    [self buildBar];
+    [self buildContent];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(onPan:)];
     [self addGestureRecognizer:pan];
 
-    [[NSNotificationCenter defaultCenter]
-        addObserver:self selector:@selector(keyboardWillShow:)
-               name:UIKeyboardWillShowNotification object:nil];
-    [[NSNotificationCenter defaultCenter]
-        addObserver:self selector:@selector(keyboardWillHide:)
-               name:UIKeyboardWillHideNotification object:nil];
-
     return self;
 }
 
-- (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [super dealloc];
-}
+// ── Header bar ────────────────────────────────────────────────────────────────
 
-// ── Tab bar ──────────────────────────────────────────────────────────────
-
-- (void)buildTabBar {
-    // Small drag-handle hint
+- (void)buildBar {
+    // Drag handle indicator
     UIView *handle = [[UIView alloc]
-        initWithFrame:CGRectMake(kPanelWidth / 2 - 20, 5, 40, 3)];
-    handle.backgroundColor    = [UIColor colorWithWhite:0.5 alpha:0.45];
+        initWithFrame:CGRectMake(kPanelW / 2 - 22, 7, 44, 3)];
+    handle.backgroundColor    = [UIColor colorWithWhite:0.50 alpha:0.45];
     handle.layer.cornerRadius = 1.5;
     [self addSubview:handle];
 
-    CGFloat btnW = (kPanelWidth - 2) / 2.0;
-    CGFloat btnH = kTabBarHeight - 10;
-    CGFloat btnY = (kTabBarHeight - btnH) / 2.0;
+    // Title
+    UILabel *title = [UILabel new];
+    title.text          = @"SK Manager";
+    title.textColor     = [UIColor colorWithWhite:0.78 alpha:1];
+    title.font          = [UIFont boldSystemFontOfSize:12];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.frame         = CGRectMake(0, 14, kPanelW, 22);
+    title.userInteractionEnabled = NO;
+    [self addSubview:title];
 
-    self.tabAccounts = [self makeTabBtn:@"Accounts"
-                                  frame:CGRectMake(1, btnY, btnW, btnH)];
-    self.tabActions  = [self makeTabBtn:@"Actions"
-                                  frame:CGRectMake(1 + btnW, btnY, btnW, btnH)];
-
-    [self.tabAccounts addTarget:self action:@selector(tapTabAccounts)
-               forControlEvents:UIControlEventTouchUpInside];
-    [self.tabActions  addTarget:self action:@selector(tapTabActions)
-               forControlEvents:UIControlEventTouchUpInside];
-
-    [self addSubview:self.tabAccounts];
-    [self addSubview:self.tabActions];
+    // Invisible tap zone over the bar to toggle expand/collapse
+    UIView *tapZone = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kPanelW, kBarH)];
+    tapZone.backgroundColor = UIColor.clearColor;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(toggleExpand)];
+    [tapZone addGestureRecognizer:tap];
+    [self addSubview:tapZone];
 }
 
-- (UIButton *)makeTabBtn:(NSString *)title frame:(CGRect)frame {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = frame;
-    [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor colorWithWhite:0.60 alpha:1] forState:UIControlStateNormal];
-    [b setTitleColor:UIColor.whiteColor forState:UIControlStateHighlighted];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    b.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
-    b.layer.cornerRadius = 7;
-    return b;
+// ── Content pane ─────────────────────────────────────────────────────────────
+
+- (void)buildContent {
+    self.contentPane = [[UIView alloc]
+        initWithFrame:CGRectMake(0, kBarH, kPanelW, kContentH)];
+    self.contentPane.hidden        = YES;
+    self.contentPane.alpha         = 0;
+    self.contentPane.clipsToBounds = YES;
+    [self addSubview:self.contentPane];
+
+    UIView  *p  = self.contentPane;
+    CGFloat pad = 8;
+    CGFloat w   = kPanelW - pad * 2;
+
+    // Info label
+    self.infoLabel = [UILabel new];
+    self.infoLabel.frame         = CGRectMake(pad, 8, w, 14);
+    self.infoLabel.textColor     = [UIColor colorWithWhite:0.52 alpha:1];
+    self.infoLabel.font          = [UIFont systemFontOfSize:10];
+    self.infoLabel.textAlignment = NSTextAlignmentCenter;
+    [p addSubview:self.infoLabel];
+    [self refreshInfo];
+
+    // Edit (Fetch & Apply) button
+    self.editBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.editBtn.frame = CGRectMake(pad, 28, w, 44);
+    [self.editBtn setTitle:@"Edit  (Fetch & Apply)" forState:UIControlStateNormal];
+    [self.editBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [self.editBtn setTitleColor:[UIColor colorWithWhite:0.80 alpha:1]
+                       forState:UIControlStateHighlighted];
+    self.editBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
+    self.editBtn.backgroundColor  = [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1];
+    self.editBtn.layer.cornerRadius = 9;
+    [self.editBtn addTarget:self action:@selector(tapEdit)
+           forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:self.editBtn];
+
+    // Export button
+    UIButton *expBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    expBtn.frame = CGRectMake(pad, 80, w, 44);
+    [expBtn setTitle:@"Export used accounts" forState:UIControlStateNormal];
+    [expBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [expBtn setTitleColor:[UIColor colorWithWhite:0.80 alpha:1]
+                 forState:UIControlStateHighlighted];
+    expBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
+    expBtn.backgroundColor  = [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1];
+    expBtn.layer.cornerRadius = 9;
+    [expBtn addTarget:self action:@selector(tapExport)
+     forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:expBtn];
 }
 
-- (void)tapTabAccounts {
-    if (self.activeTab == SKPanelTabAccounts) [self collapse];
-    else [self switchToTab:SKPanelTabAccounts];
-}
-- (void)tapTabActions {
-    if (self.activeTab == SKPanelTabActions) [self collapse];
-    else [self switchToTab:SKPanelTabActions];
+- (void)refreshInfo {
+    self.infoLabel.text = [NSString stringWithFormat:@"Export ready: %lu",
+                           (unsigned long)getExports().count];
 }
 
-- (void)switchToTab:(SKPanelTab)tab {
-    [self.tv resignFirstResponder];
-    self.activeTab = tab;
-    [self updateTabHighlight];
+// ── Toggle ────────────────────────────────────────────────────────────────────
 
-    CGFloat targetH;
-    UIView *show, *hide;
-
-    if (tab == SKPanelTabAccounts) {
-        targetH = kTabBarHeight + kAccountsContentH;
-        show = self.accountsPane;
-        hide = self.actionsPane;
-        [self.table reloadData];
+- (void)toggleExpand {
+    self.expanded = !self.expanded;
+    if (self.expanded) {
+        self.contentPane.hidden = NO;
+        self.contentPane.frame  = CGRectMake(0, kBarH, kPanelW, kContentH);
+        [UIView animateWithDuration:0.22 delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            CGRect f = self.frame; f.size.height = kBarH + kContentH; self.frame = f;
+            self.contentPane.alpha = 1;
+        } completion:nil];
     } else {
-        targetH = kTabBarHeight + kActionsContentH;
-        show = self.actionsPane;
-        hide = self.accountsPane;
-        [self refreshInfo];
+        [UIView animateWithDuration:0.18 delay:0
+                            options:UIViewAnimationOptionCurveEaseIn
+                         animations:^{
+            CGRect f = self.frame; f.size.height = kBarH; self.frame = f;
+            self.contentPane.alpha = 0;
+        } completion:^(BOOL _) { self.contentPane.hidden = YES; }];
     }
-
-    hide.hidden = YES;
-    hide.alpha  = 0;
-    show.hidden = NO;
-    show.frame  = CGRectMake(0, kTabBarHeight, kPanelWidth, targetH - kTabBarHeight);
-
-    [UIView animateWithDuration:0.22 delay:0
-                        options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{
-        CGRect f = self.frame;
-        f.size.height = targetH;
-        self.frame = f;
-        show.alpha = 1;
-    } completion:nil];
 }
 
-- (void)collapse {
-    [self.tv resignFirstResponder];
-    self.activeTab = SKPanelTabNone;
-    [self updateTabHighlight];
+// ── Edit — fetch then confirm ─────────────────────────────────────────────────
 
-    UIView *pane = (self.accountsPane.alpha > 0) ? self.accountsPane : self.actionsPane;
-    [UIView animateWithDuration:0.18 delay:0
-                        options:UIViewAnimationOptionCurveEaseIn
-                     animations:^{
-        CGRect f = self.frame;
-        f.size.height = kTabBarHeight;
-        self.frame = f;
-        pane.alpha = 0;
-    } completion:^(BOOL _) {
-        pane.hidden = YES;
-        self.accountsPane.alpha = 0;
-        self.actionsPane.alpha  = 0;
-    }];
+- (void)tapEdit {
+    self.editBtn.enabled = NO;
+    [self.editBtn setTitle:@"Fetching…" forState:UIControlStateNormal];
+    self.editBtn.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
+
+    fetchRemoteAccount(^(NSDictionary *acc, NSString *errMsg) {
+        self.editBtn.enabled = YES;
+        [self.editBtn setTitle:@"Edit  (Fetch & Apply)" forState:UIControlStateNormal];
+        self.editBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1];
+
+        if (!acc) {
+            [self showToast:[NSString stringWithFormat:@"Fetch failed:\n%@", errMsg]
+                    success:NO exit:NO];
+            return;
+        }
+        [self showConfirmCard:acc];
+    });
 }
 
-- (void)updateTabHighlight {
-    UIColor *on   = [UIColor colorWithRed:0.18 green:0.45 blue:0.90 alpha:1];
-    UIColor *off  = [UIColor colorWithWhite:0.16 alpha:1];
-    UIColor *textOn  = UIColor.whiteColor;
-    UIColor *textOff = [UIColor colorWithWhite:0.58 alpha:1];
+// ── Confirm card ──────────────────────────────────────────────────────────────
 
-    BOOL accOn = (self.activeTab == SKPanelTabAccounts);
-    BOOL actOn = (self.activeTab == SKPanelTabActions);
-
-    self.tabAccounts.backgroundColor = accOn ? on : off;
-    self.tabActions.backgroundColor  = actOn ? on : off;
-    [self.tabAccounts setTitleColor:accOn ? textOn : textOff forState:UIControlStateNormal];
-    [self.tabActions  setTitleColor:actOn ? textOn : textOff forState:UIControlStateNormal];
-}
-
-// ── Accounts pane ────────────────────────────────────────────────────────
-
-- (void)buildAccountsPane {
-    self.accountsPane = [[UIView alloc]
-        initWithFrame:CGRectMake(0, kTabBarHeight, kPanelWidth, kAccountsContentH)];
-    self.accountsPane.hidden = YES;
-    self.accountsPane.alpha  = 0;
-    self.accountsPane.clipsToBounds = YES;
-    [self addSubview:self.accountsPane];
-
-    UIView  *p   = self.accountsPane;
-    CGFloat pad  = 8;
-    CGFloat w    = kPanelWidth - pad * 2;
-
-    // Saved accounts table
-    self.table = [[UITableView alloc]
-        initWithFrame:CGRectMake(pad, 6, w, 140) style:UITableViewStylePlain];
-    self.table.dataSource       = self;
-    self.table.delegate         = self;
-    self.table.backgroundColor  = [UIColor colorWithWhite:0.12 alpha:1];
-    self.table.separatorColor   = [UIColor colorWithWhite:0.22 alpha:1];
-    self.table.layer.cornerRadius = 7;
-    self.table.clipsToBounds    = YES;
-    [p addSubview:self.table];
-
-    // Hint
-    UILabel *hint = [UILabel new];
-    hint.text = @"email|pass|uid|token  (one per line)";
-    hint.textColor = [UIColor colorWithWhite:0.42 alpha:1];
-    hint.font = [UIFont systemFontOfSize:10];
-    hint.textAlignment = NSTextAlignmentCenter;
-    hint.frame = CGRectMake(pad, 152, w, 14);
-    [p addSubview:hint];
-
-    // Text view — scrollable input
-    self.tv = [UITextView new];
-    self.tv.backgroundColor        = [UIColor colorWithWhite:0.15 alpha:1];
-    self.tv.textColor              = [UIColor colorWithRed:0.4 green:1 blue:0.55 alpha:1];
-    self.tv.font                   = [UIFont fontWithName:@"Courier" size:11]
-                                     ?: [UIFont systemFontOfSize:11];
-    self.tv.layer.cornerRadius     = 7;
-    self.tv.autocorrectionType     = UITextAutocorrectionTypeNo;
-    self.tv.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.tv.scrollEnabled          = YES;
-    self.tv.frame                  = CGRectMake(pad, 170, w, 108);
-    [p addSubview:self.tv];
-
-    // Keyboard toolbar
-    UIToolbar *bar = [[UIToolbar alloc]
-        initWithFrame:CGRectMake(0, 0, UIScreen.mainScreen.bounds.size.width, 44)];
-    bar.barStyle  = UIBarStyleBlack;
-    bar.translucent = YES;
-    UIBarButtonItem *flex = [[UIBarButtonItem alloc]
-        initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
-                             target:nil action:nil];
-    UIBarButtonItem *doneKb = [[UIBarButtonItem alloc]
-        initWithTitle:@"Done" style:UIBarButtonItemStyleDone
-               target:self action:@selector(dismissKeyboard)];
-    doneKb.tintColor = [UIColor colorWithRed:0.4 green:0.8 blue:1 alpha:1];
-    bar.items = @[flex, doneKb];
-    self.tv.inputAccessoryView = bar;
-
-    // Save button
-    UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    [saveBtn setTitle:@"Save Accounts" forState:UIControlStateNormal];
-    [saveBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    saveBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
-    saveBtn.backgroundColor  = [UIColor colorWithRed:0.18 green:0.65 blue:0.38 alpha:1];
-    saveBtn.layer.cornerRadius = 8;
-    saveBtn.frame = CGRectMake(pad, 284, w, 38);
-    [saveBtn addTarget:self action:@selector(doSave)
-      forControlEvents:UIControlEventTouchUpInside];
-    [p addSubview:saveBtn];
-}
-
-// UITableViewDataSource
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    NSUInteger c = getSaved().count;
-    return c == 0 ? 1 : (NSInteger)c;
-}
-- (UITableViewCell *)tableView:(UITableView *)tv
-         cellForRowAtIndexPath:(NSIndexPath *)ip {
-    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:@"c"];
-    if (!cell)
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
-                                      reuseIdentifier:@"c"];
-    cell.backgroundColor           = [UIColor colorWithWhite:0.12 alpha:1];
-    cell.textLabel.textColor       = UIColor.whiteColor;
-    cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.48 alpha:1];
-    cell.textLabel.font            = [UIFont systemFontOfSize:12];
-    cell.detailTextLabel.font      = [UIFont systemFontOfSize:10];
-
-    NSMutableArray *list = getSaved();
-    if (list.count == 0) {
-        cell.textLabel.text       = @"No saved accounts";
-        cell.detailTextLabel.text = @"";
-        cell.userInteractionEnabled = NO;
-    } else {
-        NSDictionary *a = list[ip.row];
-        cell.textLabel.text = a[@"email"];
-        NSString *tok = a[@"token"];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"uid: %@  token: %@...",
-            a[@"uid"], [tok substringToIndex:MIN((NSUInteger)10, tok.length)]];
-        cell.userInteractionEnabled = YES;
-    }
-    return cell;
-}
-- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
-    return 34;
-}
-// Swipe-to-delete
-- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip {
-    return getSaved().count > 0;
-}
-- (UITableViewCellEditingStyle)tableView:(UITableView *)tv
-           editingStyleForRowAtIndexPath:(NSIndexPath *)ip {
-    return getSaved().count > 0
-        ? UITableViewCellEditingStyleDelete
-        : UITableViewCellEditingStyleNone;
-}
-- (void)tableView:(UITableView *)tv
-commitEditingStyle:(UITableViewCellEditingStyle)es
-forRowAtIndexPath:(NSIndexPath *)ip {
-    if (es != UITableViewCellEditingStyleDelete) return;
-    NSMutableArray *list = getSaved();
-    if (ip.row >= (NSInteger)list.count) return;
-    [list removeObjectAtIndex:ip.row];
-    writeSaved(list);
-    if (list.count == 0)
-        [tv reloadData];
-    else
-        [tv deleteRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationAutomatic];
-}
-
-// Row tap — show inline Apply / Remove action card
-- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    [tv deselectRowAtIndexPath:ip animated:YES];
-    NSMutableArray *list = getSaved();
-    if (ip.row >= (NSInteger)list.count) return;
-    NSDictionary *acc = list[ip.row];
-    [self showAccountActionForAccount:acc atRow:ip.row];
-}
-
-- (void)showAccountActionForAccount:(NSDictionary *)acc atRow:(NSInteger)row {
-    // Build a small floating card anchored on the panel's superview
+- (void)showConfirmCard:(NSDictionary *)acc {
     UIView *parent = self.superview ?: [self topVC].view;
     if (!parent) return;
 
-    // Dim backdrop — tap to dismiss
+    // Backdrop
     UIView *backdrop = [[UIView alloc] initWithFrame:parent.bounds];
-    backdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
+    backdrop.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.50];
     backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [parent addSubview:backdrop];
 
     // Card
-    UIView *card = [[UIView alloc] init];
+    UIView *card = [UIView new];
     card.backgroundColor     = [UIColor colorWithRed:0.10 green:0.10 blue:0.14 alpha:1];
-    card.layer.cornerRadius  = 12;
+    card.layer.cornerRadius  = 13;
     card.layer.shadowColor   = UIColor.blackColor.CGColor;
-    card.layer.shadowOpacity = 0.65;
+    card.layer.shadowOpacity = 0.70;
     card.layer.shadowRadius  = 10;
     card.layer.shadowOffset  = CGSizeMake(0, 4);
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [parent addSubview:card];
 
-    // Header — email
-    UILabel *header = [UILabel new];
-    header.text          = acc[@"email"];
-    header.textColor     = UIColor.whiteColor;
-    header.font          = [UIFont boldSystemFontOfSize:13];
-    header.textAlignment = NSTextAlignmentCenter;
-    header.numberOfLines = 1;
-    header.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:header];
+    // Email label
+    UILabel *emailLbl = [UILabel new];
+    emailLbl.text          = acc[@"email"];
+    emailLbl.textColor     = UIColor.whiteColor;
+    emailLbl.font          = [UIFont boldSystemFontOfSize:13];
+    emailLbl.textAlignment = NSTextAlignmentCenter;
+    emailLbl.numberOfLines = 1;
+    emailLbl.adjustsFontSizeToFitWidth = YES;
+    emailLbl.minimumScaleFactor = 0.7;
+    emailLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:emailLbl];
 
-    // Sub — uid
-    UILabel *sub = [UILabel new];
-    sub.text          = [NSString stringWithFormat:@"uid: %@", acc[@"uid"]];
-    sub.textColor     = [UIColor colorWithWhite:0.52 alpha:1];
-    sub.font          = [UIFont systemFontOfSize:11];
-    sub.textAlignment = NSTextAlignmentCenter;
-    sub.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:sub];
+    // UID label
+    UILabel *uidLbl = [UILabel new];
+    uidLbl.text          = [NSString stringWithFormat:@"UID: %@", acc[@"uid"]];
+    uidLbl.textColor     = [UIColor colorWithWhite:0.55 alpha:1];
+    uidLbl.font          = [UIFont systemFontOfSize:11];
+    uidLbl.textAlignment = NSTextAlignmentCenter;
+    uidLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:uidLbl];
+
+    // Token label
+    NSString *tok = acc[@"token"];
+    UILabel *tokLbl = [UILabel new];
+    tokLbl.text          = [NSString stringWithFormat:@"Token: %@…",
+                            [tok substringToIndex:MIN((NSUInteger)12, tok.length)]];
+    tokLbl.textColor     = [UIColor colorWithWhite:0.48 alpha:1];
+    tokLbl.font          = [UIFont fontWithName:@"Courier" size:10]
+                           ?: [UIFont systemFontOfSize:10];
+    tokLbl.textAlignment = NSTextAlignmentCenter;
+    tokLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:tokLbl];
+
+    // Remaining label
+    NSString *remStr = acc[@"remaining"];
+    UILabel *remLbl = [UILabel new];
+    remLbl.text      = remStr
+        ? [NSString stringWithFormat:@"Remaining in file: %@", remStr] : @"";
+    remLbl.textColor = [UIColor colorWithRed:0.40 green:0.78 blue:1.00 alpha:1];
+    remLbl.font      = [UIFont systemFontOfSize:10];
+    remLbl.textAlignment = NSTextAlignmentCenter;
+    remLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:remLbl];
 
     // Separator
-    UIView *sep = [[UIView alloc] init];
+    UIView *sep = [UIView new];
     sep.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
     sep.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:sep];
@@ -561,22 +488,11 @@ forRowAtIndexPath:(NSIndexPath *)ip {
     applyBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:applyBtn];
 
-    // Remove button
-    UIButton *removeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    [removeBtn setTitle:@"Remove" forState:UIControlStateNormal];
-    [removeBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [removeBtn setTitleColor:[UIColor colorWithWhite:0.75 alpha:1]
-                    forState:UIControlStateHighlighted];
-    removeBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
-    removeBtn.backgroundColor  = [UIColor colorWithRed:0.68 green:0.18 blue:0.18 alpha:1];
-    removeBtn.layer.cornerRadius = 9;
-    removeBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:removeBtn];
-
     // Cancel button
     UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [cancelBtn setTitle:@"Cancel" forState:UIControlStateNormal];
-    [cancelBtn setTitleColor:[UIColor colorWithWhite:0.60 alpha:1] forState:UIControlStateNormal];
+    [cancelBtn setTitleColor:[UIColor colorWithWhite:0.60 alpha:1]
+                    forState:UIControlStateNormal];
     [cancelBtn setTitleColor:UIColor.whiteColor forState:UIControlStateHighlighted];
     cancelBtn.titleLabel.font  = [UIFont systemFontOfSize:12];
     cancelBtn.backgroundColor  = [UIColor colorWithWhite:0.16 alpha:1];
@@ -587,311 +503,154 @@ forRowAtIndexPath:(NSIndexPath *)ip {
     [NSLayoutConstraint activateConstraints:@[
         [card.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
-        [card.widthAnchor constraintEqualToConstant:260],
-        [header.topAnchor constraintEqualToAnchor:card.topAnchor constant:16],
-        [header.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [header.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-        [sub.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:4],
-        [sub.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [sub.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-        [sep.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:12],
-        [sep.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:0],
-        [sep.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:0],
+        [card.widthAnchor constraintEqualToConstant:268],
+
+        [emailLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
+        [emailLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [emailLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+
+        [uidLbl.topAnchor constraintEqualToAnchor:emailLbl.bottomAnchor constant:5],
+        [uidLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [uidLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+
+        [tokLbl.topAnchor constraintEqualToAnchor:uidLbl.bottomAnchor constant:3],
+        [tokLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [tokLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+
+        [remLbl.topAnchor constraintEqualToAnchor:tokLbl.bottomAnchor constant:3],
+        [remLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
+        [remLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+
+        [sep.topAnchor constraintEqualToAnchor:remLbl.bottomAnchor constant:12],
+        [sep.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [sep.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
         [sep.heightAnchor constraintEqualToConstant:1],
+
         [applyBtn.topAnchor constraintEqualToAnchor:sep.bottomAnchor constant:12],
         [applyBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
         [applyBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-        [applyBtn.heightAnchor constraintEqualToConstant:44],
-        [removeBtn.topAnchor constraintEqualToAnchor:applyBtn.bottomAnchor constant:8],
-        [removeBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [removeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-        [removeBtn.heightAnchor constraintEqualToConstant:44],
-        [cancelBtn.topAnchor constraintEqualToAnchor:removeBtn.bottomAnchor constant:8],
+        [applyBtn.heightAnchor constraintEqualToConstant:46],
+
+        [cancelBtn.topAnchor constraintEqualToAnchor:applyBtn.bottomAnchor constant:8],
         [cancelBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
         [cancelBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
         [cancelBtn.heightAnchor constraintEqualToConstant:36],
+
         [card.bottomAnchor constraintEqualToAnchor:cancelBtn.bottomAnchor constant:14],
     ]];
 
-    // Dismiss helper
     void (^dismiss)(void) = ^{
         [UIView animateWithDuration:0.15 animations:^{
-            backdrop.alpha = 0;
-            card.alpha     = 0;
+            backdrop.alpha = 0; card.alpha = 0;
         } completion:^(BOOL _) {
             [backdrop removeFromSuperview];
             [card removeFromSuperview];
         }];
     };
 
-    // Backdrop tap — store dismiss block via associated object so the gesture target can call it
     objc_setAssociatedObject(backdrop, "dismissBlock",
         [dismiss copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
     UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(actionBackdropTapped:)];
+        initWithTarget:self action:@selector(backdropTapped:)];
     bgTap.cancelsTouchesInView = NO;
     [backdrop addGestureRecognizer:bgTap];
 
-    // Apply
     [applyBtn sk_setActionBlock:^{
         dismiss();
-        // Move account to "removed" pool then apply
-        NSMutableArray *list = getSaved();
-        if (row >= (NSInteger)list.count) return;
-        NSDictionary *a = list[row];
-        NSMutableArray *rem = getRemoved();
-        [list removeObjectAtIndex:row];
-        [rem addObject:a];
-        writeSaved(list);
-        writeRemoved(rem);
-        applyAccount(a);
-        [self.table reloadData];
+
+        // ── Save to exports plist BEFORE wiping NSUserDefaults ─────────────
+        NSMutableArray *exports = getExports();
+        [exports addObject:acc];
+        writeExports(exports);
+        // ───────────────────────────────────────────────────────────────────
+
+        applyAccount(acc);
         [self refreshInfo];
-        NSString *tok = a[@"token"];
+
         NSString *msg = [NSString stringWithFormat:
-            @"Applied\n\nEmail : %@\nUID   : %@\nToken : %@...\n\nIDs replaced globally\nNSUserDefaults patched\n\nRemaining: %lu\nClosing app...",
-            a[@"email"], a[@"uid"],
-            [tok substringToIndex:MIN((NSUInteger)10, tok.length)],
-            (unsigned long)list.count];
+            @"Applied\n\nEmail : %@\nUID   : %@\nToken : %@…\n\nNSUserDefaults patched\nSave files backed up\nClosing app…",
+            acc[@"email"], acc[@"uid"],
+            [tok substringToIndex:MIN((NSUInteger)10, tok.length)]];
         [self showToast:msg success:YES exit:YES];
     }];
 
-    // Remove
-    [removeBtn sk_setActionBlock:^{
-        dismiss();
-        NSMutableArray *list = getSaved();
-        if (row >= (NSInteger)list.count) return;
-        [list removeObjectAtIndex:row];
-        writeSaved(list);
-        [self.table reloadData];
-        [self showToast:@"Account removed." success:NO exit:NO];
-    }];
-
-    // Cancel
     [cancelBtn sk_setActionBlock:^{ dismiss(); }];
 
-    // Animate in
-    card.alpha     = 0;
-    backdrop.alpha = 0;
+    card.alpha = 0; backdrop.alpha = 0;
     [UIView animateWithDuration:0.18 animations:^{
-        backdrop.alpha = 1;
-        card.alpha     = 1;
+        backdrop.alpha = 1; card.alpha = 1;
     }];
 }
 
-- (void)actionBackdropTapped:(UITapGestureRecognizer *)g {
-    UIView *bd = g.view;
-    void (^dismiss)(void) = objc_getAssociatedObject(bd, "dismissBlock");
-    if (dismiss) dismiss();
+- (void)backdropTapped:(UITapGestureRecognizer *)g {
+    void (^d)(void) = objc_getAssociatedObject(g.view, "dismissBlock");
+    if (d) d();
 }
 
-- (void)dismissKeyboard { [self.tv resignFirstResponder]; }
-
-- (void)doSave {
-    NSMutableArray *list = getSaved();
-    NSUInteger before = list.count;
-    for (NSString *line in [self.tv.text
-            componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
-        NSString *t = [line stringByTrimmingCharactersInSet:
-                       NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (!t.length) continue;
-        NSDictionary *a = parseLine(t);
-        if (!a) continue;
-        BOOL dup = NO;
-        for (NSDictionary *e in list)
-            if ([e[@"uid"] isEqualToString:a[@"uid"]]) { dup = YES; break; }
-        if (!dup) [list addObject:a];
-    }
-    writeSaved(list);
-    self.tv.text = @"";
-    [self.tv resignFirstResponder];
-    [self.table reloadData];
-    NSUInteger added = list.count - before;
-    [self showToast:[NSString stringWithFormat:
-        @"Added %lu  |  Total: %lu", (unsigned long)added, (unsigned long)list.count]
-            success:YES exit:NO];
-}
-
-// ── Actions pane ─────────────────────────────────────────────────────────
-
-- (void)buildActionsPane {
-    self.actionsPane = [[UIView alloc]
-        initWithFrame:CGRectMake(0, kTabBarHeight, kPanelWidth, kActionsContentH)];
-    self.actionsPane.hidden = YES;
-    self.actionsPane.alpha  = 0;
-    self.actionsPane.clipsToBounds = YES;
-    [self addSubview:self.actionsPane];
-
-    UIView  *p   = self.actionsPane;
-    CGFloat pad  = 8;
-    CGFloat w    = kPanelWidth - pad * 2;
-
-    // Info label
-    self.infoLabel = [UILabel new];
-    self.infoLabel.frame         = CGRectMake(pad, 8, w, 14);
-    self.infoLabel.textColor     = [UIColor colorWithWhite:0.55 alpha:1];
-    self.infoLabel.font          = [UIFont systemFontOfSize:10];
-    self.infoLabel.textAlignment = NSTextAlignmentCenter;
-    [p addSubview:self.infoLabel];
-    [self refreshInfo];
-
-    NSArray *titles = @[@"Edit  (apply random)", @"Export used accounts"];
-    NSArray *colors = @[
-        [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1],
-        [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1]
-    ];
-    SEL sels[2] = { @selector(tapEdit), @selector(tapExport) };
-
-    for (int i = 0; i < 2; i++) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(pad, 28 + i * 52, w, 44);
-        b.backgroundColor = colors[i];
-        [b setTitle:titles[i] forState:UIControlStateNormal];
-        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        [b setTitleColor:[UIColor colorWithWhite:0.80 alpha:1] forState:UIControlStateHighlighted];
-        b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-        b.layer.cornerRadius = 9;
-        [b addTarget:self action:sels[i] forControlEvents:UIControlEventTouchUpInside];
-        [p addSubview:b];
-    }
-}
-
-- (void)refreshInfo {
-    NSUInteger saved   = getSaved().count;
-    NSUInteger exports = getRemoved().count;
-    self.infoLabel.text = [NSString stringWithFormat:@"Saved: %lu     Export ready: %lu",
-                           (unsigned long)saved, (unsigned long)exports];
-}
-
-// ── Action handlers ──────────────────────────────────────────────────────
-
-- (void)tapEdit {
-    NSMutableArray *list = getSaved();
-    if (!list.count) {
-        [self showToast:@"No accounts saved.\nUse Accounts tab to add some."
-                success:NO exit:NO];
-        return;
-    }
-    NSUInteger idx    = arc4random_uniform((uint32_t)list.count);
-    NSDictionary *acc = list[idx];
-    NSMutableArray *rem = getRemoved();
-    [list removeObjectAtIndex:idx];
-    [rem addObject:acc];
-    writeSaved(list);
-    writeRemoved(rem);
-    applyAccount(acc);
-    [self refreshInfo];
-
-    NSString *tok = acc[@"token"];
-    NSString *msg = [NSString stringWithFormat:
-        @"Applied\n\nEmail : %@\nUID   : %@\nToken : %@...\n\nIDs replaced globally\nNSUserDefaults patched\nSave files backed up\n\nRemaining: %lu\nClosing app...",
-        acc[@"email"], acc[@"uid"],
-        [tok substringToIndex:MIN((NSUInteger)10, tok.length)],
-        (unsigned long)list.count];
-    [self showToast:msg success:YES exit:YES];
-}
+// ── Export ────────────────────────────────────────────────────────────────────
 
 - (void)tapExport {
-    NSMutableArray *rem = getRemoved();
-    if (!rem.count) {
+    NSMutableArray *exports = getExports();
+    if (!exports.count) {
         [self showToast:@"Nothing to export.\nUse Edit first." success:NO exit:NO];
         return;
     }
     NSMutableString *out = [NSMutableString new];
-    for (NSDictionary *a in rem)
+    for (NSDictionary *a in exports)
         [out appendFormat:@"%@|%@\n", a[@"email"], a[@"pass"]];
     [UIPasteboard generalPasteboard].string = out;
-    writeRemoved(@[]);
+    writeExports(@[]);
     [self refreshInfo];
     [self showToast:[NSString stringWithFormat:
-        @"Copied %lu account(s) to clipboard.", (unsigned long)rem.count]
-            success:YES exit:NO];
+        @"Copied %lu account(s) to clipboard.\nExport list cleared.",
+        (unsigned long)exports.count] success:YES exit:NO];
 }
 
-// ── Toast ────────────────────────────────────────────────────────────────
+// ── Toast ─────────────────────────────────────────────────────────────────────
 
-- (void)showToast:(NSString *)msg success:(BOOL)success exit:(BOOL)ex {
+- (void)showToast:(NSString *)msg success:(BOOL)ok exit:(BOOL)ex {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIView *parent = self.superview ?: [self topVC].view;
 
-        UILabel *toast = [UILabel new];
-        toast.text            = msg;
-        toast.textColor       = UIColor.whiteColor;
-        toast.font            = [UIFont systemFontOfSize:12];
-        toast.backgroundColor = success
+        UILabel *t = [UILabel new];
+        t.text            = msg;
+        t.textColor       = UIColor.whiteColor;
+        t.font            = [UIFont systemFontOfSize:12];
+        t.backgroundColor = ok
             ? [UIColor colorWithRed:0.08 green:0.20 blue:0.10 alpha:0.97]
             : [UIColor colorWithRed:0.20 green:0.08 blue:0.08 alpha:0.97];
-        toast.layer.cornerRadius = 10;
-        toast.layer.borderColor  = (success
-            ? [UIColor colorWithRed:0.28 green:0.78 blue:0.38 alpha:0.5]
-            : [UIColor colorWithRed:0.78 green:0.28 blue:0.28 alpha:0.5]).CGColor;
-        toast.layer.borderWidth = 1;
-        toast.clipsToBounds     = YES;
-        toast.numberOfLines     = 0;
-        toast.textAlignment     = NSTextAlignmentCenter;
-        toast.translatesAutoresizingMaskIntoConstraints = NO;
+        t.layer.cornerRadius = 10;
+        t.layer.borderColor  = ok
+            ? [UIColor colorWithRed:0.28 green:0.78 blue:0.38 alpha:0.5].CGColor
+            : [UIColor colorWithRed:0.78 green:0.28 blue:0.28 alpha:0.5].CGColor;
+        t.layer.borderWidth  = 1;
+        t.clipsToBounds      = YES;
+        t.numberOfLines      = 0;
+        t.textAlignment      = NSTextAlignmentCenter;
+        t.translatesAutoresizingMaskIntoConstraints = NO;
+        [parent addSubview:t];
 
-        [parent addSubview:toast];
         [NSLayoutConstraint activateConstraints:@[
-            [toast.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
-            [toast.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
-            [toast.widthAnchor constraintLessThanOrEqualToAnchor:parent.widthAnchor constant:-40],
+            [t.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
+            [t.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
+            [t.widthAnchor constraintLessThanOrEqualToAnchor:parent.widthAnchor constant:-40],
         ]];
 
         NSTimeInterval delay = ex ? 2.8 : 1.8;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.3 animations:^{ toast.alpha = 0; }
+            [UIView animateWithDuration:0.3 animations:^{ t.alpha = 0; }
                              completion:^(BOOL _) {
-                [toast removeFromSuperview];
+                [t removeFromSuperview];
                 if (ex) exit(0);
             }];
         });
     });
 }
 
-// ── Keyboard avoidance ───────────────────────────────────────────────────
-
-- (void)keyboardWillShow:(NSNotification *)n {
-    if (!self.tv.isFirstResponder) return;
-    if (self.keyboardVisible) return;
-    self.keyboardVisible   = YES;
-    self.preKeyboardCenter = self.center;
-
-    CGRect kbFrame = [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
-    NSTimeInterval dur = [n.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-    NSInteger rawCurve = [n.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
-    UIViewAnimationOptions opts = (UIViewAnimationOptions)(rawCurve << 16)
-                                | UIViewAnimationOptionBeginFromCurrentState;
-
-    CGFloat panelBottom = self.frame.origin.y + self.frame.size.height;
-    CGFloat overlap     = panelBottom - kbFrame.origin.y + 10;
-    if (overlap <= 0) return;
-
-    CGPoint newCenter = CGPointMake(self.center.x, self.center.y - overlap);
-    [UIView animateWithDuration:dur delay:0 options:opts animations:^{
-        self.center = newCenter;
-    } completion:nil];
-}
-
-- (void)keyboardWillHide:(NSNotification *)n {
-    if (!self.keyboardVisible) return;
-    self.keyboardVisible = NO;
-    NSTimeInterval dur = [n.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-    NSInteger rawCurve = [n.userInfo[UIKeyboardAnimationCurveUserInfoKey] integerValue];
-    UIViewAnimationOptions opts = (UIViewAnimationOptions)(rawCurve << 16)
-                                | UIViewAnimationOptionBeginFromCurrentState;
-    CGPoint restore = self.preKeyboardCenter;
-    [UIView animateWithDuration:dur delay:0 options:opts animations:^{
-        self.center = restore;
-    } completion:nil];
-}
-
-// ── Drag ─────────────────────────────────────────────────────────────────
+// ── Drag ──────────────────────────────────────────────────────────────────────
 
 - (void)onPan:(UIPanGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateBegan)
-        [self.tv resignFirstResponder];
     CGPoint d  = [g translationInView:self.superview];
     CGRect  sb = self.superview.bounds;
     CGFloat nx = MAX(self.bounds.size.width  / 2,
@@ -902,7 +661,7 @@ forRowAtIndexPath:(NSIndexPath *)ip {
     [g setTranslation:CGPointZero inView:self.superview];
 }
 
-// ── Top VC ───────────────────────────────────────────────────────────────
+// ── Top VC helper ─────────────────────────────────────────────────────────────
 
 - (UIViewController *)topVC {
     UIViewController *vc = nil;
