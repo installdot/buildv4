@@ -108,7 +108,14 @@ static UIViewController *topViewController(void) {
             }
         }
     }
-    if (!vc) vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    if (!vc) {
+        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+            if (![w isKindOfClass:NSClassFromString(@"TweakOverlayWindow")]
+                && !w.isHidden && w.rootViewController) {
+                vc = w.rootViewController; break;
+            }
+        }
+    }
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
