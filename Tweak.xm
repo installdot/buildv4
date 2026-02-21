@@ -1,7 +1,7 @@
-// tweak.xm — Soul Knight Save Manager v9
+// tweak.xm — Soul Knight Save Manager v10
 // iOS 14+ | Theos/Logos | ARC
-// Fixes: uploadTask instead of HTTPBody+dataTask (no crash on large files)
-// Parallel file uploads, all-or-specific-UID selection, Open Link button
+// Changes: .data files are plain text — no base64 encode/decode anywhere.
+//          Parallel file uploads, All/specific-UID selection, Open Link button.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -51,8 +51,7 @@ static NSURLSession *makeSession(void) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Multipart body builder
-//  KEY FIX: we return the body as NSData and use uploadTask:fromData:
-//  instead of setting req.HTTPBody + dataTask — avoids crash on large payloads
+//   Returns body as NSData; caller uses uploadTask:fromData: (no crash on large files).
 // ─────────────────────────────────────────────────────────────────────────────
 typedef struct { NSMutableURLRequest *req; NSData *body; } MPRequest;
 
@@ -75,7 +74,7 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
     if (fileField && filename && fileData) {
         NSString *hdr = [NSString stringWithFormat:
             @"--%@\r\nContent-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n"
-            @"Content-Type: application/octet-stream\r\n\r\n",
+            @"Content-Type: text/plain; charset=utf-8\r\n\r\n",
             boundary, fileField, filename];
         [body appendData:[hdr dataUsingEncoding:NSUTF8StringEncoding]];
         [body appendData:fileData];
@@ -93,13 +92,12 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
     [req setValue:[NSString stringWithFormat:
         @"multipart/form-data; boundary=%@", boundary]
        forHTTPHeaderField:@"Content-Type"];
-    // Do NOT set HTTPBody here — caller uses uploadTask:fromData:
 
     return (MPRequest){ req, body };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - POST helper using uploadTask (no crash on large data)
+// MARK: - POST helper using uploadTask
 // ─────────────────────────────────────────────────────────────────────────────
 static void skPost(NSURLSession *session,
                    NSMutableURLRequest *req,
@@ -139,13 +137,13 @@ static void skPost(NSURLSession *session,
 // MARK: - SKProgressOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKProgressOverlay : UIView
-@property (nonatomic, strong) UILabel       *titleLabel;
+@property (nonatomic, strong) UILabel        *titleLabel;
 @property (nonatomic, strong) UIProgressView *bar;
-@property (nonatomic, strong) UILabel       *percentLabel;
-@property (nonatomic, strong) UITextView    *logView;
-@property (nonatomic, strong) UIButton      *closeBtn;
-@property (nonatomic, strong) UIButton      *openLinkBtn;
-@property (nonatomic, copy)   NSString      *uploadedLink;
+@property (nonatomic, strong) UILabel        *percentLabel;
+@property (nonatomic, strong) UITextView     *logView;
+@property (nonatomic, strong) UIButton       *closeBtn;
+@property (nonatomic, strong) UIButton       *openLinkBtn;
+@property (nonatomic, copy)   NSString       *uploadedLink;
 + (instancetype)showInView:(UIView *)parent title:(NSString *)title;
 - (void)setProgress:(float)p label:(NSString *)label;
 - (void)appendLog:(NSString *)msg;
@@ -179,7 +177,6 @@ static void skPost(NSURLSession *session,
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
-    // Title
     self.titleLabel = [UILabel new];
     self.titleLabel.text          = title;
     self.titleLabel.textColor     = [UIColor whiteColor];
@@ -189,7 +186,6 @@ static void skPost(NSURLSession *session,
     self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.titleLabel];
 
-    // Progress bar
     self.bar = [[UIProgressView alloc]
         initWithProgressViewStyle:UIProgressViewStyleDefault];
     self.bar.trackTintColor    = [UIColor colorWithWhite:0.22 alpha:1];
@@ -200,7 +196,6 @@ static void skPost(NSURLSession *session,
     self.bar.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.bar];
 
-    // Percent
     self.percentLabel = [UILabel new];
     self.percentLabel.text          = @"0%";
     self.percentLabel.textColor     = [UIColor colorWithWhite:0.55 alpha:1];
@@ -209,20 +204,18 @@ static void skPost(NSURLSession *session,
     self.percentLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.percentLabel];
 
-    // Log view
     self.logView = [UITextView new];
-    self.logView.backgroundColor   = [UIColor colorWithWhite:0.04 alpha:1];
-    self.logView.textColor         = [UIColor colorWithRed:0.42 green:0.98 blue:0.58 alpha:1];
-    self.logView.font              = [UIFont fontWithName:@"Courier" size:10]
-                                    ?: [UIFont systemFontOfSize:10];
-    self.logView.editable          = NO;
-    self.logView.selectable        = NO;
+    self.logView.backgroundColor    = [UIColor colorWithWhite:0.04 alpha:1];
+    self.logView.textColor          = [UIColor colorWithRed:0.42 green:0.98 blue:0.58 alpha:1];
+    self.logView.font               = [UIFont fontWithName:@"Courier" size:10]
+                                     ?: [UIFont systemFontOfSize:10];
+    self.logView.editable           = NO;
+    self.logView.selectable         = NO;
     self.logView.layer.cornerRadius = 8;
-    self.logView.text              = @"";
+    self.logView.text               = @"";
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.logView];
 
-    // Open Link button (hidden until upload done)
     self.openLinkBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [self.openLinkBtn setTitle:@"🌐  Open Link in Browser" forState:UIControlStateNormal];
     [self.openLinkBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -230,20 +223,19 @@ static void skPost(NSURLSession *session,
     self.openLinkBtn.backgroundColor  =
         [UIColor colorWithRed:0.16 green:0.52 blue:0.92 alpha:1];
     self.openLinkBtn.layer.cornerRadius = 9;
-    self.openLinkBtn.hidden            = YES;
+    self.openLinkBtn.hidden             = YES;
     self.openLinkBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [self.openLinkBtn addTarget:self action:@selector(openLink)
                forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:self.openLinkBtn];
 
-    // Close button (hidden until done)
     self.closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [self.closeBtn setTitle:@"Close" forState:UIControlStateNormal];
     [self.closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.closeBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
     self.closeBtn.backgroundColor  = [UIColor colorWithWhite:0.20 alpha:1];
     self.closeBtn.layer.cornerRadius = 9;
-    self.closeBtn.hidden           = YES;
+    self.closeBtn.hidden             = YES;
     self.closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [self.closeBtn addTarget:self action:@selector(dismiss)
              forControlEvents:UIControlEventTouchUpInside];
@@ -307,17 +299,13 @@ static void skPost(NSURLSession *session,
 
 - (void)finish:(BOOL)ok message:(NSString *)msg link:(NSString *)link {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self setProgress:1.0 label: ok ? @"✓ Done" : @"✗ Failed"];
+        [self setProgress:1.0 label:ok ? @"✓ Done" : @"✗ Failed"];
         self.percentLabel.textColor = ok
             ? [UIColor colorWithRed:0.25 green:0.88 blue:0.45 alpha:1]
             : [UIColor colorWithRed:0.90 green:0.28 blue:0.28 alpha:1];
         if (msg.length) [self appendLog:msg];
-
         self.uploadedLink = link;
-
-        if (link.length) {
-            self.openLinkBtn.hidden = NO;
-        }
+        if (link.length) self.openLinkBtn.hidden = NO;
         self.closeBtn.hidden = NO;
         self.closeBtn.backgroundColor = ok
             ? [UIColor colorWithWhite:0.22 alpha:1]
@@ -339,9 +327,9 @@ static void skPost(NSURLSession *session,
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload  (init first, then parallel file uploads)
+// MARK: - Upload  (init session, then parallel file uploads)
 // ─────────────────────────────────────────────────────────────────────────────
-static void performUpload(NSArray<NSString *> *fileNames,   // just the basenames to upload
+static void performUpload(NSArray<NSString *> *fileNames,
                           SKProgressOverlay *ov,
                           void (^done)(NSString *link, NSString *err)) {
 
@@ -350,7 +338,7 @@ static void performUpload(NSArray<NSString *> *fileNames,   // just the basename
     NSString *docs    = NSSearchPathForDirectoriesInDomains(
                             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 
-    // ── Step 1: serialize NSUserDefaults ─────────────────────────────────────
+    // ── Step 1: Serialize NSUserDefaults ─────────────────────────────────────
     [ov appendLog:@"Serialising NSUserDefaults…"];
     [[NSUserDefaults standardUserDefaults] synchronize];
     NSDictionary *snap = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
@@ -391,7 +379,7 @@ static void performUpload(NSArray<NSString *> *fileNames,   // just the basename
             return;
         }
 
-        // ── Step 3: Upload all .data files in parallel ─────────────────────
+        // ── Step 3: Upload all .data files in parallel (as plain text) ────────
         [ov appendLog:@"Uploading .data files (parallel)…"];
 
         NSUInteger total         = fileNames.count;
@@ -401,9 +389,11 @@ static void performUpload(NSArray<NSString *> *fileNames,   // just the basename
 
         for (NSString *fname in fileNames) {
             NSString *path  = [docs stringByAppendingPathComponent:fname];
-            NSData   *fdata = [NSData dataWithContentsOfFile:path];
-
-            if (!fdata) {
+            // Read as UTF-8 text — .data files are plain text (base64-encoded ciphertext)
+            NSString *textContent = [NSString stringWithContentsOfFile:path
+                                                              encoding:NSUTF8StringEncoding
+                                                                 error:nil];
+            if (!textContent) {
                 [ov appendLog:[NSString stringWithFormat:@"⚠ Skip %@ (unreadable)", fname]];
                 @synchronized (fileNames) { doneN++; failN++; }
                 float p = 0.1f + 0.88f * ((float)doneN / (float)total);
@@ -412,8 +402,9 @@ static void performUpload(NSArray<NSString *> *fileNames,   // just the basename
                 continue;
             }
 
-            [ov appendLog:[NSString stringWithFormat:@"↑ %@  (%.0f KB)",
-                           fname, fdata.length / 1024.0]];
+            NSData *fdata = [textContent dataUsingEncoding:NSUTF8StringEncoding];
+            [ov appendLog:[NSString stringWithFormat:@"↑ %@  (%lu chars)",
+                           fname, (unsigned long)textContent.length]];
 
             dispatch_group_enter(group);
 
@@ -421,7 +412,6 @@ static void performUpload(NSArray<NSString *> *fileNames,   // just the basename
                 @{@"action":@"upload_file", @"uuid":uuid},
                 @"datafile", fname, fdata);
 
-            // Use a fresh request per file but share the session
             skPost(ses, fmp.req, fmp.body, ^(NSDictionary *fj, NSError *ferr) {
                 @synchronized (fileNames) { doneN++; }
                 if (ferr) {
@@ -492,7 +482,7 @@ static void performLoad(SKProgressOverlay *ov,
             }
         }
 
-        // Write .data files
+        // Write .data files — server sends plain text strings (no base64)
         NSDictionary *dataMap = j[@"data"];
         NSString *docsPath = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -501,19 +491,26 @@ static void performLoad(SKProgressOverlay *ov,
         __block NSUInteger fi = 0;
 
         for (NSString *fname in dataMap) {
-            NSData *raw = [[NSData alloc]
-                initWithBase64EncodedString:dataMap[fname]
-                options:NSDataBase64DecodingIgnoreUnknownCharacters];
-            if (raw) {
+            // Value is a plain text string — write it as UTF-8 directly
+            NSString *textContent = dataMap[fname];
+            if ([textContent isKindOfClass:[NSString class]] && textContent.length) {
                 NSString *dst = [docsPath stringByAppendingPathComponent:fname];
                 [fm removeItemAtPath:dst error:nil];
-                [raw writeToFile:dst atomically:YES];
-                [ov appendLog:[NSString stringWithFormat:@"✓ %@  (%.0f KB)",
-                               fname, raw.length / 1024.0]];
-                applied++;
+                NSError *we = nil;
+                [textContent writeToFile:dst atomically:YES
+                                encoding:NSUTF8StringEncoding error:&we];
+                if (!we) {
+                    [ov appendLog:[NSString stringWithFormat:@"✓ %@  (%lu chars)",
+                                   fname, (unsigned long)textContent.length]];
+                    applied++;
+                } else {
+                    [ov appendLog:[NSString stringWithFormat:@"⚠ %@ write failed: %@",
+                                   fname, we.localizedDescription]];
+                }
             } else {
-                [ov appendLog:[NSString stringWithFormat:@"⚠ %@ bad base64", fname]];
+                [ov appendLog:[NSString stringWithFormat:@"⚠ %@ empty or invalid", fname]];
             }
+
             fi++;
             [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)total))
                       label:[NSString stringWithFormat:@"%lu/%lu",
@@ -655,10 +652,9 @@ static const CGFloat kCH = 122;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload flow with All / Specific UID selection
+// MARK: - Upload flow
 // ─────────────────────────────────────────────────────────────────────────────
 - (void)tapUpload {
-    // Collect all .data files first
     NSString *docs = NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSArray *all = [[NSFileManager defaultManager]
@@ -670,7 +666,6 @@ static const CGFloat kCH = 122;
 
     NSString *existing = loadSessionUUID();
 
-    // ── Ask: All or Specific UID ──────────────────────────────────────────────
     UIAlertController *choice = [UIAlertController
         alertControllerWithTitle:@"Select files to upload"
                          message:[NSString stringWithFormat:
@@ -679,22 +674,16 @@ static const CGFloat kCH = 122;
             existing ? @"⚠ Existing session will be overwritten." : @""]
                   preferredStyle:UIAlertControllerStyleAlert];
 
-    // All
     [choice addAction:[UIAlertAction
         actionWithTitle:[NSString stringWithFormat:@"Upload All (%lu files)",
                          (unsigned long)dataFiles.count]
         style:UIAlertActionStyleDefault
-        handler:^(UIAlertAction *a) {
-            [self confirmAndUpload:dataFiles];
-        }]];
+        handler:^(UIAlertAction *a) { [self confirmAndUpload:dataFiles]; }]];
 
-    // Specific UID
     [choice addAction:[UIAlertAction
         actionWithTitle:@"Specific UID…"
         style:UIAlertActionStyleDefault
-        handler:^(UIAlertAction *a) {
-            [self askUIDThenUpload:dataFiles];
-        }]];
+        handler:^(UIAlertAction *a) { [self askUIDThenUpload:dataFiles]; }]];
 
     [choice addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
@@ -709,9 +698,9 @@ static const CGFloat kCH = 122;
                   preferredStyle:UIAlertControllerStyleAlert];
 
     [input addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder       = @"e.g. 211062956";
-        tf.keyboardType      = UIKeyboardTypeNumberPad;
-        tf.clearButtonMode   = UITextFieldViewModeWhileEditing;
+        tf.placeholder     = @"e.g. 211062956";
+        tf.keyboardType    = UIKeyboardTypeNumberPad;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
 
     [input addAction:[UIAlertAction
@@ -721,19 +710,15 @@ static const CGFloat kCH = 122;
             NSString *uid = [input.textFields.firstObject.text
                 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             if (!uid.length) {
-                [self showAlert:@"No UID entered" message:@"Please enter a UID."];
-                return;
+                [self showAlert:@"No UID entered" message:@"Please enter a UID."]; return;
             }
-            // Filter files containing the UID in their name
             NSMutableArray<NSString*> *filtered = [NSMutableArray new];
             for (NSString *f in allFiles)
                 if ([f containsString:uid]) [filtered addObject:f];
-
             if (!filtered.count) {
                 [self showAlert:@"No files found"
                         message:[NSString stringWithFormat:
-                    @"No .data file contains UID \"%@\" in its name.", uid]];
-                return;
+                    @"No .data file contains UID \"%@\" in its name.", uid]]; return;
             }
             [self confirmAndUpload:filtered];
         }]];
@@ -767,7 +752,6 @@ static const CGFloat kCH = 122;
             UIView *parent = [self topVC].view ?: self.superview;
             SKProgressOverlay *ov = [SKProgressOverlay
                 showInView:parent title:@"Uploading save data…"];
-
             performUpload(files, ov, ^(NSString *link, NSString *err) {
                 [self refreshStatus];
                 if (err) {
