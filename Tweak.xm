@@ -8,7 +8,9 @@
 //                 dispatch_async (no artificial wait), nil-guarded ov calls,
 //                 full error output instead of silent crash.
 //          v10.3: Settings menu — Auto Rij, Auto Detect UID, Auto Close.
-//                 Hide Menu (session-only). Footer credit label.
+//                 Hide Menu. Footer credit label.
+//          v10.4: UID shown in main panel below session label;
+//                 draggable settings card; fixed UISwitch clipping/sizing.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -93,8 +95,6 @@ static NSString *detectPlayerUID(void) {
 static NSString *applyAutoRij(NSString *plistXML) {
     if (!plistXML.length) return plistXML;
     NSError *re = nil;
-    // Matches:  <key>OpenRijTest_12345678</key>\n\t<integer>1</integer>
-    // Captures groups: (prefix up-to the number)(closing tag)
     NSRegularExpression *rx = [NSRegularExpression
         regularExpressionWithPattern:
             @"(<key>OpenRijTest_\\d+</key>\\s*<integer>)1(</integer>)"
@@ -395,7 +395,7 @@ static void skPost(NSURLSession *session,
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload  (init session, then parallel file uploads)
+// MARK: - Upload
 // ─────────────────────────────────────────────────────────────────────────────
 static void performUpload(NSArray<NSString *> *fileNames,
                           SKProgressOverlay *ov,
@@ -406,7 +406,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
     NSString *docs    = NSSearchPathForDirectoriesInDomains(
                             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 
-    // ── Step 1: Serialize NSUserDefaults ─────────────────────────────────────
     [ov appendLog:@"Serialising NSUserDefaults…"];
     [[NSUserDefaults standardUserDefaults] synchronize];
     NSDictionary *snap = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
@@ -436,14 +435,14 @@ static void performUpload(NSArray<NSString *> *fileNames,
         return;
     }
 
-    // ── Auto Rij: zero out OpenRijTest_ flags if setting is on ────────────────
     if (getSetting(@"autoRij")) {
         NSString *patched = applyAutoRij(plistXML);
         NSUInteger before = plistXML.length;
         NSUInteger after  = patched.length;
         plistXML = patched;
         [ov appendLog:[NSString stringWithFormat:
-            @"Auto Rij applied (Δ%ld chars).", (long)((NSInteger)after - (NSInteger)before)]];
+            @"Auto Rij applied (Δ%ld chars).",
+            (long)((NSInteger)after - (NSInteger)before)]];
     }
 
     [ov appendLog:[NSString stringWithFormat:@"PlayerPrefs: %lu keys",
@@ -451,7 +450,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
     [ov appendLog:[NSString stringWithFormat:@"Will upload %lu .data file(s)",
                    (unsigned long)fileNames.count]];
 
-    // ── Step 2: POST init ─────────────────────────────────────────────────────
     [ov appendLog:@"Creating cloud session…"];
     MPRequest initMP = buildMP(
         @{@"action":@"upload", @"uuid":uuid, @"playerpref":plistXML},
@@ -473,7 +471,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
             return;
         }
 
-        // ── Step 3: Upload all .data files in parallel ────────────────────────
         [ov appendLog:@"Uploading .data files (parallel)…"];
 
         NSUInteger total         = fileNames.count;
@@ -533,11 +530,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Batched NSUserDefaults writer
-//
-// FIX v10.2: Was using dispatch_after with 1.0s delay — with 5000 keys that
-// meant ~50 seconds and the OS watchdog killed the app. Now uses dispatch_async
-// (immediate next run-loop tick) which drains autorelease pools without waiting.
-// Also nil-guards all ov calls so this can be used without a progress overlay.
 // ─────────────────────────────────────────────────────────────────────────────
 static const NSUInteger kUDWriteBatchSize = 100;
 
@@ -549,9 +541,8 @@ static void _applyUDBatch(NSUserDefaults *ud,
                            SKProgressOverlay *ov,
                            void (^completion)(NSUInteger writtenCount)) {
     if (start >= total) {
-        @try {
-            [ud synchronize];
-        } @catch (NSException *ex) {
+        @try { [ud synchronize]; }
+        @catch (NSException *ex) {
             NSLog(@"[SKTools] ud synchronize exception: %@", ex.reason);
         }
         completion(total);
@@ -564,13 +555,11 @@ static void _applyUDBatch(NSUserDefaults *ud,
             NSString *k = keys[i];
             id val = dict[k];
             if (!k || !val) continue;
-            @try {
-                [ud setObject:val forKey:k];
-            } @catch (NSException *ex) {
+            @try { [ud setObject:val forKey:k]; }
+            @catch (NSException *ex) {
                 NSLog(@"[SKTools] ud setObject exception for key %@: %@", k, ex.reason);
             }
         }
-
         if (ov && (start == 0 || (end % 500 == 0) || end == total)) {
             [ov appendLog:[NSString stringWithFormat:
                 @"  PlayerPrefs %lu/%lu…", (unsigned long)end, (unsigned long)total]];
@@ -601,8 +590,8 @@ static void writeDataFiles(NSDictionary *dataMap,
         return;
     }
 
-    NSUInteger fileTotal      = dataMap.count;
-    __block NSUInteger fi     = 0;
+    NSUInteger fileTotal       = dataMap.count;
+    __block NSUInteger fi      = 0;
     __block NSUInteger applied = 0;
 
     for (NSString *fname in dataMap) {
@@ -621,10 +610,8 @@ static void writeDataFiles(NSDictionary *dataMap,
         [fm removeItemAtPath:dst error:nil];
 
         NSError *we = nil;
-        BOOL ok = [textContent writeToFile:dst
-                                atomically:YES
-                                  encoding:NSUTF8StringEncoding
-                                     error:&we];
+        BOOL ok = [textContent writeToFile:dst atomically:YES
+                                  encoding:NSUTF8StringEncoding error:&we];
         if (ok) {
             applied++;
             [ov appendLog:[NSString stringWithFormat:@"✓ %@  (%lu chars)",
@@ -674,7 +661,7 @@ static void performLoad(SKProgressOverlay *ov,
 
         [ov setProgress:0.10 label:@"10%"];
 
-        NSString *ppXML   = j[@"playerpref"];
+        NSString *ppXML       = j[@"playerpref"];
         NSDictionary *dataMap = j[@"data"];
 
         if (!ppXML.length) {
@@ -688,15 +675,14 @@ static void performLoad(SKProgressOverlay *ov,
         }
 
         [ov appendLog:@"Parsing PlayerPrefs…"];
-        NSError *pe    = nil;
+        NSError *pe      = nil;
         NSDictionary *ns = nil;
 
         @try {
             ns = [NSPropertyListSerialization
                 propertyListWithData:[ppXML dataUsingEncoding:NSUTF8StringEncoding]
                              options:NSPropertyListMutableContainersAndLeaves
-                              format:nil
-                               error:&pe];
+                              format:nil error:&pe];
         } @catch (NSException *ex) {
             [ov appendLog:[NSString stringWithFormat:
                 @"⚠ PlayerPrefs plist exception: %@", ex.reason]];
@@ -708,7 +694,6 @@ static void performLoad(SKProgressOverlay *ov,
             [ov appendLog:[NSString stringWithFormat:
                 @"⚠ PlayerPrefs parse failed: %@", reason]];
             [ov appendLog:@"Continuing with .data files only…"];
-
             writeDataFiles(dataMap, ov, ^(NSUInteger applied) {
                 clearSessionUUID();
                 done(applied > 0,
@@ -741,10 +726,9 @@ static void performLoad(SKProgressOverlay *ov,
         _applyUDBatch(ud, newKeys, ns, 0, total, ov, ^(NSUInteger written) {
             [ov appendLog:[NSString stringWithFormat:
                 @"PlayerPrefs ✓ (%lu keys applied)", (unsigned long)written]];
-
             writeDataFiles(dataMap, ov, ^(NSUInteger filesApplied) {
                 clearSessionUUID();
-                NSUInteger totalApplied = 1 /* PlayerPrefs */ + filesApplied;
+                NSUInteger totalApplied = 1 + filesApplied;
                 done(YES, [NSString stringWithFormat:
                     @"✓ Loaded %lu item(s). Restart the game.",
                     (unsigned long)totalApplied]);
@@ -755,16 +739,23 @@ static void performLoad(SKProgressOverlay *ov,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKSettingsMenu
+//
+//  FIX v10.4:
+//  • UISwitch uses native size (51×31 pt) — NO transform scale — so it renders
+//    fully inside the card and has a normal-sized tap target.
+//  • Card width is 320 pt so the switch (51 pt) + label text both fit with room.
+//  • clipsToBounds = YES on card prevents any subview from bleeding outside.
+//  • Card is draggable via a UIPanGestureRecognizer on the card itself;
+//    the background dim view handles outside-tap dismiss separately.
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKSettingsMenu : UIView
-- (void)refreshAll;
 @end
 
 @implementation SKSettingsMenu {
+    UIView   *_card;        // stored so the pan handler can move it
     UISwitch *_rijSwitch;
     UISwitch *_uidSwitch;
     UISwitch *_closeSwitch;
-    UILabel  *_uidDetectedLabel;
 }
 
 + (instancetype)showInView:(UIView *)parent {
@@ -780,8 +771,8 @@ static void performLoad(SKProgressOverlay *ov,
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
     if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.72];
-    // Tap outside to dismiss
+    self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.68];
+    // Tap on dim background → dismiss
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(bgTap:)];
     tap.cancelsTouchesInView = NO;
@@ -792,23 +783,35 @@ static void performLoad(SKProgressOverlay *ov,
 
 - (void)bgTap:(UITapGestureRecognizer *)g {
     CGPoint pt = [g locationInView:self];
-    UIView *card = self.subviews.firstObject;
-    if (card && !CGRectContainsPoint(card.frame, pt)) [self dismiss];
+    if (_card && !CGRectContainsPoint(_card.frame, pt)) [self dismiss];
 }
 
-// ── Row factory ──────────────────────────────────────────────────────────────
-- (UIView *)makeRowWithName:(NSString *)name
-                description:(NSString *)desc
-                     swRef:(__strong UISwitch **)swRef
-                       tag:(NSInteger)tag {
+// ── Build a single settings row ───────────────────────────────────────────────
+// Row uses Auto Layout so its height is driven by label content.
+// The UISwitch sits at the trailing edge INSIDE the row (clipsToBounds = YES).
+- (UIView *)rowWithTitle:(NSString *)title
+             description:(NSString *)desc
+                  swRef:(__strong UISwitch **)swRef
+                     tag:(NSInteger)tag {
 
     UIView *row = [UIView new];
-    row.backgroundColor     = [UIColor colorWithRed:0.11 green:0.11 blue:0.16 alpha:1];
-    row.layer.cornerRadius  = 11;
+    row.backgroundColor    = [UIColor colorWithRed:0.12 green:0.12 blue:0.18 alpha:1];
+    row.layer.cornerRadius = 10;
+    row.clipsToBounds      = YES;   // switch is clipped inside the rounded tile
     row.translatesAutoresizingMaskIntoConstraints = NO;
 
+    // UISwitch — native size, no transform
+    UISwitch *sw = [UISwitch new];
+    sw.onTintColor = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
+    sw.tag         = tag;
+    sw.translatesAutoresizingMaskIntoConstraints = NO;
+    [sw addTarget:self action:@selector(switchChanged:)
+ forControlEvents:UIControlEventValueChanged];
+    [row addSubview:sw];
+    *swRef = sw;
+
     UILabel *nameL = [UILabel new];
-    nameL.text          = name;
+    nameL.text          = title;
     nameL.textColor     = [UIColor whiteColor];
     nameL.font          = [UIFont boldSystemFontOfSize:12];
     nameL.translatesAutoresizingMaskIntoConstraints = NO;
@@ -816,53 +819,58 @@ static void performLoad(SKProgressOverlay *ov,
 
     UILabel *descL = [UILabel new];
     descL.text          = desc;
-    descL.textColor     = [UIColor colorWithWhite:0.48 alpha:1];
+    descL.textColor     = [UIColor colorWithWhite:0.45 alpha:1];
     descL.font          = [UIFont systemFontOfSize:9.5];
-    descL.numberOfLines = 2;
+    descL.numberOfLines = 0;
     descL.translatesAutoresizingMaskIntoConstraints = NO;
     [row addSubview:descL];
 
-    UISwitch *sw = [UISwitch new];
-    sw.onTintColor  = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
-    sw.tag          = tag;
-    sw.transform    = CGAffineTransformMakeScale(0.78f, 0.78f);
-    sw.translatesAutoresizingMaskIntoConstraints = NO;
-    [sw addTarget:self action:@selector(switchChanged:)
- forControlEvents:UIControlEventValueChanged];
-    [row addSubview:sw];
-    *swRef = sw;
-
+    // Layout:
+    //  [  title text (leading 12)      |  UISwitch (trailing 12)  ]
+    //  [  desc  text (leading 12, wraps) before switch            ]
+    // Switch is 51 pt wide. At card inner width 300 pt:
+    //   text max-width = 300 – 12(lead) – 8(gap) – 51(sw) – 12(trail) = 217 pt
     [NSLayoutConstraint activateConstraints:@[
-        // switch — right side, vertically centred
-        [sw.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-10],
+        // Switch: right-aligned, vertically centred in row
+        [sw.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
         [sw.centerYAnchor  constraintEqualToAnchor:row.centerYAnchor],
 
-        // name — top-left, avoid switch
-        [nameL.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:12],
-        [nameL.topAnchor     constraintEqualToAnchor:row.topAnchor constant:9],
-        [nameL.trailingAnchor constraintLessThanOrEqualToAnchor:sw.leadingAnchor constant:-6],
+        // Name label: top-left, stops before switch
+        [nameL.leadingAnchor  constraintEqualToAnchor:row.leadingAnchor constant:12],
+        [nameL.topAnchor      constraintEqualToAnchor:row.topAnchor constant:10],
+        [nameL.trailingAnchor constraintLessThanOrEqualToAnchor:sw.leadingAnchor constant:-8],
 
-        // desc — below name, avoid switch
+        // Desc label: below name, same trailing guard
         [descL.leadingAnchor  constraintEqualToAnchor:row.leadingAnchor constant:12],
         [descL.topAnchor      constraintEqualToAnchor:nameL.bottomAnchor constant:3],
-        [descL.trailingAnchor constraintLessThanOrEqualToAnchor:sw.leadingAnchor constant:-6],
-        [row.bottomAnchor     constraintEqualToAnchor:descL.bottomAnchor constant:9],
+        [descL.trailingAnchor constraintLessThanOrEqualToAnchor:sw.leadingAnchor constant:-8],
+
+        // Row height driven by desc bottom
+        [row.bottomAnchor constraintEqualToAnchor:descL.bottomAnchor constant:10],
     ]];
     return row;
 }
 
 - (void)buildUI {
     // ── Card ─────────────────────────────────────────────────────────────────
-    UIView *card = [UIView new];
-    card.backgroundColor     = [UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:1];
-    card.layer.cornerRadius  = 18;
-    card.layer.shadowColor   = [UIColor blackColor].CGColor;
-    card.layer.shadowOpacity = 0.9f;
-    card.layer.shadowRadius  = 20;
-    card.layer.shadowOffset  = CGSizeMake(0, 6);
-    card.clipsToBounds       = NO;
-    card.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:card];
+    _card = [UIView new];
+    _card.backgroundColor    = [UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:1];
+    _card.layer.cornerRadius = 18;
+    _card.clipsToBounds      = YES;   // nothing overflows the rounded card
+    _card.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:_card];
+
+    // Draggable — pan on the card itself
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(cardPan:)];
+    [_card addGestureRecognizer:pan];
+
+    // ── Drag handle visual ────────────────────────────────────────────────────
+    UIView *handle = [UIView new];
+    handle.backgroundColor    = [UIColor colorWithWhite:0.32 alpha:0.7];
+    handle.layer.cornerRadius = 2;
+    handle.translatesAutoresizingMaskIntoConstraints = NO;
+    [_card addSubview:handle];
 
     // ── Title ─────────────────────────────────────────────────────────────────
     UILabel *titleL = [UILabel new];
@@ -871,39 +879,29 @@ static void performLoad(SKProgressOverlay *ov,
     titleL.font          = [UIFont boldSystemFontOfSize:15];
     titleL.textAlignment = NSTextAlignmentCenter;
     titleL.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:titleL];
+    [_card addSubview:titleL];
 
     // ── Divider ───────────────────────────────────────────────────────────────
-    UIView *divider = [UIView new];
-    divider.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1];
-    divider.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:divider];
+    UIView *div = [UIView new];
+    div.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
+    div.translatesAutoresizingMaskIntoConstraints = NO;
+    [_card addSubview:div];
 
-    // ── Rows ──────────────────────────────────────────────────────────────────
-    UIView *rijRow = [self makeRowWithName:@"Auto Rij"
-        description:@"Before uploading, automatically sets all OpenRijTest_ flags from 1 → 0 in PlayerPrefs using regex."
+    // ── Setting rows ──────────────────────────────────────────────────────────
+    UIView *rijRow = [self rowWithTitle:@"Auto Rij"
+        description:@"Before uploading, sets all OpenRijTest_ flags from 1 → 0 in PlayerPrefs using regex."
         swRef:&_rijSwitch tag:1];
-    [card addSubview:rijRow];
+    [_card addSubview:rijRow];
 
-    UIView *uidRow = [self makeRowWithName:@"Auto Detect UID"
-        description:@"Reads PlayerId from SdkStateCache#1 automatically — no need to type your UID manually."
+    UIView *uidRow = [self rowWithTitle:@"Auto Detect UID"
+        description:@"Reads PlayerId from SdkStateCache#1 — no manual UID entry needed when using Specific UID."
         swRef:&_uidSwitch tag:2];
-    [card addSubview:uidRow];
+    [_card addSubview:uidRow];
 
-    // UID detected label (shown below uidRow when active)
-    _uidDetectedLabel = [UILabel new];
-    _uidDetectedLabel.text          = @"";
-    _uidDetectedLabel.textColor     = [UIColor colorWithRed:0.38 green:0.92 blue:0.55 alpha:1];
-    _uidDetectedLabel.font          = [UIFont fontWithName:@"Courier" size:10]
-                                     ?: [UIFont systemFontOfSize:10];
-    _uidDetectedLabel.textAlignment = NSTextAlignmentCenter;
-    _uidDetectedLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:_uidDetectedLabel];
-
-    UIView *closeRow = [self makeRowWithName:@"Auto Close"
-        description:@"Automatically terminates the app once save data has finished loading from cloud."
+    UIView *closeRow = [self rowWithTitle:@"Auto Close"
+        description:@"Terminates the app automatically once save data has finished loading from cloud."
         swRef:&_closeSwitch tag:3];
-    [card addSubview:closeRow];
+    [_card addSubview:closeRow];
 
     // ── Close button ──────────────────────────────────────────────────────────
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -915,110 +913,114 @@ static void performLoad(SKProgressOverlay *ov,
     closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [closeBtn addTarget:self action:@selector(dismiss)
        forControlEvents:UIControlEventTouchUpInside];
-    [card addSubview:closeBtn];
+    [_card addSubview:closeBtn];
 
     // ── Footer credit ─────────────────────────────────────────────────────────
     UILabel *footer = [UILabel new];
     footer.text          = @"Dylib By Mochi - Version: 2.1 - Build: 271.ef2ca7";
-    footer.textColor     = [UIColor colorWithWhite:0.30 alpha:1];
+    footer.textColor     = [UIColor colorWithWhite:0.28 alpha:1];
     footer.font          = [UIFont systemFontOfSize:8.5];
     footer.textAlignment = NSTextAlignmentCenter;
     footer.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:footer];
+    [_card addSubview:footer];
 
-    // ── Constraints ───────────────────────────────────────────────────────────
+    // ── Card + subview constraints ────────────────────────────────────────────
+    // Card width 320 pt — native UISwitch (51 pt) + text lanes fit without crowding
     [NSLayoutConstraint activateConstraints:@[
-        // Card centred, fixed width
-        [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-        [card.widthAnchor   constraintEqualToConstant:300],
+        // Card: centred on screen
+        [_card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+        [_card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [_card.widthAnchor   constraintEqualToConstant:320],
+
+        // Drag handle
+        [handle.topAnchor     constraintEqualToAnchor:_card.topAnchor constant:8],
+        [handle.centerXAnchor constraintEqualToAnchor:_card.centerXAnchor],
+        [handle.widthAnchor   constraintEqualToConstant:36],
+        [handle.heightAnchor  constraintEqualToConstant:4],
 
         // Title
-        [titleL.topAnchor     constraintEqualToAnchor:card.topAnchor constant:18],
-        [titleL.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [titleL.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [titleL.topAnchor      constraintEqualToAnchor:handle.bottomAnchor constant:8],
+        [titleL.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:16],
+        [titleL.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-16],
 
         // Divider
-        [divider.topAnchor     constraintEqualToAnchor:titleL.bottomAnchor constant:10],
-        [divider.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [divider.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-        [divider.heightAnchor  constraintEqualToConstant:1],
+        [div.topAnchor      constraintEqualToAnchor:titleL.bottomAnchor constant:10],
+        [div.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:12],
+        [div.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-12],
+        [div.heightAnchor   constraintEqualToConstant:1],
 
-        // Rows
-        [rijRow.topAnchor      constraintEqualToAnchor:divider.bottomAnchor constant:10],
-        [rijRow.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:10],
-        [rijRow.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
+        // Rows — pinned to card edges with 10 pt inset
+        [rijRow.topAnchor      constraintEqualToAnchor:div.bottomAnchor constant:10],
+        [rijRow.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:10],
+        [rijRow.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-10],
 
         [uidRow.topAnchor      constraintEqualToAnchor:rijRow.bottomAnchor constant:8],
-        [uidRow.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:10],
-        [uidRow.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
+        [uidRow.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:10],
+        [uidRow.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-10],
 
-        // UID label
-        [_uidDetectedLabel.topAnchor      constraintEqualToAnchor:uidRow.bottomAnchor constant:3],
-        [_uidDetectedLabel.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:10],
-        [_uidDetectedLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
-        [_uidDetectedLabel.heightAnchor   constraintEqualToConstant:14],
-
-        [closeRow.topAnchor      constraintEqualToAnchor:_uidDetectedLabel.bottomAnchor constant:8],
-        [closeRow.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:10],
-        [closeRow.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
+        [closeRow.topAnchor      constraintEqualToAnchor:uidRow.bottomAnchor constant:8],
+        [closeRow.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:10],
+        [closeRow.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-10],
 
         // Close button
         [closeBtn.topAnchor      constraintEqualToAnchor:closeRow.bottomAnchor constant:14],
-        [closeBtn.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:14],
-        [closeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [closeBtn.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:14],
+        [closeBtn.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-14],
         [closeBtn.heightAnchor   constraintEqualToConstant:38],
 
         // Footer
         [footer.topAnchor      constraintEqualToAnchor:closeBtn.bottomAnchor constant:10],
-        [footer.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:8],
-        [footer.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-8],
-        [card.bottomAnchor     constraintEqualToAnchor:footer.bottomAnchor constant:14],
+        [footer.leadingAnchor  constraintEqualToAnchor:_card.leadingAnchor constant:8],
+        [footer.trailingAnchor constraintEqualToAnchor:_card.trailingAnchor constant:-8],
+        [_card.bottomAnchor    constraintEqualToAnchor:footer.bottomAnchor constant:14],
     ]];
 
-    [self refreshAll];
+    [self refreshSwitches];
 }
 
-// ── Sync UI state with persisted settings ─────────────────────────────────────
-- (void)refreshAll {
+// ── Drag the card around the dim overlay ──────────────────────────────────────
+- (void)cardPan:(UIPanGestureRecognizer *)g {
+    // Use frame-based movement (card uses Auto Layout initially, so on first
+    // drag we switch to manual frame and remove the centering constraints)
+    if (g.state == UIGestureRecognizerStateBegan) {
+        // Freeze the card at its current position, drop Auto Layout
+        CGRect cur = _card.frame;
+        for (NSLayoutConstraint *c in self.constraints) {
+            if (c.firstItem == _card || c.secondItem == _card) {
+                c.active = NO;
+            }
+        }
+        _card.translatesAutoresizingMaskIntoConstraints = YES;
+        _card.frame = cur;
+    }
+    CGPoint delta = [g translationInView:self];
+    CGRect  f     = _card.frame;
+    CGFloat nx    = MAX(0, MIN(self.bounds.size.width  - f.size.width,  f.origin.x + delta.x));
+    CGFloat ny    = MAX(0, MIN(self.bounds.size.height - f.size.height, f.origin.y + delta.y));
+    _card.frame   = CGRectMake(nx, ny, f.size.width, f.size.height);
+    [g setTranslation:CGPointZero inView:self];
+}
+
+- (void)refreshSwitches {
     _rijSwitch.on   = getSetting(@"autoRij");
     _uidSwitch.on   = getSetting(@"autoDetectUID");
     _closeSwitch.on = getSetting(@"autoClose");
-    [self refreshUIDLabel];
 }
 
-- (void)refreshUIDLabel {
-    if (_uidSwitch.isOn) {
-        NSString *uid = detectPlayerUID();
-        _uidDetectedLabel.text = uid
-            ? [NSString stringWithFormat:@"UID: %@", uid]
-            : @"UID: Not found in SdkStateCache#1";
-    } else {
-        _uidDetectedLabel.text = @"";
-    }
-}
-
-// ── Toggle handler with flicker animation ─────────────────────────────────────
 - (void)switchChanged:(UISwitch *)sw {
     NSString *key;
     switch (sw.tag) {
-        case 1: key = @"autoRij";        break;
-        case 2: key = @"autoDetectUID";  break;
-        case 3: key = @"autoClose";      break;
+        case 1: key = @"autoRij";       break;
+        case 2: key = @"autoDetectUID"; break;
+        case 3: key = @"autoClose";     break;
         default: return;
     }
     setSetting(key, sw.isOn);
-
-    // Brief flicker to confirm the toggle registered
-    [UIView animateWithDuration:0.06 animations:^{
-        sw.alpha = 0.25f;
-    } completion:^(BOOL _) {
-        [UIView animateWithDuration:0.06 animations:^{
-            sw.alpha = 1.0f;
-        }];
+    // Flicker animation to confirm toggle
+    [UIView animateWithDuration:0.07 animations:^{ sw.alpha = 0.25f; }
+                     completion:^(BOOL _) {
+        [UIView animateWithDuration:0.07 animations:^{ sw.alpha = 1.0f; }];
     }];
-
-    if (sw.tag == 2) [self refreshUIDLabel];
 }
 
 - (void)dismiss {
@@ -1029,14 +1031,18 @@ static void performLoad(SKProgressOverlay *ov,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKPanel
+//
+//  FIX v10.4: Added uidLabel below statusLabel in the expanded content area.
+//  refreshStatus now updates both labels.  kCH increased to 168 to fit.
 // ─────────────────────────────────────────────────────────────────────────────
-static const CGFloat kPW = 258;
-static const CGFloat kBH = 46;
-static const CGFloat kCH = 152;   // taller: added Settings + Hide buttons
+static const CGFloat kPW  = 258;
+static const CGFloat kBH  = 46;
+static const CGFloat kCH  = 168;   // session(12) + uid(12) + gap + upload(42) + load(42) + btns(30) + padding
 
 @interface SKPanel : UIView
 @property (nonatomic, strong) UIView   *content;
 @property (nonatomic, strong) UILabel  *statusLabel;
+@property (nonatomic, strong) UILabel  *uidLabel;
 @property (nonatomic, strong) UIButton *uploadBtn;
 @property (nonatomic, strong) UIButton *loadBtn;
 @property (nonatomic, assign) BOOL     expanded;
@@ -1091,47 +1097,58 @@ static const CGFloat kCH = 152;   // taller: added Settings + Hide buttons
     self.content.clipsToBounds = YES;
     [self addSubview:self.content];
 
-    CGFloat pad = 9, w = kPW - pad*2;
+    CGFloat pad = 9, w = kPW - pad * 2;
 
+    // ── Session line ──────────────────────────────────────────────────────────
     self.statusLabel = [UILabel new];
     self.statusLabel.frame         = CGRectMake(pad, 6, w, 12);
     self.statusLabel.font          = [UIFont systemFontOfSize:9.5];
     self.statusLabel.textColor     = [UIColor colorWithWhite:0.44 alpha:1];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
     [self.content addSubview:self.statusLabel];
-    [self refreshStatus];
+
+    // ── UID line (visible only when Auto Detect UID is ON) ────────────────────
+    self.uidLabel = [UILabel new];
+    self.uidLabel.frame         = CGRectMake(pad, 20, w, 12);
+    self.uidLabel.font          = [UIFont fontWithName:@"Courier" size:9]
+                                 ?: [UIFont systemFontOfSize:9];
+    self.uidLabel.textColor     = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
+    self.uidLabel.textAlignment = NSTextAlignmentCenter;
+    self.uidLabel.text          = @"";
+    [self.content addSubview:self.uidLabel];
 
     // ── Upload button ─────────────────────────────────────────────────────────
     self.uploadBtn = [self btn:@"⬆  Upload to Cloud"
                          color:[UIColor colorWithRed:0.14 green:0.56 blue:0.92 alpha:1]
-                         frame:CGRectMake(pad, 22, w, 42)
+                         frame:CGRectMake(pad, 36, w, 42)
                         action:@selector(tapUpload)];
     [self.content addSubview:self.uploadBtn];
 
     // ── Load button ───────────────────────────────────────────────────────────
     self.loadBtn = [self btn:@"⬇  Load from Cloud"
                        color:[UIColor colorWithRed:0.18 green:0.70 blue:0.42 alpha:1]
-                       frame:CGRectMake(pad, 70, w, 42)
+                       frame:CGRectMake(pad, 84, w, 42)
                       action:@selector(tapLoad)];
     [self.content addSubview:self.loadBtn];
 
-    // ── Settings button ───────────────────────────────────────────────────────
+    // ── Settings + Hide (small button row) ───────────────────────────────────
     CGFloat halfW = (w - 6) / 2;
 
     UIButton *settingsBtn = [self btn:@"⚙ Settings"
                                 color:[UIColor colorWithRed:0.22 green:0.22 blue:0.30 alpha:1]
-                                frame:CGRectMake(pad, 120, halfW, 28)
+                                frame:CGRectMake(pad, 134, halfW, 30)
                                action:@selector(tapSettings)];
     settingsBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
     [self.content addSubview:settingsBtn];
 
-    // ── Hide Menu button ──────────────────────────────────────────────────────
     UIButton *hideBtn = [self btn:@"✕ Hide Menu"
-                            color:[UIColor colorWithRed:0.32 green:0.14 blue:0.14 alpha:1]
-                            frame:CGRectMake(pad + halfW + 6, 120, halfW, 28)
+                            color:[UIColor colorWithRed:0.30 green:0.12 blue:0.12 alpha:1]
+                            frame:CGRectMake(pad + halfW + 6, 134, halfW, 30)
                            action:@selector(tapHide)];
     hideBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
     [self.content addSubview:hideBtn];
+
+    [self refreshStatus];
 }
 
 - (UIButton *)btn:(NSString *)t color:(UIColor *)c frame:(CGRect)f action:(SEL)s {
@@ -1145,12 +1162,22 @@ static const CGFloat kCH = 152;   // taller: added Settings + Hide buttons
     return b;
 }
 
+// ── refreshStatus: update session text AND UID label ─────────────────────────
 - (void)refreshStatus {
     NSString *uuid = loadSessionUUID();
     self.statusLabel.text = uuid
         ? [NSString stringWithFormat:@"Session: %@…",
            [uuid substringToIndex:MIN(8u, (unsigned)uuid.length)]]
         : @"No active session";
+
+    if (getSetting(@"autoDetectUID")) {
+        NSString *uid = detectPlayerUID();
+        self.uidLabel.text = uid
+            ? [NSString stringWithFormat:@"UID: %@", uid]
+            : @"UID: not found";
+    } else {
+        self.uidLabel.text = @"";
+    }
 }
 
 - (void)togglePanel {
@@ -1184,21 +1211,20 @@ static const CGFloat kCH = 152;   // taller: added Settings + Hide buttons
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Hide Menu  (session-only — panel comes back on app relaunch)
+// MARK: - Hide Menu  (session-only — re-injects on next app launch)
 // ─────────────────────────────────────────────────────────────────────────────
 - (void)tapHide {
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"Hide Menu"
-                         message:@"The panel will be removed until next app launch."
+                         message:@"The panel will be removed until the next app launch."
                   preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction
-        actionWithTitle:@"Hide"
+    [a addAction:[UIAlertAction actionWithTitle:@"Hide"
         style:UIAlertActionStyleDestructive
         handler:^(UIAlertAction *_) {
             [UIView animateWithDuration:0.2 animations:^{
-                self.alpha = 0;
+                self.alpha     = 0;
                 self.transform = CGAffineTransformMakeScale(0.85f, 0.85f);
             } completion:^(BOOL __) {
                 [self removeFromSuperview];
@@ -1236,13 +1262,11 @@ static const CGFloat kCH = 152;   // taller: added Settings + Hide buttons
         style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) { [self confirmAndUpload:dataFiles]; }]];
 
-    // "Specific UID" — auto-fill or ask
     [choice addAction:[UIAlertAction
         actionWithTitle:@"Specific UID…"
         style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) {
             if (getSetting(@"autoDetectUID")) {
-                // Use detected UID directly, no dialog
                 NSString *uid = detectPlayerUID();
                 if (!uid.length) {
                     [self showAlert:@"Auto Detect UID"
@@ -1363,8 +1387,8 @@ static const CGFloat kCH = 152;   // taller: added Settings + Hide buttons
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Load Save"
                          message:[NSString stringWithFormat:
-            @"Download edited save data and apply it?\n\nCloud session is deleted after loading.%@",
-            closeNote]
+            @"Download edited save data and apply it?\n\n"
+            @"Cloud session is deleted after loading.%@", closeNote]
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
@@ -1376,14 +1400,10 @@ static const CGFloat kCH = 152;   // taller: added Settings + Hide buttons
         performLoad(ov, ^(BOOL ok, NSString *msg) {
             [self refreshStatus];
             [ov finish:ok message:msg link:nil];
-
-            // ── Auto Close: terminate after a short display delay ─────────────
             if (ok && getSetting(@"autoClose")) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                     (int64_t)(1.6 * NSEC_PER_SEC)),
-                    dispatch_get_main_queue(), ^{
-                        exit(0);
-                    });
+                    dispatch_get_main_queue(), ^{ exit(0); });
             }
         });
     }]];
