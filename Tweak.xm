@@ -1,12 +1,7 @@
 // tweak.xm — Soul Knight Save Manager v10
-// iOS 14+ | Theos/Logos | ARC
-// Changes: .data files are plain text — no base64 encode/decode anywhere.
-//          Parallel file uploads, All/specific-UID selection, Open Link button.
-//          v10.1: Batched NSUserDefaults restore (100 keys/tick) to prevent
-//                 memory leak / crash when restoring large saves (~5000 keys).
-//          v10.2: Fixed crash on Load — dispatch_after 1s delay replaced with
-//                 dispatch_async (no artificial wait), nil-guarded ov calls,
-//                 full error output instead of silent crash.
+// iOS 14+ | Theos/Logos | MRC
+// v10.2: Fixed crash on Load, nil-guarded ov calls, error output.
+// v10.3: Settings menu — Auto Rij, Auto Detect UID, Auto Close.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -15,8 +10,52 @@
 // ── Config ────────────────────────────────────────────────────────────────────
 #define API_BASE @"https://chillysilly.frfrnocap.men/isk.php"
 
+// ── Settings keys ─────────────────────────────────────────────────────────────
+#define kSettingsPath [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Preferences/SKToolsSettings.plist"]
+#define kKeyAutoRij       @"AutoRij"
+#define kKeyAutoDetectUID @"AutoDetectUID"
+#define kKeyAutoClose     @"AutoClose"
+
+static NSMutableDictionary *gSettings = nil;
+
+static void loadSettings(void) {
+    if (!gSettings) {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kSettingsPath];
+        gSettings = d ? [d mutableCopy] : [NSMutableDictionary new];
+    }
+}
+static void saveSettings(void) {
+    [gSettings writeToFile:kSettingsPath atomically:YES];
+}
+static BOOL getSetting(NSString *key) {
+    loadSettings();
+    return [gSettings[key] boolValue];
+}
+static void setSetting(NSString *key, BOOL val) {
+    loadSettings();
+    gSettings[key] = @(val);
+    saveSettings();
+}
+
+// ── Auto Detect UID: parse PlayerId from SdkStateCache#1 ─────────────────────
+static NSString *detectUIDFromPrefs(void) {
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSString *cache = [[NSUserDefaults standardUserDefaults]
+                       stringForKey:@"SdkStateCache#1"];
+    if (!cache.length) return nil;
+    NSError *reErr = nil;
+    NSRegularExpression *re = [NSRegularExpression
+        regularExpressionWithPattern:@"\"PlayerId\"\\s*:\\s*(\\d+)"
+                             options:0 error:&reErr];
+    if (reErr || !re) return nil;
+    NSTextCheckingResult *m = [re firstMatchInString:cache options:0
+                                               range:NSMakeRange(0, cache.length)];
+    if (!m || m.numberOfRanges < 2) return nil;
+    return [cache substringWithRange:[m rangeAtIndex:1]];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Session file  (survives NSUserDefaults wipe)
+// MARK: - Session file
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *sessionFilePath(void) {
     return [NSHomeDirectory()
@@ -43,7 +82,7 @@ static NSString *deviceUUID(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - URLSession  (generous timeouts)
+// MARK: - URLSession
 // ─────────────────────────────────────────────────────────────────────────────
 static NSURLSession *makeSession(void) {
     NSURLSessionConfiguration *c =
@@ -65,16 +104,13 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
                           arc4random(), arc4random()];
     NSMutableData *body = [NSMutableData dataWithCapacity:
                            fileData ? fileData.length + 1024 : 1024];
-
     void (^addField)(NSString *, NSString *) = ^(NSString *n, NSString *v) {
         NSString *s = [NSString stringWithFormat:
             @"--%@\r\nContent-Disposition: form-data; name=\"%@\"\r\n\r\n%@\r\n",
             boundary, n, v];
         [body appendData:[s dataUsingEncoding:NSUTF8StringEncoding]];
     };
-
     for (NSString *k in fields) addField(k, fields[k]);
-
     if (fileField && filename && fileData) {
         NSString *hdr = [NSString stringWithFormat:
             @"--%@\r\nContent-Disposition: form-data; name=\"%@\"; filename=\"%@\"\r\n"
@@ -84,10 +120,8 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
         [body appendData:fileData];
         [body appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
     }
-
     [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary]
                       dataUsingEncoding:NSUTF8StringEncoding]];
-
     NSMutableURLRequest *req = [NSMutableURLRequest
         requestWithURL:[NSURL URLWithString:API_BASE]
            cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
@@ -96,19 +130,17 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
     [req setValue:[NSString stringWithFormat:
         @"multipart/form-data; boundary=%@", boundary]
        forHTTPHeaderField:@"Content-Type"];
-
     return (MPRequest){ req, body };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - POST helper using uploadTask
+// MARK: - POST helper
 // ─────────────────────────────────────────────────────────────────────────────
 static void skPost(NSURLSession *session,
                    NSMutableURLRequest *req,
                    NSData *body,
                    void (^cb)(NSDictionary *json, NSError *err)) {
-    [[session uploadTaskWithRequest:req
-                           fromData:body
+    [[session uploadTaskWithRequest:req fromData:body
                   completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (err) { cb(nil, err); return; }
@@ -138,6 +170,26 @@ static void skPost(NSURLSession *session,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Auto Rij: regex replace OpenRijTest_{uid} integer 1 → 0
+// ─────────────────────────────────────────────────────────────────────────────
+static NSString *applyAutoRij(NSString *plistXML) {
+    if (!plistXML.length) return plistXML;
+    NSError *err = nil;
+    NSRegularExpression *re = [NSRegularExpression
+        regularExpressionWithPattern:
+            @"(<key>OpenRijTest_\\d+</key>\\s*<integer>)1(</integer>)"
+                             options:0 error:&err];
+    if (err || !re) {
+        NSLog(@"[SKTools] AutoRij regex error: %@", err.localizedDescription);
+        return plistXML;
+    }
+    return [re stringByReplacingMatchesInString:plistXML
+                                        options:0
+                                          range:NSMakeRange(0, plistXML.length)
+                                   withTemplate:@"$10$2"];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKProgressOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKProgressOverlay : UIView
@@ -158,8 +210,7 @@ static void skPost(NSURLSession *session,
 
 + (instancetype)showInView:(UIView *)parent title:(NSString *)title {
     SKProgressOverlay *o = [[SKProgressOverlay alloc] initWithFrame:parent.bounds];
-    o.autoresizingMask =
-        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [parent addSubview:o];
     [o setup:title];
     o.alpha = 0;
@@ -169,7 +220,6 @@ static void skPost(NSURLSession *session,
 
 - (void)setup:(NSString *)title {
     self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
-
     UIView *card = [UIView new];
     card.backgroundColor     = [UIColor colorWithRed:0.08 green:0.08 blue:0.12 alpha:1];
     card.layer.cornerRadius  = 18;
@@ -190,8 +240,7 @@ static void skPost(NSURLSession *session,
     self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.titleLabel];
 
-    self.bar = [[UIProgressView alloc]
-        initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
     self.bar.trackTintColor    = [UIColor colorWithWhite:0.22 alpha:1];
     self.bar.progressTintColor = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
     self.bar.layer.cornerRadius = 3;
@@ -224,8 +273,7 @@ static void skPost(NSURLSession *session,
     [self.openLinkBtn setTitle:@"🌐  Open Link in Browser" forState:UIControlStateNormal];
     [self.openLinkBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.openLinkBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
-    self.openLinkBtn.backgroundColor  =
-        [UIColor colorWithRed:0.16 green:0.52 blue:0.92 alpha:1];
+    self.openLinkBtn.backgroundColor  = [UIColor colorWithRed:0.16 green:0.52 blue:0.92 alpha:1];
     self.openLinkBtn.layer.cornerRadius = 9;
     self.openLinkBtn.hidden             = YES;
     self.openLinkBtn.translatesAutoresizingMaskIntoConstraints = NO;
@@ -236,8 +284,8 @@ static void skPost(NSURLSession *session,
     self.closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [self.closeBtn setTitle:@"Close" forState:UIControlStateNormal];
     [self.closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.closeBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
-    self.closeBtn.backgroundColor  = [UIColor colorWithWhite:0.20 alpha:1];
+    self.closeBtn.titleLabel.font    = [UIFont boldSystemFontOfSize:13];
+    self.closeBtn.backgroundColor    = [UIColor colorWithWhite:0.20 alpha:1];
     self.closeBtn.layer.cornerRadius = 9;
     self.closeBtn.hidden             = YES;
     self.closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
@@ -249,30 +297,24 @@ static void skPost(NSURLSession *session,
         [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
         [card.widthAnchor constraintEqualToConstant:310],
-
         [self.titleLabel.topAnchor constraintEqualToAnchor:card.topAnchor constant:20],
         [self.titleLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [self.titleLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-
         [self.bar.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:14],
         [self.bar.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [self.bar.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-72],
         [self.bar.heightAnchor constraintEqualToConstant:6],
-
         [self.percentLabel.centerYAnchor constraintEqualToAnchor:self.bar.centerYAnchor],
         [self.percentLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [self.percentLabel.widthAnchor constraintEqualToConstant:54],
-
         [self.logView.topAnchor constraintEqualToAnchor:self.bar.bottomAnchor constant:10],
         [self.logView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
         [self.logView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
         [self.logView.heightAnchor constraintEqualToConstant:170],
-
         [self.openLinkBtn.topAnchor constraintEqualToAnchor:self.logView.bottomAnchor constant:10],
         [self.openLinkBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
         [self.openLinkBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
         [self.openLinkBtn.heightAnchor constraintEqualToConstant:42],
-
         [self.closeBtn.topAnchor constraintEqualToAnchor:self.openLinkBtn.bottomAnchor constant:8],
         [self.closeBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14],
         [self.closeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
@@ -326,82 +368,74 @@ static void skPost(NSURLSession *session,
 
 - (void)dismiss {
     [UIView animateWithDuration:0.18 animations:^{ self.alpha = 0; }
-                     completion:^(BOOL _){ [self removeFromSuperview]; }];
+                     completion:^(BOOL f){ [self removeFromSuperview]; }];
 }
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload  (init session, then parallel file uploads)
+// MARK: - Upload
 // ─────────────────────────────────────────────────────────────────────────────
 static void performUpload(NSArray<NSString *> *fileNames,
                           SKProgressOverlay *ov,
                           void (^done)(NSString *link, NSString *err)) {
-
     NSString *uuid    = deviceUUID();
     NSURLSession *ses = makeSession();
     NSString *docs    = NSSearchPathForDirectoriesInDomains(
                             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 
-    // ── Step 1: Serialize NSUserDefaults ─────────────────────────────────────
     [ov appendLog:@"Serialising NSUserDefaults…"];
     [[NSUserDefaults standardUserDefaults] synchronize];
     NSDictionary *snap = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
 
     NSError *pe = nil;
     NSData *pData = nil;
-
     @try {
         pData = [NSPropertyListSerialization
-            dataWithPropertyList:snap
-            format:NSPropertyListXMLFormat_v1_0
+            dataWithPropertyList:snap format:NSPropertyListXMLFormat_v1_0
             options:0 error:&pe];
     } @catch (NSException *ex) {
         done(nil, [NSString stringWithFormat:@"Plist serialise exception: %@", ex.reason]);
         return;
     }
-
     if (pe || !pData) {
         done(nil, [NSString stringWithFormat:@"Plist serialise error: %@",
                    pe.localizedDescription ?: @"Unknown"]);
         return;
     }
-
     NSString *plistXML = [[NSString alloc] initWithData:pData encoding:NSUTF8StringEncoding];
-    if (!plistXML) {
-        done(nil, @"Plist UTF-8 conversion failed");
-        return;
+    if (!plistXML) { done(nil, @"Plist UTF-8 conversion failed"); return; }
+
+    // Auto Rij
+    if (getSetting(kKeyAutoRij)) {
+        NSString *patched = applyAutoRij(plistXML);
+        if (![patched isEqualToString:plistXML]) {
+            [ov appendLog:@"Auto Rij: patched OpenRijTest entries → 0"];
+            plistXML = patched;
+        } else {
+            [ov appendLog:@"Auto Rij: no OpenRijTest entries found"];
+        }
     }
 
-    [ov appendLog:[NSString stringWithFormat:@"PlayerPrefs: %lu keys",
-                   (unsigned long)snap.count]];
-    [ov appendLog:[NSString stringWithFormat:@"Will upload %lu .data file(s)",
-                   (unsigned long)fileNames.count]];
-
-    // ── Step 2: POST init ─────────────────────────────────────────────────────
+    [ov appendLog:[NSString stringWithFormat:@"PlayerPrefs: %lu keys", (unsigned long)snap.count]];
+    [ov appendLog:[NSString stringWithFormat:@"Will upload %lu .data file(s)", (unsigned long)fileNames.count]];
     [ov appendLog:@"Creating cloud session…"];
+    [ov setProgress:0.05 label:@"5%"];
+
     MPRequest initMP = buildMP(
         @{@"action":@"upload", @"uuid":uuid, @"playerpref":plistXML},
         nil, nil, nil);
-    [ov setProgress:0.05 label:@"5%"];
 
     skPost(ses, initMP.req, initMP.body, ^(NSDictionary *j, NSError *err) {
         if (err) { done(nil, [NSString stringWithFormat:@"Init failed: %@",
                               err.localizedDescription]); return; }
-
         NSString *link = j[@"link"] ?: [NSString stringWithFormat:
             @"https://chillysilly.frfrnocap.men/isk.php?view=%@", uuid];
         [ov appendLog:@"Session created ✓"];
         [ov appendLog:[NSString stringWithFormat:@"Link: %@", link]];
         saveSessionUUID(uuid);
+        if (!fileNames.count) { done(link, nil); return; }
 
-        if (!fileNames.count) {
-            done(link, nil);
-            return;
-        }
-
-        // ── Step 3: Upload all .data files in parallel ────────────────────────
         [ov appendLog:@"Uploading .data files (parallel)…"];
-
         NSUInteger total         = fileNames.count;
         __block NSUInteger doneN = 0;
         __block NSUInteger failN = 0;
@@ -416,21 +450,16 @@ static void performUpload(NSArray<NSString *> *fileNames,
                 [ov appendLog:[NSString stringWithFormat:@"⚠ Skip %@ (unreadable)", fname]];
                 @synchronized (fileNames) { doneN++; failN++; }
                 float p = 0.1f + 0.88f * ((float)doneN / (float)total);
-                [ov setProgress:p label:[NSString stringWithFormat:
-                    @"%lu/%lu", (unsigned long)doneN, (unsigned long)total]];
+                [ov setProgress:p label:[NSString stringWithFormat:@"%lu/%lu",
+                    (unsigned long)doneN, (unsigned long)total]];
                 continue;
             }
-
             NSData *fdata = [textContent dataUsingEncoding:NSUTF8StringEncoding];
             [ov appendLog:[NSString stringWithFormat:@"↑ %@  (%lu chars)",
                            fname, (unsigned long)textContent.length]];
-
             dispatch_group_enter(group);
-
-            MPRequest fmp = buildMP(
-                @{@"action":@"upload_file", @"uuid":uuid},
-                @"datafile", fname, fdata);
-
+            MPRequest fmp = buildMP(@{@"action":@"upload_file", @"uuid":uuid},
+                                    @"datafile", fname, fdata);
             skPost(ses, fmp.req, fmp.body, ^(NSDictionary *fj, NSError *ferr) {
                 @synchronized (fileNames) { doneN++; }
                 if (ferr) {
@@ -441,17 +470,16 @@ static void performUpload(NSArray<NSString *> *fileNames,
                     [ov appendLog:[NSString stringWithFormat:@"✓ %@", fname]];
                 }
                 float p = 0.10f + 0.88f * ((float)doneN / (float)total);
-                [ov setProgress:p label:[NSString stringWithFormat:
-                    @"%lu/%lu", (unsigned long)doneN, (unsigned long)total]];
+                [ov setProgress:p label:[NSString stringWithFormat:@"%lu/%lu",
+                    (unsigned long)doneN, (unsigned long)total]];
                 dispatch_group_leave(group);
             });
         }
 
         dispatch_group_notify(group, dispatch_get_main_queue(), ^{
             if (failN > 0)
-                [ov appendLog:[NSString stringWithFormat:
-                    @"⚠ %lu file(s) failed, %lu succeeded",
-                    (unsigned long)failN, (unsigned long)(total - failN)]];
+                [ov appendLog:[NSString stringWithFormat:@"⚠ %lu failed, %lu succeeded",
+                               (unsigned long)failN, (unsigned long)(total - failN)]];
             done(link, nil);
         });
     });
@@ -459,11 +487,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Batched NSUserDefaults writer
-//
-// FIX v10.2: Was using dispatch_after with 1.0s delay — with 5000 keys that
-// meant ~50 seconds and the OS watchdog killed the app. Now uses dispatch_async
-// (immediate next run-loop tick) which drains autorelease pools without waiting.
-// Also nil-guards all ov calls so this can be used without a progress overlay.
 // ─────────────────────────────────────────────────────────────────────────────
 static const NSUInteger kUDWriteBatchSize = 100;
 
@@ -475,48 +498,37 @@ static void _applyUDBatch(NSUserDefaults *ud,
                            SKProgressOverlay *ov,
                            void (^completion)(NSUInteger writtenCount)) {
     if (start >= total) {
-        @try {
-            [ud synchronize];
-        } @catch (NSException *ex) {
+        @try { [ud synchronize]; } @catch (NSException *ex) {
             NSLog(@"[SKTools] ud synchronize exception: %@", ex.reason);
         }
         completion(total);
         return;
     }
-
     @autoreleasepool {
         NSUInteger end = MIN(start + kUDWriteBatchSize, total);
         for (NSUInteger i = start; i < end; i++) {
             NSString *k = keys[i];
             id val = dict[k];
-            if (!k || !val) continue;   // guard nil keys/values → no crash
-            @try {
-                [ud setObject:val forKey:k];
-            } @catch (NSException *ex) {
-                NSLog(@"[SKTools] ud setObject exception for key %@: %@", k, ex.reason);
+            if (!k || !val) continue;
+            @try { [ud setObject:val forKey:k]; } @catch (NSException *ex) {
+                NSLog(@"[SKTools] ud setObject exception key %@: %@", k, ex.reason);
             }
         }
-
-        // Log/progress every 500 keys (nil-guarded)
         if (ov && (start == 0 || (end % 500 == 0) || end == total)) {
             [ov appendLog:[NSString stringWithFormat:
                 @"  PlayerPrefs %lu/%lu…", (unsigned long)end, (unsigned long)total]];
             [ov setProgress:0.10f + 0.28f * ((float)end / (float)total)
-                      label:[NSString stringWithFormat:
-                @"%lu/%lu", (unsigned long)end, (unsigned long)total]];
+                      label:[NSString stringWithFormat:@"%lu/%lu",
+                             (unsigned long)end, (unsigned long)total]];
         }
     }
-
-    // FIX: was dispatch_after 1.0s — replaced with dispatch_async so batches
-    // run back-to-back on the next run-loop tick. No artificial delay, no watchdog kill.
     dispatch_async(dispatch_get_main_queue(), ^{
         _applyUDBatch(ud, keys, dict, start + kUDWriteBatchSize, total, ov, completion);
     });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Helper: write .data files from server response
-//         Extracted to avoid duplicating the same block 3 times below.
+// MARK: - Write .data files helper
 // ─────────────────────────────────────────────────────────────────────────────
 static void writeDataFiles(NSDictionary *dataMap,
                             SKProgressOverlay *ov,
@@ -524,53 +536,40 @@ static void writeDataFiles(NSDictionary *dataMap,
     NSString *docsPath = NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSFileManager *fm = NSFileManager.defaultManager;
-
     if (![dataMap isKindOfClass:[NSDictionary class]] || !dataMap.count) {
-        [ov appendLog:@"No .data files to write."];
-        done(0);
-        return;
+        if (ov) [ov appendLog:@"No .data files to write."];
+        done(0); return;
     }
-
-    NSUInteger fileTotal      = dataMap.count;
-    __block NSUInteger fi     = 0;
+    NSUInteger fileTotal       = dataMap.count;
+    __block NSUInteger fi      = 0;
     __block NSUInteger applied = 0;
-
     for (NSString *fname in dataMap) {
         id rawValue = dataMap[fname];
-
         if (![rawValue isKindOfClass:[NSString class]] || !((NSString *)rawValue).length) {
-            [ov appendLog:[NSString stringWithFormat:@"⚠ %@ — empty or invalid, skipped", fname]];
-            fi++;
-            continue;
+            if (ov) [ov appendLog:[NSString stringWithFormat:
+                @"⚠ %@ — empty or invalid, skipped", fname]];
+            fi++; continue;
         }
-
         NSString *textContent = (NSString *)rawValue;
-        NSString *safeName    = [fname lastPathComponent]; // no path traversal
+        NSString *safeName    = [fname lastPathComponent];
         NSString *dst         = [docsPath stringByAppendingPathComponent:safeName];
-
-        // Remove existing file (ignore error — it may not exist)
         [fm removeItemAtPath:dst error:nil];
-
         NSError *we = nil;
-        BOOL ok = [textContent writeToFile:dst
-                                atomically:YES
-                                  encoding:NSUTF8StringEncoding
-                                     error:&we];
+        BOOL ok = [textContent writeToFile:dst atomically:YES
+                                  encoding:NSUTF8StringEncoding error:&we];
         if (ok) {
             applied++;
-            [ov appendLog:[NSString stringWithFormat:@"✓ %@  (%lu chars)",
+            if (ov) [ov appendLog:[NSString stringWithFormat:@"✓ %@  (%lu chars)",
                            safeName, (unsigned long)textContent.length]];
         } else {
-            [ov appendLog:[NSString stringWithFormat:@"✗ %@ write failed: %@",
-                           safeName, we.localizedDescription ?: @"Unknown error"]];
+            if (ov) [ov appendLog:[NSString stringWithFormat:@"✗ %@ write failed: %@",
+                           safeName, we.localizedDescription ?: @"Unknown"]];
         }
-
         fi++;
-        [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
-                  label:[NSString stringWithFormat:
-            @"%lu/%lu", (unsigned long)fi, (unsigned long)fileTotal]];
+        if (ov) [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
+                  label:[NSString stringWithFormat:@"%lu/%lu",
+                         (unsigned long)fi, (unsigned long)fileTotal]];
     }
-
     done(applied);
 }
 
@@ -590,48 +589,44 @@ static void performLoad(SKProgressOverlay *ov,
 
     MPRequest mp = buildMP(@{@"action":@"load", @"uuid":uuid}, nil, nil, nil);
     skPost(ses, mp.req, mp.body, ^(NSDictionary *j, NSError *err) {
-
-        // ── Network / server error ─────────────────────────────────────────
         if (err) {
             done(NO, [NSString stringWithFormat:@"✗ Load failed: %@",
-                      err.localizedDescription]);
-            return;
+                      err.localizedDescription]); return;
         }
-
-        // ── Server says nothing was modified ──────────────────────────────
         if ([j[@"changed"] isEqual:@NO] || [j[@"changed"] isEqual:@0]) {
             clearSessionUUID();
-            done(YES, @"ℹ Server reports no changes were made. Nothing applied.");
-            return;
+            done(YES, @"ℹ Server reports no changes. Nothing applied."); return;
         }
-
         [ov setProgress:0.10 label:@"10%"];
 
-        NSString *ppXML   = j[@"playerpref"];
+        NSString *ppXML       = j[@"playerpref"];
         NSDictionary *dataMap = j[@"data"];
 
-        // ── No PlayerPrefs → just write .data files ───────────────────────
+        void (^afterLoad)(NSUInteger) = ^(NSUInteger filesApplied) {
+            clearSessionUUID();
+            if (getSetting(kKeyAutoClose)) {
+                [ov appendLog:@"Auto Close: exiting app in 1s…"];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ exit(0); });
+            }
+            done(YES, [NSString stringWithFormat:
+                @"✓ Loaded %lu item(s). Restart the game.", (unsigned long)filesApplied]);
+        };
+
         if (!ppXML.length) {
             [ov appendLog:@"No PlayerPrefs in response — writing .data files only."];
-            writeDataFiles(dataMap, ov, ^(NSUInteger applied) {
-                clearSessionUUID();
-                done(YES, [NSString stringWithFormat:
-                    @"✓ Loaded %lu file(s). Restart the game.", (unsigned long)applied]);
-            });
+            writeDataFiles(dataMap, ov, ^(NSUInteger applied) { afterLoad(applied); });
             return;
         }
 
-        // ── Parse PlayerPrefs plist ───────────────────────────────────────
         [ov appendLog:@"Parsing PlayerPrefs…"];
-        NSError *pe    = nil;
+        NSError *pe = nil;
         NSDictionary *ns = nil;
-
         @try {
             ns = [NSPropertyListSerialization
                 propertyListWithData:[ppXML dataUsingEncoding:NSUTF8StringEncoding]
                              options:NSPropertyListMutableContainersAndLeaves
-                              format:nil
-                               error:&pe];
+                              format:nil error:&pe];
         } @catch (NSException *ex) {
             [ov appendLog:[NSString stringWithFormat:
                 @"⚠ PlayerPrefs plist exception: %@", ex.reason]];
@@ -639,35 +634,32 @@ static void performLoad(SKProgressOverlay *ov,
         }
 
         if (pe || ![ns isKindOfClass:[NSDictionary class]]) {
-            // Log the exact error so the user can see what went wrong
-            NSString *reason = pe.localizedDescription ?: @"Not a dictionary";
-            [ov appendLog:[NSString stringWithFormat:
-                @"⚠ PlayerPrefs parse failed: %@", reason]];
+            [ov appendLog:[NSString stringWithFormat:@"⚠ PlayerPrefs parse failed: %@",
+                           pe.localizedDescription ?: @"Not a dictionary"]];
             [ov appendLog:@"Continuing with .data files only…"];
-
             writeDataFiles(dataMap, ov, ^(NSUInteger applied) {
                 clearSessionUUID();
+                if (getSetting(kKeyAutoClose)) {
+                    [ov appendLog:@"Auto Close: exiting app in 1s…"];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{ exit(0); });
+                }
                 done(applied > 0,
                     applied > 0
                     ? [NSString stringWithFormat:
-                        @"⚠ PlayerPrefs failed (parse error), %lu file(s) applied. "
-                        @"Restart the game.", (unsigned long)applied]
+                        @"⚠ PlayerPrefs parse failed, %lu file(s) applied. Restart.",
+                        (unsigned long)applied]
                     : @"✗ PlayerPrefs parse failed and no .data files were written.");
             });
             return;
         }
 
-        // ── Apply PlayerPrefs in batches ──────────────────────────────────
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-
-        // Clear old keys inside an autorelease pool to avoid a spike
         @autoreleasepool {
             NSArray *oldKeys = [[ud dictionaryRepresentation] allKeys];
-            [ov appendLog:[NSString stringWithFormat:
-                @"Clearing %lu existing PlayerPrefs keys…", (unsigned long)oldKeys.count]];
-            for (NSString *k in oldKeys) {
-                if (k) [ud removeObjectForKey:k];
-            }
+            [ov appendLog:[NSString stringWithFormat:@"Clearing %lu existing keys…",
+                           (unsigned long)oldKeys.count]];
+            for (NSString *k in oldKeys) { if (k) [ud removeObjectForKey:k]; }
         }
 
         NSArray<NSString *> *newKeys = [ns allKeys];
@@ -676,22 +668,252 @@ static void performLoad(SKProgressOverlay *ov,
             @"Writing %lu PlayerPrefs keys (%lu per batch)…",
             (unsigned long)total, (unsigned long)kUDWriteBatchSize]];
 
-        // Batched write — dispatch_async between batches (no 1s delay → no watchdog kill)
         _applyUDBatch(ud, newKeys, ns, 0, total, ov, ^(NSUInteger written) {
             [ov appendLog:[NSString stringWithFormat:
                 @"PlayerPrefs ✓ (%lu keys applied)", (unsigned long)written]];
-
-            // Write .data files after PlayerPrefs completes
             writeDataFiles(dataMap, ov, ^(NSUInteger filesApplied) {
-                clearSessionUUID();
-                NSUInteger totalApplied = 1 /* PlayerPrefs */ + filesApplied;
-                done(YES, [NSString stringWithFormat:
-                    @"✓ Loaded %lu item(s). Restart the game.",
-                    (unsigned long)totalApplied]);
+                afterLoad(1 + filesApplied);
             });
         });
     });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - SKSettingsMenu
+// ─────────────────────────────────────────────────────────────────────────────
+@interface SKSettingsMenu : UIView
+@property (nonatomic, strong) UILabel *uidLabel;
+- (void)refreshUID;
+@end
+
+@implementation SKSettingsMenu
+
+- (instancetype)init {
+    self = [super initWithFrame:CGRectZero];
+    if (!self) return nil;
+    [self buildUI];
+    return self;
+}
+
+- (void)buildUI {
+    self.backgroundColor     = [UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:0.98];
+    self.layer.cornerRadius  = 16;
+    self.layer.shadowColor   = [UIColor blackColor].CGColor;
+    self.layer.shadowOpacity = 0.9;
+    self.layer.shadowRadius  = 16;
+    self.layer.shadowOffset  = CGSizeMake(0, 4);
+    self.clipsToBounds       = NO;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+
+    // Title
+    UILabel *title = [UILabel new];
+    title.text          = @"⚙  Settings";
+    title.textColor     = [UIColor whiteColor];
+    title.font          = [UIFont boldSystemFontOfSize:14];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:title];
+
+    // Divider
+    UIView *div = [UIView new];
+    div.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    div.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:div];
+
+    // Setting rows
+    UIView *row1 = [self makeRowForKey:kKeyAutoRij
+                                  icon:@"🔴"
+                                 label:@"Auto Rij"
+                                  desc:@"Sets all OpenRijTest entries to 0 before upload"];
+    UIView *row2 = [self makeRowForKey:kKeyAutoDetectUID
+                                  icon:@"🔍"
+                                 label:@"Auto Detect UID"
+                                  desc:@"Reads your Player ID from save data automatically"];
+    UIView *row3 = [self makeRowForKey:kKeyAutoClose
+                                  icon:@"🚪"
+                                 label:@"Auto Close"
+                                  desc:@"Closes the app after loading save from cloud"];
+
+    // UID display label
+    self.uidLabel = [UILabel new];
+    self.uidLabel.font          = [UIFont fontWithName:@"Courier" size:10]
+                                  ?: [UIFont systemFontOfSize:10];
+    self.uidLabel.textColor     = [UIColor colorWithRed:0.35 green:0.80 blue:1.0 alpha:1];
+    self.uidLabel.textAlignment = NSTextAlignmentCenter;
+    self.uidLabel.numberOfLines = 1;
+    self.uidLabel.hidden        = YES;
+    self.uidLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:self.uidLabel];
+
+    // Footer
+    UILabel *footer = [UILabel new];
+    footer.text          = @"Dylib By Mochi  ·  Version: 2.1  ·  Build: 271.ef2ca7";
+    footer.textColor     = [UIColor colorWithWhite:0.26 alpha:1];
+    footer.font          = [UIFont systemFontOfSize:9];
+    footer.textAlignment = NSTextAlignmentCenter;
+    footer.numberOfLines = 1;
+    footer.adjustsFontSizeToFitWidth = YES;
+    footer.minimumScaleFactor = 0.7;
+    footer.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:footer];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.widthAnchor constraintEqualToConstant:264],
+
+        [title.topAnchor constraintEqualToAnchor:self.topAnchor constant:14],
+        [title.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+        [title.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+
+        [div.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:10],
+        [div.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+        [div.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+        [div.heightAnchor constraintEqualToConstant:1],
+
+        [row1.topAnchor constraintEqualToAnchor:div.bottomAnchor constant:4],
+        [row1.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [row1.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+
+        [row2.topAnchor constraintEqualToAnchor:row1.bottomAnchor],
+        [row2.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [row2.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+
+        [row3.topAnchor constraintEqualToAnchor:row2.bottomAnchor],
+        [row3.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [row3.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+
+        [self.uidLabel.topAnchor constraintEqualToAnchor:row3.bottomAnchor constant:6],
+        [self.uidLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12],
+        [self.uidLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
+
+        [footer.topAnchor constraintEqualToAnchor:self.uidLabel.bottomAnchor constant:10],
+        [footer.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:10],
+        [footer.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-10],
+        [self.bottomAnchor constraintEqualToAnchor:footer.bottomAnchor constant:12],
+    ]];
+
+    [self refreshUID];
+}
+
+- (UIView *)makeRowForKey:(NSString *)key icon:(NSString *)icon
+                    label:(NSString *)labelText desc:(NSString *)descText {
+    UIView *row = [UIView new];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *iconLbl = [UILabel new];
+    iconLbl.text = icon;
+    iconLbl.font = [UIFont systemFontOfSize:17];
+    iconLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:iconLbl];
+
+    UILabel *nameLbl = [UILabel new];
+    nameLbl.text      = labelText;
+    nameLbl.textColor = [UIColor colorWithWhite:0.90 alpha:1];
+    nameLbl.font      = [UIFont boldSystemFontOfSize:12];
+    nameLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:nameLbl];
+
+    UILabel *descLbl = [UILabel new];
+    descLbl.text          = descText;
+    descLbl.textColor     = [UIColor colorWithWhite:0.40 alpha:1];
+    descLbl.font          = [UIFont systemFontOfSize:10];
+    descLbl.numberOfLines = 2;
+    descLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:descLbl];
+
+    // Toggle button — uses accessibilityIdentifier to store settings key
+    UIButton *toggle = [UIButton buttonWithType:UIButtonTypeCustom];
+    toggle.translatesAutoresizingMaskIntoConstraints = NO;
+    toggle.layer.cornerRadius = 12;
+    toggle.layer.borderWidth  = 1.5;
+    toggle.clipsToBounds      = YES;
+    toggle.accessibilityIdentifier = key;
+    [self applyToggleState:toggle on:getSetting(key) animated:NO];
+    [toggle addTarget:self action:@selector(toggleTapped:)
+     forControlEvents:UIControlEventTouchUpInside];
+    [row addSubview:toggle];
+
+    // Row separator
+    UIView *sep = [UIView new];
+    sep.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
+    sep.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:sep];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [iconLbl.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:14],
+        [iconLbl.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [iconLbl.widthAnchor constraintEqualToConstant:22],
+
+        [toggle.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-14],
+        [toggle.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [toggle.widthAnchor constraintEqualToConstant:44],
+        [toggle.heightAnchor constraintEqualToConstant:24],
+
+        [nameLbl.topAnchor constraintEqualToAnchor:row.topAnchor constant:10],
+        [nameLbl.leadingAnchor constraintEqualToAnchor:iconLbl.trailingAnchor constant:10],
+        [nameLbl.trailingAnchor constraintEqualToAnchor:toggle.leadingAnchor constant:-6],
+
+        [descLbl.topAnchor constraintEqualToAnchor:nameLbl.bottomAnchor constant:2],
+        [descLbl.leadingAnchor constraintEqualToAnchor:nameLbl.leadingAnchor],
+        [descLbl.trailingAnchor constraintEqualToAnchor:toggle.leadingAnchor constant:-6],
+        [descLbl.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-10],
+
+        [sep.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+        [sep.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:12],
+        [sep.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
+        [sep.heightAnchor constraintEqualToConstant:1],
+    ]];
+
+    [self addSubview:row];
+    return row;
+}
+
+- (void)applyToggleState:(UIButton *)btn on:(BOOL)on animated:(BOOL)anim {
+    UIColor *onBg    = [UIColor colorWithRed:0.12 green:0.76 blue:0.38 alpha:1];
+    UIColor *offBg   = [UIColor colorWithWhite:0.20 alpha:1];
+    UIColor *onBdr   = [UIColor colorWithRed:0.08 green:0.58 blue:0.28 alpha:1];
+    UIColor *offBdr  = [UIColor colorWithWhite:0.30 alpha:1];
+    UIColor *onTxt   = [UIColor whiteColor];
+    UIColor *offTxt  = [UIColor colorWithWhite:0.42 alpha:1];
+
+    void (^apply)(void) = ^{
+        btn.backgroundColor = on ? onBg : offBg;
+        btn.layer.borderColor = (on ? onBdr : offBdr).CGColor;
+        [btn setTitle:on ? @"ON" : @"OFF" forState:UIControlStateNormal];
+        [btn setTitleColor:on ? onTxt : offTxt forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+    };
+    anim ? [UIView animateWithDuration:0.18 animations:apply] : apply();
+}
+
+- (void)toggleTapped:(UIButton *)btn {
+    NSString *key = btn.accessibilityIdentifier;
+    BOOL newVal = !getSetting(key);
+    setSetting(key, newVal);
+    [self applyToggleState:btn on:newVal animated:YES];
+
+    // Flicker
+    btn.alpha = 0.45;
+    [UIView animateWithDuration:0.15 animations:^{ btn.alpha = 1.0; }];
+
+    if ([key isEqualToString:kKeyAutoDetectUID]) {
+        [UIView animateWithDuration:0.2 animations:^{ [self refreshUID]; }];
+    }
+}
+
+- (void)refreshUID {
+    if (getSetting(kKeyAutoDetectUID)) {
+        NSString *uid = detectUIDFromPrefs();
+        self.uidLabel.text   = uid
+            ? [NSString stringWithFormat:@"UID: %@", uid]
+            : @"UID: not found";
+        self.uidLabel.hidden = NO;
+    } else {
+        self.uidLabel.hidden = YES;
+        self.uidLabel.text   = @"";
+    }
+}
+
+@end
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKPanel
@@ -701,11 +923,13 @@ static const CGFloat kBH = 46;
 static const CGFloat kCH = 122;
 
 @interface SKPanel : UIView
-@property (nonatomic, strong) UIView   *content;
-@property (nonatomic, strong) UILabel  *statusLabel;
-@property (nonatomic, strong) UIButton *uploadBtn;
-@property (nonatomic, strong) UIButton *loadBtn;
-@property (nonatomic, assign) BOOL     expanded;
+@property (nonatomic, strong) UIView         *content;
+@property (nonatomic, strong) UILabel        *statusLabel;
+@property (nonatomic, strong) UIButton       *uploadBtn;
+@property (nonatomic, strong) UIButton       *loadBtn;
+@property (nonatomic, assign) BOOL            expanded;
+@property (nonatomic, strong) SKSettingsMenu *settingsMenu;
+@property (nonatomic, assign) BOOL            settingsVisible;
 @end
 
 @implementation SKPanel
@@ -735,15 +959,27 @@ static const CGFloat kCH = 122;
     [self addSubview:h];
 
     UILabel *t = [UILabel new];
-    t.text = @"⚙  SK Save Manager";
+    t.text      = @"⚙  SK Save Manager";
     t.textColor = [UIColor colorWithWhite:0.82 alpha:1];
-    t.font = [UIFont boldSystemFontOfSize:12];
+    t.font      = [UIFont boldSystemFontOfSize:12];
     t.textAlignment = NSTextAlignmentCenter;
-    t.frame = CGRectMake(0, 14, kPW, 22);
+    t.frame = CGRectMake(0, 14, kPW - 38, 22);
     t.userInteractionEnabled = NO;
     [self addSubview:t];
 
-    UIView *tz = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kPW, kBH)];
+    // Gear / settings button top-right
+    UIButton *gear = [UIButton buttonWithType:UIButtonTypeCustom];
+    gear.frame = CGRectMake(kPW - 36, 9, 28, 28);
+    [gear setTitle:@"☰" forState:UIControlStateNormal];
+    gear.titleLabel.font = [UIFont systemFontOfSize:16];
+    [gear setTitleColor:[UIColor colorWithWhite:0.52 alpha:1] forState:UIControlStateNormal];
+    [gear setTitleColor:[UIColor whiteColor] forState:UIControlStateHighlighted];
+    [gear addTarget:self action:@selector(tapSettings)
+   forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:gear];
+
+    // Tap zone for expand/collapse (avoid gear button area)
+    UIView *tz = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kPW - 40, kBH)];
     tz.backgroundColor = UIColor.clearColor;
     [tz addGestureRecognizer:[[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(togglePanel)]];
@@ -801,10 +1037,10 @@ static const CGFloat kCH = 122;
 
 - (void)togglePanel {
     self.expanded = !self.expanded;
+    [self hideSettings];
     if (self.expanded) {
         [self refreshStatus];
         self.content.hidden = NO;
-        self.content.frame  = CGRectMake(0, kBH, kPW, kCH);
         [UIView animateWithDuration:0.22 delay:0
                             options:UIViewAnimationOptionCurveEaseOut
                          animations:^{
@@ -817,14 +1053,77 @@ static const CGFloat kCH = 122;
                          animations:^{
             CGRect f = self.frame; f.size.height = kBH; self.frame = f;
             self.content.alpha = 0;
-        } completion:^(BOOL _){ self.content.hidden = YES; }];
+        } completion:^(BOOL f){ self.content.hidden = YES; }];
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Settings menu show/hide
+// ─────────────────────────────────────────────────────────────────────────────
+- (void)tapSettings {
+    self.settingsVisible ? [self hideSettings] : [self showSettings];
+}
+
+- (void)showSettings {
+    if (self.settingsVisible) return;
+    self.settingsVisible = YES;
+
+    if (!self.settingsMenu) {
+        self.settingsMenu = [SKSettingsMenu new];
+        self.settingsMenu.layer.zPosition = 10000;
+    }
+    [self.settingsMenu refreshUID];
+
+    UIView *parent = self.superview;
+    [parent addSubview:self.settingsMenu];
+
+    // Anchor left of panel, aligned to panel top
+    [NSLayoutConstraint activateConstraints:@[
+        [self.settingsMenu.trailingAnchor constraintEqualToAnchor:self.leadingAnchor constant:-8],
+        [self.settingsMenu.topAnchor constraintEqualToAnchor:self.topAnchor],
+    ]];
+
+    self.settingsMenu.alpha     = 0;
+    self.settingsMenu.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    [UIView animateWithDuration:0.22 delay:0
+         usingSpringWithDamping:0.72 initialSpringVelocity:0.5
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        self.settingsMenu.alpha     = 1;
+        self.settingsMenu.transform = CGAffineTransformIdentity;
+    } completion:nil];
+
+    // Dismiss on tap outside
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(hideSettings)];
+    tap.cancelsTouchesInView = NO;
+    [parent addGestureRecognizer:tap];
+    objc_setAssociatedObject(self, "skDismissTap", tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)hideSettings {
+    if (!self.settingsVisible) return;
+    self.settingsVisible = NO;
+    UITapGestureRecognizer *tap =
+        objc_getAssociatedObject(self, "skDismissTap");
+    if (tap) [tap.view removeGestureRecognizer:tap];
+    objc_setAssociatedObject(self, "skDismissTap", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    SKSettingsMenu *menu = self.settingsMenu;
+    [UIView animateWithDuration:0.16 animations:^{
+        menu.alpha     = 0;
+        menu.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    } completion:^(BOOL f) {
+        [menu removeFromSuperview];
+        menu.transform = CGAffineTransformIdentity;
+    }];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Upload flow
 // ─────────────────────────────────────────────────────────────────────────────
 - (void)tapUpload {
+    [self hideSettings];
     NSString *docs = NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSArray *all = [[NSFileManager defaultManager]
@@ -835,7 +1134,6 @@ static const CGFloat kCH = 122;
             [dataFiles addObject:f];
 
     NSString *existing = loadSessionUUID();
-
     UIAlertController *choice = [UIAlertController
         alertControllerWithTitle:@"Select files to upload"
                          message:[NSString stringWithFormat:
@@ -850,32 +1148,49 @@ static const CGFloat kCH = 122;
         style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) { [self confirmAndUpload:dataFiles]; }]];
 
+    // Auto Detect UID option
+    if (getSetting(kKeyAutoDetectUID)) {
+        NSString *detectedUID = detectUIDFromPrefs();
+        if (detectedUID.length) {
+            NSMutableArray *filtered = [NSMutableArray new];
+            for (NSString *f in dataFiles)
+                if ([f containsString:detectedUID]) [filtered addObject:f];
+            NSString *autoTitle = [NSString stringWithFormat:
+                @"Auto UID: %@ (%lu files)", detectedUID, (unsigned long)filtered.count];
+            NSArray *snap = [filtered copy];
+            [choice addAction:[UIAlertAction
+                actionWithTitle:autoTitle
+                style:UIAlertActionStyleDefault
+                handler:^(UIAlertAction *a) {
+                    snap.count
+                        ? [self confirmAndUpload:snap]
+                        : [self showAlert:@"No files found"
+                                  message:[NSString stringWithFormat:
+                              @"No .data file contains UID \"%@\".", detectedUID]];
+                }]];
+        }
+    }
+
     [choice addAction:[UIAlertAction
         actionWithTitle:@"Specific UID…"
         style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) { [self askUIDThenUpload:dataFiles]; }]];
-
     [choice addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
-
     [[self topVC] presentViewController:choice animated:YES completion:nil];
 }
 
 - (void)askUIDThenUpload:(NSArray<NSString*> *)allFiles {
     UIAlertController *input = [UIAlertController
         alertControllerWithTitle:@"Enter UID"
-                         message:@"Only .data files containing this UID in their filename will be uploaded."
+                         message:@"Only .data files containing this UID will be uploaded."
                   preferredStyle:UIAlertControllerStyleAlert];
-
     [input addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder     = @"e.g. 211062956";
         tf.keyboardType    = UIKeyboardTypeNumberPad;
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
-
-    [input addAction:[UIAlertAction
-        actionWithTitle:@"Upload"
-        style:UIAlertActionStyleDefault
+    [input addAction:[UIAlertAction actionWithTitle:@"Upload" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) {
             NSString *uid = [input.textFields.firstObject.text
                 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
@@ -888,52 +1203,44 @@ static const CGFloat kCH = 122;
             if (!filtered.count) {
                 [self showAlert:@"No files found"
                         message:[NSString stringWithFormat:
-                    @"No .data file contains UID \"%@\" in its name.", uid]]; return;
+                    @"No .data file contains UID \"%@\".", uid]]; return;
             }
             [self confirmAndUpload:filtered];
         }]];
-
     [input addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
-
     [[self topVC] presentViewController:input animated:YES completion:nil];
 }
 
 - (void)confirmAndUpload:(NSArray<NSString*> *)files {
+    NSString *rijNote = getSetting(kKeyAutoRij) ? @"\n• Auto Rij ON (zeros OpenRijTest)" : @"";
     NSString *msg = [NSString stringWithFormat:
-        @"Are you sure?\n\nWill upload:\n• PlayerPrefs (NSUserDefaults)\n• %lu .data file(s):\n%@",
-        (unsigned long)files.count,
+        @"Are you sure?\n\nWill upload:\n• PlayerPrefs%@\n• %lu .data file(s):\n%@",
+        rijNote, (unsigned long)files.count,
         files.count <= 6
             ? [files componentsJoinedByString:@"\n"]
             : [[files subarrayWithRange:NSMakeRange(0, 6)] componentsJoinedByString:@"\n"]];
 
     UIAlertController *confirm = [UIAlertController
-        alertControllerWithTitle:@"Confirm Upload"
-                         message:msg
-                  preferredStyle:UIAlertControllerStyleAlert];
-
+        alertControllerWithTitle:@"Confirm Upload" message:msg
+        preferredStyle:UIAlertControllerStyleAlert];
     [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
-
-    [confirm addAction:[UIAlertAction
-        actionWithTitle:@"Yes, Upload"
-        style:UIAlertActionStyleDefault
-        handler:^(UIAlertAction *a) {
-            UIView *parent = [self topVC].view ?: self.superview;
-            SKProgressOverlay *ov = [SKProgressOverlay
-                showInView:parent title:@"Uploading save data…"];
-            performUpload(files, ov, ^(NSString *link, NSString *err) {
-                [self refreshStatus];
-                if (err) {
-                    [ov finish:NO message:[NSString stringWithFormat:@"✗ %@", err] link:nil];
-                } else {
-                    [UIPasteboard generalPasteboard].string = link;
-                    [ov appendLog:@"Link copied to clipboard."];
-                    [ov finish:YES message:@"Upload complete ✓" link:link];
-                }
-            });
-        }]];
-
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Yes, Upload"
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIView *parent = [self topVC].view ?: self.superview;
+        SKProgressOverlay *ov = [SKProgressOverlay showInView:parent title:@"Uploading save data…"];
+        performUpload(files, ov, ^(NSString *link, NSString *err) {
+            [self refreshStatus];
+            if (err) {
+                [ov finish:NO message:[NSString stringWithFormat:@"✗ %@", err] link:nil];
+            } else {
+                [UIPasteboard generalPasteboard].string = link;
+                [ov appendLog:@"Link copied to clipboard."];
+                [ov finish:YES message:@"Upload complete ✓" link:link];
+            }
+        });
+    }]];
     [[self topVC] presentViewController:confirm animated:YES completion:nil];
 }
 
@@ -941,21 +1248,24 @@ static const CGFloat kCH = 122;
 // MARK: - Load
 // ─────────────────────────────────────────────────────────────────────────────
 - (void)tapLoad {
+    [self hideSettings];
     if (!loadSessionUUID().length) {
         [self showAlert:@"No Session" message:@"No upload session found. Upload first."];
         return;
     }
+    NSString *extra = getSetting(kKeyAutoClose)
+        ? @"\n\n⚠ Auto Close is ON — app will exit after load." : @"";
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Load Save"
-                         message:@"Download edited save data and apply it?\n\nCloud session is deleted after loading."
+                         message:[NSString stringWithFormat:
+            @"Download edited save and apply it?\nSession is deleted after loading.%@", extra]
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Yes, Load"
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         UIView *parent = [self topVC].view ?: self.superview;
-        SKProgressOverlay *ov = [SKProgressOverlay
-            showInView:parent title:@"Loading save data…"];
+        SKProgressOverlay *ov = [SKProgressOverlay showInView:parent title:@"Loading save data…"];
         performLoad(ov, ^(BOOL ok, NSString *msg) {
             [self refreshStatus];
             [ov finish:ok message:msg link:nil];
@@ -977,6 +1287,7 @@ static const CGFloat kCH = 122;
 }
 
 - (void)onPan:(UIPanGestureRecognizer *)g {
+    [self hideSettings];
     CGPoint d  = [g translationInView:self.superview];
     CGRect  sb = self.superview.bounds;
     CGFloat nx = MAX(self.bounds.size.width/2,
