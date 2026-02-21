@@ -472,7 +472,7 @@ static void _applyUDBatch(NSUserDefaults *ud,
                            NSDictionary *dict,
                            NSUInteger start,
                            NSUInteger total,
-                           SKProgressOverlay * __weak ov,   // weak — overlay may be gone
+                           SKProgressOverlay *ov,
                            void (^completion)(NSUInteger writtenCount)) {
     if (start >= total) {
         @try {
