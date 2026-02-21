@@ -4,6 +4,9 @@
 //          Parallel file uploads, All/specific-UID selection, Open Link button.
 //          v10.1: Batched NSUserDefaults restore (100 keys/tick) to prevent
 //                 memory leak / crash when restoring large saves (~5000 keys).
+//          v10.2: Fixed crash on Load — dispatch_after 1s delay replaced with
+//                 dispatch_async (no artificial wait), nil-guarded ov calls,
+//                 full error output instead of silent crash.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -53,7 +56,6 @@ static NSURLSession *makeSession(void) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Multipart body builder
-//   Returns body as NSData; caller uses uploadTask:fromData: (no crash on large files).
 // ─────────────────────────────────────────────────────────────────────────────
 typedef struct { NSMutableURLRequest *req; NSData *body; } MPRequest;
 
@@ -344,22 +346,38 @@ static void performUpload(NSArray<NSString *> *fileNames,
     [ov appendLog:@"Serialising NSUserDefaults…"];
     [[NSUserDefaults standardUserDefaults] synchronize];
     NSDictionary *snap = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+
     NSError *pe = nil;
-    NSData *pData = [NSPropertyListSerialization
-        dataWithPropertyList:snap
-        format:NSPropertyListXMLFormat_v1_0
-        options:0 error:&pe];
-    if (pe || !pData) {
-        done(nil, [NSString stringWithFormat:@"Plist error: %@",
-                   pe.localizedDescription]); return;
+    NSData *pData = nil;
+
+    @try {
+        pData = [NSPropertyListSerialization
+            dataWithPropertyList:snap
+            format:NSPropertyListXMLFormat_v1_0
+            options:0 error:&pe];
+    } @catch (NSException *ex) {
+        done(nil, [NSString stringWithFormat:@"Plist serialise exception: %@", ex.reason]);
+        return;
     }
+
+    if (pe || !pData) {
+        done(nil, [NSString stringWithFormat:@"Plist serialise error: %@",
+                   pe.localizedDescription ?: @"Unknown"]);
+        return;
+    }
+
     NSString *plistXML = [[NSString alloc] initWithData:pData encoding:NSUTF8StringEncoding];
+    if (!plistXML) {
+        done(nil, @"Plist UTF-8 conversion failed");
+        return;
+    }
+
     [ov appendLog:[NSString stringWithFormat:@"PlayerPrefs: %lu keys",
                    (unsigned long)snap.count]];
     [ov appendLog:[NSString stringWithFormat:@"Will upload %lu .data file(s)",
                    (unsigned long)fileNames.count]];
 
-    // ── Step 2: POST init (PlayerPrefs only, creates session) ─────────────────
+    // ── Step 2: POST init ─────────────────────────────────────────────────────
     [ov appendLog:@"Creating cloud session…"];
     MPRequest initMP = buildMP(
         @{@"action":@"upload", @"uuid":uuid, @"playerpref":plistXML},
@@ -381,7 +399,7 @@ static void performUpload(NSArray<NSString *> *fileNames,
             return;
         }
 
-        // ── Step 3: Upload all .data files in parallel (as plain text) ────────
+        // ── Step 3: Upload all .data files in parallel ────────────────────────
         [ov appendLog:@"Uploading .data files (parallel)…"];
 
         NSUInteger total         = fileNames.count;
@@ -390,8 +408,7 @@ static void performUpload(NSArray<NSString *> *fileNames,
         dispatch_group_t group   = dispatch_group_create();
 
         for (NSString *fname in fileNames) {
-            NSString *path  = [docs stringByAppendingPathComponent:fname];
-            // Read as UTF-8 text — .data files are plain text (base64-encoded ciphertext)
+            NSString *path = [docs stringByAppendingPathComponent:fname];
             NSString *textContent = [NSString stringWithContentsOfFile:path
                                                               encoding:NSUTF8StringEncoding
                                                                  error:nil];
@@ -441,25 +458,28 @@ static void performUpload(NSArray<NSString *> *fileNames,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Load
+// MARK: - Batched NSUserDefaults writer
+//
+// FIX v10.2: Was using dispatch_after with 1.0s delay — with 5000 keys that
+// meant ~50 seconds and the OS watchdog killed the app. Now uses dispatch_async
+// (immediate next run-loop tick) which drains autorelease pools without waiting.
+// Also nil-guards all ov calls so this can be used without a progress overlay.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Batch size for writing NSUserDefaults keys one-at-a-time per run-loop tick.
-// 100 keys/tick is fast (~50 ms for 5000 keys) but drains autoreleasepool
-// between ticks so the heap never balloons. Tune down if you still see pressure.
 static const NSUInteger kUDWriteBatchSize = 100;
 
-// Internal: called recursively via dispatch_async so each batch
-// gets a fresh run-loop iteration (and ARC/autorelease drain).
 static void _applyUDBatch(NSUserDefaults *ud,
                            NSArray<NSString *> *keys,
                            NSDictionary *dict,
                            NSUInteger start,
                            NSUInteger total,
-                           SKProgressOverlay *ov,
+                           SKProgressOverlay * __weak ov,   // weak — overlay may be gone
                            void (^completion)(NSUInteger writtenCount)) {
     if (start >= total) {
-        [ud synchronize];
+        @try {
+            [ud synchronize];
+        } @catch (NSException *ex) {
+            NSLog(@"[SKTools] ud synchronize exception: %@", ex.reason);
+        }
         completion(total);
         return;
     }
@@ -468,11 +488,17 @@ static void _applyUDBatch(NSUserDefaults *ud,
         NSUInteger end = MIN(start + kUDWriteBatchSize, total);
         for (NSUInteger i = start; i < end; i++) {
             NSString *k = keys[i];
-            [ud setObject:dict[k] forKey:k];
+            id val = dict[k];
+            if (!k || !val) continue;   // guard nil keys/values → no crash
+            @try {
+                [ud setObject:val forKey:k];
+            } @catch (NSException *ex) {
+                NSLog(@"[SKTools] ud setObject exception for key %@: %@", k, ex.reason);
+            }
         }
-        // Log + progress every 500 keys so the UI stays responsive without
-        // spamming the log view.
-        if (start == 0 || (end % 500 == 0) || end == total) {
+
+        // Log/progress every 500 keys (nil-guarded)
+        if (ov && (start == 0 || (end % 500 == 0) || end == total)) {
             [ov appendLog:[NSString stringWithFormat:
                 @"  PlayerPrefs %lu/%lu…", (unsigned long)end, (unsigned long)total]];
             [ov setProgress:0.10f + 0.28f * ((float)end / (float)total)
@@ -481,169 +507,189 @@ static void _applyUDBatch(NSUserDefaults *ud,
         }
     }
 
-    // Yield to run loop → autorelease pool drains → next batch
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-               dispatch_get_main_queue(), ^{
-    _applyUDBatch(ud, keys, dict, start + kUDWriteBatchSize,
-                  total, ov, completion);
+    // FIX: was dispatch_after 1.0s — replaced with dispatch_async so batches
+    // run back-to-back on the next run-loop tick. No artificial delay, no watchdog kill.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        _applyUDBatch(ud, keys, dict, start + kUDWriteBatchSize, total, ov, completion);
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Helper: write .data files from server response
+//         Extracted to avoid duplicating the same block 3 times below.
+// ─────────────────────────────────────────────────────────────────────────────
+static void writeDataFiles(NSDictionary *dataMap,
+                            SKProgressOverlay *ov,
+                            void (^done)(NSUInteger appliedCount)) {
+    NSString *docsPath = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    if (![dataMap isKindOfClass:[NSDictionary class]] || !dataMap.count) {
+        [ov appendLog:@"No .data files to write."];
+        done(0);
+        return;
+    }
+
+    NSUInteger fileTotal      = dataMap.count;
+    __block NSUInteger fi     = 0;
+    __block NSUInteger applied = 0;
+
+    for (NSString *fname in dataMap) {
+        id rawValue = dataMap[fname];
+
+        if (![rawValue isKindOfClass:[NSString class]] || !((NSString *)rawValue).length) {
+            [ov appendLog:[NSString stringWithFormat:@"⚠ %@ — empty or invalid, skipped", fname]];
+            fi++;
+            continue;
+        }
+
+        NSString *textContent = (NSString *)rawValue;
+        NSString *safeName    = [fname lastPathComponent]; // no path traversal
+        NSString *dst         = [docsPath stringByAppendingPathComponent:safeName];
+
+        // Remove existing file (ignore error — it may not exist)
+        [fm removeItemAtPath:dst error:nil];
+
+        NSError *we = nil;
+        BOOL ok = [textContent writeToFile:dst
+                                atomically:YES
+                                  encoding:NSUTF8StringEncoding
+                                     error:&we];
+        if (ok) {
+            applied++;
+            [ov appendLog:[NSString stringWithFormat:@"✓ %@  (%lu chars)",
+                           safeName, (unsigned long)textContent.length]];
+        } else {
+            [ov appendLog:[NSString stringWithFormat:@"✗ %@ write failed: %@",
+                           safeName, we.localizedDescription ?: @"Unknown error"]];
+        }
+
+        fi++;
+        [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
+                  label:[NSString stringWithFormat:
+            @"%lu/%lu", (unsigned long)fi, (unsigned long)fileTotal]];
+    }
+
+    done(applied);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Load
+// ─────────────────────────────────────────────────────────────────────────────
 static void performLoad(SKProgressOverlay *ov,
                         void (^done)(BOOL ok, NSString *msg)) {
     NSString *uuid = loadSessionUUID();
-    if (!uuid.length) { done(NO, @"No session. Upload first."); return; }
+    if (!uuid.length) { done(NO, @"No session found. Upload first."); return; }
 
     NSURLSession *ses = makeSession();
     [ov appendLog:[NSString stringWithFormat:@"Session: %@…",
                    [uuid substringToIndex:MIN(8u, (unsigned)uuid.length)]]];
-    [ov appendLog:@"Requesting files…"];
+    [ov appendLog:@"Requesting files from server…"];
     [ov setProgress:0.08 label:@"8%"];
 
     MPRequest mp = buildMP(@{@"action":@"load", @"uuid":uuid}, nil, nil, nil);
     skPost(ses, mp.req, mp.body, ^(NSDictionary *j, NSError *err) {
-        if (err) { done(NO, [NSString stringWithFormat:@"Load failed: %@",
-                             err.localizedDescription]); return; }
+
+        // ── Network / server error ─────────────────────────────────────────
+        if (err) {
+            done(NO, [NSString stringWithFormat:@"✗ Load failed: %@",
+                      err.localizedDescription]);
+            return;
+        }
+
+        // ── Server says nothing was modified ──────────────────────────────
+        if ([j[@"changed"] isEqual:@NO] || [j[@"changed"] isEqual:@0]) {
+            clearSessionUUID();
+            done(YES, @"ℹ Server reports no changes were made. Nothing applied.");
+            return;
+        }
+
         [ov setProgress:0.10 label:@"10%"];
 
-        // ── Apply PlayerPrefs (batched to prevent memory spike) ───────────────
-        NSString *ppXML = j[@"playerpref"];
-        if (ppXML.length) {
-            [ov appendLog:@"Parsing PlayerPrefs…"];
-            NSError *pe = nil;
-            NSDictionary *ns = [NSPropertyListSerialization
-                propertyListWithData:[ppXML dataUsingEncoding:NSUTF8StringEncoding]
-                options:NSPropertyListMutableContainersAndLeaves
-                format:nil error:&pe];
+        NSString *ppXML   = j[@"playerpref"];
+        NSDictionary *dataMap = j[@"data"];
 
-            if (!pe && [ns isKindOfClass:[NSDictionary class]]) {
-                NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-
-                // Clear existing keys in one batched pass (also avoids spike)
-                @autoreleasepool {
-                    NSArray *oldKeys = [[ud dictionaryRepresentation] allKeys];
-                    for (NSString *k in oldKeys) [ud removeObjectForKey:k];
-                }
-
-                NSArray<NSString *> *newKeys = [ns allKeys];
-                NSUInteger total = newKeys.count;
-                [ov appendLog:[NSString stringWithFormat:
-                    @"Writing %lu PlayerPrefs keys (%lu/batch)…",
-                    (unsigned long)total, (unsigned long)kUDWriteBatchSize]];
-
-                // ── KEY CHANGE: write keys in small batches, one per run-loop tick ──
-                // Each call to _applyUDBatch processes kUDWriteBatchSize keys,
-                // wraps them in @autoreleasepool, then yields via dispatch_async
-                // before processing the next batch. This keeps peak memory flat
-                // regardless of key count (~5000 keys ≈ 50 ticks, ~50 ms total).
-                _applyUDBatch(ud, newKeys, ns, 0, total, ov, ^(NSUInteger written) {
-                    [ov appendLog:[NSString stringWithFormat:
-                        @"PlayerPrefs ✓ (%lu keys applied)", (unsigned long)written]];
-
-                    // ── Write .data files after PlayerPrefs finishes ───────────
-                    NSDictionary *dataMap = j[@"data"];
-                    NSString *docsPath = NSSearchPathForDirectoriesInDomains(
-                        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-                    NSFileManager *fm = NSFileManager.defaultManager;
-
-                    NSUInteger fileTotal = ((NSDictionary *)dataMap).count;
-                    __block NSUInteger fi      = 0;
-                    __block NSUInteger applied = 1; // count PlayerPrefs as 1
-
-                    for (NSString *fname in dataMap) {
-                        // Value is plain text — write it directly as UTF-8
-                        NSString *textContent = dataMap[fname];
-                        if ([textContent isKindOfClass:[NSString class]] && textContent.length) {
-                            NSString *dst = [docsPath stringByAppendingPathComponent:fname];
-                            [fm removeItemAtPath:dst error:nil];
-                            NSError *we = nil;
-                            [textContent writeToFile:dst atomically:YES
-                                            encoding:NSUTF8StringEncoding error:&we];
-                            if (!we) {
-                                [ov appendLog:[NSString stringWithFormat:
-                                    @"✓ %@  (%lu chars)",
-                                    fname, (unsigned long)textContent.length]];
-                                applied++;
-                            } else {
-                                [ov appendLog:[NSString stringWithFormat:
-                                    @"⚠ %@ write failed: %@",
-                                    fname, we.localizedDescription]];
-                            }
-                        } else {
-                            [ov appendLog:[NSString stringWithFormat:
-                                @"⚠ %@ empty or invalid", fname]];
-                        }
-
-                        fi++;
-                        [ov setProgress:0.40f + 0.58f *
-                                ((float)fi / MAX(1.0f, (float)fileTotal))
-                                  label:[NSString stringWithFormat:
-                            @"%lu/%lu", (unsigned long)fi, (unsigned long)fileTotal]];
-                    }
-
-                    clearSessionUUID();
-                    done(YES, [NSString stringWithFormat:
-                        @"✓ Loaded %lu item(s). Restart game.", (unsigned long)applied]);
-                });
-
-            } else {
-                [ov appendLog:@"⚠ PlayerPrefs parse failed"];
-                // Still try to write .data files
-                NSDictionary *dataMap = j[@"data"];
-                NSString *docsPath = NSSearchPathForDirectoriesInDomains(
-                    NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-                NSFileManager *fm = NSFileManager.defaultManager;
-                NSUInteger fileTotal = ((NSDictionary *)dataMap).count;
-                __block NSUInteger fi = 0, applied = 0;
-                for (NSString *fname in dataMap) {
-                    NSString *textContent = dataMap[fname];
-                    if ([textContent isKindOfClass:[NSString class]] && textContent.length) {
-                        NSString *dst = [docsPath stringByAppendingPathComponent:fname];
-                        [fm removeItemAtPath:dst error:nil];
-                        NSError *we = nil;
-                        [textContent writeToFile:dst atomically:YES
-                                        encoding:NSUTF8StringEncoding error:&we];
-                        if (!we) { applied++; [ov appendLog:[NSString stringWithFormat:@"✓ %@", fname]]; }
-                        else [ov appendLog:[NSString stringWithFormat:@"⚠ %@ failed", fname]];
-                    }
-                    fi++;
-                    [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
-                              label:[NSString stringWithFormat:@"%lu/%lu",
-                                (unsigned long)fi, (unsigned long)fileTotal]];
-                }
+        // ── No PlayerPrefs → just write .data files ───────────────────────
+        if (!ppXML.length) {
+            [ov appendLog:@"No PlayerPrefs in response — writing .data files only."];
+            writeDataFiles(dataMap, ov, ^(NSUInteger applied) {
                 clearSessionUUID();
                 done(YES, [NSString stringWithFormat:
-                    @"⚠ PlayerPrefs failed, %lu file(s) loaded. Restart game.",
-                    (unsigned long)applied]);
-            }
-        } else {
-            // No PlayerPrefs, just write files
-            NSDictionary *dataMap = j[@"data"];
-            NSString *docsPath = NSSearchPathForDirectoriesInDomains(
-                NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-            NSFileManager *fm = NSFileManager.defaultManager;
-            NSUInteger fileTotal = ((NSDictionary *)dataMap).count;
-            __block NSUInteger fi = 0, applied = 0;
-            for (NSString *fname in dataMap) {
-                NSString *textContent = dataMap[fname];
-                if ([textContent isKindOfClass:[NSString class]] && textContent.length) {
-                    NSString *dst = [docsPath stringByAppendingPathComponent:fname];
-                    [fm removeItemAtPath:dst error:nil];
-                    NSError *we = nil;
-                    [textContent writeToFile:dst atomically:YES
-                                    encoding:NSUTF8StringEncoding error:&we];
-                    if (!we) { applied++; [ov appendLog:[NSString stringWithFormat:@"✓ %@", fname]]; }
-                    else [ov appendLog:[NSString stringWithFormat:@"⚠ %@ failed", fname]];
-                }
-                fi++;
-                [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
-                          label:[NSString stringWithFormat:@"%lu/%lu",
-                            (unsigned long)fi, (unsigned long)fileTotal]];
-            }
-            clearSessionUUID();
-            done(YES, [NSString stringWithFormat:
-                @"✓ Loaded %lu file(s). Restart game.", (unsigned long)applied]);
+                    @"✓ Loaded %lu file(s). Restart the game.", (unsigned long)applied]);
+            });
+            return;
         }
+
+        // ── Parse PlayerPrefs plist ───────────────────────────────────────
+        [ov appendLog:@"Parsing PlayerPrefs…"];
+        NSError *pe    = nil;
+        NSDictionary *ns = nil;
+
+        @try {
+            ns = [NSPropertyListSerialization
+                propertyListWithData:[ppXML dataUsingEncoding:NSUTF8StringEncoding]
+                             options:NSPropertyListMutableContainersAndLeaves
+                              format:nil
+                               error:&pe];
+        } @catch (NSException *ex) {
+            [ov appendLog:[NSString stringWithFormat:
+                @"⚠ PlayerPrefs plist exception: %@", ex.reason]];
+            ns = nil;
+        }
+
+        if (pe || ![ns isKindOfClass:[NSDictionary class]]) {
+            // Log the exact error so the user can see what went wrong
+            NSString *reason = pe.localizedDescription ?: @"Not a dictionary";
+            [ov appendLog:[NSString stringWithFormat:
+                @"⚠ PlayerPrefs parse failed: %@", reason]];
+            [ov appendLog:@"Continuing with .data files only…"];
+
+            writeDataFiles(dataMap, ov, ^(NSUInteger applied) {
+                clearSessionUUID();
+                done(applied > 0,
+                    applied > 0
+                    ? [NSString stringWithFormat:
+                        @"⚠ PlayerPrefs failed (parse error), %lu file(s) applied. "
+                        @"Restart the game.", (unsigned long)applied]
+                    : @"✗ PlayerPrefs parse failed and no .data files were written.");
+            });
+            return;
+        }
+
+        // ── Apply PlayerPrefs in batches ──────────────────────────────────
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
+        // Clear old keys inside an autorelease pool to avoid a spike
+        @autoreleasepool {
+            NSArray *oldKeys = [[ud dictionaryRepresentation] allKeys];
+            [ov appendLog:[NSString stringWithFormat:
+                @"Clearing %lu existing PlayerPrefs keys…", (unsigned long)oldKeys.count]];
+            for (NSString *k in oldKeys) {
+                if (k) [ud removeObjectForKey:k];
+            }
+        }
+
+        NSArray<NSString *> *newKeys = [ns allKeys];
+        NSUInteger total = newKeys.count;
+        [ov appendLog:[NSString stringWithFormat:
+            @"Writing %lu PlayerPrefs keys (%lu per batch)…",
+            (unsigned long)total, (unsigned long)kUDWriteBatchSize]];
+
+        // Batched write — dispatch_async between batches (no 1s delay → no watchdog kill)
+        _applyUDBatch(ud, newKeys, ns, 0, total, ov, ^(NSUInteger written) {
+            [ov appendLog:[NSString stringWithFormat:
+                @"PlayerPrefs ✓ (%lu keys applied)", (unsigned long)written]];
+
+            // Write .data files after PlayerPrefs completes
+            writeDataFiles(dataMap, ov, ^(NSUInteger filesApplied) {
+                clearSessionUUID();
+                NSUInteger totalApplied = 1 /* PlayerPrefs */ + filesApplied;
+                done(YES, [NSString stringWithFormat:
+                    @"✓ Loaded %lu item(s). Restart the game.",
+                    (unsigned long)totalApplied]);
+            });
+        });
     });
 }
 
