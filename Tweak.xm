@@ -799,15 +799,29 @@ static void performLoad(SKProgressOverlay *ov,
     row.layer.cornerRadius = 10;
     row.clipsToBounds      = YES;   // switch is clipped inside the rounded tile
     row.translatesAutoresizingMaskIntoConstraints = NO;
+// UISwitch inside a fixed container so scale transform doesn't break Auto Layout.
+    // Container = scaled visual size (51*0.75 ≈ 38 pt wide, 31*0.75 ≈ 24 pt tall).
+    // Adjust the 0.75f scale factor here to taste.
+    CGFloat swScale = 0.75f;
+    CGFloat swW = 51.0f * swScale;   // ≈ 38
+    CGFloat swH = 31.0f * swScale;   // ≈ 23
 
-    // UISwitch — native size, no transform
+    UIView *swContainer = [UIView new];
+    swContainer.clipsToBounds = NO;
+    swContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:swContainer];
+
     UISwitch *sw = [UISwitch new];
     sw.onTintColor = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
     sw.tag         = tag;
-    sw.translatesAutoresizingMaskIntoConstraints = NO;
+    sw.transform   = CGAffineTransformMakeScale(swScale, swScale);
+    // Manual frame inside container — center it
+    sw.frame = CGRectMake((swW - 51.0f) / 2.0f,
+                          (swH - 31.0f) / 2.0f,
+                          51.0f, 31.0f);
     [sw addTarget:self action:@selector(switchChanged:)
  forControlEvents:UIControlEventValueChanged];
-    [row addSubview:sw];
+    [swContainer addSubview:sw];
     *swRef = sw;
 
     UILabel *nameL = [UILabel new];
@@ -831,9 +845,11 @@ static void performLoad(SKProgressOverlay *ov,
     // Switch is 51 pt wide. At card inner width 300 pt:
     //   text max-width = 300 – 12(lead) – 8(gap) – 51(sw) – 12(trail) = 217 pt
     [NSLayoutConstraint activateConstraints:@[
-        // Switch: right-aligned, vertically centred in row
-        [sw.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
-        [sw.centerYAnchor  constraintEqualToAnchor:row.centerYAnchor],
+// Container: right-aligned, vertically centred, fixed to scaled size
+        [swContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
+        [swContainer.centerYAnchor  constraintEqualToAnchor:row.centerYAnchor],
+        [swContainer.widthAnchor    constraintEqualToConstant:swW],
+        [swContainer.heightAnchor   constraintEqualToConstant:swH],
 
         // Name label: top-left, stops before switch
         [nameL.leadingAnchor  constraintEqualToAnchor:row.leadingAnchor constant:12],
