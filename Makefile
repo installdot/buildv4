@@ -1,7 +1,7 @@
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = DungeonShooterModFull
-DungeonShooterModFull_FILES = Tweak.xm 
+TWEAK_NAME = iSK
+iSK_FILES = Tweak.xm 
 FRAMEWORKS = Foundation UIKit Security DeviceCheck UserNotifications OpenGLES GLKit
 LIBRARIES = crypto
 DungeonShooter_CFLAGS = -fobjc-arc -Wno-error -Wno-deprecated-declarations
