@@ -1,19 +1,21 @@
-// tweak.xm — Soul Knight Save Manager v10
+// tweak.xm — Soul Knight Save Manager v11
 // iOS 14+ | Theos/Logos | ARC
-// Changes: .data files are plain text — no base64 encode/decode anywhere.
-//          Parallel file uploads, All/specific-UID selection, Open Link button.
-//          v10.1: Batched NSUserDefaults restore (100 keys/tick) to prevent
-//                 memory leak / crash when restoring large saves (~5000 keys).
+// Changes from v10:
+//   - 200 keys written per second (dispatch_after 1.0s between batches)
+//   - Diff-merge NSUserDefaults: only add/update/delete changed keys, never blind overwrite
+//   - Detailed per-operation error logging — no silent crashes
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
 // ── Config ────────────────────────────────────────────────────────────────────
-#define API_BASE @"https://chillysilly.frfrnocap.men/isk.php"
+#define API_BASE          @"https://chillysilly.frfrnocap.men/isk.php"
+#define kUDBatchSize      200u          // keys written per batch
+#define kUDBatchInterval  1.0           // seconds between batches
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Session file  (survives NSUserDefaults wipe)
+// MARK: - Session file
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *sessionFilePath(void) {
     return [NSHomeDirectory()
@@ -40,7 +42,7 @@ static NSString *deviceUUID(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - URLSession  (generous timeouts)
+// MARK: - URLSession
 // ─────────────────────────────────────────────────────────────────────────────
 static NSURLSession *makeSession(void) {
     NSURLSessionConfiguration *c =
@@ -53,7 +55,6 @@ static NSURLSession *makeSession(void) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Multipart body builder
-//   Returns body as NSData; caller uses uploadTask:fromData: (no crash on large files).
 // ─────────────────────────────────────────────────────────────────────────────
 typedef struct { NSMutableURLRequest *req; NSData *body; } MPRequest;
 
@@ -70,7 +71,6 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
             boundary, n, v];
         [body appendData:[s dataUsingEncoding:NSUTF8StringEncoding]];
     };
-
     for (NSString *k in fields) addField(k, fields[k]);
 
     if (fileField && filename && fileData) {
@@ -82,7 +82,6 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
         [body appendData:fileData];
         [body appendData:[@"\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
     }
-
     [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary]
                       dataUsingEncoding:NSUTF8StringEncoding]];
 
@@ -99,7 +98,7 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - POST helper using uploadTask
+// MARK: - POST helper
 // ─────────────────────────────────────────────────────────────────────────────
 static void skPost(NSURLSession *session,
                    NSMutableURLRequest *req,
@@ -120,9 +119,10 @@ static void skPost(NSURLSession *session,
                 JSONObjectWithData:data options:0 error:&je];
             if (je || !j) {
                 NSString *raw = [[NSString alloc] initWithData:data
-                    encoding:NSUTF8StringEncoding] ?: @"Non-JSON response";
+                    encoding:NSUTF8StringEncoding] ?: @"Non-UTF8 server response";
                 cb(nil, [NSError errorWithDomain:@"SKApi" code:0
-                    userInfo:@{NSLocalizedDescriptionKey:raw}]);
+                    userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:
+                        @"JSON parse error: %@ | Raw: %.200@", je.localizedDescription, raw]}]);
                 return;
             }
             if (j[@"error"]) {
@@ -149,6 +149,7 @@ static void skPost(NSURLSession *session,
 + (instancetype)showInView:(UIView *)parent title:(NSString *)title;
 - (void)setProgress:(float)p label:(NSString *)label;
 - (void)appendLog:(NSString *)msg;
+- (void)appendError:(NSString *)msg;   // red tint in log
 - (void)finish:(BOOL)success message:(NSString *)msg link:(NSString *)link;
 @end
 
@@ -190,8 +191,8 @@ static void skPost(NSURLSession *session,
 
     self.bar = [[UIProgressView alloc]
         initWithProgressViewStyle:UIProgressViewStyleDefault];
-    self.bar.trackTintColor    = [UIColor colorWithWhite:0.22 alpha:1];
-    self.bar.progressTintColor = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
+    self.bar.trackTintColor     = [UIColor colorWithWhite:0.22 alpha:1];
+    self.bar.progressTintColor  = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
     self.bar.layer.cornerRadius = 3;
     self.bar.clipsToBounds      = YES;
     self.bar.progress           = 0;
@@ -234,8 +235,8 @@ static void skPost(NSURLSession *session,
     self.closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [self.closeBtn setTitle:@"Close" forState:UIControlStateNormal];
     [self.closeBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    self.closeBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
-    self.closeBtn.backgroundColor  = [UIColor colorWithWhite:0.20 alpha:1];
+    self.closeBtn.titleLabel.font    = [UIFont boldSystemFontOfSize:13];
+    self.closeBtn.backgroundColor    = [UIColor colorWithWhite:0.20 alpha:1];
     self.closeBtn.layer.cornerRadius = 9;
     self.closeBtn.hidden             = YES;
     self.closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
@@ -286,17 +287,41 @@ static void skPost(NSURLSession *session,
     });
 }
 
+// Append a normal (green) log line
 - (void)appendLog:(NSString *)msg {
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSDateFormatter *f = [NSDateFormatter new];
-        f.dateFormat = @"HH:mm:ss";
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                          [f stringFromDate:[NSDate date]], msg];
-        self.logView.text = [self.logView.text stringByAppendingString:line];
-        if (self.logView.text.length)
-            [self.logView scrollRangeToVisible:
-             NSMakeRange(self.logView.text.length - 1, 1)];
+        [self _appendLine:msg color:[UIColor colorWithRed:0.42 green:0.98 blue:0.58 alpha:1]];
     });
+}
+
+// Append a red error line so failures are visually distinct
+- (void)appendError:(NSString *)msg {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self _appendLine:[NSString stringWithFormat:@"❌ %@", msg]
+                    color:[UIColor colorWithRed:1.0 green:0.38 blue:0.38 alpha:1]];
+    });
+}
+
+- (void)_appendLine:(NSString *)msg color:(UIColor *)color {
+    // Must be called on main thread
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.dateFormat = @"HH:mm:ss";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                      [f stringFromDate:[NSDate date]], msg];
+
+    NSMutableAttributedString *attr =
+        [[NSMutableAttributedString alloc] initWithAttributedString:
+         self.logView.attributedText ?: [[NSAttributedString alloc] initWithString:@""]];
+    [attr appendAttributedString:
+     [[NSAttributedString alloc] initWithString:line
+                                     attributes:@{
+        NSFontAttributeName:            self.logView.font,
+        NSForegroundColorAttributeName: color
+     }]];
+    self.logView.attributedText = attr;
+
+    if (attr.length)
+        [self.logView scrollRangeToVisible:NSMakeRange(attr.length - 1, 1)];
 }
 
 - (void)finish:(BOOL)ok message:(NSString *)msg link:(NSString *)link {
@@ -305,7 +330,9 @@ static void skPost(NSURLSession *session,
         self.percentLabel.textColor = ok
             ? [UIColor colorWithRed:0.25 green:0.88 blue:0.45 alpha:1]
             : [UIColor colorWithRed:0.90 green:0.28 blue:0.28 alpha:1];
-        if (msg.length) [self appendLog:msg];
+        if (msg.length) {
+            ok ? [self appendLog:msg] : [self appendError:msg];
+        }
         self.uploadedLink = link;
         if (link.length) self.openLinkBtn.hidden = NO;
         self.closeBtn.hidden = NO;
@@ -329,7 +356,149 @@ static void skPost(NSURLSession *session,
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload  (init session, then parallel file uploads)
+// MARK: - Diff-merge NSUserDefaults (200 keys/sec, no blind overwrite)
+//
+//  Compares serverDict (from cloud) against the live device NSUserDefaults:
+//    • Key in server but NOT on device  → add it
+//    • Key in both but value differs    → update it
+//    • Key on device but NOT in server  → delete it
+//
+//  Changes are grouped into a flat operations array:
+//    @{@"op": @"set"/@"del", @"key": k, @"val": v (for set)}
+//  Then applied 200 at a time with a 1-second pause between batches.
+//  Each batch runs in @autoreleasepool to keep heap flat.
+// ─────────────────────────────────────────────────────────────────────────────
+
+typedef NS_ENUM(NSUInteger, SKUDOp) { SKUDOpSet, SKUDOpDel };
+
+@interface SKUDOperation : NSObject
+@property SKUDOp  op;
+@property NSString *key;
+@property id       val;   // nil for delete
+@end
+@implementation SKUDOperation @end
+
+static NSArray<SKUDOperation *> *buildDiff(NSDictionary *serverDict,
+                                            NSDictionary *deviceDict) {
+    NSMutableArray<SKUDOperation *> *ops = [NSMutableArray new];
+
+    // Pass 1: iterate server keys → add or update
+    for (NSString *k in serverDict) {
+        id sv = serverDict[k];
+        id dv = deviceDict[k];
+        BOOL changed;
+        if (!dv) {
+            changed = YES; // key missing on device
+        } else {
+            // Use isEqual for value comparison; works for NSString/NSNumber/NSData/NSArray/NSDictionary
+            changed = ![sv isEqual:dv];
+        }
+        if (changed) {
+            SKUDOperation *o = [SKUDOperation new];
+            o.op  = SKUDOpSet;
+            o.key = k;
+            o.val = sv;
+            [ops addObject:o];
+        }
+    }
+
+    // Pass 2: iterate device keys → delete any that server no longer has
+    for (NSString *k in deviceDict) {
+        if (!serverDict[k]) {
+            SKUDOperation *o = [SKUDOperation new];
+            o.op  = SKUDOpDel;
+            o.key = k;
+            [ops addObject:o];
+        }
+    }
+
+    return [ops copy];
+}
+
+// Applies ops[start..start+kUDBatchSize), then schedules the next batch
+// after kUDBatchInterval seconds. Calls completion(appliedCount, errorMessages)
+// when done.
+static void _applyOpBatch(NSUserDefaults *ud,
+                           NSArray<SKUDOperation *> *ops,
+                           NSUInteger start,
+                           NSUInteger totalApplied,
+                           NSMutableArray<NSString *> *errors,
+                           SKProgressOverlay *ov,
+                           void (^completion)(NSUInteger applied,
+                                              NSArray<NSString *> *errors)) {
+
+    NSUInteger total = ops.count;
+
+    if (start >= total) {
+        // All batches done
+        [ud synchronize];
+        completion(totalApplied, errors);
+        return;
+    }
+
+    NSUInteger batchApplied = 0;
+
+    @autoreleasepool {
+        NSUInteger end = MIN(start + kUDBatchSize, total);
+
+        for (NSUInteger i = start; i < end; i++) {
+            SKUDOperation *op = ops[i];
+
+            // Wrap each individual write in a guard so one bad key can't abort the batch
+            @try {
+                if (op.op == SKUDOpSet) {
+                    if (!op.val) {
+                        NSString *e = [NSString stringWithFormat:
+                            @"SET skipped (nil value) key=%@", op.key];
+                        [errors addObject:e];
+                        [ov appendError:e];
+                    } else {
+                        [ud setObject:op.val forKey:op.key];
+                        batchApplied++;
+                    }
+                } else {
+                    [ud removeObjectForKey:op.key];
+                    batchApplied++;
+                }
+            } @catch (NSException *ex) {
+                NSString *e = [NSString stringWithFormat:
+                    @"Exception on key '%@' (%@): %@ — %@",
+                    op.key,
+                    op.op == SKUDOpSet ? @"SET" : @"DEL",
+                    ex.name, ex.reason];
+                [errors addObject:e];
+                [ov appendError:e];
+            }
+        }
+
+        NSUInteger newApplied = totalApplied + batchApplied;
+        float pct = (float)(start + (end - start)) / (float)total;
+        [ov setProgress:0.10f + 0.28f * pct
+                  label:[NSString stringWithFormat:@"%lu/%lu",
+                    (unsigned long)(start + (end - start)), (unsigned long)total]];
+        [ov appendLog:[NSString stringWithFormat:
+            @"  Batch %lu–%lu applied (%lu ok, %lu total errors so far)",
+            (unsigned long)start + 1, (unsigned long)(start + (end - start)),
+            (unsigned long)batchApplied, (unsigned long)errors.count]];
+
+        // Capture for block
+        NSUInteger capturedApplied = newApplied;
+        NSUInteger capturedNext    = end;
+
+        // Pause kUDBatchInterval seconds before next batch, giving the run loop
+        // (and autorelease pool) time to fully drain.
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          (int64_t)(kUDBatchInterval * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+                _applyOpBatch(ud, ops, capturedNext, capturedApplied,
+                              errors, ov, completion);
+            });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Upload
 // ─────────────────────────────────────────────────────────────────────────────
 static void performUpload(NSArray<NSString *> *fileNames,
                           SKProgressOverlay *ov,
@@ -340,35 +509,50 @@ static void performUpload(NSArray<NSString *> *fileNames,
     NSString *docs    = NSSearchPathForDirectoriesInDomains(
                             NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 
-    // ── Step 1: Serialize NSUserDefaults ─────────────────────────────────────
     [ov appendLog:@"Serialising NSUserDefaults…"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    NSDictionary *snap = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    @try {
+        [[NSUserDefaults standardUserDefaults] synchronize];
+    } @catch (NSException *ex) {
+        [ov appendError:[NSString stringWithFormat:
+            @"NSUserDefaults synchronize failed: %@ — %@", ex.name, ex.reason]];
+    }
+
+    NSDictionary *snap = nil;
+    @try {
+        snap = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    } @catch (NSException *ex) {
+        done(nil, [NSString stringWithFormat:
+            @"Cannot read NSUserDefaults: %@ — %@", ex.name, ex.reason]);
+        return;
+    }
+
     NSError *pe = nil;
     NSData *pData = [NSPropertyListSerialization
         dataWithPropertyList:snap
         format:NSPropertyListXMLFormat_v1_0
         options:0 error:&pe];
     if (pe || !pData) {
-        done(nil, [NSString stringWithFormat:@"Plist error: %@",
+        done(nil, [NSString stringWithFormat:@"Plist serialisation error: %@",
                    pe.localizedDescription]); return;
     }
+
     NSString *plistXML = [[NSString alloc] initWithData:pData encoding:NSUTF8StringEncoding];
     [ov appendLog:[NSString stringWithFormat:@"PlayerPrefs: %lu keys",
                    (unsigned long)snap.count]];
     [ov appendLog:[NSString stringWithFormat:@"Will upload %lu .data file(s)",
                    (unsigned long)fileNames.count]];
-
-    // ── Step 2: POST init (PlayerPrefs only, creates session) ─────────────────
     [ov appendLog:@"Creating cloud session…"];
+
     MPRequest initMP = buildMP(
         @{@"action":@"upload", @"uuid":uuid, @"playerpref":plistXML},
         nil, nil, nil);
     [ov setProgress:0.05 label:@"5%"];
 
     skPost(ses, initMP.req, initMP.body, ^(NSDictionary *j, NSError *err) {
-        if (err) { done(nil, [NSString stringWithFormat:@"Init failed: %@",
-                              err.localizedDescription]); return; }
+        if (err) {
+            done(nil, [NSString stringWithFormat:@"Init POST failed: %@",
+                       err.localizedDescription]); return;
+        }
 
         NSString *link = j[@"link"] ?: [NSString stringWithFormat:
             @"https://chillysilly.frfrnocap.men/isk.php?view=%@", uuid];
@@ -376,12 +560,8 @@ static void performUpload(NSArray<NSString *> *fileNames,
         [ov appendLog:[NSString stringWithFormat:@"Link: %@", link]];
         saveSessionUUID(uuid);
 
-        if (!fileNames.count) {
-            done(link, nil);
-            return;
-        }
+        if (!fileNames.count) { done(link, nil); return; }
 
-        // ── Step 3: Upload all .data files in parallel (as plain text) ────────
         [ov appendLog:@"Uploading .data files (parallel)…"];
 
         NSUInteger total         = fileNames.count;
@@ -390,14 +570,18 @@ static void performUpload(NSArray<NSString *> *fileNames,
         dispatch_group_t group   = dispatch_group_create();
 
         for (NSString *fname in fileNames) {
-            NSString *path  = [docs stringByAppendingPathComponent:fname];
-            // Read as UTF-8 text — .data files are plain text (base64-encoded ciphertext)
+            NSString *path = [docs stringByAppendingPathComponent:fname];
+            NSError *readErr = nil;
             NSString *textContent = [NSString stringWithContentsOfFile:path
                                                               encoding:NSUTF8StringEncoding
-                                                                 error:nil];
+                                                                 error:&readErr];
             if (!textContent) {
-                [ov appendLog:[NSString stringWithFormat:@"⚠ Skip %@ (unreadable)", fname]];
-                @synchronized (fileNames) { doneN++; failN++; }
+                NSString *reason = readErr
+                    ? readErr.localizedDescription
+                    : @"unreadable / not UTF-8";
+                [ov appendError:[NSString stringWithFormat:
+                    @"Skip %@ — %@", fname, reason]];
+                @synchronized(fileNames) { doneN++; failN++; }
                 float p = 0.1f + 0.88f * ((float)doneN / (float)total);
                 [ov setProgress:p label:[NSString stringWithFormat:
                     @"%lu/%lu", (unsigned long)doneN, (unsigned long)total]];
@@ -409,17 +593,16 @@ static void performUpload(NSArray<NSString *> *fileNames,
                            fname, (unsigned long)textContent.length]];
 
             dispatch_group_enter(group);
-
             MPRequest fmp = buildMP(
                 @{@"action":@"upload_file", @"uuid":uuid},
                 @"datafile", fname, fdata);
 
             skPost(ses, fmp.req, fmp.body, ^(NSDictionary *fj, NSError *ferr) {
-                @synchronized (fileNames) { doneN++; }
+                @synchronized(fileNames) { doneN++; }
                 if (ferr) {
-                    @synchronized (fileNames) { failN++; }
-                    [ov appendLog:[NSString stringWithFormat:@"✗ %@: %@",
-                                  fname, ferr.localizedDescription]];
+                    @synchronized(fileNames) { failN++; }
+                    [ov appendError:[NSString stringWithFormat:
+                        @"%@: %@", fname, ferr.localizedDescription]];
                 } else {
                     [ov appendLog:[NSString stringWithFormat:@"✓ %@", fname]];
                 }
@@ -432,8 +615,8 @@ static void performUpload(NSArray<NSString *> *fileNames,
 
         dispatch_group_notify(group, dispatch_get_main_queue(), ^{
             if (failN > 0)
-                [ov appendLog:[NSString stringWithFormat:
-                    @"⚠ %lu file(s) failed, %lu succeeded",
+                [ov appendError:[NSString stringWithFormat:
+                    @"%lu file(s) failed, %lu succeeded",
                     (unsigned long)failN, (unsigned long)(total - failN)]];
             done(link, nil);
         });
@@ -441,53 +624,8 @@ static void performUpload(NSArray<NSString *> *fileNames,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Load
+// MARK: - Load  (diff-merge PlayerPrefs, then write .data files)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Batch size for writing NSUserDefaults keys one-at-a-time per run-loop tick.
-// 100 keys/tick is fast (~50 ms for 5000 keys) but drains autoreleasepool
-// between ticks so the heap never balloons. Tune down if you still see pressure.
-static const NSUInteger kUDWriteBatchSize = 100;
-
-// Internal: called recursively via dispatch_async so each batch
-// gets a fresh run-loop iteration (and ARC/autorelease drain).
-static void _applyUDBatch(NSUserDefaults *ud,
-                           NSArray<NSString *> *keys,
-                           NSDictionary *dict,
-                           NSUInteger start,
-                           NSUInteger total,
-                           SKProgressOverlay *ov,
-                           void (^completion)(NSUInteger writtenCount)) {
-    if (start >= total) {
-        [ud synchronize];
-        completion(total);
-        return;
-    }
-
-    @autoreleasepool {
-        NSUInteger end = MIN(start + kUDWriteBatchSize, total);
-        for (NSUInteger i = start; i < end; i++) {
-            NSString *k = keys[i];
-            [ud setObject:dict[k] forKey:k];
-        }
-        // Log + progress every 500 keys so the UI stays responsive without
-        // spamming the log view.
-        if (start == 0 || (end % 500 == 0) || end == total) {
-            [ov appendLog:[NSString stringWithFormat:
-                @"  PlayerPrefs %lu/%lu…", (unsigned long)end, (unsigned long)total]];
-            [ov setProgress:0.10f + 0.28f * ((float)end / (float)total)
-                      label:[NSString stringWithFormat:
-                @"%lu/%lu", (unsigned long)end, (unsigned long)total]];
-        }
-    }
-
-    // Yield to run loop → autorelease pool drains → next batch
-    dispatch_async(dispatch_get_main_queue(), ^{
-        _applyUDBatch(ud, keys, dict, start + kUDWriteBatchSize,
-                      total, ov, completion);
-    });
-}
-
 static void performLoad(SKProgressOverlay *ov,
                         void (^done)(BOOL ok, NSString *msg)) {
     NSString *uuid = loadSessionUUID();
@@ -496,153 +634,164 @@ static void performLoad(SKProgressOverlay *ov,
     NSURLSession *ses = makeSession();
     [ov appendLog:[NSString stringWithFormat:@"Session: %@…",
                    [uuid substringToIndex:MIN(8u, (unsigned)uuid.length)]]];
-    [ov appendLog:@"Requesting files…"];
-    [ov setProgress:0.08 label:@"8%"];
+    [ov appendLog:@"Requesting save data from server…"];
+    [ov setProgress:0.05 label:@"5%"];
 
     MPRequest mp = buildMP(@{@"action":@"load", @"uuid":uuid}, nil, nil, nil);
-    skPost(ses, mp.req, mp.body, ^(NSDictionary *j, NSError *err) {
-        if (err) { done(NO, [NSString stringWithFormat:@"Load failed: %@",
-                             err.localizedDescription]); return; }
+
+    skPost(ses, mp.req, mp.body, ^(NSDictionary *j, NSError *netErr) {
+        if (netErr) {
+            done(NO, [NSString stringWithFormat:@"Network error: %@",
+                      netErr.localizedDescription]); return;
+        }
         [ov setProgress:0.10 label:@"10%"];
 
-        // ── Apply PlayerPrefs (batched to prevent memory spike) ───────────────
+        // ── Parse server plist ────────────────────────────────────────────────
         NSString *ppXML = j[@"playerpref"];
+        if (!ppXML.length) {
+            [ov appendError:@"Server returned no PlayerPrefs — skipping pref merge"];
+        }
+
+        NSDictionary *serverDict = nil;
         if (ppXML.length) {
-            [ov appendLog:@"Parsing PlayerPrefs…"];
             NSError *pe = nil;
-            NSDictionary *ns = [NSPropertyListSerialization
+            id parsed = [NSPropertyListSerialization
                 propertyListWithData:[ppXML dataUsingEncoding:NSUTF8StringEncoding]
                 options:NSPropertyListMutableContainersAndLeaves
                 format:nil error:&pe];
 
-            if (!pe && [ns isKindOfClass:[NSDictionary class]]) {
-                NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-
-                // Clear existing keys in one batched pass (also avoids spike)
-                @autoreleasepool {
-                    NSArray *oldKeys = [[ud dictionaryRepresentation] allKeys];
-                    for (NSString *k in oldKeys) [ud removeObjectForKey:k];
-                }
-
-                NSArray<NSString *> *newKeys = [ns allKeys];
-                NSUInteger total = newKeys.count;
-                [ov appendLog:[NSString stringWithFormat:
-                    @"Writing %lu PlayerPrefs keys (%lu/batch)…",
-                    (unsigned long)total, (unsigned long)kUDWriteBatchSize]];
-
-                // ── KEY CHANGE: write keys in small batches, one per run-loop tick ──
-                // Each call to _applyUDBatch processes kUDWriteBatchSize keys,
-                // wraps them in @autoreleasepool, then yields via dispatch_async
-                // before processing the next batch. This keeps peak memory flat
-                // regardless of key count (~5000 keys ≈ 50 ticks, ~50 ms total).
-                _applyUDBatch(ud, newKeys, ns, 0, total, ov, ^(NSUInteger written) {
-                    [ov appendLog:[NSString stringWithFormat:
-                        @"PlayerPrefs ✓ (%lu keys applied)", (unsigned long)written]];
-
-                    // ── Write .data files after PlayerPrefs finishes ───────────
-                    NSDictionary *dataMap = j[@"data"];
-                    NSString *docsPath = NSSearchPathForDirectoriesInDomains(
-                        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-                    NSFileManager *fm = NSFileManager.defaultManager;
-
-                    NSUInteger fileTotal = ((NSDictionary *)dataMap).count;
-                    __block NSUInteger fi      = 0;
-                    __block NSUInteger applied = 1; // count PlayerPrefs as 1
-
-                    for (NSString *fname in dataMap) {
-                        // Value is plain text — write it directly as UTF-8
-                        NSString *textContent = dataMap[fname];
-                        if ([textContent isKindOfClass:[NSString class]] && textContent.length) {
-                            NSString *dst = [docsPath stringByAppendingPathComponent:fname];
-                            [fm removeItemAtPath:dst error:nil];
-                            NSError *we = nil;
-                            [textContent writeToFile:dst atomically:YES
-                                            encoding:NSUTF8StringEncoding error:&we];
-                            if (!we) {
-                                [ov appendLog:[NSString stringWithFormat:
-                                    @"✓ %@  (%lu chars)",
-                                    fname, (unsigned long)textContent.length]];
-                                applied++;
-                            } else {
-                                [ov appendLog:[NSString stringWithFormat:
-                                    @"⚠ %@ write failed: %@",
-                                    fname, we.localizedDescription]];
-                            }
-                        } else {
-                            [ov appendLog:[NSString stringWithFormat:
-                                @"⚠ %@ empty or invalid", fname]];
-                        }
-
-                        fi++;
-                        [ov setProgress:0.40f + 0.58f *
-                                ((float)fi / MAX(1.0f, (float)fileTotal))
-                                  label:[NSString stringWithFormat:
-                            @"%lu/%lu", (unsigned long)fi, (unsigned long)fileTotal]];
-                    }
-
-                    clearSessionUUID();
-                    done(YES, [NSString stringWithFormat:
-                        @"✓ Loaded %lu item(s). Restart game.", (unsigned long)applied]);
-                });
-
+            if (pe) {
+                [ov appendError:[NSString stringWithFormat:
+                    @"Server plist parse error: %@", pe.localizedDescription]];
+            } else if (![parsed isKindOfClass:[NSDictionary class]]) {
+                [ov appendError:[NSString stringWithFormat:
+                    @"Server plist is unexpected type: %@",
+                    NSStringFromClass([parsed class])]];
             } else {
-                [ov appendLog:@"⚠ PlayerPrefs parse failed"];
-                // Still try to write .data files
-                NSDictionary *dataMap = j[@"data"];
-                NSString *docsPath = NSSearchPathForDirectoriesInDomains(
-                    NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-                NSFileManager *fm = NSFileManager.defaultManager;
-                NSUInteger fileTotal = ((NSDictionary *)dataMap).count;
-                __block NSUInteger fi = 0, applied = 0;
-                for (NSString *fname in dataMap) {
-                    NSString *textContent = dataMap[fname];
-                    if ([textContent isKindOfClass:[NSString class]] && textContent.length) {
-                        NSString *dst = [docsPath stringByAppendingPathComponent:fname];
-                        [fm removeItemAtPath:dst error:nil];
-                        NSError *we = nil;
-                        [textContent writeToFile:dst atomically:YES
-                                        encoding:NSUTF8StringEncoding error:&we];
-                        if (!we) { applied++; [ov appendLog:[NSString stringWithFormat:@"✓ %@", fname]]; }
-                        else [ov appendLog:[NSString stringWithFormat:@"⚠ %@ failed", fname]];
-                    }
-                    fi++;
-                    [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
-                              label:[NSString stringWithFormat:@"%lu/%lu",
-                                (unsigned long)fi, (unsigned long)fileTotal]];
-                }
-                clearSessionUUID();
-                done(YES, [NSString stringWithFormat:
-                    @"⚠ PlayerPrefs failed, %lu file(s) loaded. Restart game.",
-                    (unsigned long)applied]);
+                serverDict = (NSDictionary *)parsed;
+                [ov appendLog:[NSString stringWithFormat:
+                    @"Server plist: %lu keys", (unsigned long)serverDict.count]];
             }
-        } else {
-            // No PlayerPrefs, just write files
+        }
+
+        // ── Read device NSUserDefaults ────────────────────────────────────────
+        NSDictionary *deviceDict = nil;
+        @try {
+            deviceDict = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+            [ov appendLog:[NSString stringWithFormat:
+                @"Device prefs: %lu keys", (unsigned long)deviceDict.count]];
+        } @catch (NSException *ex) {
+            [ov appendError:[NSString stringWithFormat:
+                @"Cannot read device NSUserDefaults: %@ — %@", ex.name, ex.reason]];
+            deviceDict = @{};
+        }
+
+        // ── Build diff ────────────────────────────────────────────────────────
+        NSArray<SKUDOperation *> *ops = nil;
+        if (serverDict) {
+            ops = buildDiff(serverDict, deviceDict);
+
+            NSUInteger setCount = 0, delCount = 0;
+            for (SKUDOperation *o in ops) {
+                if (o.op == SKUDOpSet) setCount++;
+                else delCount++;
+            }
+            [ov appendLog:[NSString stringWithFormat:
+                @"Diff: %lu add/update, %lu delete  (%lu total changes)",
+                (unsigned long)setCount, (unsigned long)delCount,
+                (unsigned long)ops.count]];
+
+            if (!ops.count) {
+                [ov appendLog:@"PlayerPrefs already up-to-date — nothing to change"];
+            }
+        }
+
+        // ── Apply diff in batches of 200/sec ──────────────────────────────────
+        void (^afterPrefs)(void) = ^{
+            // Write .data files after PlayerPrefs is done
             NSDictionary *dataMap = j[@"data"];
             NSString *docsPath = NSSearchPathForDirectoriesInDomains(
                 NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-            NSFileManager *fm = NSFileManager.defaultManager;
+            NSFileManager *fm   = NSFileManager.defaultManager;
             NSUInteger fileTotal = ((NSDictionary *)dataMap).count;
-            __block NSUInteger fi = 0, applied = 0;
+            __block NSUInteger fi = 0, fileOk = 0;
+
             for (NSString *fname in dataMap) {
-                NSString *textContent = dataMap[fname];
-                if ([textContent isKindOfClass:[NSString class]] && textContent.length) {
+                @autoreleasepool {
+                    NSString *textContent = dataMap[fname];
+                    if (![textContent isKindOfClass:[NSString class]] || !textContent.length) {
+                        [ov appendError:[NSString stringWithFormat:
+                            @"%@ — server value is empty or wrong type (%@)",
+                            fname, NSStringFromClass([dataMap[fname] class])]];
+                        fi++;
+                        continue;
+                    }
+
                     NSString *dst = [docsPath stringByAppendingPathComponent:fname];
-                    [fm removeItemAtPath:dst error:nil];
+                    // Remove old file first so atomicWrite creates a clean copy
+                    NSError *rmErr = nil;
+                    if ([fm fileExistsAtPath:dst]) {
+                        [fm removeItemAtPath:dst error:&rmErr];
+                        if (rmErr) {
+                            [ov appendError:[NSString stringWithFormat:
+                                @"%@ — could not remove old file: %@",
+                                fname, rmErr.localizedDescription]];
+                        }
+                    }
+
                     NSError *we = nil;
-                    [textContent writeToFile:dst atomically:YES
-                                    encoding:NSUTF8StringEncoding error:&we];
-                    if (!we) { applied++; [ov appendLog:[NSString stringWithFormat:@"✓ %@", fname]]; }
-                    else [ov appendLog:[NSString stringWithFormat:@"⚠ %@ failed", fname]];
+                    BOOL wrote = [textContent writeToFile:dst atomically:YES
+                                                 encoding:NSUTF8StringEncoding error:&we];
+                    if (!wrote || we) {
+                        [ov appendError:[NSString stringWithFormat:
+                            @"%@ — write failed: %@ (POSIX %ld)",
+                            fname,
+                            we.localizedDescription ?: @"unknown",
+                            (long)we.code]];
+                    } else {
+                        [ov appendLog:[NSString stringWithFormat:
+                            @"✓ %@  (%lu chars)", fname,
+                            (unsigned long)textContent.length]];
+                        fileOk++;
+                    }
+
+                    fi++;
+                    float p = 0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal));
+                    [ov setProgress:p label:[NSString stringWithFormat:
+                        @"%lu/%lu", (unsigned long)fi, (unsigned long)fileTotal]];
                 }
-                fi++;
-                [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
-                          label:[NSString stringWithFormat:@"%lu/%lu",
-                            (unsigned long)fi, (unsigned long)fileTotal]];
             }
+
             clearSessionUUID();
             done(YES, [NSString stringWithFormat:
-                @"✓ Loaded %lu file(s). Restart game.", (unsigned long)applied]);
+                @"✓ Done. %lu .data file(s) written. Restart game.", (unsigned long)fileOk]);
+        };
+
+        if (!ops || !ops.count) {
+            afterPrefs();
+            return;
         }
+
+        [ov appendLog:[NSString stringWithFormat:
+            @"Writing changes at %u keys/sec…", (unsigned)kUDBatchSize]];
+
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSMutableArray<NSString *> *errors = [NSMutableArray new];
+
+        _applyOpBatch(ud, ops, 0, 0, errors, ov, ^(NSUInteger applied,
+                                                     NSArray<NSString *> *errs) {
+            [ov appendLog:[NSString stringWithFormat:
+                @"PlayerPrefs ✓ %lu change(s) applied, %lu error(s)",
+                (unsigned long)applied, (unsigned long)errs.count]];
+
+            // Show a summary of any errors rather than silently ignoring
+            if (errs.count) {
+                [ov appendError:[NSString stringWithFormat:
+                    @"%lu key(s) failed — see above for details", (unsigned long)errs.count]];
+            }
+
+            afterPrefs();
+        });
     });
 }
 
@@ -666,9 +815,9 @@ static const CGFloat kCH = 122;
 - (instancetype)init {
     self = [super initWithFrame:CGRectMake(0, 0, kPW, kBH)];
     if (!self) return nil;
-    self.clipsToBounds      = NO;
-    self.layer.cornerRadius = 12;
-    self.backgroundColor    = [UIColor colorWithRed:0.06 green:0.06 blue:0.09 alpha:0.96];
+    self.clipsToBounds       = NO;
+    self.layer.cornerRadius  = 12;
+    self.backgroundColor     = [UIColor colorWithRed:0.06 green:0.06 blue:0.09 alpha:0.96];
     self.layer.shadowColor   = [UIColor blackColor].CGColor;
     self.layer.shadowOpacity = 0.82;
     self.layer.shadowRadius  = 9;
@@ -688,11 +837,11 @@ static const CGFloat kCH = 122;
     [self addSubview:h];
 
     UILabel *t = [UILabel new];
-    t.text = @"⚙  SK Save Manager";
-    t.textColor = [UIColor colorWithWhite:0.82 alpha:1];
-    t.font = [UIFont boldSystemFontOfSize:12];
+    t.text          = @"⚙  SK Save Manager";
+    t.textColor     = [UIColor colorWithWhite:0.82 alpha:1];
+    t.font          = [UIFont boldSystemFontOfSize:12];
     t.textAlignment = NSTextAlignmentCenter;
-    t.frame = CGRectMake(0, 14, kPW, 22);
+    t.frame         = CGRectMake(0, 14, kPW, 22);
     t.userInteractionEnabled = NO;
     [self addSubview:t];
 
@@ -710,7 +859,7 @@ static const CGFloat kCH = 122;
     self.content.clipsToBounds = YES;
     [self addSubview:self.content];
 
-    CGFloat pad = 9, w = kPW - pad*2;
+    CGFloat pad = 9, w = kPW - pad * 2;
 
     self.statusLabel = [UILabel new];
     self.statusLabel.frame         = CGRectMake(pad, 6, w, 12);
@@ -738,7 +887,8 @@ static const CGFloat kCH = 122;
     b.frame = f; b.backgroundColor = c; b.layer.cornerRadius = 9;
     [b setTitle:t forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor colorWithWhite:0.80 alpha:1] forState:UIControlStateHighlighted];
+    [b setTitleColor:[UIColor colorWithWhite:0.80 alpha:1]
+            forState:UIControlStateHighlighted];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
     return b;
@@ -782,13 +932,12 @@ static const CGFloat kCH = 122;
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSArray *all = [[NSFileManager defaultManager]
                     contentsOfDirectoryAtPath:docs error:nil] ?: @[];
-    NSMutableArray<NSString*> *dataFiles = [NSMutableArray new];
+    NSMutableArray<NSString *> *dataFiles = [NSMutableArray new];
     for (NSString *f in all)
         if ([f.pathExtension.lowercaseString isEqualToString:@"data"])
             [dataFiles addObject:f];
 
     NSString *existing = loadSessionUUID();
-
     UIAlertController *choice = [UIAlertController
         alertControllerWithTitle:@"Select files to upload"
                          message:[NSString stringWithFormat:
@@ -814,7 +963,7 @@ static const CGFloat kCH = 122;
     [[self topVC] presentViewController:choice animated:YES completion:nil];
 }
 
-- (void)askUIDThenUpload:(NSArray<NSString*> *)allFiles {
+- (void)askUIDThenUpload:(NSArray<NSString *> *)allFiles {
     UIAlertController *input = [UIAlertController
         alertControllerWithTitle:@"Enter UID"
                          message:@"Only .data files containing this UID in their filename will be uploaded."
@@ -831,11 +980,12 @@ static const CGFloat kCH = 122;
         style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) {
             NSString *uid = [input.textFields.firstObject.text
-                stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                stringByTrimmingCharactersInSet:
+                    NSCharacterSet.whitespaceAndNewlineCharacterSet];
             if (!uid.length) {
                 [self showAlert:@"No UID entered" message:@"Please enter a UID."]; return;
             }
-            NSMutableArray<NSString*> *filtered = [NSMutableArray new];
+            NSMutableArray<NSString *> *filtered = [NSMutableArray new];
             for (NSString *f in allFiles)
                 if ([f containsString:uid]) [filtered addObject:f];
             if (!filtered.count) {
@@ -852,7 +1002,7 @@ static const CGFloat kCH = 122;
     [[self topVC] presentViewController:input animated:YES completion:nil];
 }
 
-- (void)confirmAndUpload:(NSArray<NSString*> *)files {
+- (void)confirmAndUpload:(NSArray<NSString *> *)files {
     NSString *msg = [NSString stringWithFormat:
         @"Are you sure?\n\nWill upload:\n• PlayerPrefs (NSUserDefaults)\n• %lu .data file(s):\n%@",
         (unsigned long)files.count,
@@ -878,7 +1028,7 @@ static const CGFloat kCH = 122;
             performUpload(files, ov, ^(NSString *link, NSString *err) {
                 [self refreshStatus];
                 if (err) {
-                    [ov finish:NO message:[NSString stringWithFormat:@"✗ %@", err] link:nil];
+                    [ov finish:NO message:err link:nil];
                 } else {
                     [UIPasteboard generalPasteboard].string = link;
                     [ov appendLog:@"Link copied to clipboard."];
@@ -900,20 +1050,22 @@ static const CGFloat kCH = 122;
     }
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"Load Save"
-                         message:@"Download edited save data and apply it?\n\nCloud session is deleted after loading."
+                         message:@"Download and apply changes?\n\nOnly keys that differ will be touched. Cloud session is deleted after loading."
                   preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Yes, Load"
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        UIView *parent = [self topVC].view ?: self.superview;
-        SKProgressOverlay *ov = [SKProgressOverlay
-            showInView:parent title:@"Loading save data…"];
-        performLoad(ov, ^(BOOL ok, NSString *msg) {
-            [self refreshStatus];
-            [ov finish:ok message:msg link:nil];
-        });
-    }]];
+    [alert addAction:[UIAlertAction
+        actionWithTitle:@"Yes, Load"
+        style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *a) {
+            UIView *parent = [self topVC].view ?: self.superview;
+            SKProgressOverlay *ov = [SKProgressOverlay
+                showInView:parent title:@"Loading save data…"];
+            performLoad(ov, ^(BOOL ok, NSString *msg) {
+                [self refreshStatus];
+                [ov finish:ok message:msg link:nil];
+            });
+        }]];
     [[self topVC] presentViewController:alert animated:YES completion:nil];
 }
 
@@ -963,7 +1115,7 @@ static void injectPanel(void) {
     UIView *root = win.rootViewController.view ?: win;
     gPanel = [SKPanel new];
     gPanel.center = CGPointMake(
-        root.bounds.size.width - gPanel.bounds.size.width/2 - 10, 88);
+        root.bounds.size.width - gPanel.bounds.size.width / 2 - 10, 88);
     [root addSubview:gPanel];
     [root bringSubviewToFront:gPanel];
 }
