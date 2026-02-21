@@ -486,7 +486,8 @@ static void _applyUDBatch(NSUserDefaults *ud,
                dispatch_get_main_queue(), ^{
     _applyUDBatch(ud, keys, dict, start + kUDWriteBatchSize,
                   total, ov, completion);
-});
+    });
+}
 
 static void performLoad(SKProgressOverlay *ov,
                         void (^done)(BOOL ok, NSString *msg)) {
