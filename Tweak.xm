@@ -930,7 +930,7 @@ static void performLoad(SKProgressOverlay *ov,
         // Card: centred on screen
         [_card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
         [_card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-        [_card.widthAnchor   constraintEqualToConstant:320],
+        [_card.widthAnchor   constraintEqualToConstant:350],
 
         // Drag handle
         [handle.topAnchor     constraintEqualToAnchor:_card.topAnchor constant:8],
