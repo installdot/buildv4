@@ -1,9 +1,15 @@
 // tweak.xm — Soul Knight Save Manager v10
 // iOS 14+ | Theos/Logos | ARC
-// v10.6: AUTO RIJ FIX — replaced template-based regex (${1}0${2} was
-//         ambiguous/unreliable) with enumerateMatchesInString + plain string
-//         replacement. Added post-transform plist validation: if the result
-//         is not a valid plist, original XML is returned — upload never corrupted.
+// v10.7: iPad crash fixes
+//   - Replaced UIApplication.sharedApplication.windows with UIWindowScene API (iOS 13+)
+//     so window lookup works correctly on iPad with multi-scene / multi-window setups.
+//   - topVC: added nil-safety guard; falls back to keyWindow rootViewController.
+//   - injectPanel: added rootViewController.isViewLoaded guard to prevent injecting
+//     into a view that hasn't been laid out yet (common crash on iPad cold launch).
+//   - All UIAlertController presentations: set popoverPresentationController.sourceView
+//     so iPad doesn't crash trying to present without an anchor.
+//   - Panel initial position clamped to actual screen bounds so it doesn't render
+//     off-screen on large iPad displays.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -11,6 +17,27 @@
 
 // ── Config ────────────────────────────────────────────────────────────────────
 #define API_BASE @"https://chillysilly.frfrnocap.men/isk.php"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Safe window / key-window helper (iOS 13+ scene-aware)
+// ─────────────────────────────────────────────────────────────────────────────
+static UIWindow *activeKeyWindow(void) {
+    if (@available(iOS 13, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            // Prefer the key window; fall back to first visible window in scene.
+            for (UIWindow *w in ws.windows.reverseObjectEnumerator) {
+                if (!w.isHidden && w.alpha > 0) return w;
+            }
+        }
+    }
+    // Legacy fallback (iOS 12 or no active foreground scene found)
+    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator)
+        if (!w.isHidden && w.alpha > 0) return w;
+    return nil;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Session file
@@ -84,24 +111,6 @@ static NSString *detectPlayerUID(void) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Auto Rij  (v10.6 rewrite — safe, no template ambiguity)
-//
-//  ROOT CAUSE of the old bug:
-//    NSRegularExpression's template @"${1}0${2}" is ambiguous.  After the
-//    engine processes capture group $1, it encounters the literal character
-//    "0", but some ICU builds interpret "$10" as back-reference #10 (not
-//    group #1 followed by "0"), producing garbage and breaking the plist XML.
-//
-//  New approach:
-//    1. Match the COMPLETE <key>OpenRijTest_N</key> … <integer>1</integer>
-//       block so we know exactly which substring to edit.
-//    2. Collect all match ranges up-front, then walk them in REVERSE ORDER
-//       so earlier character offsets remain valid after each edit.
-//    3. Inside each matched block do a plain NSString replacement of
-//       "<integer>1</integer>" → "<integer>0</integer>".
-//       No template substitution — no ambiguity possible.
-//    4. Validate the resulting NSString is still a parseable plist.
-//       If validation fails for any reason, silently return the original XML
-//       so the upload is never corrupted.
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *applyAutoRij(NSString *plistXML) {
     if (!plistXML.length) return plistXML;
@@ -121,22 +130,19 @@ static NSString *applyAutoRij(NSString *plistXML) {
         [rx matchesInString:plistXML
                     options:0
                       range:NSMakeRange(0, plistXML.length)];
-    if (!matches.count) return plistXML;  // nothing to change — return as-is
+    if (!matches.count) return plistXML;
 
     NSMutableString *result = [plistXML mutableCopy];
 
-    // Reverse iteration keeps all preceding character offsets valid.
     for (NSTextCheckingResult *match in matches.reverseObjectEnumerator) {
         NSRange   r         = match.range;
         NSString *original  = [result substringWithRange:r];
-        // Plain string swap — no regex template, no ambiguity.
         NSString *patched   = [original
             stringByReplacingOccurrencesOfString:@"<integer>1</integer>"
                                       withString:@"<integer>0</integer>"];
         [result replaceCharactersInRange:r withString:patched];
     }
 
-    // ── Integrity check: make sure the XML is still a valid plist ────────────
     NSData *testData = [result dataUsingEncoding:NSUTF8StringEncoding];
     if (!testData) return plistXML;
 
@@ -150,13 +156,13 @@ static NSString *applyAutoRij(NSString *plistXML) {
                            error:&verr];
     } @catch (NSException *ex) {
         NSLog(@"[SKTools] applyAutoRij: validation exception: %@", ex.reason);
-        return plistXML;   // fallback — return original
+        return plistXML;
     }
     if (verr || !parsed) {
         NSLog(@"[SKTools] applyAutoRij: validation failed (%@) — "
               @"returning original to prevent corrupt upload.",
               verr.localizedDescription ?: @"not a valid plist");
-        return plistXML;   // fallback — return original
+        return plistXML;
     }
 
     return result;
@@ -491,8 +497,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
     if (getSetting(@"autoRij")) {
         NSString *patched = applyAutoRij(plistXML);
         if (patched == plistXML) {
-            // pointer equality — applyAutoRij returned the original (either no
-            // matching flags were found, or the plist validation check failed)
             [ov appendLog:@"Auto Rij: no changes (no matching flags, or validation fallback)."];
         } else {
             NSUInteger delta = (NSInteger)patched.length - (NSInteger)plistXML.length;
@@ -728,7 +732,6 @@ static void performLoad(SKProgressOverlay *ov,
             return;
         }
 
-        // Server sends changed:false when nothing was edited in the web viewer
         if ([j[@"changed"] isEqual:@NO] || [j[@"changed"] isEqual:@0]) {
             clearSessionUUID();
             done(YES, @"ℹ Server reports no changes were made. Nothing applied.");
@@ -780,7 +783,6 @@ static void performLoad(SKProgressOverlay *ov,
             return;
         }
 
-        // Smart diff — only keys that actually changed are touched
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         [ud synchronize];
         NSDictionary *live = [ud dictionaryRepresentation];
@@ -1251,6 +1253,7 @@ static const CGFloat kCH  = 168;
 }
 
 - (void)tapHide {
+    // ── iPad fix: UIAlertController needs a popover anchor on iPad ────────────
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"Hide Menu"
                          message:@"The panel will be removed until the next app launch."
@@ -1265,7 +1268,16 @@ static const CGFloat kCH  = 168;
                 self.transform = CGAffineTransformMakeScale(0.85f, 0.85f);
             } completion:^(BOOL __) { [self removeFromSuperview]; }];
         }]];
-    [[self topVC] presentViewController:a animated:YES completion:nil];
+    UIViewController *vc = [self topVC];
+    if (!vc) return;
+    // iPad popover anchor — required or UIKit throws an NSInternalInconsistencyException
+    if (a.popoverPresentationController) {
+        a.popoverPresentationController.sourceView = self;
+        a.popoverPresentationController.sourceRect = self.bounds;
+        a.popoverPresentationController.permittedArrowDirections =
+            UIPopoverArrowDirectionAny;
+    }
+    [vc presentViewController:a animated:YES completion:nil];
 }
 
 - (void)tapUpload {
@@ -1324,7 +1336,16 @@ static const CGFloat kCH  = 168;
     [choice addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
 
-    [[self topVC] presentViewController:choice animated:YES completion:nil];
+    UIViewController *vc = [self topVC];
+    if (!vc) return;
+    // iPad popover anchor
+    if (choice.popoverPresentationController) {
+        choice.popoverPresentationController.sourceView = self;
+        choice.popoverPresentationController.sourceRect = self.bounds;
+        choice.popoverPresentationController.permittedArrowDirections =
+            UIPopoverArrowDirectionAny;
+    }
+    [vc presentViewController:choice animated:YES completion:nil];
 }
 
 - (void)askUIDThenUpload:(NSArray<NSString*> *)allFiles {
@@ -1362,7 +1383,16 @@ static const CGFloat kCH  = 168;
     [input addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
 
-    [[self topVC] presentViewController:input animated:YES completion:nil];
+    UIViewController *vc = [self topVC];
+    if (!vc) return;
+    // iPad popover anchor
+    if (input.popoverPresentationController) {
+        input.popoverPresentationController.sourceView = self;
+        input.popoverPresentationController.sourceRect = self.bounds;
+        input.popoverPresentationController.permittedArrowDirections =
+            UIPopoverArrowDirectionAny;
+    }
+    [vc presentViewController:input animated:YES completion:nil];
 }
 
 - (void)confirmAndUpload:(NSArray<NSString*> *)files {
@@ -1401,7 +1431,16 @@ static const CGFloat kCH  = 168;
             });
         }]];
 
-    [[self topVC] presentViewController:confirm animated:YES completion:nil];
+    UIViewController *vc = [self topVC];
+    if (!vc) return;
+    // iPad popover anchor
+    if (confirm.popoverPresentationController) {
+        confirm.popoverPresentationController.sourceView = self;
+        confirm.popoverPresentationController.sourceRect = self.bounds;
+        confirm.popoverPresentationController.permittedArrowDirections =
+            UIPopoverArrowDirectionAny;
+    }
+    [vc presentViewController:confirm animated:YES completion:nil];
 }
 
 - (void)tapLoad {
@@ -1435,7 +1474,16 @@ static const CGFloat kCH  = 168;
             }
         });
     }]];
-    [[self topVC] presentViewController:alert animated:YES completion:nil];
+    UIViewController *vc = [self topVC];
+    if (!vc) return;
+    // iPad popover anchor
+    if (alert.popoverPresentationController) {
+        alert.popoverPresentationController.sourceView = self;
+        alert.popoverPresentationController.sourceRect = self.bounds;
+        alert.popoverPresentationController.permittedArrowDirections =
+            UIPopoverArrowDirectionAny;
+    }
+    [vc presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)showAlert:(NSString *)title message:(NSString *)msg {
@@ -1444,7 +1492,16 @@ static const CGFloat kCH  = 168;
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK"
         style:UIAlertActionStyleDefault handler:nil]];
-    [[self topVC] presentViewController:a animated:YES completion:nil];
+    UIViewController *vc = [self topVC];
+    if (!vc) return;
+    // iPad popover anchor
+    if (a.popoverPresentationController) {
+        a.popoverPresentationController.sourceView = self;
+        a.popoverPresentationController.sourceRect = self.bounds;
+        a.popoverPresentationController.permittedArrowDirections =
+            UIPopoverArrowDirectionAny;
+    }
+    [vc presentViewController:a animated:YES completion:nil];
 }
 
 - (void)onPan:(UIPanGestureRecognizer *)g {
@@ -1458,12 +1515,14 @@ static const CGFloat kCH  = 168;
     [g setTranslation:CGPointZero inView:self.superview];
 }
 
+// ── iPad fix: scene-aware topVC resolution ────────────────────────────────────
 - (UIViewController *)topVC {
-    UIViewController *vc = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator)
-        if (!w.isHidden && w.alpha > 0 && w.rootViewController)
-            { vc = w.rootViewController; break; }
-    while (vc.presentedViewController) vc = vc.presentedViewController;
+    UIWindow *win = activeKeyWindow();
+    if (!win) return nil;
+    UIViewController *vc = win.rootViewController;
+    if (!vc) return nil;
+    while (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed)
+        vc = vc.presentedViewController;
     return vc;
 }
 @end
@@ -1474,14 +1533,26 @@ static const CGFloat kCH  = 168;
 static SKPanel *gPanel = nil;
 
 static void injectPanel(void) {
-    UIWindow *win = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows)
-        if (!w.isHidden && w.alpha > 0) { win = w; break; }
+    // ── iPad fix: use scene-aware window lookup ───────────────────────────────
+    UIWindow *win = activeKeyWindow();
     if (!win) return;
-    UIView *root = win.rootViewController.view ?: win;
+
+    // ── iPad fix: ensure rootViewController and its view are fully loaded ─────
+    UIViewController *rootVC = win.rootViewController;
+    if (!rootVC || !rootVC.isViewLoaded || !rootVC.view.window) return;
+
+    UIView *root = rootVC.view;
+
     gPanel = [SKPanel new];
-    gPanel.center = CGPointMake(
-        root.bounds.size.width - gPanel.bounds.size.width/2 - 10, 88);
+
+    // ── iPad fix: clamp initial position to actual screen bounds ─────────────
+    CGFloat screenW = root.bounds.size.width;
+    CGFloat panelW  = gPanel.bounds.size.width;
+    CGFloat cx      = MAX(panelW / 2.0f + 10.0f,
+                          MIN(screenW - panelW / 2.0f - 10.0f,
+                              screenW - panelW / 2.0f - 10.0f));
+    gPanel.center = CGPointMake(cx, 88.0f);
+
     [root addSubview:gPanel];
     [root bringSubviewToFront:gPanel];
 }
@@ -1491,8 +1562,19 @@ static void injectPanel(void) {
     %orig;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ injectPanel(); });
+        // ── iPad fix: extended delay so the window hierarchy is fully settled ─
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            injectPanel();
+            // Retry once if the first attempt found the view not yet in a window
+            if (!gPanel || !gPanel.superview) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                    (int64_t)(1.5 * NSEC_PER_SEC)),
+                    dispatch_get_main_queue(), ^{
+                    if (!gPanel || !gPanel.superview) injectPanel();
+                });
+            }
+        });
     });
 }
 %end
