@@ -1,29 +1,25 @@
 // tweak.xm — Soul Knight Save Manager v11
 // iOS 14+ / iPadOS 26+ | Theos/Logos | ARC
 //
-// v11.0 FULL REWRITE:
-//   • Removed crash reporter entirely
-//   • New injection: dedicated UIWindow at UIWindowLevelAlert+1 — never touches
-//     the game's view hierarchy, works on iOS 26 / iPadOS 26 without scene issues
-//   • SKOverlayWindow owns its own UIWindowScene reference (iOS 13+)
-//   • Floating 💾 pill button (collapsed) → slide-up bottom sheet (expanded)
-//   • All errors: copied to UIPasteboard + shown in red in-window banner
-//   • Every UIAlertController has popoverPresentationController configured
-//   • @try/@catch around every injection and UI step — nothing can crash the app
-//   • UISceneDidActivateNotification used as primary injection trigger on iOS 13+
-//     with three fallback retry timers at 0.8s / 2.0s / 4.0s
+// v11.1 CHANGES:
+//   • Removed floating pill button and bottom sheet entirely
+//   • NEW trigger: Press Volume UP then Volume DOWN within 3 seconds → opens menu
+//   • Menu is now a UIAlertController (action sheet on iPhone, alert on iPad)
+//   • Volume state is monitored via AVAudioSession outputVolume KVO
+//   • All other behaviour (upload/load/settings/progress overlay) unchanged
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
-// ── Config ─────────────────────────────────────────────────────────────────
+// ── Config ──────────────────────────────────────────────────────────────────
 #define API_BASE      @"https://chillysilly.frfrnocap.men/isk.php"
 #define DYLIB_VERSION @"2.2"
-#define DYLIB_BUILD   @"300.v11"
+#define DYLIB_BUILD   @"300.v11.1"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Error helper — copies to clipboard + feeds banner, never crashes
+// MARK: - Error helper
 // ─────────────────────────────────────────────────────────────────────────────
 static void skError(NSString *context, NSString *detail);  // forward
 
@@ -413,7 +409,7 @@ static NSDictionary *udDiff(NSDictionary *live, NSDictionary *incoming) {
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload / Load
+// MARK: - Upload / Load helpers
 // ─────────────────────────────────────────────────────────────────────────────
 static void writeDataFiles(NSDictionary *dataMap, SKProgressOverlay *ov,
                             void (^done)(NSUInteger)) {
@@ -648,8 +644,7 @@ static void performLoad(SKProgressOverlay *ov, void (^done)(BOOL,NSString*)) {
 
     UISwitch *sw=[UISwitch new];
     sw.onTintColor=[UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
-    sw.tag=tag;
-    sw.translatesAutoresizingMaskIntoConstraints=NO;
+    sw.tag=tag; sw.translatesAutoresizingMaskIntoConstraints=NO;
     [sw addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
     [row addSubview:sw];
     if (outSw) *outSw=sw;
@@ -791,32 +786,25 @@ static void performLoad(SKProgressOverlay *ov, void (^done)(BOOL,NSString*)) {
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKOverlayWindow
 //
-//  Dedicated UIWindow at UIWindowLevelAlert+1.
-//  Never touches the game's window/rootVC.
-//  UI: 💾 pill FAB (draggable, snaps to edges) → bottom sheet with actions.
+//  Dedicated UIWindow at UIWindowLevelAlert+1. No visible UI at rest.
+//  TRIGGER: Volume UP then Volume DOWN within 3 seconds → UIAlertController menu.
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKOverlayWindow : UIWindow
 @property (nonatomic,strong) SKRootViewController *skRoot;
-// Pill
-@property (nonatomic,strong) UIButton *pillBtn;
-// Sheet
-@property (nonatomic,strong) UIView   *sheetBg;
-@property (nonatomic,strong) UIView   *sheetContainer;
-@property (nonatomic,assign) BOOL      sheetVisible;
-// Sheet content labels/buttons (kept as ivars for refreshStatus)
-@property (nonatomic,strong) UILabel  *statusLbl;
-@property (nonatomic,strong) UILabel  *uidLbl;
+// Volume trigger state
+@property (nonatomic,assign) NSTimeInterval volUpTimestamp;  // 0 = not armed
+@property (nonatomic,assign) float          lastVolume;
 // Error banner
-@property (nonatomic,strong) UIView   *bannerView;
-@property (nonatomic,strong) UILabel  *bannerLbl;
+@property (nonatomic,strong) UIView  *bannerView;
+@property (nonatomic,strong) UILabel *bannerLbl;
 +(instancetype)makeForScene:(UIWindowScene*)scene;
 -(void)showError:(NSString*)msg;
 -(void)presentAlert:(UIAlertController*)alert;
+-(void)openMenu;
 @end
 
 static SKOverlayWindow *gOverlay = nil;
 
-// skError needs gOverlay — forward impl after class
 static void skError(NSString *context, NSString *detail) {
     if (!context) context=@"?";
     if (!detail)  detail=@"(nil)";
@@ -834,7 +822,7 @@ static void skError(NSString *context, NSString *detail) {
     SKOverlayWindow *w;
     if (@available(iOS 13.0,*)) {
         if (scene) w=[[SKOverlayWindow alloc] initWithWindowScene:scene];
-        else w=[[SKOverlayWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        else       w=[[SKOverlayWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     } else {
         w=[[SKOverlayWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     }
@@ -842,11 +830,8 @@ static void skError(NSString *context, NSString *detail) {
 }
 
 -(instancetype)initWithWindowScene:(UIWindowScene*)scene {
-    if (@available(iOS 13.0,*)) {
-        self=[super initWithWindowScene:scene];
-    } else {
-        self=[super initWithFrame:[UIScreen mainScreen].bounds];
-    }
+    if (@available(iOS 13.0,*)) { self=[super initWithWindowScene:scene]; }
+    else                        { self=[super initWithFrame:[UIScreen mainScreen].bounds]; }
     if (!self) return nil;
     [self setup];
     return self;
@@ -870,8 +855,7 @@ static void skError(NSString *context, NSString *detail) {
     self.rootViewController=_skRoot;
 
     [self buildBanner];
-    [self buildSheet];
-    [self buildPill];
+    [self startVolumeMonitor];
     [self makeKeyAndVisible];
 }
 
@@ -918,232 +902,176 @@ static void skError(NSString *context, NSString *detail) {
     });
 }
 
-// ── Sheet ──────────────────────────────────────────────────────────────────
--(void)buildSheet {
-    // Dim overlay
-    _sheetBg=[[UIView alloc] initWithFrame:_skRoot.view.bounds];
-    _sheetBg.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
-    _sheetBg.backgroundColor=[UIColor colorWithWhite:0 alpha:0.48];
-    _sheetBg.alpha=0; _sheetBg.hidden=YES;
-    [_skRoot.view addSubview:_sheetBg];
-    [_sheetBg addGestureRecognizer:[[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(hideSheet)]];
-
-    // Sheet panel — max 400pt wide, centered horizontally on iPad
-    CGRect screen=[UIScreen mainScreen].bounds;
-    CGFloat w=MIN(screen.size.width,400);
-    CGFloat h=300;
-    CGFloat x=(screen.size.width-w)/2;
-    _sheetContainer=[[UIView alloc] initWithFrame:CGRectMake(x,screen.size.height,w,h)];
-    _sheetContainer.backgroundColor=[UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:0.97];
-    _sheetContainer.layer.cornerRadius=22;
-    _sheetContainer.layer.maskedCorners=kCALayerMinXMinYCorner|kCALayerMaxXMinYCorner;
-    _sheetContainer.layer.shadowColor=[UIColor blackColor].CGColor;
-    _sheetContainer.layer.shadowOpacity=0.8; _sheetContainer.layer.shadowRadius=20;
-    _sheetContainer.clipsToBounds=NO;
-    _sheetContainer.autoresizingMask=UIViewAutoresizingFlexibleTopMargin
-                                   |UIViewAutoresizingFlexibleLeftMargin
-                                   |UIViewAutoresizingFlexibleRightMargin;
-    [_skRoot.view addSubview:_sheetContainer];
-
-    // Drag handle
-    UIView *handle=[[UIView alloc] initWithFrame:CGRectMake(w/2-20,10,40,4)];
-    handle.backgroundColor=[UIColor colorWithWhite:0.4 alpha:0.6];
-    handle.layer.cornerRadius=2;
-    [_sheetContainer addSubview:handle];
-
-    // Swipe down to dismiss
-    UISwipeGestureRecognizer *sw=[[UISwipeGestureRecognizer alloc]
-        initWithTarget:self action:@selector(hideSheet)];
-    sw.direction=UISwipeGestureRecognizerDirectionDown;
-    [_sheetContainer addGestureRecognizer:sw];
-
-    // ── Content ──
-    CGFloat p=14;
-    CGFloat cw=w-p*2;
-
-    // Status labels
-    _statusLbl=[[UILabel alloc] initWithFrame:CGRectMake(p,26,cw,14)];
-    _statusLbl.textColor=[UIColor colorWithWhite:0.5 alpha:1];
-    _statusLbl.font=[UIFont systemFontOfSize:10]; _statusLbl.textAlignment=NSTextAlignmentCenter;
-    [_sheetContainer addSubview:_statusLbl];
-
-    _uidLbl=[[UILabel alloc] initWithFrame:CGRectMake(p,42,cw,12)];
-    _uidLbl.textColor=[UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
-    _uidLbl.font=[UIFont fontWithName:@"Courier" size:9]?:[UIFont systemFontOfSize:9];
-    _uidLbl.textAlignment=NSTextAlignmentCenter;
-    [_sheetContainer addSubview:_uidLbl];
-
-    // Buttons
-    void(^styleBtn)(UIButton*,UIColor*) = ^(UIButton *b, UIColor *col){
-        b.backgroundColor=col; b.layer.cornerRadius=10;
-        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        b.titleLabel.font=[UIFont boldSystemFontOfSize:14];
-    };
-
-    UIButton *upBtn=[[UIButton alloc] initWithFrame:CGRectMake(p,62,cw,48)];
-    [upBtn setTitle:@"⬆  Upload to Cloud" forState:UIControlStateNormal];
-    styleBtn(upBtn,[UIColor colorWithRed:0.14 green:0.56 blue:0.92 alpha:1]);
-    [upBtn addTarget:self action:@selector(tapUpload) forControlEvents:UIControlEventTouchUpInside];
-    [_sheetContainer addSubview:upBtn];
-
-    UIButton *dnBtn=[[UIButton alloc] initWithFrame:CGRectMake(p,118,cw,48)];
-    [dnBtn setTitle:@"⬇  Load from Cloud" forState:UIControlStateNormal];
-    styleBtn(dnBtn,[UIColor colorWithRed:0.18 green:0.70 blue:0.42 alpha:1]);
-    [dnBtn addTarget:self action:@selector(tapLoad) forControlEvents:UIControlEventTouchUpInside];
-    [_sheetContainer addSubview:dnBtn];
-
-    CGFloat halfW=(cw-8)/2;
-    UIButton *setBtn=[[UIButton alloc] initWithFrame:CGRectMake(p,176,halfW,36)];
-    [setBtn setTitle:@"⚙ Settings" forState:UIControlStateNormal];
-    styleBtn(setBtn,[UIColor colorWithRed:0.20 green:0.20 blue:0.28 alpha:1]);
-    setBtn.titleLabel.font=[UIFont boldSystemFontOfSize:12];
-    [setBtn addTarget:self action:@selector(tapSettings) forControlEvents:UIControlEventTouchUpInside];
-    [_sheetContainer addSubview:setBtn];
-
-    UIButton *clBtn=[[UIButton alloc] initWithFrame:CGRectMake(p+halfW+8,176,halfW,36)];
-    [clBtn setTitle:@"✕ Close" forState:UIControlStateNormal];
-    styleBtn(clBtn,[UIColor colorWithRed:0.28 green:0.10 blue:0.10 alpha:1]);
-    clBtn.titleLabel.font=[UIFont boldSystemFontOfSize:12];
-    [clBtn addTarget:self action:@selector(hideSheet) forControlEvents:UIControlEventTouchUpInside];
-    [_sheetContainer addSubview:clBtn];
-
-    UILabel *footer=[[UILabel alloc] initWithFrame:CGRectMake(p,222,cw,14)];
-    footer.text=[NSString stringWithFormat:@"SK Save Manager v%@ build %@",DYLIB_VERSION,DYLIB_BUILD];
-    footer.textColor=[UIColor colorWithWhite:0.28 alpha:1];
-    footer.font=[UIFont systemFontOfSize:8]; footer.textAlignment=NSTextAlignmentCenter;
-    [_sheetContainer addSubview:footer];
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Volume Monitor
+//   Press Vol UP → arms trigger.
+//   Press Vol DOWN within 3 s → opens menu.
+//   Any other order or timeout → resets state silently.
+// ─────────────────────────────────────────────────────────────────────────────
+-(void)startVolumeMonitor {
+    @try {
+        AVAudioSession *session=[AVAudioSession sharedInstance];
+        NSError *err=nil;
+        [session setActive:YES error:&err];
+        _lastVolume=session.outputVolume;
+        _volUpTimestamp=0;
+        [session addObserver:self
+                  forKeyPath:@"outputVolume"
+                     options:NSKeyValueObservingOptionNew
+                     context:nil];
+        NSLog(@"[SKTools] Volume monitor ready — Vol UP then Vol DOWN within 3s opens menu");
+    } @catch (NSException *ex) {
+        NSLog(@"[SKTools] startVolumeMonitor failed: %@", ex.reason);
+    }
 }
 
--(void)refreshStatus {
-    NSString *uuid=loadSessionUUID();
-    _statusLbl.text=uuid
-        ?[NSString stringWithFormat:@"Session: %@…",
-          [uuid substringToIndex:MIN(8u,(unsigned)uuid.length)]]
-        :@"No active session";
+-(void)observeValueForKeyPath:(NSString*)keyPath
+                     ofObject:(id)object
+                       change:(NSDictionary*)change
+                      context:(void*)context {
+    if (![keyPath isEqualToString:@"outputVolume"]) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    @try {
+        float newVol = [[change objectForKey:NSKeyValueChangeNewKey] floatValue];
+        float prev   = _lastVolume;
+        _lastVolume  = newVol;
+
+        // Use a threshold of 0.01 to ignore tiny floating-point noise
+        if (newVol > prev + 0.01f) {
+            // ── Volume UP pressed ──────────────────────────────────────────
+            _volUpTimestamp = [NSDate date].timeIntervalSinceReferenceDate;
+            NSLog(@"[SKTools] Vol UP (%.2f→%.2f) armed, waiting for Vol DOWN…", prev, newVol);
+
+        } else if (newVol < prev - 0.01f) {
+            // ── Volume DOWN pressed ────────────────────────────────────────
+            NSTimeInterval now = [NSDate date].timeIntervalSinceReferenceDate;
+            if (_volUpTimestamp > 0 && (now - _volUpTimestamp) <= 3.0) {
+                _volUpTimestamp = 0;
+                NSLog(@"[SKTools] Sequence matched — opening menu");
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self openMenu];
+                });
+            } else {
+                // No prior UP within window — reset
+                _volUpTimestamp = 0;
+            }
+        }
+    } @catch (...) {}
+}
+
+-(void)dealloc {
+    @try {
+        [[AVAudioSession sharedInstance] removeObserver:self forKeyPath:@"outputVolume"];
+    } @catch (...) {}
+}
+
+// ── Touch passthrough for transparent root view ────────────────────────────
+-(UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+    UIView *hit=[super hitTest:point withEvent:event];
+    // Return nil for our own transparent root so touches pass to the game
+    if (hit==_skRoot.view) return nil;
+    return hit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Main Menu (UIAlertController)
+// ─────────────────────────────────────────────────────────────────────────────
+-(void)openMenu {
+    @try {
+        if (_skRoot.presentedViewController) {
+            [_skRoot dismissViewControllerAnimated:NO completion:^{ [self showMainMenu]; }];
+        } else {
+            [self showMainMenu];
+        }
+    } @catch (NSException *ex) {
+        skError(@"openMenu", ex.reason);
+    }
+}
+
+-(void)showMainMenu {
+    NSString *session = loadSessionUUID();
+    NSString *sessionNote = session
+        ? [NSString stringWithFormat:@"Session: %@…",
+           [session substringToIndex:MIN(8u,(unsigned)session.length)]]
+        : @"No active session";
+
+    NSString *uidNote = @"";
     if (getSetting(@"autoDetectUID")) {
-        NSString *uid=detectPlayerUID();
-        _uidLbl.text=uid?[NSString stringWithFormat:@"UID: %@",uid]:@"UID: not found";
-    } else {
-        _uidLbl.text=@"";
+        NSString *uid = detectPlayerUID();
+        uidNote = uid
+            ? [NSString stringWithFormat:@"\nUID: %@", uid]
+            : @"\nUID: not found";
     }
+
+    NSString *msg = [NSString stringWithFormat:@"%@%@\n\nv%@ build %@",
+                     sessionNote, uidNote, DYLIB_VERSION, DYLIB_BUILD];
+
+    // Action sheet on iPhone; plain alert on iPad (action sheet without popover crashes on iPad)
+    UIAlertControllerStyle style = (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad)
+        ? UIAlertControllerStyleAlert
+        : UIAlertControllerStyleActionSheet;
+
+    UIAlertController *menu = [UIAlertController
+        alertControllerWithTitle:@"💾 SK Save Manager"
+                         message:msg
+                  preferredStyle:style];
+
+    [menu addAction:[UIAlertAction
+        actionWithTitle:@"⬆  Upload to Cloud"
+        style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *_){ [self tapUpload]; }]];
+
+    [menu addAction:[UIAlertAction
+        actionWithTitle:@"⬇  Load from Cloud"
+        style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *_){ [self tapLoad]; }]];
+
+    [menu addAction:[UIAlertAction
+        actionWithTitle:@"⚙  Settings"
+        style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *_){
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.15*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [SKSettingsView showInView:_skRoot.view];
+            });
+        }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel"
+        style:UIAlertActionStyleCancel handler:nil]];
+
+    [self presentAlert:menu];
 }
 
--(void)showSheet {
-    if (_sheetVisible) return;
-    _sheetVisible=YES;
-    [self refreshStatus];
-    [_skRoot.view bringSubviewToFront:_sheetBg];
-    [_skRoot.view bringSubviewToFront:_sheetContainer];
-    [_skRoot.view bringSubviewToFront:_pillBtn];
-    CGRect bounds=_skRoot.view.bounds;
-    CGFloat safe=_skRoot.view.safeAreaInsets.bottom;
-    CGRect end=_sheetContainer.frame;
-    end.origin.y=bounds.size.height-end.size.height-safe;
-    _sheetBg.hidden=NO;
-    [UIView animateWithDuration:0.30 delay:0 options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{ _sheetBg.alpha=1; _sheetContainer.frame=end; }
-                     completion:nil];
-}
-
--(void)hideSheet {
-    if (!_sheetVisible) return;
-    _sheetVisible=NO;
-    CGRect bounds=_skRoot.view.bounds;
-    CGRect end=_sheetContainer.frame;
-    end.origin.y=bounds.size.height;
-    [UIView animateWithDuration:0.22 delay:0 options:UIViewAnimationOptionCurveEaseIn
-                     animations:^{ _sheetBg.alpha=0; _sheetContainer.frame=end; }
-                     completion:^(BOOL _){ _sheetBg.hidden=YES; }];
-}
-
-// ── Pill ───────────────────────────────────────────────────────────────────
--(void)buildPill {
-    _pillBtn=[UIButton buttonWithType:UIButtonTypeCustom];
-    _pillBtn.backgroundColor=[UIColor colorWithRed:0.06 green:0.06 blue:0.14 alpha:0.92];
-    _pillBtn.layer.cornerRadius=24;
-    _pillBtn.layer.shadowColor=[UIColor blackColor].CGColor;
-    _pillBtn.layer.shadowOpacity=0.7; _pillBtn.layer.shadowRadius=8;
-    _pillBtn.layer.shadowOffset=CGSizeMake(0,3);
-    _pillBtn.clipsToBounds=NO;
-    [_pillBtn setTitle:@"💾" forState:UIControlStateNormal];
-    _pillBtn.titleLabel.font=[UIFont systemFontOfSize:22];
-    [_pillBtn addTarget:self action:@selector(pillTapped) forControlEvents:UIControlEventTouchUpInside];
-    UIPanGestureRecognizer *pan=[[UIPanGestureRecognizer alloc]
-        initWithTarget:self action:@selector(pillPan:)];
-    [_pillBtn addGestureRecognizer:pan];
-
-    CGRect screen=[UIScreen mainScreen].bounds;
-    CGFloat safe=0;
-    if (@available(iOS 11.0,*)) {
-        // safeAreaInsets not available yet at window creation time — use 34pt estimate
-        safe=34;
-    }
-    _pillBtn.frame=CGRectMake(screen.size.width-62, screen.size.height-100-safe, 48, 48);
-    [_skRoot.view addSubview:_pillBtn];
-}
-
--(void)pillTapped {
-    _sheetVisible ? [self hideSheet] : [self showSheet];
-}
-
--(void)pillPan:(UIPanGestureRecognizer*)g {
-    static CGPoint startCenter;
-    if (g.state==UIGestureRecognizerStateBegan) startCenter=_pillBtn.center;
-    CGPoint delta=[g translationInView:_skRoot.view];
-    CGRect sb=_skRoot.view.bounds;
-    CGFloat nx=MAX(30,MIN(sb.size.width-30, startCenter.x+delta.x));
-    CGFloat ny=MAX(60,MIN(sb.size.height-80,startCenter.y+delta.y));
-    _pillBtn.center=CGPointMake(nx,ny);
-    if (g.state==UIGestureRecognizerStateEnded||g.state==UIGestureRecognizerStateCancelled) {
-        // snap to nearest side edge
-        CGFloat snapX=(_pillBtn.center.x<sb.size.width/2)?34:sb.size.width-34;
-        [UIView animateWithDuration:0.22 delay:0 options:UIViewAnimationOptionCurveEaseOut
-                         animations:^{ _pillBtn.center=CGPointMake(snapX,_pillBtn.center.y); }
-                         completion:nil];
-    }
-}
-
-// ── Alert ──────────────────────────────────────────────────────────────────
+// ── Alert presenter ─────────────────────────────────────────────────────────
 -(void)presentAlert:(UIAlertController*)alert {
     @try {
         if (!alert) return;
+        // iPad requires a source for popovers — anchor to screen centre
         if (alert.popoverPresentationController) {
-            alert.popoverPresentationController.sourceView=_pillBtn?:_skRoot.view;
-            alert.popoverPresentationController.sourceRect=
-                _pillBtn?_pillBtn.bounds:CGRectMake(0,0,1,1);
-            alert.popoverPresentationController.permittedArrowDirections=UIPopoverArrowDirectionAny;
+            alert.popoverPresentationController.sourceView = _skRoot.view;
+            alert.popoverPresentationController.sourceRect =
+                CGRectMake(CGRectGetMidX(_skRoot.view.bounds),
+                           CGRectGetMidY(_skRoot.view.bounds), 1, 1);
+            alert.popoverPresentationController.permittedArrowDirections = 0;
         }
-        UIViewController *vc=_skRoot;
-        if (vc.presentedViewController) {
-            [vc dismissViewControllerAnimated:NO completion:^{
+        if (_skRoot.presentedViewController) {
+            [_skRoot dismissViewControllerAnimated:NO completion:^{
                 [_skRoot presentViewController:alert animated:YES completion:nil];
             }];
         } else {
             [_skRoot presentViewController:alert animated:YES completion:nil];
         }
     } @catch (NSException *ex) {
-        skError(@"presentAlert",ex.reason);
+        skError(@"presentAlert", ex.reason);
         [self showError:ex.reason?:@"Alert failed"];
     }
 }
 
-// ── Touch passthrough for transparent root view ────────────────────────────
--(UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
-    UIView *hit=[super hitTest:point withEvent:event];
-    if (hit==_skRoot.view) return nil;
-    return hit;
-}
-
-// ── Actions ────────────────────────────────────────────────────────────────
--(void)tapSettings {
-    [self hideSheet];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.15*NSEC_PER_SEC)),
-                   dispatch_get_main_queue(),^{
-        [SKSettingsView showInView:_skRoot.view];
-    });
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Upload action
+// ─────────────────────────────────────────────────────────────────────────────
 -(void)tapUpload {
     @try {
         NSString *docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
@@ -1227,7 +1155,6 @@ static void skError(NSString *context, NSString *detail) {
             @try {
                 SKProgressOverlay *ov=[SKProgressOverlay showInView:_skRoot.view title:@"Uploading…"];
                 performUpload(files,ov,^(NSString *link, NSString *err){
-                    [self refreshStatus];
                     if (err) {
                         [ov finish:NO message:[NSString stringWithFormat:@"✗ %@",err] link:nil];
                         skError(@"upload",err); [self showError:err];
@@ -1245,6 +1172,9 @@ static void skError(NSString *context, NSString *detail) {
     [self presentAlert:c];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Load action
+// ─────────────────────────────────────────────────────────────────────────────
 -(void)tapLoad {
     @try {
         if (!loadSessionUUID().length) {
@@ -1263,7 +1193,6 @@ static void skError(NSString *context, NSString *detail) {
                 @try {
                     SKProgressOverlay *ov=[SKProgressOverlay showInView:_skRoot.view title:@"Loading…"];
                     performLoad(ov,^(BOOL ok, NSString *msg){
-                        [self refreshStatus];
                         [ov finish:ok message:msg link:nil];
                         if (!ok) { skError(@"load",msg); [self showError:msg?:@"Load failed"]; }
                         if (ok&&getSetting(@"autoClose"))
@@ -1304,7 +1233,7 @@ static void tryInject(void) {
         if (!gOverlay) {
             skError(@"inject",@"SKOverlayWindow returned nil");
         } else {
-            NSLog(@"[SKTools] v11 overlay injected ✓");
+            NSLog(@"[SKTools] v11.1 injected ✓ — trigger: Vol UP → Vol DOWN within 3s");
         }
     } @catch (NSException *ex) {
         NSString *msg=ex.reason?:@"Unknown injection exception";
@@ -1321,7 +1250,6 @@ static void tryInject(void) {
     %orig;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // Primary: scene activation notification (iOS 13+)
         if (@available(iOS 13.0,*)) {
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:UISceneDidActivateNotification
@@ -1331,7 +1259,6 @@ static void tryInject(void) {
                     if (!gOverlay) tryInject();
                 }];
         }
-        // Fallback timers — 0.8s, 2.0s, 4.0s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.8*NSEC_PER_SEC)),
                        dispatch_get_main_queue(),^{ if (!gOverlay) tryInject(); });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2.0*NSEC_PER_SEC)),
@@ -1341,10 +1268,9 @@ static void tryInject(void) {
             if (!gOverlay) {
                 tryInject();
                 if (!gOverlay) {
-                    // All attempts failed — write to clipboard as last resort
                     @try {
                         [UIPasteboard generalPasteboard].string=
-                            @"[SKTools] FATAL: All 4 injection attempts failed. No UIWindowScene available.";
+                            @"[SKTools] FATAL: All 4 injection attempts failed.";
                     } @catch (...) {}
                 }
             }
