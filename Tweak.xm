@@ -19,8 +19,8 @@
 // ── Config ────────────────────────────────────────────────────────────────────
 #define API_BASE       @"https://chillysilly.frfrnocap.men/isk.php"
 #define CRASH_API_BASE @"https://chillysilly.frfrnocap.men/crash_api.php"
-#define DYLIB_VERSION  @"2.1"
-#define DYLIB_BUILD    @"271.ef2ca7"
+#define DYLIB_VERSION  "2.1"
+#define DYLIB_BUILD    "271.ef2ca7"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Session file
@@ -347,7 +347,7 @@ static void skExceptionHandler(NSException *exception) {
             @"device_model" : @(gDeviceModel),
             @"ios_version"  : @(gIOSVersion),
             @"app_version"  : @(gAppVersion),
-            @"dylib_build"  : DYLIB_BUILD,
+            @"dylib_build"  : @(DYLIB_BUILD),
             @"crash_type"   : name,
             @"crash_reason" : reason,
             @"crash_log"    : log,
@@ -1250,7 +1250,7 @@ static const CGFloat kSWScale = 0.75f;
 
     UILabel *footer = [UILabel new];
     footer.text          = [NSString stringWithFormat:
-        @"Dylib By Mochi - Version: %@ - Build: %@", DYLIB_VERSION, DYLIB_BUILD];
+        @"Dylib By Mochi - Version: %s - Build: %s", DYLIB_VERSION, DYLIB_BUILD];
     footer.textColor     = [UIColor colorWithWhite:0.28 alpha:1];
     footer.font          = [UIFont systemFontOfSize:8.5];
     footer.textAlignment = NSTextAlignmentCenter;
