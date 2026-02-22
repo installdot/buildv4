@@ -622,7 +622,55 @@ static void skPost(NSURLSession *ses, NSMutableURLRequest *req, NSData *body,
     [[SKMenuController shared] presentMainMenu];
 }
 @end
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Floating Menu Button Controller
+// ─────────────────────────────────────────────────────────────────────────────
 
+@interface SKFloatingController : UIViewController
+@property (nonatomic, strong) UIButton *menuButton;
+@end
+
+@implementation SKFloatingController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.clearColor;
+
+    CGFloat size = 60.0;
+
+    self.menuButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.menuButton.frame = CGRectMake(100, 200, size, size);
+    self.menuButton.layer.cornerRadius = size / 2;
+    self.menuButton.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
+    [self.menuButton setTitle:@"≡" forState:UIControlStateNormal];
+    [self.menuButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.menuButton.titleLabel.font = [UIFont boldSystemFontOfSize:28];
+
+    [self.menuButton addTarget:self
+                        action:@selector(openMenu)
+              forControlEvents:UIControlEventTouchUpInside];
+
+    // Drag gesture
+    UIPanGestureRecognizer *pan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                action:@selector(handlePan:)];
+    [self.menuButton addGestureRecognizer:pan];
+
+    [self.view addSubview:self.menuButton];
+}
+
+- (void)openMenu {
+    [[SKMenuController shared] presentMainMenu];
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)g {
+    CGPoint translation = [g translationInView:self.view];
+    g.view.center = CGPointMake(g.view.center.x + translation.x,
+                                g.view.center.y + translation.y);
+    [g setTranslation:CGPointZero inView:self.view];
+}
+
+@end
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Injection
 // ─────────────────────────────────────────────────────────────────────────────
@@ -631,27 +679,31 @@ static SKOverlayWindow *gOverlayWindow = nil;
 static void createOverlayWindow(void) {
     if (gOverlayWindow) return;
 
-    SKGestureViewController *vc = [SKGestureViewController new];
+    SKFloatingController *vc = [SKFloatingController new];
     SKOverlayWindow *win = nil;
 
     if (@available(iOS 13, *)) {
         UIWindowScene *scene = nil;
         for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
             if (![s isKindOfClass:[UIWindowScene class]]) continue;
-            if (s.activationState == UISceneActivationStateForegroundActive)
-                { scene = (UIWindowScene *)s; break; }
-            if (!scene) scene = (UIWindowScene *)s;
+            if (s.activationState == UISceneActivationStateForegroundActive) {
+                scene = (UIWindowScene *)s;
+                break;
+            }
         }
-        if (scene) win = [[SKOverlayWindow alloc] initWithWindowScene:scene];
+        if (scene)
+            win = [[SKOverlayWindow alloc] initWithWindowScene:scene];
     }
-    if (!win) win = [[SKOverlayWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
 
-    win.windowLevel            = UIWindowLevelStatusBar - 1;
-    win.backgroundColor        = UIColor.clearColor;
-    win.rootViewController     = vc;
-    win.userInteractionEnabled = YES;
-    win.hidden                 = NO;
-    gOverlayWindow             = win;
+    if (!win)
+        win = [[SKOverlayWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+
+    win.windowLevel = UIWindowLevelAlert + 1;
+    win.backgroundColor = UIColor.clearColor;
+    win.rootViewController = vc;
+    win.hidden = NO;
+
+    gOverlayWindow = win;
 }
 
 %hook UIApplication
