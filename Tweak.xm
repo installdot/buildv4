@@ -1,20 +1,24 @@
-// SKCrashReporter.xm — Soul Knight Crash Reporter
-// Captures ObjC exceptions + Unix signals, saves to disk, and uploads on next launch.
+// SKCrashReporter.xm — Soul Knight Crash Reporter  v2
+// Captures ObjC exceptions + Unix signals, saves to disk, uploads on next launch.
 //
-// HOW IT WORKS (important — read before modifying):
+// v2 KEY CHANGE — "instant crash on launch" fix:
+//   Signal handlers are now installed via __attribute__((constructor)), which
+//   runs BEFORE main(), BEFORE any ObjC, BEFORE any view appears.
+//   This means even a crash that happens in +load, in a constructor of another
+//   dylib, or in applicationDidFinishLaunching is captured.
 //
-//   Signal handlers are severely restricted by POSIX — you CANNOT call malloc,
-//   ObjC methods, NSLog, or any non-async-signal-safe function inside them.
-//   Safe operations: write(), open(), close(), _exit(), signal-safe C functions.
+//   The crash file path is built using getenv("HOME") — available at constructor
+//   time with no heap allocation and no ObjC runtime required.
 //
-//   Strategy:
-//     1. On crash  → write a plain JSON file to the app's Documents folder
-//                    using only async-signal-safe syscalls (write/open/close).
-//     2. On launch → SKCrashReporter checks for a pending crash file,
-//                    reads it, POSTs it to the PHP API, then deletes it.
+//   ObjC exception handler + UIDevice info are filled in later (still early,
+//   via applicationDidFinishLaunching hook) because UIDevice requires a running
+//   run loop.  If the crash happens before that point the device fields will
+//   show "Unknown-early" — but the backtrace and crash type ARE captured.
 //
-//   This two-phase approach is the same technique used by PLCrashReporter,
-//   Firebase Crashlytics, and every other production crash SDK.
+// TWO-PHASE DESIGN:
+//   Phase 1 (crash moment)  → write JSON to Documents/SKPendingCrash.json
+//                             using only async-signal-safe POSIX syscalls.
+//   Phase 2 (next launch)   → read file, POST to PHP API, delete file.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -24,31 +28,29 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   // getenv
 #include <sys/utsname.h>
 
 // ── Config ────────────────────────────────────────────────────────────────────
-#define CRASH_API_URL   @"https://chillysilly.frfrnocap.men/crash_api.php"  // ← change this
-#define DYLIB_BUILD     @"271.ef2ca7"
-#define APP_VERSION     @"10.7"
-#define PENDING_CRASH_FILENAME  "SKPendingCrash.json"
+#define CRASH_API_URL          @"https://YOUR_SERVER/crash_api.php"   // ← change
+#define DYLIB_BUILD            @"271.ef2ca7"
+#define APP_VERSION            @"10.7"
+#define PENDING_CRASH_FILENAME "SKPendingCrash.json"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Async-signal-safe file writer
-//
-//  We use raw POSIX I/O here — NO malloc, NO ObjC, NO NSLog.
-//  Everything is stack-allocated.  The JSON we write is intentionally simple
-//  so we can build it with snprintf into a fixed-size stack buffer.
+// MARK: - Globals
 // ─────────────────────────────────────────────────────────────────────────────
-#define CRASH_BUF_SIZE  (64 * 1024)   // 64 KB — enough for a deep backtrace
+static char g_pendingCrashPath[1024];  // set in constructor via getenv("HOME")
+static char g_deviceModel[64];         // set after run loop starts
+static char g_iosVersion[32];          // set after run loop starts
+static char g_deviceID[64];            // set after run loop starts
+static char g_lastUserAction[256];     // updated by panel buttons
 
-// Globals written BEFORE signal handler is invoked (set from main thread on launch)
-static char  g_pendingCrashPath[1024];   // absolute path to the pending-crash file
-static char  g_deviceModel[64];
-static char  g_iosVersion[32];
-static char  g_deviceID[64];
-static char  g_lastUserAction[256];      // updated by the panel on each user action
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Async-signal-safe helpers  (NO malloc, NO ObjC, NO stdio buffering)
+// ─────────────────────────────────────────────────────────────────────────────
+#define CRASH_BUF_SIZE (64 * 1024)
 
-// Simple async-signal-safe string copy that guarantees NUL termination
 static void safe_strncpy(char *dst, const char *src, size_t n) {
     if (!dst || !src || n == 0) return;
     size_t i = 0;
@@ -56,57 +58,59 @@ static void safe_strncpy(char *dst, const char *src, size_t n) {
     dst[i] = '\0';
 }
 
-// Write a C string to an fd — async-signal-safe
 static void fd_write(int fd, const char *s) {
     if (fd < 0 || !s) return;
     size_t len = strlen(s);
     while (len > 0) {
         ssize_t n = write(fd, s, len);
         if (n <= 0) break;
-        s   += n;
-        len -= (size_t)n;
+        s += n; len -= (size_t)n;
     }
 }
 
-// Escape a C string for JSON (minimal: escape backslash, double-quote, and control chars)
 static void json_escape(char *out, size_t outSize, const char *in) {
-    if (!out || outSize < 2 || !in) { if (out && outSize) out[0] = '\0'; return; }
+    if (!out || outSize < 2) return;
+    if (!in) { out[0] = '\0'; return; }
     size_t wi = 0;
-    for (size_t i = 0; in[i] && wi + 3 < outSize; i++) {
+    for (size_t i = 0; in[i] && wi + 6 < outSize; i++) {
         unsigned char c = (unsigned char)in[i];
         if      (c == '"')  { out[wi++] = '\\'; out[wi++] = '"';  }
         else if (c == '\\') { out[wi++] = '\\'; out[wi++] = '\\'; }
         else if (c == '\n') { out[wi++] = '\\'; out[wi++] = 'n';  }
         else if (c == '\r') { out[wi++] = '\\'; out[wi++] = 'r';  }
         else if (c == '\t') { out[wi++] = '\\'; out[wi++] = 't';  }
-        else if (c < 0x20)  { /* skip other control chars */ }
+        else if (c < 0x20)  { /* skip control chars */ }
         else                { out[wi++] = (char)c; }
     }
     out[wi] = '\0';
 }
 
-// Core crash writer — called from both signal handler and ObjC exception handler.
-// Must be async-signal-safe (no malloc, no ObjC, no stdio buffered calls).
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Crash file writer (async-signal-safe)
+// ─────────────────────────────────────────────────────────────────────────────
 static void writeCrashFile(const char *crashType,
                             const char *crashReason,
                             const char *crashLog) {
     if (!g_pendingCrashPath[0]) return;
 
-    // Open/create the crash file — O_CREAT|O_WRONLY|O_TRUNC, mode 0644
     int fd = open(g_pendingCrashPath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) return;
 
-    // Escape fields for JSON
+    // Static buffers — do NOT use large stack arrays inside a signal handler
     static char eCrashType[256], eCrashReason[1024], eCrashLog[CRASH_BUF_SIZE];
     static char eDeviceModel[128], eIOSVersion[64], eDeviceID[128], eAction[512];
 
-    json_escape(eCrashType,    sizeof(eCrashType),    crashType    ?: "Unknown");
-    json_escape(eCrashReason,  sizeof(eCrashReason),  crashReason  ?: "");
-    json_escape(eCrashLog,     sizeof(eCrashLog),      crashLog     ?: "");
-    json_escape(eDeviceModel,  sizeof(eDeviceModel),   g_deviceModel);
-    json_escape(eIOSVersion,   sizeof(eIOSVersion),    g_iosVersion);
-    json_escape(eDeviceID,     sizeof(eDeviceID),      g_deviceID);
-    json_escape(eAction,       sizeof(eAction),        g_lastUserAction);
+    json_escape(eCrashType,   sizeof(eCrashType),   crashType   ?: "Unknown");
+    json_escape(eCrashReason, sizeof(eCrashReason), crashReason ?: "");
+    json_escape(eCrashLog,    sizeof(eCrashLog),    crashLog    ?: "");
+    json_escape(eDeviceModel, sizeof(eDeviceModel),
+                g_deviceModel[0] ? g_deviceModel : "Unknown-early");
+    json_escape(eIOSVersion,  sizeof(eIOSVersion),
+                g_iosVersion[0]  ? g_iosVersion  : "Unknown-early");
+    json_escape(eDeviceID,    sizeof(eDeviceID),
+                g_deviceID[0]    ? g_deviceID    : "Unknown-early");
+    json_escape(eAction,      sizeof(eAction),
+                g_lastUserAction[0] ? g_lastUserAction : "Crash before app launched");
 
     fd_write(fd, "{");
     fd_write(fd, "\"crash_type\":\"");    fd_write(fd, eCrashType);    fd_write(fd, "\",");
@@ -127,31 +131,27 @@ static void writeCrashFile(const char *crashType,
 // MARK: - Backtrace builder (async-signal-safe)
 // ─────────────────────────────────────────────────────────────────────────────
 static void buildBacktrace(char *out, size_t outSize) {
-    if (!out || outSize < 2) return;
+    if (!out || outSize < 2) { if (out) out[0] = '\0'; return; }
     out[0] = '\0';
 
     void  *frames[128];
-    int    frameCount = backtrace(frames, 128);
-    char **syms       = backtrace_symbols(frames, frameCount);
+    int    count = backtrace(frames, 128);
+    char **syms  = backtrace_symbols(frames, count);
 
     size_t written = 0;
     if (syms) {
-        for (int i = 0; i < frameCount && written + 256 < outSize; i++) {
+        for (int i = 0; i < count && written + 256 < outSize; i++) {
             const char *sym = syms[i] ?: "???";
-            // Use async-signal-safe path: copy char by char
             size_t slen = strlen(sym);
             if (written + slen + 2 >= outSize) break;
             memcpy(out + written, sym, slen);
             written += slen;
             out[written++] = '\n';
         }
-        // NOTE: free() is NOT async-signal-safe.
-        // We intentionally leak 'syms' here — the process is about to die anyway.
-        // In the ObjC exception handler path (which IS heap-safe) we free it.
+        // Intentionally NOT freeing syms — process is dying
     } else {
-        // backtrace_symbols failed — write raw addresses
         char addr[32];
-        for (int i = 0; i < frameCount && written + 32 < outSize; i++) {
+        for (int i = 0; i < count && written + 32 < outSize; i++) {
             snprintf(addr, sizeof(addr), "%p\n", frames[i]);
             size_t alen = strlen(addr);
             memcpy(out + written, addr, alen);
@@ -180,20 +180,27 @@ static const char *sigName(int sig) {
 }
 
 static void skSignalHandler(int sig, siginfo_t *info, void *ctx) {
-    // Stack-allocate the backtrace buffer — no heap
     static char btBuf[CRASH_BUF_SIZE];
+    static char fullLog[CRASH_BUF_SIZE + 512];
+
     buildBacktrace(btBuf, sizeof(btBuf));
 
-    char fullLog[CRASH_BUF_SIZE + 256];
+    char faultAddr[32] = "0x0";
+    if (info) snprintf(faultAddr, sizeof(faultAddr), "%p", info->si_addr);
+
     snprintf(fullLog, sizeof(fullLog),
-        "Signal: %s (%d)\nAddress: %p\n\n=== Backtrace ===\n%s",
+        "Signal: %s (%d)\n"
+        "Fault Address: %s\n"
+        "Device info populated: %s\n"
+        "\n=== Backtrace ===\n%s",
         sigName(sig), sig,
-        info ? info->si_addr : (void *)0,
+        faultAddr,
+        g_deviceModel[0] ? "yes" : "no — crash before UIDevice init",
         btBuf);
 
     writeCrashFile(sigName(sig), "App received fatal signal", fullLog);
 
-    // Re-raise with the original handler so the OS gets a proper crash report
+    // Re-raise with original handler so OS gets a proper crash report
     struct sigaction *old = NULL;
     switch (sig) {
         case SIGSEGV: old = &g_oldSIGSEGV; break;
@@ -203,11 +210,8 @@ static void skSignalHandler(int sig, siginfo_t *info, void *ctx) {
         case SIGFPE:  old = &g_oldSIGFPE;  break;
         case SIGPIPE: old = &g_oldSIGPIPE; break;
     }
-    if (old) {
-        sigaction(sig, old, NULL);
-    } else {
-        signal(sig, SIG_DFL);
-    }
+    if (old) sigaction(sig, old, NULL);
+    else     signal(sig, SIG_DFL);
     raise(sig);
 }
 
@@ -222,15 +226,13 @@ static void skExceptionHandler(NSException *exception) {
     NSArray  *bt     = exception.callStackSymbols ?: @[];
 
     NSMutableString *log = [NSMutableString string];
-    [log appendFormat:@"Exception: %@\nReason: %@\n\n=== Call Stack ===\n", name, reason];
-    for (NSString *frame in bt) {
-        [log appendFormat:@"%@\n", frame];
-    }
-
-    // Also append userInfo if present
-    if (exception.userInfo.count) {
+    [log appendFormat:@"Exception: %@\nReason: %@\n", name, reason];
+    if (!g_deviceModel[0])
+        [log appendString:@"Note: crash before UIDevice init — device fields Unknown-early\n"];
+    [log appendString:@"\n=== Call Stack ===\n"];
+    for (NSString *frame in bt) [log appendFormat:@"%@\n", frame];
+    if (exception.userInfo.count)
         [log appendFormat:@"\n=== UserInfo ===\n%@\n", exception.userInfo];
-    }
 
     writeCrashFile(
         [NSString stringWithFormat:@"ObjC: %@", name].UTF8String,
@@ -238,21 +240,51 @@ static void skExceptionHandler(NSException *exception) {
         log.UTF8String
     );
 
-    // Chain to any previous handler (e.g. from the game itself or other dylibs)
-    if (g_previousExceptionHandler) {
-        g_previousExceptionHandler(exception);
-    }
+    if (g_previousExceptionHandler) g_previousExceptionHandler(exception);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Install handlers
+// MARK: - ⚡ CONSTRUCTOR — fires before main(), before any ObjC
+//
+//  WHY THIS FIXES THE INSTANT-CRASH PROBLEM:
+//
+//  Old code installed handlers in viewDidAppear.
+//  If the app crashed at ANY point before a view appeared — in +load,
+//  in another dylib's constructor, in applicationDidFinishLaunching,
+//  in the game's own early init — the handlers were never registered
+//  and the crash was never captured.
+//
+//  __attribute__((constructor)) is executed by dyld when it loads this dylib,
+//  which is the very first thing that happens before any app code runs.
+//  After this function returns we are guaranteed to catch any signal or
+//  uncaught exception regardless of when it happens in the app lifecycle.
+//
+//  At constructor time we can use:
+//    ✓ getenv()                — $HOME is set by the sandbox before dyld runs
+//    ✓ snprintf / strlen       — libc is available
+//    ✓ sigaction()             — kernel interface, always available
+//    ✓ NSSetUncaughtExceptionHandler — just a C function pointer write
+//    ✗ UIDevice / NSUserDefaults    — need a run loop; filled in later
 // ─────────────────────────────────────────────────────────────────────────────
-static void installCrashHandlers(void) {
-    // ObjC exception handler (chain-safe)
-    g_previousExceptionHandler = NSGetUncaughtExceptionHandler();
-    NSSetUncaughtExceptionHandler(skExceptionHandler);
+__attribute__((constructor))
+static void SKCrashReporterEarlyInit(void) {
+    // ── 1. Build crash file path from $HOME (no ObjC, no heap) ───────────────
+    const char *home = getenv("HOME");
+    if (home) {
+        snprintf(g_pendingCrashPath, sizeof(g_pendingCrashPath),
+                 "%s/Documents/%s", home, PENDING_CRASH_FILENAME);
+    } else {
+        snprintf(g_pendingCrashPath, sizeof(g_pendingCrashPath),
+                 "/tmp/%s", PENDING_CRASH_FILENAME);
+    }
 
-    // Unix signal handlers — save old handlers for chaining
+    // ── 2. Default device fields (overwritten later by ObjC code) ────────────
+    safe_strncpy(g_deviceModel,    "Unknown-early",             sizeof(g_deviceModel));
+    safe_strncpy(g_iosVersion,     "Unknown-early",             sizeof(g_iosVersion));
+    safe_strncpy(g_deviceID,       "Unknown-early",             sizeof(g_deviceID));
+    safe_strncpy(g_lastUserAction, "Crash before app launched", sizeof(g_lastUserAction));
+
+    // ── 3. Install signal handlers ────────────────────────────────────────────
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
@@ -266,81 +298,57 @@ static void installCrashHandlers(void) {
     sigaction(SIGFPE,  &sa, &g_oldSIGFPE);
     sigaction(SIGPIPE, &sa, &g_oldSIGPIPE);
 
-    NSLog(@"[SKCrash] Crash handlers installed. Pending path: %s", g_pendingCrashPath);
+    // ── 4. Install ObjC exception handler (safe — it's just a pointer swap) ──
+    g_previousExceptionHandler = NSGetUncaughtExceptionHandler();
+    NSSetUncaughtExceptionHandler(skExceptionHandler);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Populate device info globals (called once from main thread)
+// MARK: - Populate real device info (needs UIDevice / run loop)
 // ─────────────────────────────────────────────────────────────────────────────
-static void populateDeviceGlobals(void) {
-    // Pending crash file path
-    NSString *docs = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *pendingPath = [docs stringByAppendingPathComponent:
-        [NSString stringWithUTF8String:PENDING_CRASH_FILENAME]];
-    safe_strncpy(g_pendingCrashPath, pendingPath.UTF8String, sizeof(g_pendingCrashPath));
+static void populateDeviceInfo(void) {
+    struct utsname s;
+    uname(&s);
+    safe_strncpy(g_deviceModel, s.machine, sizeof(g_deviceModel));
 
-    // Device model (uname — available without UIDevice)
-    struct utsname sysInfo;
-    uname(&sysInfo);
-    safe_strncpy(g_deviceModel, sysInfo.machine, sizeof(g_deviceModel));
-
-    // iOS version
     NSString *ver = [[UIDevice currentDevice] systemVersion] ?: @"Unknown";
     safe_strncpy(g_iosVersion, ver.UTF8String, sizeof(g_iosVersion));
 
-    // Device ID
     NSString *did = [[[UIDevice currentDevice] identifierForVendor] UUIDString]
                     ?: @"Unknown";
     safe_strncpy(g_deviceID, did.UTF8String, sizeof(g_deviceID));
 
-    // Default user action
-    safe_strncpy(g_lastUserAction, "App launched (no action recorded yet)",
-                 sizeof(g_lastUserAction));
+    NSLog(@"[SKCrash] Device info: %s / iOS %s", g_deviceModel, g_iosVersion);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Update last user action (call this from panel buttons)
-//
-//  Thread-safe for reading purposes — single write from main thread is fine.
-//  The signal handler only ever reads g_lastUserAction, never writes.
-// ─────────────────────────────────────────────────────────────────────────────
-void SKCrashSetLastAction(NSString *action) {
-    if (!action) return;
-    safe_strncpy(g_lastUserAction, action.UTF8String, sizeof(g_lastUserAction));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload pending crash (called on next launch from main thread)
+// MARK: - Upload pending crash from previous run
 // ─────────────────────────────────────────────────────────────────────────────
 static void uploadPendingCrashIfNeeded(void) {
-    NSString *pendingPath = [NSString stringWithUTF8String:g_pendingCrashPath];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:pendingPath]) return;
+    NSString *path = [NSString stringWithUTF8String:g_pendingCrashPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
 
-    NSError *readErr = nil;
-    NSData  *jsonData = [NSData dataWithContentsOfFile:pendingPath
-                                               options:0
-                                                 error:&readErr];
-    if (!jsonData || readErr) {
-        NSLog(@"[SKCrash] Could not read pending crash: %@", readErr);
-        [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
+    NSData *jsonData = [NSData dataWithContentsOfFile:path options:0 error:nil];
+    if (!jsonData.length) {
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
         return;
     }
 
-    NSDictionary *crashDict = [NSJSONSerialization
+    NSDictionary *dict = [NSJSONSerialization
         JSONObjectWithData:jsonData options:0 error:nil];
-    if (![crashDict isKindOfClass:[NSDictionary class]]) {
-        NSLog(@"[SKCrash] Pending crash JSON invalid — deleting.");
-        [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
+    if (![dict isKindOfClass:[NSDictionary class]]) {
+        NSLog(@"[SKCrash] Corrupted pending crash — deleted.");
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
         return;
     }
 
-    NSLog(@"[SKCrash] Found pending crash (%@), uploading…",
-          crashDict[@"crash_type"] ?: @"?");
+    NSLog(@"[SKCrash] Uploading pending crash: %@", dict[@"crash_type"] ?: @"?");
 
-    // Add action field and send
-    NSMutableDictionary *payload = [crashDict mutableCopy];
+    NSMutableDictionary *payload = [dict mutableCopy];
     payload[@"action"] = @"report";
+
+    // Delete BEFORE uploading to avoid loop if upload itself crashes
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 
     NSURLSessionConfiguration *cfg =
         [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -353,54 +361,57 @@ static void uploadPendingCrashIfNeeded(void) {
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 
-    NSError *serErr = nil;
-    NSData  *body   = [NSJSONSerialization dataWithJSONObject:payload
-                                                      options:0
-                                                        error:&serErr];
-    if (serErr || !body) {
-        NSLog(@"[SKCrash] Failed to serialise payload: %@", serErr);
-        [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
-        return;
-    }
-
-    // Delete the file BEFORE sending — if the app crashes again during upload
-    // we don't want to loop forever re-uploading the same report.
-    [[NSFileManager defaultManager] removeItemAtPath:pendingPath error:nil];
+    NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    if (!body) return;
 
     [[session uploadTaskWithRequest:req
                            fromData:body
-                  completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if (err) {
-            NSLog(@"[SKCrash] Upload failed: %@", err.localizedDescription);
-            return;
-        }
-        NSDictionary *json = [NSJSONSerialization
+                  completionHandler:^(NSData *data, NSURLResponse *r, NSError *err) {
+        if (err) { NSLog(@"[SKCrash] Upload error: %@", err.localizedDescription); return; }
+        NSDictionary *res = [NSJSONSerialization
             JSONObjectWithData:data ?: [NSData data] options:0 error:nil];
-        NSLog(@"[SKCrash] Upload response: %@", json ?: @"(non-JSON)");
+        NSLog(@"[SKCrash] Upload OK: %@", res ?: @"(non-JSON)");
     }] resume];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Logos hook — init on first viewDidAppear
+// MARK: - Public API — call from tweak.xm panel buttons
 // ─────────────────────────────────────────────────────────────────────────────
-%hook UIViewController
 
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        // Must run on main thread — UIDevice calls require it
-        dispatch_async(dispatch_get_main_queue(), ^{
-            populateDeviceGlobals();
-            installCrashHandlers();
-            // Small delay so the app finishes launching before we do network I/O
-            dispatch_after(
-                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                dispatch_get_main_queue(),
-                ^{ uploadPendingCrashIfNeeded(); }
-            );
-        });
+// Call before any action that might crash so the log shows context.
+// Example: SKCrashSetLastAction(@"Tapped Upload — 3 files");
+void SKCrashSetLastAction(NSString *action) {
+    if (!action) return;
+    safe_strncpy(g_lastUserAction, action.UTF8String, sizeof(g_lastUserAction));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Logos hook — applicationDidFinishLaunching
+//         Fills in real UIDevice info early in the app lifecycle.
+//         Using this hook instead of viewDidAppear means we get device info
+//         even if the crash happens before the first view appears.
+// ─────────────────────────────────────────────────────────────────────────────
+%hook UIApplication
+
+- (BOOL)application:(UIApplication *)app
+    didFinishLaunchingWithOptions:(NSDictionary *)opts {
+
+    BOOL result = %orig;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // Populate real device info now that UIDevice is available
+        populateDeviceInfo();
+
+        // Upload any crash from the previous session
+        // Delay 2.5s so the game finishes its own init and network is up
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(),
+            ^{ uploadPendingCrashIfNeeded(); }
+        );
     });
+
+    return result;
 }
 
 %end
