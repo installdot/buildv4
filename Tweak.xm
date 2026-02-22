@@ -1,7 +1,3 @@
-// SKCrashReporter.xm
-// Add to your Makefile: iSK_FILES = Tweak.xm SKCrashReporter.xm
-// Or #import "SKCrashReporter.xm" at the top of Tweak.xm if you prefer 1 file.
-//
 // All C code lives inside %{ %} — Logos never parses those braces.
 // Only the two %hook blocks at the bottom are touched by Logos.
 
@@ -217,9 +213,9 @@ static void sk_earlyInit(void) {
     snprintf(sk_crashPath, sizeof(sk_crashPath), "%s/Documents/%s",
              home ? home : "/tmp", SK_CRASH_FILE);
 
-    sk_copy(sk_model,  "Unknown-early",          sizeof(sk_model));
-    sk_copy(sk_ios,    "Unknown-early",           sizeof(sk_ios));
-    sk_copy(sk_devid,  "Unknown-early",           sizeof(sk_devid));
+    sk_copy(sk_model,  "Unknown-early",            sizeof(sk_model));
+    sk_copy(sk_ios,    "Unknown-early",             sizeof(sk_ios));
+    sk_copy(sk_devid,  "Unknown-early",             sizeof(sk_devid));
     sk_copy(sk_action, "Crash before app launched", sizeof(sk_action));
 
     struct sigaction sa;
@@ -306,6 +302,21 @@ static void SKCrashNote(NSString *action) {
     if (action) sk_copy(sk_action, action.UTF8String, sizeof(sk_action));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Launch trampoline — kept here (inside %{ %}) so Logos never sees the nested
+// ^{ ^{ } } block literals, which confuse its brace-counter inside %hook.
+// ─────────────────────────────────────────────────────────────────────────────
+static void sk_onLaunch(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        sk_populateDevice();
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(),
+            ^{ sk_uploadIfNeeded(); }
+        );
+    });
+}
+
 %}  // ── end of %{ %} verbatim block ──────────────────────────────────────────
 
 
@@ -318,14 +329,7 @@ static void SKCrashNote(NSString *action) {
 - (BOOL)application:(UIApplication *)app
     didFinishLaunchingWithOptions:(NSDictionary *)opts {
     BOOL result = %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        sk_populateDevice();
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(),
-            ^{ sk_uploadIfNeeded(); }
-        );
-    });
+    sk_onLaunch();
     return result;
 }
 
