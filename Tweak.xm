@@ -1,10 +1,10 @@
-// SKCrashReporter.xm — Soul Knight Crash Reporter  v2
-// Logos fix: all C/ObjC helper code is wrapped in %{ %} so the Logos
-// preprocessor never tries to count braces inside plain C functions.
+// SKCrashReporter.xm
+// Add to your Makefile: iSK_FILES = Tweak.xm SKCrashReporter.xm
+// Or #import "SKCrashReporter.xm" at the top of Tweak.xm if you prefer 1 file.
+//
+// All C code lives inside %{ %} — Logos never parses those braces.
+// Only the two %hook blocks at the bottom are touched by Logos.
 
-// ─────────────────────────────────────────────────────────────────────────────
-// %{ ... %} = "pass through verbatim — do NOT parse as Logos"
-// ─────────────────────────────────────────────────────────────────────────────
 %{
 
 #import <UIKit/UIKit.h>
@@ -19,122 +19,133 @@
 #include <sys/utsname.h>
 
 // ── Config ────────────────────────────────────────────────────────────────────
-#define CRASH_API_URL          @"https://YOUR_SERVER/crash_api.php"
-#define DYLIB_BUILD            @"271.ef2ca7"
-#define APP_VERSION            @"10.7"
-#define PENDING_CRASH_FILENAME "SKPendingCrash.json"
-#define CRASH_BUF_SIZE         (64 * 1024)
+#define SK_CRASH_API    @"https://YOUR_SERVER/crash_api.php"
+#define SK_APP_VER      "10.7"
+#define SK_BUILD        "271.ef2ca7"
+#define SK_CRASH_FILE   "SKPendingCrash.json"
+#define SK_BUF          65536
 
-// ── Globals ───────────────────────────────────────────────────────────────────
-static char g_pendingCrashPath[1024];
-static char g_deviceModel[64];
-static char g_iosVersion[32];
-static char g_deviceID[64];
-static char g_lastUserAction[256];
+// ── Globals (written before crash, read inside signal handler) ────────────────
+static char sk_crashPath[1024];
+static char sk_model[64];
+static char sk_ios[32];
+static char sk_devid[64];
+static char sk_action[256];
 
-// ── Async-signal-safe helpers ─────────────────────────────────────────────────
-static void safe_strncpy(char *dst, const char *src, size_t n) {
-    if (!dst || !src || n == 0) return;
+// ── Signal handler old-action slots ──────────────────────────────────────────
+static struct sigaction sk_old_segv, sk_old_abrt, sk_old_bus,
+                         sk_old_ill,  sk_old_fpe,  sk_old_pipe;
+
+// ── ObjC exception chain ──────────────────────────────────────────────────────
+static NSUncaughtExceptionHandler *sk_prevHandler = NULL;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async-signal-safe helpers — NO malloc, NO ObjC, NO buffered I/O
+// ─────────────────────────────────────────────────────────────────────────────
+static void sk_copy(char *d, const char *s, size_t n) {
+    if (!d || !s || n == 0) return;
     size_t i = 0;
-    while (i < n - 1 && src[i]) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
+    while (i < n-1 && s[i]) { d[i] = s[i]; i++; }
+    d[i] = '\0';
 }
 
-static void fd_write(int fd, const char *s) {
+static void sk_fdwrite(int fd, const char *s) {
     if (fd < 0 || !s) return;
     size_t len = strlen(s);
     while (len > 0) {
-        ssize_t n = write(fd, s, len);
-        if (n <= 0) break;
-        s += n; len -= (size_t)n;
+        ssize_t w = write(fd, s, len);
+        if (w <= 0) break;
+        s += w; len -= (size_t)w;
     }
 }
 
-static void json_escape(char *out, size_t outSize, const char *in) {
-    if (!out || outSize < 2) return;
+static void sk_escape(char *out, size_t sz, const char *in) {
+    if (!out || sz < 2) return;
     if (!in) { out[0] = '\0'; return; }
     size_t wi = 0;
-    for (size_t i = 0; in[i] && wi + 6 < outSize; i++) {
+    for (size_t i = 0; in[i] && wi+6 < sz; i++) {
         unsigned char c = (unsigned char)in[i];
-        if      (c == '"')  { out[wi++] = '\\'; out[wi++] = '"';  }
-        else if (c == '\\') { out[wi++] = '\\'; out[wi++] = '\\'; }
-        else if (c == '\n') { out[wi++] = '\\'; out[wi++] = 'n';  }
-        else if (c == '\r') { out[wi++] = '\\'; out[wi++] = 'r';  }
-        else if (c == '\t') { out[wi++] = '\\'; out[wi++] = 't';  }
-        else if (c < 0x20)  { /* skip control chars */ }
-        else                { out[wi++] = (char)c; }
+        if      (c == '"')  { out[wi++]='\\'; out[wi++]='"';  }
+        else if (c == '\\') { out[wi++]='\\'; out[wi++]='\\'; }
+        else if (c == '\n') { out[wi++]='\\'; out[wi++]='n';  }
+        else if (c == '\r') { out[wi++]='\\'; out[wi++]='r';  }
+        else if (c == '\t') { out[wi++]='\\'; out[wi++]='t';  }
+        else if (c < 0x20)  { }
+        else                { out[wi++]=(char)c; }
     }
     out[wi] = '\0';
 }
 
-// ── Crash file writer (async-signal-safe) ─────────────────────────────────────
-static void writeCrashFile(const char *crashType,
-                            const char *crashReason,
-                            const char *crashLog) {
-    if (!g_pendingCrashPath[0]) return;
-    int fd = open(g_pendingCrashPath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+// ─────────────────────────────────────────────────────────────────────────────
+// Write crash JSON to disk — async-signal-safe
+// ─────────────────────────────────────────────────────────────────────────────
+static void sk_writeCrash(const char *type, const char *reason, const char *log) {
+    if (!sk_crashPath[0]) return;
+    int fd = open(sk_crashPath, O_CREAT|O_WRONLY|O_TRUNC, 0644);
     if (fd < 0) return;
 
-    static char eCrashType[256], eCrashReason[1024], eCrashLog[CRASH_BUF_SIZE];
-    static char eDeviceModel[128], eIOSVersion[64], eDeviceID[128], eAction[512];
+    // Static so signal-stack usage stays minimal
+    static char eType[256], eReason[1024], eLog[SK_BUF];
+    static char eModel[128], eOS[64], eID[128], eAct[512];
 
-    json_escape(eCrashType,   sizeof(eCrashType),   crashType   ? crashType   : "Unknown");
-    json_escape(eCrashReason, sizeof(eCrashReason), crashReason ? crashReason : "");
-    json_escape(eCrashLog,    sizeof(eCrashLog),    crashLog    ? crashLog    : "");
-    json_escape(eDeviceModel, sizeof(eDeviceModel), g_deviceModel[0] ? g_deviceModel : "Unknown-early");
-    json_escape(eIOSVersion,  sizeof(eIOSVersion),  g_iosVersion[0]  ? g_iosVersion  : "Unknown-early");
-    json_escape(eDeviceID,    sizeof(eDeviceID),    g_deviceID[0]    ? g_deviceID    : "Unknown-early");
-    json_escape(eAction,      sizeof(eAction),      g_lastUserAction[0] ? g_lastUserAction : "Crash before app launched");
+    sk_escape(eType,   sizeof(eType),   type   ? type   : "Unknown");
+    sk_escape(eReason, sizeof(eReason), reason ? reason : "");
+    sk_escape(eLog,    sizeof(eLog),    log    ? log    : "");
+    sk_escape(eModel,  sizeof(eModel),  sk_model[0]  ? sk_model  : "Unknown-early");
+    sk_escape(eOS,     sizeof(eOS),     sk_ios[0]    ? sk_ios    : "Unknown-early");
+    sk_escape(eID,     sizeof(eID),     sk_devid[0]  ? sk_devid  : "Unknown-early");
+    sk_escape(eAct,    sizeof(eAct),    sk_action[0] ? sk_action : "Crash at launch");
 
-    fd_write(fd, "{");
-    fd_write(fd, "\"crash_type\":\"");    fd_write(fd, eCrashType);    fd_write(fd, "\",");
-    fd_write(fd, "\"crash_reason\":\"");  fd_write(fd, eCrashReason);  fd_write(fd, "\",");
-    fd_write(fd, "\"crash_log\":\"");     fd_write(fd, eCrashLog);     fd_write(fd, "\",");
-    fd_write(fd, "\"device_model\":\"");  fd_write(fd, eDeviceModel);  fd_write(fd, "\",");
-    fd_write(fd, "\"ios_version\":\"");   fd_write(fd, eIOSVersion);   fd_write(fd, "\",");
-    fd_write(fd, "\"device_id\":\"");     fd_write(fd, eDeviceID);     fd_write(fd, "\",");
-    fd_write(fd, "\"user_action\":\"");   fd_write(fd, eAction);       fd_write(fd, "\",");
-    fd_write(fd, "\"app_version\":\"");   fd_write(fd, APP_VERSION);   fd_write(fd, "\",");
-    fd_write(fd, "\"dylib_build\":\"");   fd_write(fd, DYLIB_BUILD);   fd_write(fd, "\"");
-    fd_write(fd, "}");
+    sk_fdwrite(fd, "{");
+    sk_fdwrite(fd, "\"crash_type\":\"");    sk_fdwrite(fd, eType);    sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"crash_reason\":\"");  sk_fdwrite(fd, eReason);  sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"crash_log\":\"");     sk_fdwrite(fd, eLog);     sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"device_model\":\"");  sk_fdwrite(fd, eModel);   sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"ios_version\":\"");   sk_fdwrite(fd, eOS);      sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"device_id\":\"");     sk_fdwrite(fd, eID);      sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"user_action\":\"");   sk_fdwrite(fd, eAct);     sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"app_version\":\"");   sk_fdwrite(fd, SK_APP_VER); sk_fdwrite(fd, "\",");
+    sk_fdwrite(fd, "\"dylib_build\":\"");   sk_fdwrite(fd, SK_BUILD);   sk_fdwrite(fd, "\"");
+    sk_fdwrite(fd, "}");
     close(fd);
 }
 
-// ── Backtrace builder (async-signal-safe) ─────────────────────────────────────
-static void buildBacktrace(char *out, size_t outSize) {
-    if (!out || outSize < 2) { if (out) out[0] = '\0'; return; }
+// ─────────────────────────────────────────────────────────────────────────────
+// Backtrace — async-signal-safe
+// ─────────────────────────────────────────────────────────────────────────────
+static void sk_backtrace(char *out, size_t sz) {
+    if (!out || sz < 2) { if (out) out[0]='\0'; return; }
     out[0] = '\0';
     void  *frames[128];
-    int    count = backtrace(frames, 128);
-    char **syms  = backtrace_symbols(frames, count);
-    size_t written = 0;
+    int    cnt  = backtrace(frames, 128);
+    char **syms = backtrace_symbols(frames, cnt);
+    size_t w = 0;
     if (syms) {
-        for (int i = 0; i < count && written + 256 < outSize; i++) {
-            const char *sym = syms[i] ? syms[i] : "???";
-            size_t slen = strlen(sym);
-            if (written + slen + 2 >= outSize) break;
-            memcpy(out + written, sym, slen);
-            written += slen;
-            out[written++] = '\n';
+        for (int i = 0; i < cnt && w+256 < sz; i++) {
+            const char *s = syms[i] ? syms[i] : "???";
+            size_t l = strlen(s);
+            if (w+l+2 >= sz) break;
+            memcpy(out+w, s, l);
+            w += l;
+            out[w++] = '\n';
         }
-        // Not freeing syms — process is dying
+        // intentionally not freeing — process is dying
     } else {
-        char addr[32];
-        for (int i = 0; i < count && written + 32 < outSize; i++) {
-            snprintf(addr, sizeof(addr), "%p\n", frames[i]);
-            size_t alen = strlen(addr);
-            memcpy(out + written, addr, alen);
-            written += alen;
+        char a[32];
+        for (int i = 0; i < cnt && w+32 < sz; i++) {
+            snprintf(a, sizeof(a), "%p\n", frames[i]);
+            size_t l = strlen(a);
+            memcpy(out+w, a, l);
+            w += l;
         }
     }
-    out[written] = '\0';
+    out[w] = '\0';
 }
 
-// ── Signal handler ────────────────────────────────────────────────────────────
-static struct sigaction g_oldSIGSEGV, g_oldSIGABRT, g_oldSIGBUS,
-                         g_oldSIGILL,  g_oldSIGFPE,  g_oldSIGPIPE;
-
-static const char *sigName(int sig) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Signal handler
+// ─────────────────────────────────────────────────────────────────────────────
+static const char *sk_signame(int sig) {
     switch (sig) {
         case SIGSEGV: return "SIGSEGV (Bad Memory Access)";
         case SIGABRT: return "SIGABRT (Abort)";
@@ -146,193 +157,175 @@ static const char *sigName(int sig) {
     }
 }
 
-static void skSignalHandler(int sig, siginfo_t *info, void *ctx) {
-    static char btBuf[CRASH_BUF_SIZE];
-    static char fullLog[CRASH_BUF_SIZE + 512];
-
-    buildBacktrace(btBuf, sizeof(btBuf));
-
-    char faultAddr[32];
-    snprintf(faultAddr, sizeof(faultAddr), "%p", info ? info->si_addr : (void *)0);
-
-    snprintf(fullLog, sizeof(fullLog),
-        "Signal: %s (%d)\n"
-        "Fault Address: %s\n"
-        "Device info populated: %s\n"
-        "\n=== Backtrace ===\n%s",
-        sigName(sig), sig,
-        faultAddr,
-        g_deviceModel[0] ? "yes" : "no — crash before UIDevice init",
-        btBuf);
-
-    writeCrashFile(sigName(sig), "App received fatal signal", fullLog);
-
+static void sk_sighandler(int sig, siginfo_t *info, void *ctx) {
+    static char bt[SK_BUF];
+    static char full[SK_BUF + 512];
+    sk_backtrace(bt, sizeof(bt));
+    char addr[32];
+    snprintf(addr, sizeof(addr), "%p", info ? info->si_addr : (void *)0);
+    snprintf(full, sizeof(full),
+        "Signal: %s (%d)\nFault Address: %s\nDevice populated: %s\n\n=== Backtrace ===\n%s",
+        sk_signame(sig), sig, addr,
+        sk_model[0] ? "yes" : "no — crash before UIDevice init",
+        bt);
+    sk_writeCrash(sk_signame(sig), "Fatal signal", full);
     struct sigaction *old = NULL;
     switch (sig) {
-        case SIGSEGV: old = &g_oldSIGSEGV; break;
-        case SIGABRT: old = &g_oldSIGABRT; break;
-        case SIGBUS:  old = &g_oldSIGBUS;  break;
-        case SIGILL:  old = &g_oldSIGILL;  break;
-        case SIGFPE:  old = &g_oldSIGFPE;  break;
-        case SIGPIPE: old = &g_oldSIGPIPE; break;
+        case SIGSEGV: old = &sk_old_segv; break;
+        case SIGABRT: old = &sk_old_abrt; break;
+        case SIGBUS:  old = &sk_old_bus;  break;
+        case SIGILL:  old = &sk_old_ill;  break;
+        case SIGFPE:  old = &sk_old_fpe;  break;
+        case SIGPIPE: old = &sk_old_pipe; break;
     }
     if (old) sigaction(sig, old, NULL);
     else     signal(sig, SIG_DFL);
     raise(sig);
 }
 
-// ── ObjC uncaught exception handler ──────────────────────────────────────────
-static NSUncaughtExceptionHandler *g_previousExceptionHandler = NULL;
-
-static void skExceptionHandler(NSException *exception) {
-    NSString *name   = exception.name   ?: @"Unknown";
-    NSString *reason = exception.reason ?: @"No reason";
-    NSArray  *bt     = exception.callStackSymbols ?: @[];
-
+// ─────────────────────────────────────────────────────────────────────────────
+// ObjC exception handler
+// ─────────────────────────────────────────────────────────────────────────────
+static void sk_exceptionHandler(NSException *ex) {
+    NSString *name   = ex.name   ?: @"Unknown";
+    NSString *reason = ex.reason ?: @"No reason";
     NSMutableString *log = [NSMutableString string];
     [log appendFormat:@"Exception: %@\nReason: %@\n", name, reason];
-    if (!g_deviceModel[0])
+    if (!sk_model[0])
         [log appendString:@"Note: crash before UIDevice init\n"];
     [log appendString:@"\n=== Call Stack ===\n"];
-    for (NSString *frame in bt)
-        [log appendFormat:@"%@\n", frame];
-    if (exception.userInfo.count)
-        [log appendFormat:@"\n=== UserInfo ===\n%@\n", exception.userInfo];
-
-    writeCrashFile(
+    for (NSString *f in (ex.callStackSymbols ?: @[]))
+        [log appendFormat:@"%@\n", f];
+    if (ex.userInfo.count)
+        [log appendFormat:@"\n=== UserInfo ===\n%@\n", ex.userInfo];
+    sk_writeCrash(
         [NSString stringWithFormat:@"ObjC: %@", name].UTF8String,
         reason.UTF8String,
         log.UTF8String
     );
-
-    if (g_previousExceptionHandler) g_previousExceptionHandler(exception);
+    if (sk_prevHandler) sk_prevHandler(ex);
 }
 
-// ── CONSTRUCTOR — runs before main(), before any ObjC ────────────────────────
-//
-//  This is what fixes "instant crash on launch".
-//  Installs signal + exception handlers at dylib-load time via dyld,
-//  before any app code runs at all.
-//  Uses only getenv() and sigaction() — no heap, no ObjC needed.
-//
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTRUCTOR — runs before main(), before any app code
+// This is what catches instant-on-launch crashes.
+// Only uses getenv() + sigaction() — no heap, no ObjC needed at this point.
+// ─────────────────────────────────────────────────────────────────────────────
 __attribute__((constructor))
-static void SKCrashReporterEarlyInit(void) {
+static void sk_earlyInit(void) {
     const char *home = getenv("HOME");
-    if (home) {
-        snprintf(g_pendingCrashPath, sizeof(g_pendingCrashPath),
-                 "%s/Documents/%s", home, PENDING_CRASH_FILENAME);
-    } else {
-        snprintf(g_pendingCrashPath, sizeof(g_pendingCrashPath),
-                 "/tmp/%s", PENDING_CRASH_FILENAME);
-    }
+    snprintf(sk_crashPath, sizeof(sk_crashPath), "%s/Documents/%s",
+             home ? home : "/tmp", SK_CRASH_FILE);
 
-    safe_strncpy(g_deviceModel,    "Unknown-early",             sizeof(g_deviceModel));
-    safe_strncpy(g_iosVersion,     "Unknown-early",             sizeof(g_iosVersion));
-    safe_strncpy(g_deviceID,       "Unknown-early",             sizeof(g_deviceID));
-    safe_strncpy(g_lastUserAction, "Crash before app launched", sizeof(g_lastUserAction));
+    sk_copy(sk_model,  "Unknown-early",          sizeof(sk_model));
+    sk_copy(sk_ios,    "Unknown-early",           sizeof(sk_ios));
+    sk_copy(sk_devid,  "Unknown-early",           sizeof(sk_devid));
+    sk_copy(sk_action, "Crash before app launched", sizeof(sk_action));
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
     sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
-    sa.sa_sigaction = skSignalHandler;
+    sa.sa_sigaction = sk_sighandler;
+    sigaction(SIGSEGV, &sa, &sk_old_segv);
+    sigaction(SIGABRT, &sa, &sk_old_abrt);
+    sigaction(SIGBUS,  &sa, &sk_old_bus);
+    sigaction(SIGILL,  &sa, &sk_old_ill);
+    sigaction(SIGFPE,  &sa, &sk_old_fpe);
+    sigaction(SIGPIPE, &sa, &sk_old_pipe);
 
-    sigaction(SIGSEGV, &sa, &g_oldSIGSEGV);
-    sigaction(SIGABRT, &sa, &g_oldSIGABRT);
-    sigaction(SIGBUS,  &sa, &g_oldSIGBUS);
-    sigaction(SIGILL,  &sa, &g_oldSIGILL);
-    sigaction(SIGFPE,  &sa, &g_oldSIGFPE);
-    sigaction(SIGPIPE, &sa, &g_oldSIGPIPE);
-
-    g_previousExceptionHandler = NSGetUncaughtExceptionHandler();
-    NSSetUncaughtExceptionHandler(skExceptionHandler);
+    sk_prevHandler = NSGetUncaughtExceptionHandler();
+    NSSetUncaughtExceptionHandler(sk_exceptionHandler);
 }
 
-// ── Populate real UIDevice info (needs run loop) ──────────────────────────────
-static void populateDeviceInfo(void) {
-    struct utsname s;
-    uname(&s);
-    safe_strncpy(g_deviceModel, s.machine, sizeof(g_deviceModel));
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Fill real device info — called after UIDevice is available
+// ─────────────────────────────────────────────────────────────────────────────
+static void sk_populateDevice(void) {
+    struct utsname u;
+    uname(&u);
+    sk_copy(sk_model, u.machine, sizeof(sk_model));
     NSString *ver = [[UIDevice currentDevice] systemVersion] ?: @"Unknown";
-    safe_strncpy(g_iosVersion, ver.UTF8String, sizeof(g_iosVersion));
-
+    sk_copy(sk_ios, ver.UTF8String, sizeof(sk_ios));
     NSString *did = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"Unknown";
-    safe_strncpy(g_deviceID, did.UTF8String, sizeof(g_deviceID));
+    sk_copy(sk_devid, did.UTF8String, sizeof(sk_devid));
 }
 
-// ── Upload pending crash from previous run ────────────────────────────────────
-static void uploadPendingCrashIfNeeded(void) {
-    NSString *path = [NSString stringWithUTF8String:g_pendingCrashPath];
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload any pending crash from the previous run
+// ─────────────────────────────────────────────────────────────────────────────
+static void sk_uploadIfNeeded(void) {
+    NSString *path = [NSString stringWithUTF8String:sk_crashPath];
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return;
 
-    NSData *jsonData = [NSData dataWithContentsOfFile:path options:0 error:nil];
-    if (!jsonData.length) {
+    NSData *data = [NSData dataWithContentsOfFile:path options:0 error:nil];
+    if (!data.length) {
         [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
         return;
     }
-
-    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+    NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![dict isKindOfClass:[NSDictionary class]]) {
         [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
         return;
     }
-
-    NSLog(@"[SKCrash] Uploading pending crash: %@", dict[@"crash_type"] ?: @"?");
+    NSLog(@"[SKCrash] Uploading: %@", dict[@"crash_type"] ?: @"?");
 
     NSMutableDictionary *payload = [dict mutableCopy];
     payload[@"action"] = @"report";
 
-    // Delete BEFORE uploading — prevents infinite loop if upload crashes
+    // Delete BEFORE upload so a crash during upload doesn't loop forever
     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
 
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.timeoutIntervalForRequest  = 30;
     cfg.timeoutIntervalForResource = 60;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
 
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:CRASH_API_URL]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:SK_CRASH_API]];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 
     NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     if (!body) return;
 
-    [[session uploadTaskWithRequest:req fromData:body completionHandler:^(NSData *data, NSURLResponse *r, NSError *err) {
-        if (err) { NSLog(@"[SKCrash] Upload error: %@", err.localizedDescription); return; }
-        NSDictionary *res = [NSJSONSerialization JSONObjectWithData:data ?: [NSData data] options:0 error:nil];
+    [[[NSURLSession sessionWithConfiguration:cfg]
+        uploadTaskWithRequest:req fromData:body
+            completionHandler:^(NSData *resp, NSURLResponse *r, NSError *err) {
+        if (err) { NSLog(@"[SKCrash] Upload failed: %@", err.localizedDescription); return; }
+        NSDictionary *res = [NSJSONSerialization
+            JSONObjectWithData:resp ?: [NSData data] options:0 error:nil];
         NSLog(@"[SKCrash] Upload OK: %@", res ?: @"(non-JSON)");
     }] resume];
 }
 
-// ── Public API — call from Tweak.xm panel buttons ─────────────────────────────
-void SKCrashSetLastAction(NSString *action) {
-    if (!action) return;
-    safe_strncpy(g_lastUserAction, action.UTF8String, sizeof(g_lastUserAction));
+// ─────────────────────────────────────────────────────────────────────────────
+// Public — call from panel buttons so crash log shows which action crashed
+// e.g.  SKCrashNote(@"Tapped Upload");
+// ─────────────────────────────────────────────────────────────────────────────
+static void SKCrashNote(NSString *action) {
+    if (action) sk_copy(sk_action, action.UTF8String, sizeof(sk_action));
 }
 
-%}  // end of %{ ... %} verbatim block
+%}  // ── end of %{ %} verbatim block ──────────────────────────────────────────
+
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Logos hooks — these are parsed by Logos normally
+// Logos hooks — the ONLY thing Logos parses
 // ─────────────────────────────────────────────────────────────────────────────
 
 %hook UIApplication
 
 - (BOOL)application:(UIApplication *)app
     didFinishLaunchingWithOptions:(NSDictionary *)opts {
-
     BOOL result = %orig;
-
     dispatch_async(dispatch_get_main_queue(), ^{
-        populateDeviceInfo();
+        sk_populateDevice();
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
             dispatch_get_main_queue(),
-            ^{ uploadPendingCrashIfNeeded(); }
+            ^{ sk_uploadIfNeeded(); }
         );
     });
-
     return result;
 }
 
