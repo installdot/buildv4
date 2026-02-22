@@ -2,7 +2,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = iSK
 iSK_FILES = Tweak.xm 
-FRAMEWORKS = Foundation UIKit Security DeviceCheck UserNotifications OpenGLES GLKit
+FRAMEWORKS = Foundation UIKit Security DeviceCheck UserNotifications OpenGLES GLKit AVFoundation
 LIBRARIES = crypto
 DungeonShooter_CFLAGS = -fobjc-arc -Wno-error -Wno-deprecated-declarations -Werror -Wno-unused-but-set-variable
 DungeonShooter_IPHONEOS_DEPLOYMENT_TARGET = 16.6.1
