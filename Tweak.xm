@@ -1,21 +1,9 @@
 // tweak.xm — Soul Knight Save Manager v10
 // iOS 14+ | Theos/Logos | ARC
-// Changes: .data files are plain text — no base64 encode/decode anywhere.
-//          Parallel file uploads, All/specific-UID selection, Open Link button.
-//          v10.1: Batched NSUserDefaults restore (100 keys/tick) to prevent
-//                 memory leak / crash when restoring large saves (~5000 keys).
-//          v10.2: Fixed crash on Load — dispatch_after 1s delay replaced with
-//                 dispatch_async (no artificial wait), nil-guarded ov calls,
-//                 full error output instead of silent crash.
-//          v10.3: Settings menu — Auto Rij, Auto Detect UID, Auto Close.
-//                 Hide Menu. Footer credit label.
-//          v10.4: UID shown in main panel below session label;
-//                 draggable settings card; fixed UISwitch clipping/sizing.
-//          v10.5: UISwitch scaled via fixed container view (no AL breakage).
-//                 CRASH FIX: Load now uses smart-diff apply — only changed/
-//                 new/deleted keys are touched. If plist is identical to the
-//                 current NSUserDefaults snapshot the game's runtime keys are
-//                 never disturbed, preventing the "unmodified plist" crash.
+// v10.6: AUTO RIJ FIX — replaced template-based regex (${1}0${2} was
+//         ambiguous/unreliable) with enumerateMatchesInString + plain string
+//         replacement. Added post-transform plist validation: if the result
+//         is not a valid plist, original XML is returned — upload never corrupted.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -25,7 +13,7 @@
 #define API_BASE @"https://chillysilly.frfrnocap.men/isk.php"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Session file  (survives NSUserDefaults wipe)
+// MARK: - Session file
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *sessionFilePath(void) {
     return [NSHomeDirectory()
@@ -44,7 +32,7 @@ static void clearSessionUUID(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Settings  (persistent per-install, separate from session)
+// MARK: - Settings
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *settingsFilePath(void) {
     return [NSHomeDirectory()
@@ -76,7 +64,7 @@ static NSString *deviceUUID(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Auto Detect UID — reads PlayerId from SdkStateCache#1
+// MARK: - Auto Detect UID
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *detectPlayerUID(void) {
     NSString *raw = [[NSUserDefaults standardUserDefaults]
@@ -95,24 +83,87 @@ static NSString *detectPlayerUID(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Auto Rij — zero out OpenRijTest_ flags before upload
+// MARK: - Auto Rij  (v10.6 rewrite — safe, no template ambiguity)
+//
+//  ROOT CAUSE of the old bug:
+//    NSRegularExpression's template @"${1}0${2}" is ambiguous.  After the
+//    engine processes capture group $1, it encounters the literal character
+//    "0", but some ICU builds interpret "$10" as back-reference #10 (not
+//    group #1 followed by "0"), producing garbage and breaking the plist XML.
+//
+//  New approach:
+//    1. Match the COMPLETE <key>OpenRijTest_N</key> … <integer>1</integer>
+//       block so we know exactly which substring to edit.
+//    2. Collect all match ranges up-front, then walk them in REVERSE ORDER
+//       so earlier character offsets remain valid after each edit.
+//    3. Inside each matched block do a plain NSString replacement of
+//       "<integer>1</integer>" → "<integer>0</integer>".
+//       No template substitution — no ambiguity possible.
+//    4. Validate the resulting NSString is still a parseable plist.
+//       If validation fails for any reason, silently return the original XML
+//       so the upload is never corrupted.
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *applyAutoRij(NSString *plistXML) {
     if (!plistXML.length) return plistXML;
-    NSError *re = nil;
+
+    NSError *rxErr = nil;
     NSRegularExpression *rx = [NSRegularExpression
         regularExpressionWithPattern:
-            @"(<key>OpenRijTest_\\d+</key>\\s*<integer>)1(</integer>)"
-        options:0 error:&re];
-    if (!rx || re) return plistXML;
-    return [rx stringByReplacingMatchesInString:plistXML
-                                        options:0
-                                          range:NSMakeRange(0, plistXML.length)
-                                   withTemplate:@"${1}0${2}"];
+            @"<key>OpenRijTest_\\d+</key>\\s*<integer>1</integer>"
+        options:0
+          error:&rxErr];
+    if (!rx || rxErr) {
+        NSLog(@"[SKTools] applyAutoRij: regex compile error: %@", rxErr);
+        return plistXML;
+    }
+
+    NSArray<NSTextCheckingResult *> *matches =
+        [rx matchesInString:plistXML
+                    options:0
+                      range:NSMakeRange(0, plistXML.length)];
+    if (!matches.count) return plistXML;  // nothing to change — return as-is
+
+    NSMutableString *result = [plistXML mutableCopy];
+
+    // Reverse iteration keeps all preceding character offsets valid.
+    for (NSTextCheckingResult *match in matches.reverseObjectEnumerator) {
+        NSRange   r         = match.range;
+        NSString *original  = [result substringWithRange:r];
+        // Plain string swap — no regex template, no ambiguity.
+        NSString *patched   = [original
+            stringByReplacingOccurrencesOfString:@"<integer>1</integer>"
+                                      withString:@"<integer>0</integer>"];
+        [result replaceCharactersInRange:r withString:patched];
+    }
+
+    // ── Integrity check: make sure the XML is still a valid plist ────────────
+    NSData *testData = [result dataUsingEncoding:NSUTF8StringEncoding];
+    if (!testData) return plistXML;
+
+    NSError *verr = nil;
+    id parsed     = nil;
+    @try {
+        parsed = [NSPropertyListSerialization
+            propertyListWithData:testData
+                         options:NSPropertyListImmutable
+                          format:nil
+                           error:&verr];
+    } @catch (NSException *ex) {
+        NSLog(@"[SKTools] applyAutoRij: validation exception: %@", ex.reason);
+        return plistXML;   // fallback — return original
+    }
+    if (verr || !parsed) {
+        NSLog(@"[SKTools] applyAutoRij: validation failed (%@) — "
+              @"returning original to prevent corrupt upload.",
+              verr.localizedDescription ?: @"not a valid plist");
+        return plistXML;   // fallback — return original
+    }
+
+    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - URLSession  (generous timeouts)
+// MARK: - URLSession
 // ─────────────────────────────────────────────────────────────────────────────
 static NSURLSession *makeSession(void) {
     NSURLSessionConfiguration *c =
@@ -170,7 +221,7 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - POST helper using uploadTask
+// MARK: - POST helper
 // ─────────────────────────────────────────────────────────────────────────────
 static void skPost(NSURLSession *session,
                    NSMutableURLRequest *req,
@@ -259,8 +310,7 @@ static void skPost(NSURLSession *session,
     self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.titleLabel];
 
-    self.bar = [[UIProgressView alloc]
-        initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
     self.bar.trackTintColor    = [UIColor colorWithWhite:0.22 alpha:1];
     self.bar.progressTintColor = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
     self.bar.layer.cornerRadius = 3;
@@ -417,7 +467,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
 
     NSError *pe = nil;
     NSData *pData = nil;
-
     @try {
         pData = [NSPropertyListSerialization
             dataWithPropertyList:snap
@@ -427,7 +476,6 @@ static void performUpload(NSArray<NSString *> *fileNames,
         done(nil, [NSString stringWithFormat:@"Plist serialise exception: %@", ex.reason]);
         return;
     }
-
     if (pe || !pData) {
         done(nil, [NSString stringWithFormat:@"Plist serialise error: %@",
                    pe.localizedDescription ?: @"Unknown"]);
@@ -442,12 +490,16 @@ static void performUpload(NSArray<NSString *> *fileNames,
 
     if (getSetting(@"autoRij")) {
         NSString *patched = applyAutoRij(plistXML);
-        NSUInteger before = plistXML.length;
-        NSUInteger after  = patched.length;
-        plistXML = patched;
-        [ov appendLog:[NSString stringWithFormat:
-            @"Auto Rij applied (Δ%ld chars).",
-            (long)((NSInteger)after - (NSInteger)before)]];
+        if (patched == plistXML) {
+            // pointer equality — applyAutoRij returned the original (either no
+            // matching flags were found, or the plist validation check failed)
+            [ov appendLog:@"Auto Rij: no changes (no matching flags, or validation fallback)."];
+        } else {
+            NSUInteger delta = (NSInteger)patched.length - (NSInteger)plistXML.length;
+            plistXML = patched;
+            [ov appendLog:[NSString stringWithFormat:@"Auto Rij applied (Δ%ld chars).",
+                           (long)delta]];
+        }
     }
 
     [ov appendLog:[NSString stringWithFormat:@"PlayerPrefs: %lu keys",
@@ -530,65 +582,38 @@ static void performUpload(NSArray<NSString *> *fileNames,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Smart-diff batched NSUserDefaults writer  (v10.5 crash fix)
-//
-// OLD behaviour: wipe ALL keys → rewrite ALL keys from downloaded plist.
-//   Problem: runtime keys the game writes after launch (session tokens, device
-//   IDs, cache entries) get destroyed then restored with stale snapshot values.
-//   The game detects the inconsistency and crashes — especially when the plist
-//   was not edited at all, so every key comes back bit-for-bit identical yet
-//   the wipe still happens.
-//
-// NEW behaviour: diff downloaded dict against live NSUserDefaults.
-//   • Keys whose value CHANGED  → setObject
-//   • Keys that are NEW         → setObject
-//   • Keys that were DELETED    → removeObjectForKey
-//   • Keys that are IDENTICAL   → untouched  ← the key fix
-//   If the diff is empty (plist identical to live state) NSUserDefaults is
-//   never touched at all and the game never notices anything happened.
+// MARK: - Smart-diff batched NSUserDefaults writer
 // ─────────────────────────────────────────────────────────────────────────────
 static const NSUInteger kUDWriteBatchSize = 100;
 
-// Deep-equality helper for plist values (NSString, NSNumber, NSData,
-// NSArray, NSDictionary, NSDate).  Falls back to isEqual: for anything else.
 static BOOL plistValuesEqual(id a, id b) {
     if (a == b) return YES;
     if (!a || !b) return NO;
     if ([a isKindOfClass:[NSDictionary class]] && [b isKindOfClass:[NSDictionary class]]) {
         NSDictionary *da = a, *db = b;
         if (da.count != db.count) return NO;
-        for (NSString *k in da) {
+        for (NSString *k in da)
             if (!plistValuesEqual(da[k], db[k])) return NO;
-        }
         return YES;
     }
     if ([a isKindOfClass:[NSArray class]] && [b isKindOfClass:[NSArray class]]) {
         NSArray *aa = a, *ab = b;
         if (aa.count != ab.count) return NO;
-        for (NSUInteger i = 0; i < aa.count; i++) {
+        for (NSUInteger i = 0; i < aa.count; i++)
             if (!plistValuesEqual(aa[i], ab[i])) return NO;
-        }
         return YES;
     }
     return [a isEqual:b];
 }
 
-// Compute diff: returns dict with keys to set (value = new value) and keys to
-// remove (value = [NSNull null]).
 static NSDictionary *udDiff(NSDictionary *live, NSDictionary *incoming) {
     NSMutableDictionary *diff = [NSMutableDictionary dictionary];
-
-    // Changed or new keys
     [incoming enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *_) {
-        id current = live[k];
-        if (!plistValuesEqual(current, v)) diff[k] = v;
+        if (!plistValuesEqual(live[k], v)) diff[k] = v;
     }];
-
-    // Deleted keys
     [live enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *_) {
         if (!incoming[k]) diff[k] = [NSNull null];
     }];
-
     return diff;
 }
 
@@ -600,14 +625,12 @@ static void _applyDiffBatch(NSUserDefaults *ud,
                              SKProgressOverlay *ov,
                              void (^completion)(NSUInteger changed)) {
     if (start >= total) {
-        @try { [ud synchronize]; }
-        @catch (NSException *ex) {
+        @try { [ud synchronize]; } @catch (NSException *ex) {
             NSLog(@"[SKTools] ud synchronize exception: %@", ex.reason);
         }
         completion(total);
         return;
     }
-
     @autoreleasepool {
         NSUInteger end = MIN(start + kUDWriteBatchSize, total);
         for (NSUInteger i = start; i < end; i++) {
@@ -615,33 +638,27 @@ static void _applyDiffBatch(NSUserDefaults *ud,
             id v = diff[k];
             if (!k || !v) continue;
             @try {
-                if ([v isKindOfClass:[NSNull class]]) {
-                    [ud removeObjectForKey:k];
-                } else {
-                    [ud setObject:v forKey:k];
-                }
+                if ([v isKindOfClass:[NSNull class]]) [ud removeObjectForKey:k];
+                else                                  [ud setObject:v forKey:k];
             } @catch (NSException *ex) {
                 NSLog(@"[SKTools] ud apply exception for key %@: %@", k, ex.reason);
             }
         }
-
         if (ov && (start == 0 || (end % 500 == 0) || end == total)) {
             [ov appendLog:[NSString stringWithFormat:
-                @"  PlayerPrefs diff %lu/%lu…",
-                (unsigned long)end, (unsigned long)total]];
+                @"  PlayerPrefs diff %lu/%lu…", (unsigned long)end, (unsigned long)total]];
             [ov setProgress:0.10f + 0.28f * ((float)end / (float)total)
                       label:[NSString stringWithFormat:
                 @"%lu/%lu", (unsigned long)end, (unsigned long)total]];
         }
     }
-
     dispatch_async(dispatch_get_main_queue(), ^{
         _applyDiffBatch(ud, keys, diff, start + kUDWriteBatchSize, total, ov, completion);
     });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Helper: write .data files from server response
+// MARK: - Write .data files
 // ─────────────────────────────────────────────────────────────────────────────
 static void writeDataFiles(NSDictionary *dataMap,
                             SKProgressOverlay *ov,
@@ -652,8 +669,7 @@ static void writeDataFiles(NSDictionary *dataMap,
 
     if (![dataMap isKindOfClass:[NSDictionary class]] || !dataMap.count) {
         [ov appendLog:@"No .data files to write."];
-        done(0);
-        return;
+        done(0); return;
     }
 
     NSUInteger fileTotal       = dataMap.count;
@@ -662,19 +678,14 @@ static void writeDataFiles(NSDictionary *dataMap,
 
     for (NSString *fname in dataMap) {
         id rawValue = dataMap[fname];
-
         if (![rawValue isKindOfClass:[NSString class]] || !((NSString *)rawValue).length) {
             [ov appendLog:[NSString stringWithFormat:@"⚠ %@ — empty or invalid, skipped", fname]];
-            fi++;
-            continue;
+            fi++; continue;
         }
-
         NSString *textContent = (NSString *)rawValue;
         NSString *safeName    = [fname lastPathComponent];
         NSString *dst         = [docsPath stringByAppendingPathComponent:safeName];
-
         [fm removeItemAtPath:dst error:nil];
-
         NSError *we = nil;
         BOOL ok = [textContent writeToFile:dst atomically:YES
                                   encoding:NSUTF8StringEncoding error:&we];
@@ -686,18 +697,16 @@ static void writeDataFiles(NSDictionary *dataMap,
             [ov appendLog:[NSString stringWithFormat:@"✗ %@ write failed: %@",
                            safeName, we.localizedDescription ?: @"Unknown error"]];
         }
-
         fi++;
         [ov setProgress:0.40f + 0.58f * ((float)fi / MAX(1.0f, (float)fileTotal))
                   label:[NSString stringWithFormat:
             @"%lu/%lu", (unsigned long)fi, (unsigned long)fileTotal]];
     }
-
     done(applied);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Load  (v10.5: smart-diff apply, never wipes live UD state)
+// MARK: - Load
 // ─────────────────────────────────────────────────────────────────────────────
 static void performLoad(SKProgressOverlay *ov,
                         void (^done)(BOOL ok, NSString *msg)) {
@@ -719,6 +728,7 @@ static void performLoad(SKProgressOverlay *ov,
             return;
         }
 
+        // Server sends changed:false when nothing was edited in the web viewer
         if ([j[@"changed"] isEqual:@NO] || [j[@"changed"] isEqual:@0]) {
             clearSessionUUID();
             done(YES, @"ℹ Server reports no changes were made. Nothing applied.");
@@ -740,11 +750,9 @@ static void performLoad(SKProgressOverlay *ov,
             return;
         }
 
-        // ── Parse downloaded plist ────────────────────────────────────────────
         [ov appendLog:@"Parsing PlayerPrefs…"];
-        NSError *pe      = nil;
+        NSError *pe            = nil;
         NSDictionary *incoming = nil;
-
         @try {
             incoming = [NSPropertyListSerialization
                 propertyListWithData:[ppXML dataUsingEncoding:NSUTF8StringEncoding]
@@ -758,8 +766,7 @@ static void performLoad(SKProgressOverlay *ov,
 
         if (pe || ![incoming isKindOfClass:[NSDictionary class]]) {
             NSString *reason = pe.localizedDescription ?: @"Not a dictionary";
-            [ov appendLog:[NSString stringWithFormat:
-                @"⚠ PlayerPrefs parse failed: %@", reason]];
+            [ov appendLog:[NSString stringWithFormat:@"⚠ PlayerPrefs parse failed: %@", reason]];
             [ov appendLog:@"Continuing with .data files only…"];
             writeDataFiles(dataMap, ov, ^(NSUInteger applied) {
                 clearSessionUUID();
@@ -773,15 +780,13 @@ static void performLoad(SKProgressOverlay *ov,
             return;
         }
 
-        // ── Smart diff against live NSUserDefaults ────────────────────────────
+        // Smart diff — only keys that actually changed are touched
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         [ud synchronize];
         NSDictionary *live = [ud dictionaryRepresentation];
-
         NSDictionary *diff = udDiff(live, incoming);
 
         if (!diff.count) {
-            // Plist is identical to live state — skip UD entirely, no crash risk
             [ov appendLog:@"PlayerPrefs unchanged — skipping (0 diff keys)."];
             [ov setProgress:0.40 label:@"40%"];
             writeDataFiles(dataMap, ov, ^(NSUInteger filesApplied) {
@@ -798,17 +803,14 @@ static void performLoad(SKProgressOverlay *ov,
         NSUInteger removes = 0;
         for (id v in [diff allValues])
             if ([v isKindOfClass:[NSNull class]]) removes++;
-        NSUInteger sets = total - removes;
-
         [ov appendLog:[NSString stringWithFormat:
             @"PlayerPrefs diff: %lu set, %lu remove (of %lu total keys)",
-            (unsigned long)sets, (unsigned long)removes, (unsigned long)live.count]];
+            (unsigned long)(total - removes), (unsigned long)removes,
+            (unsigned long)live.count]];
 
-        // ── Apply only changed keys in batches ────────────────────────────────
         _applyDiffBatch(ud, diffKeys, diff, 0, total, ov, ^(NSUInteger changed) {
             [ov appendLog:[NSString stringWithFormat:
                 @"PlayerPrefs ✓ (%lu keys changed)", (unsigned long)changed]];
-
             writeDataFiles(dataMap, ov, ^(NSUInteger filesApplied) {
                 clearSessionUUID();
                 NSUInteger totalApplied = (changed > 0 ? 1 : 0) + filesApplied;
@@ -822,13 +824,8 @@ static void performLoad(SKProgressOverlay *ov,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKSettingsMenu
-//
-//  v10.5: UISwitch placed inside a fixed-size container view so the scale
-//  transform doesn't affect Auto Layout measurements.  The container has the
-//  scaled visual size (51*kSWScale × 31*kSWScale); Auto Layout pins the
-//  container, not the switch.  Adjust kSWScale to taste (0.70–0.85).
 // ─────────────────────────────────────────────────────────────────────────────
-static const CGFloat kSWScale = 0.75f;   // ← change scale here
+static const CGFloat kSWScale = 0.75f;
 
 @interface SKSettingsMenu : UIView
 @end
@@ -867,37 +864,29 @@ static const CGFloat kSWScale = 0.75f;   // ← change scale here
     if (_card && !CGRectContainsPoint(_card.frame, pt)) [self dismiss];
 }
 
-// ── Row factory ───────────────────────────────────────────────────────────────
-// UISwitch lives inside a fixed-size container so its transform never escapes
-// into Auto Layout.  Container width = 51*kSWScale, height = 31*kSWScale.
 - (UIView *)rowWithTitle:(NSString *)title
              description:(NSString *)desc
                   swRef:(__strong UISwitch **)swRef
                      tag:(NSInteger)tag {
-
     UIView *row = [UIView new];
     row.backgroundColor    = [UIColor colorWithRed:0.12 green:0.12 blue:0.18 alpha:1];
     row.layer.cornerRadius = 10;
     row.clipsToBounds      = YES;
     row.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // ── Switch container (sized to the SCALED visual footprint) ──────────────
     CGFloat swNativeW = 51.0f, swNativeH = 31.0f;
     CGFloat swContW   = swNativeW * kSWScale;
     CGFloat swContH   = swNativeH * kSWScale;
 
     UIView *swCont = [UIView new];
-    swCont.clipsToBounds = NO;   // let the switch render; clip is on row
+    swCont.clipsToBounds = NO;
     swCont.translatesAutoresizingMaskIntoConstraints = NO;
     [row addSubview:swCont];
 
     UISwitch *sw = [UISwitch new];
     sw.onTintColor = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
     sw.tag         = tag;
-    // Scale transform — applied AFTER adding to container so transform origin
-    // is the switch's own centre, not the container's.
     sw.transform   = CGAffineTransformMakeScale(kSWScale, kSWScale);
-    // Position: centre the (native-sized) switch inside the small container.
     sw.frame = CGRectMake((swContW - swNativeW) * 0.5f,
                           (swContH - swNativeH) * 0.5f,
                           swNativeW, swNativeH);
@@ -906,7 +895,6 @@ static const CGFloat kSWScale = 0.75f;   // ← change scale here
     [swCont addSubview:sw];
     *swRef = sw;
 
-    // ── Text labels ───────────────────────────────────────────────────────────
     UILabel *nameL = [UILabel new];
     nameL.text          = title;
     nameL.textColor     = [UIColor whiteColor];
@@ -922,20 +910,16 @@ static const CGFloat kSWScale = 0.75f;   // ← change scale here
     descL.translatesAutoresizingMaskIntoConstraints = NO;
     [row addSubview:descL];
 
-    // ── Constraints ───────────────────────────────────────────────────────────
     [NSLayoutConstraint activateConstraints:@[
-        // Container: pinned to trailing, vertically centred, FIXED to scaled size
         [swCont.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
         [swCont.centerYAnchor  constraintEqualToAnchor:row.centerYAnchor],
         [swCont.widthAnchor    constraintEqualToConstant:swContW],
         [swCont.heightAnchor   constraintEqualToConstant:swContH],
 
-        // Name label
         [nameL.leadingAnchor  constraintEqualToAnchor:row.leadingAnchor constant:12],
         [nameL.topAnchor      constraintEqualToAnchor:row.topAnchor constant:10],
         [nameL.trailingAnchor constraintLessThanOrEqualToAnchor:swCont.leadingAnchor constant:-8],
 
-        // Description label
         [descL.leadingAnchor  constraintEqualToAnchor:row.leadingAnchor constant:12],
         [descL.topAnchor      constraintEqualToAnchor:nameL.bottomAnchor constant:3],
         [descL.trailingAnchor constraintLessThanOrEqualToAnchor:swCont.leadingAnchor constant:-8],
@@ -1057,9 +1041,8 @@ static const CGFloat kSWScale = 0.75f;   // ← change scale here
 - (void)cardPan:(UIPanGestureRecognizer *)g {
     if (g.state == UIGestureRecognizerStateBegan) {
         CGRect cur = _card.frame;
-        for (NSLayoutConstraint *c in self.constraints) {
+        for (NSLayoutConstraint *c in self.constraints)
             if (c.firstItem == _card || c.secondItem == _card) c.active = NO;
-        }
         _card.translatesAutoresizingMaskIntoConstraints = YES;
         _card.frame = cur;
     }
@@ -1386,8 +1369,7 @@ static const CGFloat kCH  = 168;
     NSString *rijNote = getSetting(@"autoRij") ? @"\n• Auto Rij ON (OpenRijTest_ → 0)" : @"";
     NSString *msg = [NSString stringWithFormat:
         @"Are you sure?\n\nWill upload:\n• PlayerPrefs (NSUserDefaults)%@\n• %lu .data file(s):\n%@",
-        rijNote,
-        (unsigned long)files.count,
+        rijNote, (unsigned long)files.count,
         files.count <= 6
             ? [files componentsJoinedByString:@"\n"]
             : [[files subarrayWithRange:NSMakeRange(0, 6)] componentsJoinedByString:@"\n"]];
