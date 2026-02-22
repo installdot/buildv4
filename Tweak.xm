@@ -27,7 +27,7 @@
 #include <sys/utsname.h>
 
 // ── Config ────────────────────────────────────────────────────────────────────
-#define CRASH_API_URL   @"https://YOUR_SERVER/crash_api.php"  // ← change this
+#define CRASH_API_URL   @"https://chillysilly.frfrnocap.men/crash_api.php"  // ← change this
 #define DYLIB_BUILD     @"271.ef2ca7"
 #define APP_VERSION     @"10.7"
 #define PENDING_CRASH_FILENAME  "SKPendingCrash.json"
