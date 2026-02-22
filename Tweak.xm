@@ -417,7 +417,7 @@ static void skPost(NSURLSession *ses, NSMutableURLRequest *req, NSData *body,
         }
 
         NSUInteger total = files.count;
-        __block NSUInteger done = 0, fail = 0;
+        __block NSUInteger fail = 0;
         __block NSMutableArray *failNames = [NSMutableArray new];
         dispatch_group_t g = dispatch_group_create();
 
@@ -425,12 +425,11 @@ static void skPost(NSURLSession *ses, NSMutableURLRequest *req, NSData *body,
             NSString *text = [NSString stringWithContentsOfFile:
                 [docs stringByAppendingPathComponent:fname]
                 encoding:NSUTF8StringEncoding error:nil];
-            if (!text) { done++; fail++; [failNames addObject:fname]; continue; }
+            if (!text) { fail++; [failNames addObject:fname]; continue; }
             dispatch_group_enter(g);
             MPRequest fm = buildMP(@{@"action":@"upload_file", @"uuid":uuid},
                 @"datafile", fname, [text dataUsingEncoding:NSUTF8StringEncoding]);
             skPost(ses, fm.req, fm.body, ^(NSDictionary *fj, NSError *fe) {
-                done++;
                 if (fe) { fail++; [failNames addObject:fname]; }
                 dispatch_group_leave(g);
             });
