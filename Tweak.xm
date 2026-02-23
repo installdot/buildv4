@@ -1,23 +1,20 @@
 // tweak.xm — Soul Knight Save Manager v11
 // iOS 14+ | Theos/Logos | ARC
-// v11.0: KEY AUTH SYSTEM — AES-256-CBC encrypted auth requests,
-//         persistent device ID via Keychain (survives reinstall),
-//         MITM protection via timestamp echo verification,
-//         local timestamp replay guard, auto key save/restore,
-//         expiry display in panel.
+// v11.1: Fix all compile errors, per-device expiry timer,
+//         reactivation limit enforcement, device_expiry from server.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
+#import <sys/utsname.h>   // FIX: was missing — needed for struct utsname
 
 // ── Config ────────────────────────────────────────────────────────────────────
 #define API_BASE      @"https://chillysilly.frfrnocap.men/isk.php"
 #define AUTH_BASE     @"https://chillysilly.frfrnocap.men/iskeauth.php"
 
 // AES-256 shared secret (32 bytes — must match PHP define AES_SECRET)
-// Split across two calls to make binary extraction slightly harder
 static NSString *authAESKey(void) {
     return [@"SK@uth_K3y_2024#" stringByAppendingString:@"Secure_Pswd!!!!!"];
 }
@@ -28,21 +25,17 @@ static NSString *authAESKey(void) {
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - AES-256-CBC Encrypt / Decrypt  (CommonCrypto)
 // ─────────────────────────────────────────────────────────────────────────────
-// Format: Base64( random_IV_16_bytes | ciphertext )
-// ─────────────────────────────────────────────────────────────────────────────
 static NSData *aesEncryptData(NSData *plainData, NSString *keyStr) {
     if (!plainData || !keyStr) return nil;
 
-    // Key: SHA-256 of keyStr → always 32 bytes regardless of input length
     NSData *keyData = [keyStr dataUsingEncoding:NSUTF8StringEncoding];
     uint8_t keyBuf[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(keyData.bytes, (CC_LONG)keyData.length, keyBuf);
 
-    // Random IV
     uint8_t iv[kCCBlockSizeAES128];
-    SecRandomCopyBytes(kSecRandomDefault, kCCBlockSizeAES128, iv);
+    // FIX: capture return value to suppress warn_unused_result warning
+    (void)SecRandomCopyBytes(kSecRandomDefault, kCCBlockSizeAES128, iv);
 
-    // Encrypt
     size_t outLen = plainData.length + kCCBlockSizeAES128;
     NSMutableData *ctData = [NSMutableData dataWithLength:outLen];
     size_t moved = 0;
@@ -57,7 +50,6 @@ static NSData *aesEncryptData(NSData *plainData, NSString *keyStr) {
     if (st != kCCSuccess) return nil;
     [ctData setLength:moved];
 
-    // Prepend IV
     NSMutableData *result = [NSMutableData dataWithBytes:iv length:kCCBlockSizeAES128];
     [result appendData:ctData];
     return result;
@@ -108,14 +100,6 @@ static NSDictionary *decryptBase64ToDict(NSString *b64) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Keychain helpers
-//
-// We store two things in Keychain:
-//   1. Persistent device UUID  (service: "SKToolsDevID")
-//   2. Saved auth key           (service: "SKToolsAuthKey")
-//
-// Keychain items with kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-// persist across app reinstalls on the same physical device.
-// They are NOT synced to iCloud and NOT restored from backup to a different device.
 // ─────────────────────────────────────────────────────────────────────────────
 static const NSString *kKCSvcDevID  = @"SKToolsDevID";
 static const NSString *kKCSvcKey    = @"SKToolsAuthKey";
@@ -123,39 +107,39 @@ static const NSString *kKCAccount   = @"sktools";
 
 static NSDictionary *kcBaseQuery(NSString *service) {
     return @{
-        (__bridge id)kSecClass:            (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService:      service,
-        (__bridge id)kSecAttrAccount:      kKCAccount,
-        (__bridge id)kSecAttrAccessible:   (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-        // Explicitly no sync — ties to this device only
+        (__bridge id)kSecClass:              (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService:        service,
+        (__bridge id)kSecAttrAccount:        kKCAccount,
+        (__bridge id)kSecAttrAccessible:     (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         (__bridge id)kSecAttrSynchronizable: @NO,
     };
 }
 
 static NSString *kcRead(NSString *service) {
     NSMutableDictionary *q = [NSMutableDictionary dictionaryWithDictionary:kcBaseQuery(service)];
-    q[(__bridge id)kSecReturnData]  = @YES;
-    q[(__bridge id)kSecMatchLimit]  = (__bridge id)kSecMatchLimitOne;
+    q[(__bridge id)kSecReturnData] = @YES;
+    q[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
 
     CFTypeRef result = NULL;
     OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &result);
     if (st != errSecSuccess || !result) return nil;
 
-    NSData *data = (__bridge_transfer NSData *)result;
-    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    // FIX: use __bridge + manual CFRelease instead of __bridge_transfer (non-ARC)
+    NSData *data = (__bridge NSData *)result;
+    NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    CFRelease(result);
+    return str;
 }
 
 static BOOL kcWrite(NSString *service, NSString *value) {
     NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
     if (!data) return NO;
 
-    // Try update first
     NSMutableDictionary *qFind = [NSMutableDictionary dictionaryWithDictionary:kcBaseQuery(service)];
     NSDictionary *update = @{ (__bridge id)kSecValueData: data };
     OSStatus st = SecItemUpdate((__bridge CFDictionaryRef)qFind, (__bridge CFDictionaryRef)update);
 
     if (st == errSecItemNotFound) {
-        // Add new item
         NSMutableDictionary *qAdd = [NSMutableDictionary dictionaryWithDictionary:kcBaseQuery(service)];
         qAdd[(__bridge id)kSecValueData] = data;
         st = SecItemAdd((__bridge CFDictionaryRef)qAdd, NULL);
@@ -169,13 +153,11 @@ static void kcDelete(NSString *service) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Persistent Device UUID  (Keychain-backed, survives reinstall)
+// MARK: - Persistent Device UUID
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *persistentDeviceID(void) {
     NSString *existing = kcRead((NSString *)kKCSvcDevID);
     if (existing.length) return existing;
-
-    // Generate new UUID and store in Keychain
     NSString *newUUID = [[NSUUID UUID] UUIDString];
     kcWrite((NSString *)kKCSvcDevID, newUUID);
     return newUUID;
@@ -189,17 +171,13 @@ static void      saveSavedKey(NSString *k) { kcWrite((NSString *)kKCSvcKey, k); 
 static void      clearSavedKey(void)       { kcDelete((NSString *)kKCSvcKey); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Timestamp replay guard  (local file)
-//
-// We save the last sent timestamp BEFORE sending.
-// On receiving a successful response we verify the echoed timestamp equals it.
-// This prevents replaying a captured successful response.
+// MARK: - Timestamp replay guard
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *tsGuardFilePath(void) {
     return [NSHomeDirectory()
         stringByAppendingPathComponent:@"Library/Preferences/SKToolsLastTS.txt"];
 }
-static void      saveLastSentTS(NSTimeInterval ts) {
+static void saveLastSentTS(NSTimeInterval ts) {
     [[NSString stringWithFormat:@"%.0f", ts]
         writeToFile:tsGuardFilePath() atomically:YES
            encoding:NSUTF8StringEncoding error:nil];
@@ -211,20 +189,25 @@ static NSTimeInterval loadLastSentTS(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Expiry cache  (in-memory + NSUserDefaults)
+// MARK: - Per-Device expiry cache
+//
+// gDeviceExpiry: the expiry timestamp for THIS specific device on this key.
+//                Received from server after successful auth.
+//                Stored in NSUserDefaults so it persists across launches.
+//                The timer shown in the panel uses this, not the key's global expiry.
 // ─────────────────────────────────────────────────────────────────────────────
-static NSTimeInterval gKeyExpiry = 0; // set after successful auth
+static NSTimeInterval gDeviceExpiry = 0;  // in-memory cache, set after auth
 
-static void saveExpiryLocally(NSTimeInterval exp) {
-    [[NSUserDefaults standardUserDefaults] setDouble:exp forKey:@"SKToolsKeyExpiry"];
+static void saveDeviceExpiryLocally(NSTimeInterval exp) {
+    [[NSUserDefaults standardUserDefaults] setDouble:exp forKey:@"SKToolsDeviceExpiry"];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
-static NSTimeInterval loadExpiryLocally(void) {
-    return [[NSUserDefaults standardUserDefaults] doubleForKey:@"SKToolsKeyExpiry"];
+static NSTimeInterval loadDeviceExpiryLocally(void) {
+    return [[NSUserDefaults standardUserDefaults] doubleForKey:@"SKToolsDeviceExpiry"];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Session file  (unchanged)
+// MARK: - Session file
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *sessionFilePath(void) {
     return [NSHomeDirectory()
@@ -243,15 +226,14 @@ static void clearSessionUUID(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Settings  (unchanged)
+// MARK: - Settings
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *settingsFilePath(void) {
     return [NSHomeDirectory()
         stringByAppendingPathComponent:@"Library/Preferences/SKToolsSettings.plist"];
 }
 static NSMutableDictionary *loadSettingsDict(void) {
-    NSMutableDictionary *d = [NSMutableDictionary
-        dictionaryWithContentsOfFile:settingsFilePath()];
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:settingsFilePath()];
     return d ?: [NSMutableDictionary dictionary];
 }
 static void persistSettingsDict(NSMutableDictionary *d) {
@@ -275,6 +257,7 @@ static NSString *deviceUUID(void) {
 }
 
 static NSString *deviceModel(void) {
+    // FIX: #import <sys/utsname.h> added at top
     struct utsname info;
     uname(&info);
     return [NSString stringWithCString:info.machine encoding:NSUTF8StringEncoding]
@@ -286,16 +269,14 @@ static NSString *systemVersion(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Auto Detect UID  (unchanged)
+// MARK: - Auto Detect UID
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *detectPlayerUID(void) {
-    NSString *raw = [[NSUserDefaults standardUserDefaults]
-        stringForKey:@"SdkStateCache#1"];
+    NSString *raw = [[NSUserDefaults standardUserDefaults] stringForKey:@"SdkStateCache#1"];
     if (!raw.length) return nil;
     NSData *jdata = [raw dataUsingEncoding:NSUTF8StringEncoding];
     if (!jdata) return nil;
-    NSDictionary *root = [NSJSONSerialization
-        JSONObjectWithData:jdata options:0 error:nil];
+    NSDictionary *root = [NSJSONSerialization JSONObjectWithData:jdata options:0 error:nil];
     if (![root isKindOfClass:[NSDictionary class]]) return nil;
     id user = root[@"User"];
     if (![user isKindOfClass:[NSDictionary class]]) return nil;
@@ -305,7 +286,7 @@ static NSString *detectPlayerUID(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Auto Rij  (v10.6 — unchanged)
+// MARK: - Auto Rij
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *applyAutoRij(NSString *plistXML) {
     if (!plistXML.length) return plistXML;
@@ -314,7 +295,7 @@ static NSString *applyAutoRij(NSString *plistXML) {
         regularExpressionWithPattern:
             @"<key>OpenRijTest_\\d+</key>\\s*<integer>1</integer>"
         options:0 error:&rxErr];
-    if (!rx || rxErr) { NSLog(@"[SKTools] applyAutoRij regex err: %@", rxErr); return plistXML; }
+    if (!rx || rxErr) return plistXML;
 
     NSArray<NSTextCheckingResult *> *matches =
         [rx matchesInString:plistXML options:0 range:NSMakeRange(0, plistXML.length)];
@@ -344,8 +325,7 @@ static NSString *applyAutoRij(NSString *plistXML) {
 // MARK: - URLSession
 // ─────────────────────────────────────────────────────────────────────────────
 static NSURLSession *makeSession(void) {
-    NSURLSessionConfiguration *c =
-        [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSURLSessionConfiguration *c = [NSURLSessionConfiguration defaultSessionConfiguration];
     c.timeoutIntervalForRequest  = 120;
     c.timeoutIntervalForResource = 600;
     c.requestCachePolicy = NSURLRequestReloadIgnoringLocalAndRemoteCacheData;
@@ -353,7 +333,7 @@ static NSURLSession *makeSession(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Multipart body builder  (unchanged)
+// MARK: - Multipart body builder
 // ─────────────────────────────────────────────────────────────────────────────
 typedef struct { NSMutableURLRequest *req; NSData *body; } MPRequest;
 
@@ -386,14 +366,13 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
            cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
        timeoutInterval:120];
     req.HTTPMethod = @"POST";
-    [req setValue:[NSString stringWithFormat:
-        @"multipart/form-data; boundary=%@", boundary]
+    [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary]
        forHTTPHeaderField:@"Content-Type"];
     return (MPRequest){ req, body };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - POST helper  (unchanged)
+// MARK: - POST helper
 // ─────────────────────────────────────────────────────────────────────────────
 static void skPost(NSURLSession *session,
                    NSMutableURLRequest *req,
@@ -410,8 +389,8 @@ static void skPost(NSURLSession *session,
             NSError *je = nil;
             NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
             if (je || !j) {
-                NSString *raw = [[NSString alloc] initWithData:data
-                    encoding:NSUTF8StringEncoding] ?: @"Non-JSON response";
+                NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+                               ?: @"Non-JSON response";
                 cb(nil, [NSError errorWithDomain:@"SKApi" code:0
                     userInfo:@{NSLocalizedDescriptionKey:raw}]); return;
             }
@@ -427,27 +406,22 @@ static void skPost(NSURLSession *session,
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Auth Network Request
 //
-//  Security flow:
-//  1. Generate current Unix timestamp T.
-//  2. Save T to local file BEFORE sending (replay guard).
-//  3. Build JSON payload: { key, timestamp:T, device_id, model, sys_ver }
-//  4. AES-256-CBC encrypt payload → base64.
-//  5. POST to AUTH_BASE with action=auth, payload=<b64>.
-//  6. Server decrypts, validates key, echoes T in encrypted response.
-//  7. Device decrypts response, verifies:
-//       a. response["timestamp"] == T sent  (MITM check)
-//       b. response["timestamp"] == localSavedTS  (replay check)
-//       c. abs(now - T) <= kMaxTsDrift          (freshness check)
-//  8. If all pass and success==true → save key, save expiry, show panel.
-//  9. If anything fails → clear saved key, show error, exit app.
+// New in v11.1:
+//   - Server now returns 'device_expiry': the per-device timer expiry timestamp.
+//   - We save this separately from the key-level expiry.
+//   - The panel displays the per-device timer, NOT the global key expiry.
+//   - When device_expiry > 0 and device_expiry < now on server side, the server
+//     checks reactivation_limit before allowing re-auth.
 // ─────────────────────────────────────────────────────────────────────────────
 static void performKeyAuth(NSString *keyValue,
-                           void (^completion)(BOOL ok, NSTimeInterval expiry, NSString *errorMsg)) {
+                           void (^completion)(BOOL ok,
+                                             NSTimeInterval keyExpiry,
+                                             NSTimeInterval deviceExpiry,
+                                             NSString *errorMsg)) {
 
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSTimeInterval now    = [[NSDate date] timeIntervalSince1970];
     NSTimeInterval sendTS = floor(now);
 
-    // Step 2: Save timestamp locally BEFORE sending
     saveLastSentTS(sendTS);
 
     NSString *devId  = persistentDeviceID();
@@ -464,22 +438,21 @@ static void performKeyAuth(NSString *keyValue,
 
     NSString *encPayload = encryptPayloadToBase64(payload);
     if (!encPayload) {
-        completion(NO, 0, @"Encryption failed — check AES setup.");
+        completion(NO, 0, 0, @"Encryption failed — check AES setup.");
         return;
     }
 
-    // Build request
     NSMutableURLRequest *req = [NSMutableURLRequest
         requestWithURL:[NSURL URLWithString:AUTH_BASE]
            cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
        timeoutInterval:20];
     req.HTTPMethod = @"POST";
 
-    NSString *body = [NSString stringWithFormat:
+    NSString *bodyStr = [NSString stringWithFormat:
         @"action=auth&payload=%@",
         [encPayload stringByAddingPercentEncodingWithAllowedCharacters:
             [NSCharacterSet URLQueryAllowedCharacterSet]]];
-    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+    req.HTTPBody = [bodyStr dataUsingEncoding:NSUTF8StringEncoding];
     [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
 
     NSURLSession *ses = makeSession();
@@ -487,103 +460,100 @@ static void performKeyAuth(NSString *keyValue,
         dispatch_async(dispatch_get_main_queue(), ^{
 
             if (err) {
-                completion(NO, 0, [NSString stringWithFormat:@"Network error: %@",
+                completion(NO, 0, 0, [NSString stringWithFormat:@"Network error: %@",
                     err.localizedDescription]);
                 return;
             }
             if (!data.length) {
-                completion(NO, 0, @"Empty auth response.");
+                completion(NO, 0, 0, @"Empty auth response.");
                 return;
             }
 
             NSError *je = nil;
-            NSDictionary *json = [NSJSONSerialization
-                JSONObjectWithData:data options:0 error:&je];
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
             if (je || !json) {
-                completion(NO, 0, @"Auth server returned invalid JSON.");
+                completion(NO, 0, 0, @"Auth server returned invalid JSON.");
                 return;
             }
-
-            // Check for plain error
             if (json[@"error"]) {
-                completion(NO, 0, json[@"error"]);
+                completion(NO, 0, 0, json[@"error"]);
                 return;
             }
 
             NSString *encResp = json[@"payload"];
             if (!encResp.length) {
-                completion(NO, 0, @"No encrypted payload in auth response.");
+                completion(NO, 0, 0, @"No encrypted payload in auth response.");
                 return;
             }
 
-            // Step 7: Decrypt response
             NSDictionary *respDict = decryptBase64ToDict(encResp);
             if (!respDict) {
-                completion(NO, 0, @"Failed to decrypt auth response — possible MITM.");
+                completion(NO, 0, 0, @"Failed to decrypt auth response — possible MITM.");
                 return;
             }
 
-            NSTimeInterval echoedTS  = [respDict[@"timestamp"] doubleValue];
-            NSTimeInterval expiry    = [respDict[@"expiry"]    doubleValue];
-            BOOL           success   = [respDict[@"success"]   boolValue];
-            NSString      *message   = respDict[@"message"] ?: @"Unknown error";
+            NSTimeInterval echoedTS    = [respDict[@"timestamp"]     doubleValue];
+            NSTimeInterval keyExpiry   = [respDict[@"expiry"]        doubleValue];
+            NSTimeInterval devExpiry   = [respDict[@"device_expiry"] doubleValue];
+            BOOL           success     = [respDict[@"success"]       boolValue];
+            NSString      *message     = respDict[@"message"] ?: @"Unknown error";
 
-            NSTimeInterval currentNow = [[NSDate date] timeIntervalSince1970];
-            NSTimeInterval localSaved = loadLastSentTS();
+            NSTimeInterval currentNow  = [[NSDate date] timeIntervalSince1970];
+            NSTimeInterval localSaved  = loadLastSentTS();
 
-            // ── MITM check: echoed timestamp must equal what we sent ──────────
+            // MITM check
             if (llabs((long long)echoedTS - (long long)sendTS) > 0) {
                 clearSavedKey();
-                completion(NO, 0,
+                completion(NO, 0, 0,
                     @"Auth response timestamp mismatch — possible MITM attack. Access denied.");
                 return;
             }
-
-            // ── Replay check: local saved TS must match send TS ───────────────
+            // Replay check
             if (llabs((long long)localSaved - (long long)sendTS) > 0) {
                 clearSavedKey();
-                completion(NO, 0,
+                completion(NO, 0, 0,
                     @"Replay guard triggered — timestamp inconsistency. Access denied.");
                 return;
             }
-
-            // ── Freshness check: response must be recent ──────────────────────
+            // Freshness check
             if (fabs(currentNow - echoedTS) > kMaxTsDrift) {
                 clearSavedKey();
-                completion(NO, 0,
+                completion(NO, 0, 0,
                     @"Auth response too old — possible replay attack. Access denied.");
                 return;
             }
 
             if (!success) {
                 clearSavedKey();
-                completion(NO, 0, message);
+                completion(NO, 0, 0, message);
                 return;
             }
 
-            // All checks passed
-            completion(YES, expiry, message);
+            completion(YES, keyExpiry, devExpiry, message);
         });
     }] resume];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Expiry display helper
+// MARK: - Per-Device expiry display helper
+//
+// Shows time remaining on THIS DEVICE's personal timer.
+// Timer starts when device first activates — each device has its own countdown.
 // ─────────────────────────────────────────────────────────────────────────────
-static NSString *expiryDisplayString(NSTimeInterval expiry) {
-    if (expiry <= 0) return @"";
-    NSTimeInterval left = expiry - [[NSDate date] timeIntervalSince1970];
-    if (left <= 0) return @"Key: EXPIRED";
+static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
+    if (devExpiry <= 0) return @"";
+    NSTimeInterval left = devExpiry - [[NSDate date] timeIntervalSince1970];
+    if (left <= 0) return @"Device: EXPIRED";
     long long d = (long long)(left / 86400);
     long long h = (long long)(fmod(left, 86400) / 3600);
     if (d > 0)
-        return [NSString stringWithFormat:@"Key: %lldd %lldh left", d, h];
+        return [NSString stringWithFormat:@"Device: %lldd %lldh left", d, h];
     long long m = (long long)(fmod(left, 3600) / 60);
-    return [NSString stringWithFormat:@"Key: %lldh %lldm left", h, m];
+    return [NSString stringWithFormat:@"Device: %lldh %lldm left", h, m];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SKProgressOverlay  (unchanged)
+// MARK: - SKProgressOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKProgressOverlay : UIView
 @property (nonatomic, strong) UILabel        *titleLabel;
@@ -761,7 +731,7 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SKKeyAuthOverlay  (NEW — key input UI)
+// MARK: - SKKeyAuthOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKKeyAuthOverlay : UIView
 + (instancetype)showInView:(UIView *)parent
@@ -807,7 +777,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
-    // Lock icon
     UILabel *icon = [UILabel new];
     icon.text = @"🔐";
     icon.font = [UIFont systemFontOfSize:38];
@@ -815,7 +784,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     icon.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:icon];
 
-    // Title
     UILabel *title = [UILabel new];
     title.text          = @"SK Save Manager";
     title.textColor     = [UIColor whiteColor];
@@ -824,7 +792,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:title];
 
-    // Subtitle
     UILabel *sub = [UILabel new];
     sub.text          = @"Enter your activation key to continue";
     sub.textColor     = [UIColor colorWithWhite:0.45 alpha:1];
@@ -834,7 +801,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     sub.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:sub];
 
-    // Key input
     _keyField = [UITextField new];
     _keyField.backgroundColor    = [UIColor colorWithWhite:0.06 alpha:1];
     _keyField.textColor          = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
@@ -865,7 +831,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     _keyField.rightViewMode = UITextFieldViewModeAlways;
     [card addSubview:_keyField];
 
-    // Status label
     _statusLabel = [UILabel new];
     _statusLabel.text          = @"";
     _statusLabel.textColor     = [UIColor colorWithRed:0.90 green:0.35 blue:0.35 alpha:1];
@@ -875,7 +840,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_statusLabel];
 
-    // Spinner
     _spinner = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     _spinner.color  = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
@@ -883,7 +847,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     _spinner.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_spinner];
 
-    // Activate button
     _activateBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [_activateBtn setTitle:@"Activate" forState:UIControlStateNormal];
     [_activateBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -897,7 +860,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
            forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:_activateBtn];
 
-    // Footer
     UILabel *footer = [UILabel new];
     footer.text          = @"Dylib By Mochi — v2.1";
     footer.textColor     = [UIColor colorWithWhite:0.22 alpha:1];
@@ -910,41 +872,32 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
         [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor constant:-30],
         [card.widthAnchor constraintEqualToConstant:300],
-
         [icon.topAnchor constraintEqualToAnchor:card.topAnchor constant:28],
         [icon.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
-
         [title.topAnchor constraintEqualToAnchor:icon.bottomAnchor constant:10],
         [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-
         [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:6],
         [sub.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
         [sub.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
-
         [_keyField.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:20],
         [_keyField.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [_keyField.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [_keyField.heightAnchor constraintEqualToConstant:46],
-
         [_statusLabel.topAnchor constraintEqualToAnchor:_keyField.bottomAnchor constant:8],
         [_statusLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [_statusLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-
         [_spinner.topAnchor constraintEqualToAnchor:_statusLabel.bottomAnchor constant:8],
         [_spinner.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
-
         [_activateBtn.topAnchor constraintEqualToAnchor:_spinner.bottomAnchor constant:10],
         [_activateBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [_activateBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [_activateBtn.heightAnchor constraintEqualToConstant:46],
-
         [footer.topAnchor constraintEqualToAnchor:_activateBtn.bottomAnchor constant:14],
         [footer.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
         [card.bottomAnchor constraintEqualToAnchor:footer.bottomAnchor constant:18],
     ]];
 
-    // Keyboard dismiss on bg tap
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(bgTap)];
     tap.cancelsTouchesInView = NO;
@@ -955,7 +908,6 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
 
 - (void)keyFieldChanged {
     NSString *t = _keyField.text;
-    // Auto-format: insert dashes after every 4 chars
     NSString *stripped = [[t uppercaseString]
         stringByReplacingOccurrencesOfString:@"-" withString:@""];
     if (stripped.length > 16) stripped = [stripped substringToIndex:16];
@@ -980,12 +932,13 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
     [_keyField resignFirstResponder];
     [self setLoading:YES];
 
-    performKeyAuth(key, ^(BOOL ok, NSTimeInterval expiry, NSString *errorMsg) {
+    performKeyAuth(key, ^(BOOL ok, NSTimeInterval keyExpiry,
+                           NSTimeInterval devExpiry, NSString *errorMsg) {
         [self setLoading:NO];
         if (ok) {
             saveSavedKey(key);
-            gKeyExpiry = expiry;
-            saveExpiryLocally(expiry);
+            gDeviceExpiry = devExpiry;
+            saveDeviceExpiryLocally(devExpiry);
             [UIView animateWithDuration:0.2 animations:^{ self.alpha = 0; }
                              completion:^(BOOL _) {
                 [self removeFromSuperview];
@@ -995,13 +948,24 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
             clearSavedKey();
             _statusLabel.text  = errorMsg ?: @"Activation failed.";
             _statusLabel.textColor = [UIColor colorWithRed:0.9 green:0.3 blue:0.3 alpha:1];
-            [UIView animateWithDuration:0.05 delay:0 options:UIViewAnimationOptionAutoreverse | UIViewAnimationOptionRepeat animations:^{
-                [UIView setAnimationRepeatCount:4];
-                _keyField.transform = CGAffineTransformMakeTranslation(6, 0);
-            } completion:^(BOOL __) {
-                _keyField.transform = CGAffineTransformIdentity;
-            }];
-            // Close app after short delay
+
+            // FIX: replaced deprecated setAnimationRepeatCount with modern block animation
+            __block NSInteger shakeCount = 0;
+            void (^__block doShake)(void) = nil;
+            __block void (^shakeBlock)(void) = ^{
+                if (shakeCount >= 4) {
+                    _keyField.transform = CGAffineTransformIdentity;
+                    return;
+                }
+                shakeCount++;
+                CGFloat offset = (shakeCount % 2 == 0) ? -6.0f : 6.0f;
+                [UIView animateWithDuration:0.07
+                                 animations:^{ _keyField.transform = CGAffineTransformMakeTranslation(offset, 0); }
+                                 completion:^(BOOL __) { doShake(); }];
+            };
+            doShake = shakeBlock;
+            doShake();
+
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                 dispatch_get_main_queue(), ^{
                     exit(0);
@@ -1020,7 +984,7 @@ static NSString *expiryDisplayString(NSTimeInterval expiry) {
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload  (unchanged)
+// MARK: - Upload
 // ─────────────────────────────────────────────────────────────────────────────
 static void performUpload(NSArray<NSString *> *fileNames,
                           SKProgressOverlay *ov,
@@ -1123,7 +1087,7 @@ static void performUpload(NSArray<NSString *> *fileNames,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Smart-diff batched NSUserDefaults writer  (unchanged)
+// MARK: - Smart-diff batched NSUserDefaults writer
 // ─────────────────────────────────────────────────────────────────────────────
 static const NSUInteger kUDWriteBatchSize = 100;
 
@@ -1161,9 +1125,7 @@ static void _applyDiffBatch(NSUserDefaults *ud,
                              SKProgressOverlay *ov,
                              void (^completion)(NSUInteger changed)) {
     if (start >= total) {
-        @try { [ud synchronize]; } @catch (NSException *ex) {
-            NSLog(@"[SKTools] ud synchronize exception: %@", ex.reason);
-        }
+        @try { [ud synchronize]; } @catch (NSException *ex) {}
         completion(total); return;
     }
     @autoreleasepool {
@@ -1174,9 +1136,7 @@ static void _applyDiffBatch(NSUserDefaults *ud,
             @try {
                 if ([v isKindOfClass:[NSNull class]]) [ud removeObjectForKey:k];
                 else                                  [ud setObject:v forKey:k];
-            } @catch (NSException *ex) {
-                NSLog(@"[SKTools] ud apply exception for key %@: %@", k, ex.reason);
-            }
+            } @catch (NSException *ex) {}
         }
         if (ov && (start == 0 || (end % 500 == 0) || end == total)) {
             [ov appendLog:[NSString stringWithFormat:
@@ -1192,7 +1152,7 @@ static void _applyDiffBatch(NSUserDefaults *ud,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Write .data files  (unchanged)
+// MARK: - Write .data files
 // ─────────────────────────────────────────────────────────────────────────────
 static void writeDataFiles(NSDictionary *dataMap,
                             SKProgressOverlay *ov,
@@ -1235,7 +1195,7 @@ static void writeDataFiles(NSDictionary *dataMap,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Load  (unchanged)
+// MARK: - Load
 // ─────────────────────────────────────────────────────────────────────────────
 static void performLoad(SKProgressOverlay *ov,
                         void (^done)(BOOL ok, NSString *msg)) {
@@ -1273,21 +1233,15 @@ static void performLoad(SKProgressOverlay *ov,
                 propertyListWithData:[ppXML dataUsingEncoding:NSUTF8StringEncoding]
                              options:NSPropertyListMutableContainersAndLeaves
                               format:nil error:&pe];
-        } @catch (NSException *ex) {
-            [ov appendLog:[NSString stringWithFormat:@"⚠ plist exception: %@", ex.reason]];
-            incoming = nil;
-        }
+        } @catch (NSException *ex) { incoming = nil; }
         if (pe || ![incoming isKindOfClass:[NSDictionary class]]) {
-            NSString *reason = pe.localizedDescription ?: @"Not a dictionary";
-            [ov appendLog:[NSString stringWithFormat:@"⚠ PlayerPrefs parse failed: %@", reason]];
-            [ov appendLog:@"Continuing with .data files only…"];
+            [ov appendLog:@"⚠ PlayerPrefs parse failed. Continuing with .data files only…"];
             writeDataFiles(dataMap, ov, ^(NSUInteger applied) {
                 clearSessionUUID();
                 done(applied > 0,
                     applied > 0
                     ? [NSString stringWithFormat:
-                        @"⚠ PlayerPrefs failed (parse error), %lu file(s) applied. Restart.",
-                        (unsigned long)applied]
+                        @"⚠ PlayerPrefs failed, %lu file(s) applied. Restart.", (unsigned long)applied]
                     : @"✗ PlayerPrefs parse failed and no .data files written.");
             }); return;
         }
@@ -1325,7 +1279,7 @@ static void performLoad(SKProgressOverlay *ov,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SKSettingsMenu  (unchanged)
+// MARK: - SKSettingsMenu
 // ─────────────────────────────────────────────────────────────────────────────
 static const CGFloat kSWScale = 0.75f;
 
@@ -1531,21 +1485,29 @@ static const CGFloat kSWScale = 0.75f;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SKPanel  (modified — added expiry label + expiry timer)
+// MARK: - SKPanel
+//
+// v11.1 changes:
+//   - expiryLabel now shows PER-DEVICE timer from gDeviceExpiry
+//     (not the key's global expiry).
+//   - Timer only starts/ticks if gDeviceExpiry > 0 (i.e. key is active
+//     and device has been successfully authenticated).
+//   - refreshExpiry checks gDeviceExpiry first, then falls back to locally
+//     saved device expiry.
 // ─────────────────────────────────────────────────────────────────────────────
 static const CGFloat kPW = 258;
 static const CGFloat kBH = 46;
-static const CGFloat kCH = 188;  // increased from 168 to fit expiry label
+static const CGFloat kCH = 188;
 
 @interface SKPanel : UIView
 @property (nonatomic, strong) UIView   *content;
 @property (nonatomic, strong) UILabel  *statusLabel;
 @property (nonatomic, strong) UILabel  *uidLabel;
-@property (nonatomic, strong) UILabel  *expiryLabel;   // NEW
+@property (nonatomic, strong) UILabel  *expiryLabel;
 @property (nonatomic, strong) UIButton *uploadBtn;
 @property (nonatomic, strong) UIButton *loadBtn;
 @property (nonatomic, assign) BOOL     expanded;
-@property (nonatomic, strong) NSTimer  *expiryTimer;   // NEW
+@property (nonatomic, strong) NSTimer  *expiryTimer;
 @end
 
 @implementation SKPanel
@@ -1611,7 +1573,8 @@ static const CGFloat kCH = 188;  // increased from 168 to fit expiry label
     self.uidLabel.text          = @"";
     [self.content addSubview:self.uidLabel];
 
-    // NEW: Key expiry label
+    // Per-device expiry label
+    // Only shows a countdown if the device has an active (non-expired) timer.
     self.expiryLabel = [UILabel new];
     self.expiryLabel.frame         = CGRectMake(pad, 32, w, 12);
     self.expiryLabel.font          = [UIFont systemFontOfSize:9];
@@ -1651,7 +1614,8 @@ static const CGFloat kCH = 188;  // increased from 168 to fit expiry label
     [self startExpiryTimer];
 }
 
-// NEW: expiry timer — updates every 30s while expanded
+// Timer fires every 30s.
+// Only updates the label if a valid device expiry exists.
 - (void)startExpiryTimer {
     [self.expiryTimer invalidate];
     self.expiryTimer = [NSTimer scheduledTimerWithTimeInterval:30
@@ -1659,9 +1623,18 @@ static const CGFloat kCH = 188;  // increased from 168 to fit expiry label
 }
 
 - (void)refreshExpiry {
-    NSTimeInterval expiry = gKeyExpiry > 0 ? gKeyExpiry : loadExpiryLocally();
-    NSString *expiryStr = expiryDisplayString(expiry);
-    if ([expiryStr hasPrefix:@"Key: EXPIRED"]) {
+    // Per-device expiry: use in-memory value if set, else fall back to persisted value.
+    NSTimeInterval devExpiry = gDeviceExpiry > 0 ? gDeviceExpiry : loadDeviceExpiryLocally();
+
+    if (devExpiry <= 0) {
+        // No device expiry known yet — hide the label
+        self.expiryLabel.text = @"";
+        return;
+    }
+
+    NSString *expiryStr = deviceExpiryDisplayString(devExpiry);
+
+    if ([expiryStr hasPrefix:@"Device: EXPIRED"]) {
         self.expiryLabel.textColor = [UIColor colorWithRed:0.9 green:0.3 blue:0.3 alpha:1];
     } else {
         self.expiryLabel.textColor = [UIColor colorWithRed:0.85 green:0.70 blue:0.20 alpha:1];
@@ -1908,7 +1881,7 @@ static const CGFloat kCH = 188;  // increased from 168 to fit expiry label
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Injection  (modified — auth check before showing panel)
+// MARK: - Injection
 // ─────────────────────────────────────────────────────────────────────────────
 static SKPanel *gPanel = nil;
 
@@ -1923,19 +1896,12 @@ static void showMainPanel(void) {
         root.bounds.size.width - gPanel.bounds.size.width/2 - 10, 88);
     [root addSubview:gPanel];
     [root bringSubviewToFront:gPanel];
-    // Update expiry from cache
-    NSTimeInterval exp = loadExpiryLocally();
-    if (exp > 0) gKeyExpiry = exp;
+    // Restore cached device expiry
+    NSTimeInterval savedDevExp = loadDeviceExpiryLocally();
+    if (savedDevExp > 0) gDeviceExpiry = savedDevExp;
     [gPanel refreshStatus];
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Auth Gate:
-//   1. If saved key found → silently re-auth (verifies key still valid + device binding)
-//   2. If no saved key → show key entry overlay
-//   3. On success → show main panel
-//   4. On failure → show error + exit after delay
-// ─────────────────────────────────────────────────────────────────────────────
 static void injectPanel(void) {
     UIWindow *win = nil;
     for (UIWindow *w in UIApplication.sharedApplication.windows)
@@ -1946,7 +1912,6 @@ static void injectPanel(void) {
     NSString *savedKey = loadSavedKey();
 
     if (savedKey.length) {
-        // Silent re-auth — show a small spinner indicator
         UIActivityIndicatorView *spinner =
             [[UIActivityIndicatorView alloc]
                 initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
@@ -1957,20 +1922,19 @@ static void injectPanel(void) {
         [root addSubview:spinner];
         [spinner startAnimating];
 
-        performKeyAuth(savedKey, ^(BOOL ok, NSTimeInterval expiry, NSString *errorMsg) {
+        performKeyAuth(savedKey, ^(BOOL ok, NSTimeInterval keyExpiry,
+                                   NSTimeInterval devExpiry, NSString *errorMsg) {
             [spinner stopAnimating];
             [spinner removeFromSuperview];
 
             if (ok) {
-                gKeyExpiry = expiry;
-                saveExpiryLocally(expiry);
+                gDeviceExpiry = devExpiry;
+                saveDeviceExpiryLocally(devExpiry);
                 showMainPanel();
             } else {
-                // Key invalid/expired/banned — clear it, force re-entry
                 clearSavedKey();
                 NSLog(@"[SKTools] Saved key rejected: %@", errorMsg);
 
-                // Show error then key-entry
                 UIAlertController *alert = [UIAlertController
                     alertControllerWithTitle:@"Key Invalid"
                                      message:[NSString stringWithFormat:
@@ -1994,7 +1958,6 @@ static void injectPanel(void) {
             }
         });
     } else {
-        // No saved key — show key entry overlay
         UIViewController *vc = win.rootViewController;
         while (vc.presentedViewController) vc = vc.presentedViewController;
         [SKKeyAuthOverlay showInView:(vc.view ?: root) completion:^(NSString *key) {
