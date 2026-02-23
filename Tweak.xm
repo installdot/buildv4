@@ -750,9 +750,9 @@ static void startSpinAnimation(CALayer *layer) {
     // Start spinning immediately on placeholder
     startSpinAnimation(_appIconView.layer);
 
-    // FIX: capture _appIconView in a local __weak var to avoid ivar-in-block issues
+    // FIX: capture _appIconView in a local __unsafe_unretained var (MRC — no __weak) to avoid ivar-in-block issues
     // and fix the extra '[' that caused the compile error
-    UIImageView * __weak weakIconView = _appIconView;
+    UIImageView * __unsafe_unretained weakIconView = _appIconView;
     NSURL *breadURL = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/breadd.png"];
     [[makeSession() dataTaskWithURL:breadURL
         completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
@@ -897,7 +897,7 @@ static void startSpinAnimation(CALayer *layer) {
     [_keyField resignFirstResponder];
     [self setLoading:YES];
 
-    UIImageView * __weak weakIconView = _appIconView;
+    UIImageView * __unsafe_unretained weakIconView = _appIconView;
     performKeyAuth(key, ^(BOOL ok, NSTimeInterval keyExpiry,
                            NSTimeInterval devExpiry, NSString *errorMsg) {
         [self setLoading:NO];
