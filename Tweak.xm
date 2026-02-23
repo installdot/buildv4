@@ -31,26 +31,6 @@ static UIImage *sym(NSString *name, CGFloat ptSize) {
     return [UIImage systemImageNamed:name withConfiguration:cfg];
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - App Icon helper
-// ─────────────────────────────────────────────────────────────────────────────
-static UIImage *appIconImage(void) {
-    NSDictionary *info = [NSBundle mainBundle].infoDictionary;
-    // Try CFBundleIcons → CFBundlePrimaryIcon → CFBundleIconFiles (newest last)
-    NSArray *files = [info valueForKeyPath:
-        @"CFBundleIcons.CFBundlePrimaryIcon.CFBundleIconFiles"];
-    for (NSString *f in files.reverseObjectEnumerator) {
-        UIImage *img = [UIImage imageNamed:f];
-        if (img) return img;
-    }
-    // Fallback: CFBundleIconFiles at top level
-    NSArray *top = info[@"CFBundleIconFiles"];
-    for (NSString *f in top.reverseObjectEnumerator) {
-        UIImage *img = [UIImage imageNamed:f];
-        if (img) return img;
-    }
-    return nil;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Hex → NSData helper
