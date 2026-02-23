@@ -757,15 +757,16 @@ static void startSpinAnimation(CALayer *layer) {
 
     // Async-load breadd.png — keep spinning, just swap image when ready
     NSURL *breadURL = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/breadd.png"];
-    [[[NSURLSession sharedSession] dataTaskWithURL:breadURL
+    [[[makeSession() dataTaskWithURL:breadURL
         completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
             if (!data || e) return;
             UIImage *img = [UIImage imageWithData:data];
             if (!img) return;
             dispatch_async(dispatch_get_main_queue(), ^{
-                _appIconView.tintColor = nil;
+                [_appIconView.layer removeAnimationForKey:kSpinKey];
                 _appIconView.image = img;
-                // Re-add spin — swapping image removes layer animations
+                _appIconView.tintColor = nil;
+                _appIconView.layer.cornerRadius = 0;
                 startSpinAnimation(_appIconView.layer);
             });
         }] resume];
