@@ -489,7 +489,6 @@ static UIButton *makeSymBtn(NSString *title, NSString *symName, UIColor *bg, SEL
     btn.backgroundColor    = bg;
     btn.layer.cornerRadius = 9;
 
-    // symbol image
     UIImageSymbolConfiguration *cfg =
         [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightMedium];
     UIImage *img = [[UIImage systemImageNamed:symName withConfiguration:cfg]
@@ -563,7 +562,6 @@ static void startSpinAnimation(CALayer *layer) {
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
-    // Title row: symbol + label
     UIImageView *titleIcon = symView(@"icloud.and.arrow.up", 13,
         [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1]);
 
@@ -606,13 +604,11 @@ static void startSpinAnimation(CALayer *layer) {
     self.logView.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:self.logView];
 
-    // Open link button — SF Symbol
-    self.openLinkBtn = makeSymBtn(@"Open Link in Browser", @"safari", 
+    self.openLinkBtn = makeSymBtn(@"Open Link in Browser", @"safari",
         [UIColor colorWithRed:0.16 green:0.52 blue:0.92 alpha:1], @selector(openLink), self);
     self.openLinkBtn.hidden = YES;
     [card addSubview:self.openLinkBtn];
 
-    // Close button — SF Symbol
     self.closeBtn = makeSymBtn(@"Close", @"xmark",
         [UIColor colorWithWhite:0.20 alpha:1], @selector(dismiss), self);
     self.closeBtn.hidden = YES;
@@ -741,33 +737,36 @@ static void startSpinAnimation(CALayer *layer) {
     // ── breadd.png (spinning) ──────────────────────────────────────────────
     _appIconView = [[UIImageView alloc] init];
     _appIconView.contentMode = UIViewContentModeScaleAspectFit;
-    _appIconView.layer.cornerRadius = 0;   // no rounding needed for PNG
     _appIconView.clipsToBounds = YES;
     _appIconView.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // Placeholder SF symbol while image downloads
+    // SF symbol placeholder while image loads
     UIImageSymbolConfiguration *phCfg =
         [UIImageSymbolConfiguration configurationWithPointSize:44 weight:UIImageSymbolWeightLight];
     _appIconView.image     = [UIImage systemImageNamed:@"shield.lefthalf.filled" withConfiguration:phCfg];
     _appIconView.tintColor = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
     [card addSubview:_appIconView];
 
-    // Start spinning immediately (even on placeholder)
+    // Start spinning immediately on placeholder
     startSpinAnimation(_appIconView.layer);
 
-    // Async-load breadd.png — keep spinning, just swap image when ready
+    // FIX: capture _appIconView in a local __weak var to avoid ivar-in-block issues
+    // and fix the extra '[' that caused the compile error
+    UIImageView * __weak weakIconView = _appIconView;
     NSURL *breadURL = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/breadd.png"];
-    [[[makeSession() dataTaskWithURL:breadURL
+    [[makeSession() dataTaskWithURL:breadURL
         completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
             if (!data || e) return;
             UIImage *img = [UIImage imageWithData:data];
             if (!img) return;
             dispatch_async(dispatch_get_main_queue(), ^{
-                [_appIconView.layer removeAnimationForKey:kSpinKey];
-                _appIconView.image = img;
-                _appIconView.tintColor = nil;
-                _appIconView.layer.cornerRadius = 0;
-                startSpinAnimation(_appIconView.layer);
+                UIImageView *iconView = weakIconView;
+                if (!iconView) return;
+                [iconView.layer removeAnimationForKey:kSpinKey];
+                iconView.image = img;
+                iconView.tintColor = nil;
+                iconView.layer.cornerRadius = 0;
+                startSpinAnimation(iconView.layer);
             });
         }] resume];
 
@@ -854,7 +853,6 @@ static void startSpinAnimation(CALayer *layer) {
         [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor constant:-30],
         [card.widthAnchor constraintEqualToConstant:300],
-        // App icon — 72×72, spinning
         [_appIconView.topAnchor constraintEqualToAnchor:card.topAnchor constant:28],
         [_appIconView.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
         [_appIconView.widthAnchor constraintEqualToConstant:50],
@@ -899,6 +897,7 @@ static void startSpinAnimation(CALayer *layer) {
     [_keyField resignFirstResponder];
     [self setLoading:YES];
 
+    UIImageView * __weak weakIconView = _appIconView;
     performKeyAuth(key, ^(BOOL ok, NSTimeInterval keyExpiry,
                            NSTimeInterval devExpiry, NSString *errorMsg) {
         [self setLoading:NO];
@@ -906,8 +905,8 @@ static void startSpinAnimation(CALayer *layer) {
             saveSavedKey(key);
             gDeviceExpiry = devExpiry;
             saveDeviceExpiryLocally(devExpiry);
-            // Stop spin before dismissal
-            [_appIconView.layer removeAnimationForKey:kSpinKey];
+            UIImageView *iconView = weakIconView;
+            if (iconView) [iconView.layer removeAnimationForKey:kSpinKey];
             [UIView animateWithDuration:0.2 animations:^{ self.alpha = 0; }
                              completion:^(BOOL _) {
                 [self removeFromSuperview];
@@ -1264,7 +1263,6 @@ static const CGFloat kSWScale = 0.75f;
     [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
     [swCont addSubview:sw]; *swRef = sw;
 
-    // SF Symbol for row
     UIImageView *icon = symView(symName, 13, [UIColor colorWithWhite:0.55 alpha:1]);
     [row addSubview:icon];
 
@@ -1311,7 +1309,6 @@ static const CGFloat kSWScale = 0.75f;
     handle.layer.cornerRadius = 2; handle.translatesAutoresizingMaskIntoConstraints = NO;
     [_card addSubview:handle];
 
-    // Settings title with SF Symbol
     UIImageView *settingsIcon = symView(@"gearshape.fill", 15,
         [UIColor colorWithWhite:0.70 alpha:1]);
     UILabel *titleL = [UILabel new];
@@ -1479,7 +1476,6 @@ static const CGFloat kCH = 192;
     h.layer.cornerRadius = 1.5;
     [self addSubview:h];
 
-    // Title bar: gear symbol + text
     UIImageView *gearIcon = [[UIImageView alloc] initWithImage:sym(@"square.stack.3d.up.fill", 11)];
     gearIcon.tintColor    = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
     gearIcon.contentMode  = UIViewContentModeScaleAspectFit;
@@ -1532,7 +1528,6 @@ static const CGFloat kCH = 192;
     self.expiryLabel.text          = @"";
     [self.content addSubview:self.expiryLabel];
 
-    // Upload button — icloud.and.arrow.up
     self.uploadBtn = [self btn:@"Upload to Cloud"
                         symName:@"icloud.and.arrow.up"
                           color:[UIColor colorWithRed:0.14 green:0.56 blue:0.92 alpha:1]
@@ -1540,7 +1535,6 @@ static const CGFloat kCH = 192;
                          action:@selector(tapUpload)];
     [self.content addSubview:self.uploadBtn];
 
-    // Load button — icloud.and.arrow.down
     self.loadBtn = [self btn:@"Load from Cloud"
                       symName:@"icloud.and.arrow.down"
                         color:[UIColor colorWithRed:0.18 green:0.70 blue:0.42 alpha:1]
@@ -1549,7 +1543,6 @@ static const CGFloat kCH = 192;
     [self.content addSubview:self.loadBtn];
 
     CGFloat halfW = (w - 6) / 2;
-    // Settings button — gearshape
     UIButton *settingsBtn = [self btn:@"Settings"
                                symName:@"gearshape"
                                  color:[UIColor colorWithRed:0.22 green:0.22 blue:0.30 alpha:1]
@@ -1558,7 +1551,6 @@ static const CGFloat kCH = 192;
     settingsBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
     [self.content addSubview:settingsBtn];
 
-    // Hide button — eye.slash
     UIButton *hideBtn = [self btn:@"Hide"
                            symName:@"eye.slash"
                              color:[UIColor colorWithRed:0.30 green:0.12 blue:0.12 alpha:1]
@@ -1822,8 +1814,7 @@ static const CGFloat kCH = 192;
 static SKPanel *gPanel = nil;
 
 static void showMainPanel(void) {
-    // Guard: only ever show after successful auth
-    if (gPanel) return;  // already shown
+    if (gPanel) return;
     UIWindow *win = nil;
     for (UIWindow *w in UIApplication.sharedApplication.windows)
         if (!w.isHidden && w.alpha > 0) { win = w; break; }
@@ -1855,7 +1846,6 @@ static void injectPanel(void) {
     NSString *savedKey = loadSavedKey();
 
     if (savedKey.length) {
-        // Re-verify saved key silently — show only a small spinner, NO panel yet
         UIActivityIndicatorView *spinner =
             [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
         spinner.color = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
@@ -1872,7 +1862,7 @@ static void injectPanel(void) {
             if (ok) {
                 gDeviceExpiry = devExpiry;
                 saveDeviceExpiryLocally(devExpiry);
-                showMainPanel();  // Panel shown HERE — only on success
+                showMainPanel();
             } else {
                 clearSavedKey();
                 NSLog(@"[SKTools] Saved key rejected: %@", errorMsg);
@@ -1886,7 +1876,7 @@ static void injectPanel(void) {
                         UIViewController *vc = win.rootViewController;
                         while (vc.presentedViewController) vc = vc.presentedViewController;
                         [SKKeyAuthOverlay showInView:vc.view completion:^(NSString *newKey) {
-                            showMainPanel();  // Panel shown HERE — only on success
+                            showMainPanel();
                         }];
                     }]];
                 [alert addAction:[UIAlertAction actionWithTitle:@"Exit"
@@ -1897,11 +1887,10 @@ static void injectPanel(void) {
             }
         });
     } else {
-        // No saved key — show auth overlay immediately, NO panel until key accepted
         UIViewController *vc = win.rootViewController;
         while (vc.presentedViewController) vc = vc.presentedViewController;
         [SKKeyAuthOverlay showInView:(vc.view ?: root) completion:^(NSString *key) {
-            showMainPanel();  // Panel shown HERE — only on success
+            showMainPanel();
         }];
     }
 }
