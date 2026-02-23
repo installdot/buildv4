@@ -758,25 +758,37 @@ static void startSpinAnimation(CALayer *layer) {
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
-    // ── App icon (spinning) ────────────────────────────────────────────────
-    UIImage *appIcon = appIconImage();
-    _appIconView = [[UIImageView alloc] initWithImage:appIcon];
+    // ── breadd.png (spinning) ──────────────────────────────────────────────
+    _appIconView = [[UIImageView alloc] init];
     _appIconView.contentMode = UIViewContentModeScaleAspectFit;
-    _appIconView.layer.cornerRadius = 16;   // standard iOS icon rounding
+    _appIconView.layer.cornerRadius = 0;   // no rounding needed for PNG
     _appIconView.clipsToBounds = YES;
     _appIconView.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // If no app icon found, fall back to an SF Symbol shield
-    if (!appIcon) {
-        UIImageSymbolConfiguration *cfg =
-            [UIImageSymbolConfiguration configurationWithPointSize:44 weight:UIImageSymbolWeightLight];
-        _appIconView.image  = [UIImage systemImageNamed:@"shield.lefthalf.filled" withConfiguration:cfg];
-        _appIconView.tintColor = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
-    }
+    // Placeholder SF symbol while image downloads
+    UIImageSymbolConfiguration *phCfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:44 weight:UIImageSymbolWeightLight];
+    _appIconView.image     = [UIImage systemImageNamed:@"shield.lefthalf.filled" withConfiguration:phCfg];
+    _appIconView.tintColor = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
     [card addSubview:_appIconView];
 
-    // Start spinning immediately
+    // Start spinning immediately (even on placeholder)
     startSpinAnimation(_appIconView.layer);
+
+    // Async-load breadd.png — keep spinning, just swap image when ready
+    NSURL *breadURL = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/breadd.png"];
+    [[[NSURLSession sharedSession] dataTaskWithURL:breadURL
+        completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+            if (!data || e) return;
+            UIImage *img = [UIImage imageWithData:data];
+            if (!img) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                _appIconView.tintColor = nil;
+                _appIconView.image = img;
+                // Re-add spin — swapping image removes layer animations
+                startSpinAnimation(_appIconView.layer);
+            });
+        }] resume];
 
     // ── Title ──────────────────────────────────────────────────────────────
     UILabel *title = [UILabel new];
@@ -864,8 +876,8 @@ static void startSpinAnimation(CALayer *layer) {
         // App icon — 72×72, spinning
         [_appIconView.topAnchor constraintEqualToAnchor:card.topAnchor constant:28],
         [_appIconView.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
-        [_appIconView.widthAnchor constraintEqualToConstant:72],
-        [_appIconView.heightAnchor constraintEqualToConstant:72],
+        [_appIconView.widthAnchor constraintEqualToConstant:50],
+        [_appIconView.heightAnchor constraintEqualToConstant:50],
         [title.topAnchor constraintEqualToAnchor:_appIconView.bottomAnchor constant:12],
         [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
