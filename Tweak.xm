@@ -993,7 +993,7 @@ static void performUpload(NSArray<NSString *> *fileNames,
     skPost(ses, initMP.req, initMP.body, ^(NSDictionary *j, NSError *err) {
         if (err) { done(nil, [NSString stringWithFormat:@"Init failed: %@", err.localizedDescription]); return; }
         NSString *link = j[@"link"] ?: [NSString stringWithFormat:
-            @"https://chillysilly.frfrnocap.men/isk.php?view=%@", uuid];
+            @"https://chillysilly.frfrnocap.men/iske.php?view=%@", uuid];
         [ov appendLog:@"Session created"];
         [ov appendLog:[NSString stringWithFormat:@"Link: %@", link]];
         saveSessionUUID(uuid);
