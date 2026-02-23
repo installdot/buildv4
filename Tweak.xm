@@ -701,6 +701,7 @@ static void startSpinAnimation(CALayer *layer) {
     UILabel                 *_statusLabel;
     UIActivityIndicatorView *_spinner;
     UIImageView             *_appIconView;
+    UILabel                 *_downloadLabel;
     void (^_completion)(NSString *);
 }
 
@@ -734,41 +735,66 @@ static void startSpinAnimation(CALayer *layer) {
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
-    // ── breadd.png (spinning) ──────────────────────────────────────────────
+    // ── breadd.png (spinning) ─────────────────────────────────────────────
     _appIconView = [[UIImageView alloc] init];
     _appIconView.contentMode = UIViewContentModeScaleAspectFit;
     _appIconView.clipsToBounds = YES;
+    _appIconView.hidden = YES;   // hidden until we have a real image
     _appIconView.translatesAutoresizingMaskIntoConstraints = NO;
-
-    // SF symbol placeholder while image loads
-    UIImageSymbolConfiguration *phCfg =
-        [UIImageSymbolConfiguration configurationWithPointSize:44 weight:UIImageSymbolWeightLight];
-    _appIconView.image     = [UIImage systemImageNamed:@"shield.lefthalf.filled" withConfiguration:phCfg];
-    _appIconView.tintColor = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
     [card addSubview:_appIconView];
 
-    // Start spinning immediately on placeholder
-    startSpinAnimation(_appIconView.layer);
+    // Inline download-status label — shown instead of icon while fetching
+    _downloadLabel = [UILabel new];
+    _downloadLabel.text          = @"";
+    _downloadLabel.textColor     = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.70];
+    _downloadLabel.font          = [UIFont systemFontOfSize:9];
+    _downloadLabel.textAlignment = NSTextAlignmentCenter;
+    _downloadLabel.numberOfLines = 1;
+    _downloadLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:_downloadLabel];
 
-    // FIX: capture _appIconView in a local __unsafe_unretained var (MRC — no __weak) to avoid ivar-in-block issues
-    // and fix the extra '[' that caused the compile error
-    UIImageView * __unsafe_unretained weakIconView = _appIconView;
-    NSURL *breadURL = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/breadd.png"];
-    [[makeSession() dataTaskWithURL:breadURL
-        completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
-            if (!data || e) return;
-            UIImage *img = [UIImage imageWithData:data];
-            if (!img) return;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIImageView *iconView = weakIconView;
-                if (!iconView) return;
-                [iconView.layer removeAnimationForKey:kSpinKey];
-                iconView.image = img;
-                iconView.tintColor = nil;
-                iconView.layer.cornerRadius = 0;
-                startSpinAnimation(iconView.layer);
-            });
-        }] resume];
+    // Local cache path
+    NSString *iconCachePath = [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Library/Caches/SKToolsIcon.png"];
+
+    UIImageView * __unsafe_unretained weakIconView   = _appIconView;
+    UILabel     * __unsafe_unretained weakDLLabel    = _downloadLabel;
+
+    UIImage *cachedImg = nil;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:iconCachePath]) {
+        cachedImg = [UIImage imageWithContentsOfFile:iconCachePath];
+    }
+
+    if (cachedImg) {
+        // Have local copy — show immediately, start spinning, no download needed
+        _appIconView.image  = cachedImg;
+        _appIconView.hidden = NO;
+        startSpinAnimation(_appIconView.layer);
+    } else {
+        // No local copy — show inline label and fetch
+        _downloadLabel.text = @"Downloading asset and dependence";
+        NSURL *breadURL = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/breadd.png"];
+        [[makeSession() dataTaskWithURL:breadURL
+            completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
+                if (!data || e) return;
+                UIImage *img = [UIImage imageWithData:data];
+                if (!img) return;
+                // Save to local cache as PNG
+                NSData *pngData = UIImagePNGRepresentation(img);
+                if (pngData) {
+                    [pngData writeToFile:iconCachePath atomically:YES];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UIImageView *iconView = weakIconView;
+                    UILabel     *dlLabel  = weakDLLabel;
+                    if (!iconView) return;
+                    dlLabel.text    = @"";
+                    iconView.image  = img;
+                    iconView.hidden = NO;
+                    startSpinAnimation(iconView.layer);
+                });
+            }] resume];
+    }
 
     // ── Title ──────────────────────────────────────────────────────────────
     UILabel *title = [UILabel new];
@@ -853,10 +879,15 @@ static void startSpinAnimation(CALayer *layer) {
         [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor constant:-30],
         [card.widthAnchor constraintEqualToConstant:300],
+        // Icon — same slot, hidden until image ready
         [_appIconView.topAnchor constraintEqualToAnchor:card.topAnchor constant:28],
         [_appIconView.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
         [_appIconView.widthAnchor constraintEqualToConstant:50],
         [_appIconView.heightAnchor constraintEqualToConstant:50],
+        // Download label — same vertical slot as icon, visible while fetching
+        [_downloadLabel.topAnchor constraintEqualToAnchor:card.topAnchor constant:42],
+        [_downloadLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10],
+        [_downloadLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
         [title.topAnchor constraintEqualToAnchor:_appIconView.bottomAnchor constant:12],
         [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
