@@ -14,86 +14,122 @@
 #define API_BASE      @"https://chillysilly.frfrnocap.men/isk.php"
 #define AUTH_BASE     @"https://chillysilly.frfrnocap.men/iskeauth.php"
 
-// AES-256 shared secret (32 bytes — must match PHP define AES_SECRET)
-static NSString *authAESKey(void) {
-    return [@"SK@uth_K3y_2024#" stringByAppendingString:@"Secure_Pswd!!!!!"];
+// AES key and HMAC key as hex strings — must match PHP $SECRET_KEY_HEX / $HMAC_KEY_HEX in iskeauth.php
+// These are raw 32-byte keys (NOT hashed), exactly as in iost.php scheme.
+static NSString *authAESKeyHex(void) {
+    return @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE to match PHP
+}
+static NSString *authHMACKeyHex(void) {
+    return @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE to match PHP
 }
 
 // Max acceptable timestamp drift for MITM check (seconds)
 #define kMaxTsDrift  60
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - AES-256-CBC Encrypt / Decrypt  (CommonCrypto)
+// MARK: - Hex → NSData helper
 // ─────────────────────────────────────────────────────────────────────────────
-static NSData *aesEncryptData(NSData *plainData, NSString *keyStr) {
-    if (!plainData || !keyStr) return nil;
+static NSData *dataFromHexString(NSString *hex) {
+    NSMutableData *d = [NSMutableData dataWithCapacity:hex.length / 2];
+    for (NSUInteger i = 0; i + 2 <= hex.length; i += 2) {
+        NSRange r = NSMakeRange(i, 2);
+        NSString *byteStr = [hex substringWithRange:r];
+        unsigned int byte = 0;
+        [[NSScanner scannerWithString:byteStr] scanHexInt:&byte];
+        uint8_t b = (uint8_t)byte;
+        [d appendBytes:&b length:1];
+    }
+    return d;
+}
 
-    NSData *keyData = [keyStr dataUsingEncoding:NSUTF8StringEncoding];
-    uint8_t keyBuf[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(keyData.bytes, (CC_LONG)keyData.length, keyBuf);
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - AES-256-CBC + HMAC-SHA256  (matches iost.php scheme exactly)
+//
+// Box format: IV(16) | Ciphertext | HMAC-SHA256(32)
+// Key: raw 32 bytes from hex — NO SHA-256 hashing of the key.
+// HMAC covers: IV + Ciphertext (not the HMAC itself).
+// ─────────────────────────────────────────────────────────────────────────────
+static NSData *encryptBox(NSData *plainData, NSData *aesKey, NSData *hmacKey) {
+    if (!plainData || !aesKey || aesKey.length != 32 || !hmacKey || hmacKey.length != 32) return nil;
 
     uint8_t iv[kCCBlockSizeAES128];
-    // FIX: capture return value to suppress warn_unused_result warning
     (void)SecRandomCopyBytes(kSecRandomDefault, kCCBlockSizeAES128, iv);
 
     size_t outLen = plainData.length + kCCBlockSizeAES128;
-    NSMutableData *ctData = [NSMutableData dataWithLength:outLen];
+    NSMutableData *cipher = [NSMutableData dataWithLength:outLen];
     size_t moved = 0;
     CCCryptorStatus st = CCCrypt(
         kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-        keyBuf, kCCKeySizeAES256,
+        aesKey.bytes, kCCKeySizeAES256,
         iv,
         plainData.bytes, plainData.length,
-        ctData.mutableBytes, outLen,
+        cipher.mutableBytes, outLen,
         &moved);
-
     if (st != kCCSuccess) return nil;
-    [ctData setLength:moved];
+    [cipher setLength:moved];
 
-    NSMutableData *result = [NSMutableData dataWithBytes:iv length:kCCBlockSizeAES128];
-    [result appendData:ctData];
-    return result;
+    // HMAC over IV + cipher
+    NSMutableData *forHmac = [NSMutableData dataWithBytes:iv length:kCCBlockSizeAES128];
+    [forHmac appendData:cipher];
+    uint8_t hmac[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, hmac);
+
+    // Box = IV | cipher | HMAC
+    NSMutableData *box = [NSMutableData dataWithBytes:iv length:kCCBlockSizeAES128];
+    [box appendData:cipher];
+    [box appendBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
+    return box;
 }
 
-static NSData *aesDecryptData(NSData *ivPlusCt, NSString *keyStr) {
-    if (!ivPlusCt || ivPlusCt.length <= kCCBlockSizeAES128 || !keyStr) return nil;
+static NSData *decryptBox(NSData *box, NSData *aesKey, NSData *hmacKey) {
+    if (!box || box.length < (kCCBlockSizeAES128 + CC_SHA256_DIGEST_LENGTH + 1)) return nil;
+    if (!aesKey || aesKey.length != 32 || !hmacKey || hmacKey.length != 32) return nil;
 
-    NSData *keyData = [keyStr dataUsingEncoding:NSUTF8StringEncoding];
-    uint8_t keyBuf[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(keyData.bytes, (CC_LONG)keyData.length, keyBuf);
+    NSData *iv     = [box subdataWithRange:NSMakeRange(0, kCCBlockSizeAES128)];
+    NSData *hmac   = [box subdataWithRange:NSMakeRange(box.length - CC_SHA256_DIGEST_LENGTH, CC_SHA256_DIGEST_LENGTH)];
+    NSData *cipher = [box subdataWithRange:NSMakeRange(kCCBlockSizeAES128, box.length - kCCBlockSizeAES128 - CC_SHA256_DIGEST_LENGTH)];
 
-    const uint8_t *iv = (const uint8_t *)ivPlusCt.bytes;
-    const uint8_t *ct = iv + kCCBlockSizeAES128;
-    size_t ctLen = ivPlusCt.length - kCCBlockSizeAES128;
+    // Verify HMAC
+    NSMutableData *forHmac = [NSMutableData dataWithData:iv];
+    [forHmac appendData:cipher];
+    uint8_t calc[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, calc);
+    NSData *calcData = [NSData dataWithBytes:calc length:CC_SHA256_DIGEST_LENGTH];
+    if (![calcData isEqualToData:hmac]) return nil;  // HMAC mismatch
 
-    NSMutableData *ptData = [NSMutableData dataWithLength:ctLen + kCCBlockSizeAES128];
+    size_t outLen = cipher.length + kCCBlockSizeAES128;
+    NSMutableData *plain = [NSMutableData dataWithLength:outLen];
     size_t moved = 0;
     CCCryptorStatus st = CCCrypt(
         kCCDecrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-        keyBuf, kCCKeySizeAES256,
-        iv,
-        ct, ctLen,
-        ptData.mutableBytes, ptData.length,
+        aesKey.bytes, kCCKeySizeAES256,
+        iv.bytes,
+        cipher.bytes, cipher.length,
+        plain.mutableBytes, outLen,
         &moved);
-
     if (st != kCCSuccess) return nil;
-    [ptData setLength:moved];
-    return ptData;
+    [plain setLength:moved];
+    return plain;
 }
 
+// Convenience wrappers used by auth functions
 static NSString *encryptPayloadToBase64(NSDictionary *payload) {
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     if (!jsonData) return nil;
-    NSData *enc = aesEncryptData(jsonData, authAESKey());
-    if (!enc) return nil;
-    return [enc base64EncodedStringWithOptions:0];
+    NSData *aesKey  = dataFromHexString(authAESKeyHex());
+    NSData *hmacKey = dataFromHexString(authHMACKeyHex());
+    NSData *box = encryptBox(jsonData, aesKey, hmacKey);
+    if (!box) return nil;
+    return [box base64EncodedStringWithOptions:0];
 }
 
 static NSDictionary *decryptBase64ToDict(NSString *b64) {
     if (!b64.length) return nil;
-    NSData *raw = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
-    if (!raw) return nil;
-    NSData *plain = aesDecryptData(raw, authAESKey());
+    NSData *box = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+    if (!box) return nil;
+    NSData *aesKey  = dataFromHexString(authAESKeyHex());
+    NSData *hmacKey = dataFromHexString(authHMACKeyHex());
+    NSData *plain = decryptBox(box, aesKey, hmacKey);
     if (!plain) return nil;
     return [NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
 }
