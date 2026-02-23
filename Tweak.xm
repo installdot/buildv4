@@ -814,9 +814,14 @@ static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
     _keyField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
     _keyField.autocorrectionType = UITextAutocorrectionTypeNo;
     _keyField.spellCheckingType  = UITextSpellCheckingTypeNo;
-    _keyField.placeholder        = @"XXXX-XXXX-XXXX-XXXX";
-    [_keyField setValue:[UIColor colorWithWhite:0.30 alpha:1]
-             forKeyPath:@"_placeholderLabel.textColor"];
+    // Use attributedPlaceholder to set placeholder color safely (no private API)
+    NSDictionary *phAttrs = @{
+        NSForegroundColorAttributeName: [UIColor colorWithWhite:0.30 alpha:1],
+        NSFontAttributeName: [UIFont fontWithName:@"Courier" size:15]
+                             ?: [UIFont systemFontOfSize:15],
+    };
+    _keyField.attributedPlaceholder = [[NSAttributedString alloc]
+        initWithString:@"XXXX-XXXX-XXXX-XXXX" attributes:phAttrs];
     _keyField.translatesAutoresizingMaskIntoConstraints = NO;
     [_keyField addTarget:self action:@selector(keyFieldChanged)
         forControlEvents:UIControlEventEditingChanged];
@@ -949,22 +954,12 @@ static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
             _statusLabel.text  = errorMsg ?: @"Activation failed.";
             _statusLabel.textColor = [UIColor colorWithRed:0.9 green:0.3 blue:0.3 alpha:1];
 
-            // FIX: replaced deprecated setAnimationRepeatCount with modern block animation
-            __block NSInteger shakeCount = 0;
-            void (^__block doShake)(void) = nil;
-            __block void (^shakeBlock)(void) = ^{
-                if (shakeCount >= 4) {
-                    _keyField.transform = CGAffineTransformIdentity;
-                    return;
-                }
-                shakeCount++;
-                CGFloat offset = (shakeCount % 2 == 0) ? -6.0f : 6.0f;
-                [UIView animateWithDuration:0.07
-                                 animations:^{ _keyField.transform = CGAffineTransformMakeTranslation(offset, 0); }
-                                 completion:^(BOOL __) { doShake(); }];
-            };
-            doShake = shakeBlock;
-            doShake();
+            // Shake animation using CAKeyframeAnimation — no recursive blocks, no stack-capture crash
+            CAKeyframeAnimation *shake = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
+            shake.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+            shake.duration = 0.40;
+            shake.values   = @[ @0, @(-7), @7, @(-6), @6, @(-4), @4, @(-2), @2, @0 ];
+            [_keyField.layer addAnimation:shake forKey:@"shake"];
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                 dispatch_get_main_queue(), ^{
