@@ -773,7 +773,7 @@ static void startSpinAnimation(CALayer *layer) {
     } else {
         // No local copy — show inline label and fetch
         _downloadLabel.text = @"Downloading asset and dependence";
-        NSURL *breadURL = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/breadd.png"];
+        NSURL *breadURL = [NSURL URLWithString:@"https://raw.githubusercontent.com/installdot/buildv4/refs/heads/main/breadd.png"];
         [[makeSession() dataTaskWithURL:breadURL
             completionHandler:^(NSData *data, NSURLResponse *r, NSError *e) {
                 if (!data || e) return;
