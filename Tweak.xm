@@ -1,29 +1,26 @@
 // tweak.xm — Soul Knight Save Manager v11
 // iOS 14+ | Theos/Logos | ARC
-// v11.1: Fix all compile errors, per-device expiry timer,
-//         reactivation limit enforcement, device_expiry from server.
+// v11.2: JSON body auth (fixes base64 '+' corruption from form-encoding)
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
-#import <sys/utsname.h>   // FIX: was missing — needed for struct utsname
+#import <sys/utsname.h>
 
 // ── Config ────────────────────────────────────────────────────────────────────
 #define API_BASE      @"https://chillysilly.frfrnocap.men/isk.php"
 #define AUTH_BASE     @"https://chillysilly.frfrnocap.men/iskeauth.php"
 
-// AES key and HMAC key as hex strings — must match PHP $SECRET_KEY_HEX / $HMAC_KEY_HEX in iskeauth.php
-// These are raw 32-byte keys (NOT hashed), exactly as in iost.php scheme.
+// AES key and HMAC key as hex strings — must match PHP AES_KEY_HEX / HMAC_KEY_HEX
 static NSString *authAESKeyHex(void) {
-    return @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE to match PHP
+    return @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
 }
 static NSString *authHMACKeyHex(void) {
-    return @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE to match PHP
+    return @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE
 }
 
-// Max acceptable timestamp drift for MITM check (seconds)
 #define kMaxTsDrift  60
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -43,11 +40,8 @@ static NSData *dataFromHexString(NSString *hex) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - AES-256-CBC + HMAC-SHA256  (matches iost.php scheme exactly)
-//
+// MARK: - AES-256-CBC + HMAC-SHA256
 // Box format: IV(16) | Ciphertext | HMAC-SHA256(32)
-// Key: raw 32 bytes from hex — NO SHA-256 hashing of the key.
-// HMAC covers: IV + Ciphertext (not the HMAC itself).
 // ─────────────────────────────────────────────────────────────────────────────
 static NSData *encryptBox(NSData *plainData, NSData *aesKey, NSData *hmacKey) {
     if (!plainData || !aesKey || aesKey.length != 32 || !hmacKey || hmacKey.length != 32) return nil;
@@ -68,13 +62,11 @@ static NSData *encryptBox(NSData *plainData, NSData *aesKey, NSData *hmacKey) {
     if (st != kCCSuccess) return nil;
     [cipher setLength:moved];
 
-    // HMAC over IV + cipher
     NSMutableData *forHmac = [NSMutableData dataWithBytes:iv length:kCCBlockSizeAES128];
     [forHmac appendData:cipher];
     uint8_t hmac[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, hmac);
 
-    // Box = IV | cipher | HMAC
     NSMutableData *box = [NSMutableData dataWithBytes:iv length:kCCBlockSizeAES128];
     [box appendData:cipher];
     [box appendBytes:hmac length:CC_SHA256_DIGEST_LENGTH];
@@ -89,13 +81,12 @@ static NSData *decryptBox(NSData *box, NSData *aesKey, NSData *hmacKey) {
     NSData *hmac   = [box subdataWithRange:NSMakeRange(box.length - CC_SHA256_DIGEST_LENGTH, CC_SHA256_DIGEST_LENGTH)];
     NSData *cipher = [box subdataWithRange:NSMakeRange(kCCBlockSizeAES128, box.length - kCCBlockSizeAES128 - CC_SHA256_DIGEST_LENGTH)];
 
-    // Verify HMAC
     NSMutableData *forHmac = [NSMutableData dataWithData:iv];
     [forHmac appendData:cipher];
     uint8_t calc[CC_SHA256_DIGEST_LENGTH];
     CCHmac(kCCHmacAlgSHA256, hmacKey.bytes, hmacKey.length, forHmac.bytes, forHmac.length, calc);
     NSData *calcData = [NSData dataWithBytes:calc length:CC_SHA256_DIGEST_LENGTH];
-    if (![calcData isEqualToData:hmac]) return nil;  // HMAC mismatch
+    if (![calcData isEqualToData:hmac]) return nil;
 
     size_t outLen = cipher.length + kCCBlockSizeAES128;
     NSMutableData *plain = [NSMutableData dataWithLength:outLen];
@@ -112,7 +103,7 @@ static NSData *decryptBox(NSData *box, NSData *aesKey, NSData *hmacKey) {
     return plain;
 }
 
-// Convenience wrappers used by auth functions
+// Convenience wrappers
 static NSString *encryptPayloadToBase64(NSDictionary *payload) {
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     if (!jsonData) return nil;
@@ -160,7 +151,6 @@ static NSString *kcRead(NSString *service) {
     OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &result);
     if (st != errSecSuccess || !result) return nil;
 
-    // FIX: use __bridge + manual CFRelease instead of __bridge_transfer (non-ARC)
     NSData *data = (__bridge NSData *)result;
     NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     CFRelease(result);
@@ -226,13 +216,8 @@ static NSTimeInterval loadLastSentTS(void) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Per-Device expiry cache
-//
-// gDeviceExpiry: the expiry timestamp for THIS specific device on this key.
-//                Received from server after successful auth.
-//                Stored in NSUserDefaults so it persists across launches.
-//                The timer shown in the panel uses this, not the key's global expiry.
 // ─────────────────────────────────────────────────────────────────────────────
-static NSTimeInterval gDeviceExpiry = 0;  // in-memory cache, set after auth
+static NSTimeInterval gDeviceExpiry = 0;
 
 static void saveDeviceExpiryLocally(NSTimeInterval exp) {
     [[NSUserDefaults standardUserDefaults] setDouble:exp forKey:@"SKToolsDeviceExpiry"];
@@ -293,7 +278,6 @@ static NSString *deviceUUID(void) {
 }
 
 static NSString *deviceModel(void) {
-    // FIX: #import <sys/utsname.h> added at top
     struct utsname info;
     uname(&info);
     return [NSString stringWithCString:info.machine encoding:NSUTF8StringEncoding]
@@ -442,12 +426,10 @@ static void skPost(NSURLSession *session,
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Auth Network Request
 //
-// New in v11.1:
-//   - Server now returns 'device_expiry': the per-device timer expiry timestamp.
-//   - We save this separately from the key-level expiry.
-//   - The panel displays the per-device timer, NOT the global key expiry.
-//   - When device_expiry > 0 and device_expiry < now on server side, the server
-//     checks reactivation_limit before allowing re-auth.
+// FIX v11.2: sends JSON body {"data":"<base64>"} instead of form-encoded POST.
+// This matches the iost.php pattern and avoids base64 '+' → space corruption
+// that form-encoding causes, which was the root cause of "Decrypt failed".
+// Response envelope also uses 'data' key (was 'payload').
 // ─────────────────────────────────────────────────────────────────────────────
 static void performKeyAuth(NSString *keyValue,
                            void (^completion)(BOOL ok,
@@ -460,16 +442,12 @@ static void performKeyAuth(NSString *keyValue,
 
     saveLastSentTS(sendTS);
 
-    NSString *devId  = persistentDeviceID();
-    NSString *model  = deviceModel();
-    NSString *sysVer = systemVersion();
-
     NSDictionary *payload = @{
         @"key"       : keyValue ?: @"",
         @"timestamp" : @((long long)sendTS),
-        @"device_id" : devId,
-        @"model"     : model,
-        @"sys_ver"   : sysVer,
+        @"device_id" : persistentDeviceID(),
+        @"model"     : deviceModel(),
+        @"sys_ver"   : systemVersion(),
     };
 
     NSString *encPayload = encryptPayloadToBase64(payload);
@@ -478,18 +456,21 @@ static void performKeyAuth(NSString *keyValue,
         return;
     }
 
+    // FIX: send as JSON body {"data":"<base64>"} — no form-encoding, no '+' corruption
+    NSDictionary *bodyDict = @{ @"data" : encPayload };
+    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:bodyDict options:0 error:nil];
+    if (!bodyData) {
+        completion(NO, 0, 0, @"JSON serialization failed.");
+        return;
+    }
+
     NSMutableURLRequest *req = [NSMutableURLRequest
         requestWithURL:[NSURL URLWithString:AUTH_BASE]
            cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
        timeoutInterval:20];
     req.HTTPMethod = @"POST";
-
-    NSString *bodyStr = [NSString stringWithFormat:
-        @"action=auth&payload=%@",
-        [encPayload stringByAddingPercentEncodingWithAllowedCharacters:
-            [NSCharacterSet URLQueryAllowedCharacterSet]]];
-    req.HTTPBody = [bodyStr dataUsingEncoding:NSUTF8StringEncoding];
-    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.HTTPBody   = bodyData;
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
 
     NSURLSession *ses = makeSession();
     [[ses dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
@@ -516,9 +497,10 @@ static void performKeyAuth(NSString *keyValue,
                 return;
             }
 
-            NSString *encResp = json[@"payload"];
+            // FIX: read 'data' key (was 'payload') to match updated PHP response
+            NSString *encResp = json[@"data"];
             if (!encResp.length) {
-                completion(NO, 0, 0, @"No encrypted payload in auth response.");
+                completion(NO, 0, 0, @"No data in auth response.");
                 return;
             }
 
@@ -537,7 +519,7 @@ static void performKeyAuth(NSString *keyValue,
             NSTimeInterval currentNow  = [[NSDate date] timeIntervalSince1970];
             NSTimeInterval localSaved  = loadLastSentTS();
 
-            // MITM check
+            // MITM check: server must echo back exact timestamp we sent
             if (llabs((long long)echoedTS - (long long)sendTS) > 0) {
                 clearSavedKey();
                 completion(NO, 0, 0,
@@ -572,9 +554,6 @@ static void performKeyAuth(NSString *keyValue,
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Per-Device expiry display helper
-//
-// Shows time remaining on THIS DEVICE's personal timer.
-// Timer starts when device first activates — each device has its own countdown.
 // ─────────────────────────────────────────────────────────────────────────────
 static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
     if (devExpiry <= 0) return @"";
@@ -850,7 +829,6 @@ static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
     _keyField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     _keyField.autocorrectionType = UITextAutocorrectionTypeNo;
     _keyField.spellCheckingType  = UITextSpellCheckingTypeNo;
-    // Use attributedPlaceholder to set placeholder color safely (no private API)
     NSDictionary *phAttrs = @{
         NSForegroundColorAttributeName: [UIColor colorWithWhite:0.30 alpha:1],
         NSFontAttributeName: [UIFont fontWithName:@"Courier" size:15]
@@ -948,7 +926,6 @@ static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
 - (void)bgTap { [_keyField resignFirstResponder]; }
 
 - (void)keyFieldChanged {
-    // No auto-formatting — let the user type the key exactly as given to them
     _statusLabel.text = @"";
 }
 
@@ -979,7 +956,6 @@ static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
             _statusLabel.text  = errorMsg ?: @"Activation failed.";
             _statusLabel.textColor = [UIColor colorWithRed:0.9 green:0.3 blue:0.3 alpha:1];
 
-            // Shake animation using CAKeyframeAnimation — no recursive blocks, no stack-capture crash
             CAKeyframeAnimation *shake = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
             shake.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
             shake.duration = 0.40;
@@ -1506,14 +1482,6 @@ static const CGFloat kSWScale = 0.75f;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKPanel
-//
-// v11.1 changes:
-//   - expiryLabel now shows PER-DEVICE timer from gDeviceExpiry
-//     (not the key's global expiry).
-//   - Timer only starts/ticks if gDeviceExpiry > 0 (i.e. key is active
-//     and device has been successfully authenticated).
-//   - refreshExpiry checks gDeviceExpiry first, then falls back to locally
-//     saved device expiry.
 // ─────────────────────────────────────────────────────────────────────────────
 static const CGFloat kPW = 258;
 static const CGFloat kBH = 46;
@@ -1593,8 +1561,6 @@ static const CGFloat kCH = 188;
     self.uidLabel.text          = @"";
     [self.content addSubview:self.uidLabel];
 
-    // Per-device expiry label
-    // Only shows a countdown if the device has an active (non-expired) timer.
     self.expiryLabel = [UILabel new];
     self.expiryLabel.frame         = CGRectMake(pad, 32, w, 12);
     self.expiryLabel.font          = [UIFont systemFontOfSize:9];
@@ -1634,8 +1600,6 @@ static const CGFloat kCH = 188;
     [self startExpiryTimer];
 }
 
-// Timer fires every 30s.
-// Only updates the label if a valid device expiry exists.
 - (void)startExpiryTimer {
     [self.expiryTimer invalidate];
     self.expiryTimer = [NSTimer scheduledTimerWithTimeInterval:30
@@ -1643,17 +1607,9 @@ static const CGFloat kCH = 188;
 }
 
 - (void)refreshExpiry {
-    // Per-device expiry: use in-memory value if set, else fall back to persisted value.
     NSTimeInterval devExpiry = gDeviceExpiry > 0 ? gDeviceExpiry : loadDeviceExpiryLocally();
-
-    if (devExpiry <= 0) {
-        // No device expiry known yet — hide the label
-        self.expiryLabel.text = @"";
-        return;
-    }
-
+    if (devExpiry <= 0) { self.expiryLabel.text = @""; return; }
     NSString *expiryStr = deviceExpiryDisplayString(devExpiry);
-
     if ([expiryStr hasPrefix:@"Device: EXPIRED"]) {
         self.expiryLabel.textColor = [UIColor colorWithRed:0.9 green:0.3 blue:0.3 alpha:1];
     } else {
@@ -1916,7 +1872,6 @@ static void showMainPanel(void) {
         root.bounds.size.width - gPanel.bounds.size.width/2 - 10, 88);
     [root addSubview:gPanel];
     [root bringSubviewToFront:gPanel];
-    // Restore cached device expiry
     NSTimeInterval savedDevExp = loadDeviceExpiryLocally();
     if (savedDevExp > 0) gDeviceExpiry = savedDevExp;
     [gPanel refreshStatus];
