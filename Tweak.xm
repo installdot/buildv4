@@ -811,7 +811,7 @@ static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
     _keyField.layer.borderColor  = [UIColor colorWithWhite:0.20 alpha:1].CGColor;
     _keyField.layer.borderWidth  = 1;
     _keyField.keyboardType       = UIKeyboardTypeASCIICapable;
-    _keyField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    _keyField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     _keyField.autocorrectionType = UITextAutocorrectionTypeNo;
     _keyField.spellCheckingType  = UITextSpellCheckingTypeNo;
     // Use attributedPlaceholder to set placeholder color safely (no private API)
@@ -912,18 +912,7 @@ static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
 - (void)bgTap { [_keyField resignFirstResponder]; }
 
 - (void)keyFieldChanged {
-    NSString *t = _keyField.text;
-    NSString *stripped = [[t uppercaseString]
-        stringByReplacingOccurrencesOfString:@"-" withString:@""];
-    if (stripped.length > 16) stripped = [stripped substringToIndex:16];
-    NSMutableString *formatted = [NSMutableString new];
-    for (NSUInteger i = 0; i < stripped.length; i++) {
-        if (i > 0 && i % 4 == 0) [formatted appendString:@"-"];
-        [formatted appendString:[stripped substringWithRange:NSMakeRange(i, 1)]];
-    }
-    if (![_keyField.text isEqualToString:formatted]) {
-        _keyField.text = formatted;
-    }
+    // No auto-formatting — let the user type the key exactly as given to them
     _statusLabel.text = @"";
 }
 
