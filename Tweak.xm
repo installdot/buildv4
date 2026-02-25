@@ -1,11 +1,7 @@
-// FakeUDID.xm
-// Compile with Theos as a standard tweak dylib
-// Put in your tweak folder, create filter.plist if you want to inject only into specific app (recommended)
-// Example filter.plist:
-// { Filter = { Bundles = ( "com.your.target.app" ); }; }
-
+// Tweak.xm  (or FakeUDID.xm)
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <stdlib.h>
 
 static short const kUDIDLength = 40;
 static short const kPrefixLength = 25;
@@ -27,12 +23,32 @@ static uint8_t const kSuffix[kSuffixLength] = {
 static NSString *kPrefsFile = @"/var/mobile/Library/Preferences/com.bao.fakeudid.plist";
 static NSString *currentCustomUDID = nil;
 
+// Modern safe keyWindow (no deprecation)
+static UIWindow *getKeyWindow(void) {
+    UIWindow *keyWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                keyWindow = ((UIWindowScene *)scene).windows.firstObject;
+                if (keyWindow) break;
+            }
+        }
+    } else {
+        keyWindow = [[UIApplication sharedApplication] keyWindow];
+    }
+    return keyWindow;
+}
+
 static NSString *generateRandomUDID(void) {
-    // Original style shuffle but on proper 40-char hex base (website usually accepts any 40 chars anyway)
     NSMutableString *randomizedText = [NSMutableString stringWithString:@"0123456789ABCDEF0123456789ABCDEF0123456789"];
+    NSString *buffer = nil;
     for (NSInteger i = randomizedText.length - 1, j; i >= 0; i--) {
         j = arc4random_uniform((uint32_t)(i + 1));
-        [randomizedText exchangeCharactersInRange:NSMakeRange(i, 1) withRange:NSMakeRange(j, 1)];
+        buffer = [randomizedText substringWithRange:NSMakeRange(i, 1)];
+        [randomizedText replaceCharactersInRange:NSMakeRange(i, 1) 
+                                      withString:[randomizedText substringWithRange:NSMakeRange(j, 1)]];
+        [randomizedText replaceCharactersInRange:NSMakeRange(j, 1) withString:buffer];
     }
     return [randomizedText copy];
 }
@@ -56,21 +72,19 @@ static void savePrefs(NSString *udid) {
 }
 
 static NSData *replacedUUIDData(NSData *data) {
-    if (data.length < kPrefixLength + kUDIDLength + kSuffixLength) {
-        return data;
-    }
+    if (data.length < kPrefixLength + kUDIDLength + kSuffixLength) return data;
 
     NSMutableData *mutableData = [data mutableCopy];
     uint8_t *bytes = (uint8_t *)mutableData.mutableBytes;
     uint8_t *ptr = bytes;
-    uint8_t *end = bytes + mutableData.length - (kPrefixLength + kUDIDLength + kSuffixLength) + 1;
+    uint8_t *end = bytes + mutableData.length - kPrefixLength - kUDIDLength - kSuffixLength + 1;
 
     while (ptr < end) {
         if (memcmp(ptr, kPrefix, kPrefixLength) == 0 &&
             memcmp(ptr + kPrefixLength + kUDIDLength, kSuffix, kSuffixLength) == 0) {
             
             NSString *fakeUDID = currentCustomUDID ?: generateRandomUDID();
-            NSLog(@"[FakeUDID] Found UDID location → replacing with: %@", fakeUDID);
+            NSLog(@"[FakeUDID] Found UDID → replaced with: %@", fakeUDID);
             strncpy((char *)(ptr + kPrefixLength), [fakeUDID UTF8String], kUDIDLength);
             break;
         }
@@ -95,7 +109,6 @@ static NSData *replacedUUIDData(NSData *data) {
 @end
 
 @implementation FakeUDIDButton
-
 - (instancetype)initWithFrame:(CGRect)frame {
     if (self = [super initWithFrame:frame]) {
         self.backgroundColor = [UIColor colorWithRed:1.0 green:0.2 blue:0.2 alpha:0.9];
@@ -119,56 +132,49 @@ static NSData *replacedUUIDData(NSData *data) {
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    UIWindow *window = self.window;
+    UIWindow *window = self.window ?: getKeyWindow();
     if (!window) return;
     
-    if (gesture.state == UIGestureRecognizerStateBegan) {
-        self.lastLocation = [gesture locationInView:window];
-    } else if (gesture.state == UIGestureRecognizerStateChanged) {
+    if (gesture.state == UIGestureRecognizerStateChanged) {
         CGPoint translation = [gesture translationInView:window];
         CGPoint newCenter = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
-        
-        // Keep button inside screen
         newCenter.x = MAX(35, MIN(newCenter.x, window.bounds.size.width - 35));
         newCenter.y = MAX(35, MIN(newCenter.y, window.bounds.size.height - 35));
-        
         self.center = newCenter;
         [gesture setTranslation:CGPointZero inView:window];
     }
 }
 
 - (void)buttonTapped {
-    UIViewController *topVC = [[UIApplication sharedApplication] keyWindow].rootViewController;
+    UIWindow *window = getKeyWindow();
+    if (!window) return;
+    UIViewController *topVC = window.rootViewController;
     while (topVC.presentedViewController) topVC = topVC.presentedViewController;
-    
+
     UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Fake UDID Menu"
-                                                                  message:currentCustomUDID ? [NSString stringWithFormat:@"Current custom:\n%@", currentCustomUDID] : @"Mode: Random (auto-generated)"
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
-    
-    [menu addAction:[UIAlertAction actionWithTitle:@"Generate Random & Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        message:currentCustomUDID ? [NSString stringWithFormat:@"Current:\n%@", currentCustomUDID] : @"Mode: Random"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Generate Random & Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSString *rnd = generateRandomUDID();
         savePrefs(rnd);
         UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Saved!" message:rnd preferredStyle:UIAlertControllerStyleAlert];
         [done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [topVC presentViewController:done animated:YES completion:nil];
     }]];
-    
-    [menu addAction:[UIAlertAction actionWithTitle:@"Set Custom UDID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Set Custom UDID (40 chars)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Enter 40-char UDID"
-                                                                       message:nil
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [input addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-            textField.placeholder = @"DF9249D4418QE1E79C87D1A58FE4247434EFF1D1";
-            textField.text = currentCustomUDID;
-            textField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
-            textField.keyboardType = UIKeyboardTypeASCIICapable;
+            message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [input addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"DF9249D4418QE1E79C87D1A58FE4247434EFF1D1";
+            tf.text = currentCustomUDID;
+            tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
         }];
-        
-        [input addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            NSString *inputText = input.textFields.firstObject.text;
-            if (inputText.length == 40) {
-                savePrefs(inputText);
-            } else {
+        [input addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            NSString *txt = input.textFields.firstObject.text;
+            if (txt.length == 40) savePrefs(txt);
+            else {
                 UIAlertController *err = [UIAlertController alertControllerWithTitle:@"Error" message:@"Must be exactly 40 characters" preferredStyle:UIAlertControllerStyleAlert];
                 [err addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [topVC presentViewController:err animated:YES completion:nil];
@@ -177,47 +183,34 @@ static NSData *replacedUUIDData(NSData *data) {
         [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
         [topVC presentViewController:input animated:YES completion:nil];
     }]];
-    
-    [menu addAction:[UIAlertAction actionWithTitle:@"Use Random (clear custom)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Use Random (clear custom)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         savePrefs(nil);
     }]];
-    
+
     [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    
     [topVC presentViewController:menu animated:YES completion:nil];
 }
-
 @end
 
 %ctor {
     loadPrefs();
     
-    // Add floating button to ANY app the tweak is injected into
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1.5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            UIWindow *keyWindow = [[UIApplication sharedApplication] keyWindow];
-            if (!keyWindow) {
-                if (@available(iOS 13.0, *)) {
-                    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                        if (scene.activationState == UISceneActivationStateForegroundActive) {
-                            keyWindow = scene.windows.firstObject;
-                            break;
-                        }
-                    }
-                }
-            }
+            UIWindow *keyWindow = getKeyWindow();
             if (keyWindow && ![keyWindow viewWithTag:13371337]) {
                 FakeUDIDButton *btn = [[FakeUDIDButton alloc] initWithFrame:CGRectMake(keyWindow.bounds.size.width - 75, keyWindow.bounds.size.height - 180, 60, 60)];
-                btn.tag = 13371337; // prevent duplicates
+                btn.tag = 13371337;
                 [keyWindow addSubview:btn];
-                NSLog(@"[FakeUDID] Floating menu button added");
+                NSLog(@"[FakeUDID] Floating button added");
             }
         });
     }];
     
-    NSLog(@"[FakeUDID] Loaded by Bảo | Custom UDID: %@", currentCustomUDID ?: @"(random each time)");
+    NSLog(@"[FakeUDID] Loaded by Bảo | Custom UDID: %@", currentCustomUDID ?: @"(random)");
     %init;
 }
