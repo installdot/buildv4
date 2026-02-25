@@ -470,19 +470,6 @@ static void performKeyAuth(NSString *keyValue,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Per-Device expiry display
-// ─────────────────────────────────────────────────────────────────────────────
-static NSString *deviceExpiryDisplayString(NSTimeInterval devExpiry) {
-    if (devExpiry <= 0) return @"";
-    NSTimeInterval left = devExpiry - [[NSDate date] timeIntervalSince1970];
-    if (left <= 0) return @"Device: EXPIRED";
-    long long d = (long long)(left / 86400), h = (long long)(fmod(left, 86400) / 3600);
-    if (d > 0) return [NSString stringWithFormat:@"Device: %lldd %lldh left", d, h];
-    long long m = (long long)(fmod(left, 3600) / 60);
-    return [NSString stringWithFormat:@"Device: %lldh %lldm left", h, m];
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SF Symbol tinted image view helper
 // ─────────────────────────────────────────────────────────────────────────────
 static UIImageView *symView(NSString *name, CGFloat ptSize, UIColor *tint) {
