@@ -2423,7 +2423,6 @@ static const CGFloat kCH = 192;
 
     // Position tooltip: below target if target is in top 55%, else above
     CGFloat screenH = self.bounds.size.height;
-    CGFloat screenW = self.bounds.size.width;
     CGFloat pad = 16;
     CGFloat cardH = cardSize.height;
     CGFloat cardW = 270;
