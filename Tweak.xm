@@ -2133,14 +2133,12 @@ static const CGFloat kCH = 192;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - NEW: SKTutorialSpotlightView
-// Custom view that dims the screen while cutting a "spotlight" hole over the
-// target element, and draws a dashed pointer line toward the tooltip card.
+// Draws ONLY the dim overlay + even-odd hole + dashed border.
+// The tooltip card lives in _parent (above everything), this view lives below panel.
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKTutorialSpotlightView : UIView
-@property (nonatomic, assign) CGRect    spotRect;
-@property (nonatomic, assign) CGPoint   lineEnd;   // where the line should end (tooltip edge)
-@property (nonatomic, assign) BOOL      lineVisible;
-- (void)animateToSpot:(CGRect)newSpot lineEnd:(CGPoint)lp completion:(void(^)(void))done;
+@property (nonatomic, assign) CGRect spotRect;
+- (void)animateToSpot:(CGRect)newSpot completion:(void(^)(void))done;
 @end
 
 @implementation SKTutorialSpotlightView
@@ -2150,90 +2148,44 @@ static const CGFloat kCH = 192;
     if (!self) return nil;
     self.backgroundColor = [UIColor clearColor];
     self.opaque = NO;
+    self.userInteractionEnabled = NO; // pass touches through
     return self;
 }
 
 - (void)drawRect:(CGRect)rect {
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    // Draw dim overlay
-    [[UIColor colorWithWhite:0 alpha:0.72] setFill];
-    CGContextFillRect(ctx, self.bounds);
-
-    if (!CGRectIsEmpty(_spotRect)) {
-        // Cut spotlight hole
-        CGRect padded = CGRectInset(_spotRect, -10, -10);
-        CGContextSetBlendMode(ctx, kCGBlendModeClear);
-        UIBezierPath *hole = [UIBezierPath bezierPathWithRoundedRect:padded cornerRadius:14];
-        CGContextSetFillColorWithColor(ctx, [UIColor blackColor].CGColor);
-        CGContextAddPath(ctx, hole.CGPath);
-        CGContextFillPath(ctx);
-        CGContextSetBlendMode(ctx, kCGBlendModeNormal);
-
-        // Draw glowing border around spotlight
-        CGContextSetBlendMode(ctx, kCGBlendModeNormal);
-        UIBezierPath *border = [UIBezierPath bezierPathWithRoundedRect:padded cornerRadius:14];
-        CGContextAddPath(ctx, border.CGPath);
-        [[UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.85] setStroke];
-        CGContextSetLineWidth(ctx, 2.0);
-        CGFloat dashes[] = { 6.0, 4.0 };
-        CGContextSetLineDash(ctx, 0, dashes, 2);
-        CGContextStrokePath(ctx);
-
-        // Draw pointer line from spotlight edge toward tooltip
-        if (_lineVisible && !CGPointEqualToPoint(_lineEnd, CGPointZero)) {
-            CGPoint spotCenter = CGPointMake(CGRectGetMidX(padded), CGRectGetMidY(padded));
-            // Find nearest edge point of spotlight rect toward lineEnd
-            CGPoint from = spotCenter;
-            CGFloat dx = _lineEnd.x - spotCenter.x;
-            CGFloat dy = _lineEnd.y - spotCenter.y;
-            CGFloat len = sqrt(dx*dx + dy*dy);
-            if (len > 1) {
-                CGFloat nx = dx / len, ny = dy / len;
-                CGFloat hw = padded.size.width / 2 + 10;
-                CGFloat hh = padded.size.height / 2 + 10;
-                CGFloat t = MIN(hw / MAX(fabs(nx), 0.001), hh / MAX(fabs(ny), 0.001));
-                from = CGPointMake(spotCenter.x + nx * t, spotCenter.y + ny * t);
-            }
-
-            CGContextSetBlendMode(ctx, kCGBlendModeNormal);
-            CGFloat pDashes[] = { 5.0, 5.0 };
-            CGContextSetLineDash(ctx, 0, pDashes, 2);
-            CGContextSetLineWidth(ctx, 1.8);
-            [[UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.75] setStroke];
-            CGContextMoveToPoint(ctx, from.x, from.y);
-            CGContextAddLineToPoint(ctx, _lineEnd.x, _lineEnd.y);
-            CGContextStrokePath(ctx);
-
-            // Arrowhead at lineEnd
-            CGContextSetLineDash(ctx, 0, NULL, 0);
-            CGFloat arrowSize = 7.0;
-            CGFloat angle = atan2(dy, dx);
-            CGContextMoveToPoint(ctx, _lineEnd.x, _lineEnd.y);
-            CGContextAddLineToPoint(ctx,
-                _lineEnd.x - arrowSize * cos(angle - M_PI/7.0),
-                _lineEnd.y - arrowSize * sin(angle - M_PI/7.0));
-            CGContextMoveToPoint(ctx, _lineEnd.x, _lineEnd.y);
-            CGContextAddLineToPoint(ctx,
-                _lineEnd.x - arrowSize * cos(angle + M_PI/7.0),
-                _lineEnd.y - arrowSize * sin(angle + M_PI/7.0));
-            CGContextSetLineWidth(ctx, 2.0);
-            [[UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1] setStroke];
-            CGContextStrokePath(ctx);
-        }
+    if (CGRectIsEmpty(_spotRect)) {
+        // Plain dim
+        [[UIColor colorWithWhite:0 alpha:0.68] setFill];
+        UIRectFill(self.bounds);
+        return;
     }
+
+    CGRect padded = CGRectInset(_spotRect, -8, -8);
+
+    // Even-odd fill: outer rect (whole screen) minus hole = dim with clear cutout
+    UIBezierPath *path = [UIBezierPath bezierPathWithRect:self.bounds];
+    UIBezierPath *hole = [UIBezierPath bezierPathWithRoundedRect:padded cornerRadius:13];
+    [path appendPath:hole];
+    path.usesEvenOddFillRule = YES;
+    [[UIColor colorWithWhite:0 alpha:0.68] setFill];
+    [path fill];
+
+    // Animated green dashed border around the highlighted element
+    UIBezierPath *border = [UIBezierPath bezierPathWithRoundedRect:padded cornerRadius:13];
+    [[UIColor colorWithRed:0.30 green:0.85 blue:0.50 alpha:0.90] setStroke];
+    CGFloat dashes[] = { 7.0, 4.0 };
+    [border setLineDash:dashes count:2 phase:0];
+    border.lineWidth = 2.2;
+    [border stroke];
 }
 
-- (void)animateToSpot:(CGRect)newSpot lineEnd:(CGPoint)lp completion:(void(^)(void))done {
-    _lineVisible = NO;
-    [UIView animateWithDuration:0.28 delay:0
+- (void)animateToSpot:(CGRect)newSpot completion:(void(^)(void))done {
+    [UIView animateWithDuration:0.25 delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{
         self.spotRect = newSpot;
-        self.lineEnd  = lp;
         [self setNeedsDisplay];
     } completion:^(BOOL _) {
-        self.lineVisible = YES;
-        [self setNeedsDisplay];
         if (done) done();
     }];
 }
@@ -2241,22 +2193,22 @@ static const CGFloat kCH = 192;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - NEW: SKTutorialOverlay
-// Step-by-step guide shown the very first time the user opens the panel.
-// Steps: Upload → Load → Settings → Auto Rij → Auto Detect UID → Auto Close
-// Each step highlights the target with a spotlight + dashed line + tooltip card.
 // ─────────────────────────────────────────────────────────────────────────────
 @implementation SKTutorialOverlay {
-    SKPanel                  *_panel;
-    UIView                   *_parent;
-    SKTutorialSpotlightView  *_spotlight;
-    UIView                   *_tooltipCard;
-    UILabel                  *_stepLabel;
-    UILabel                  *_titleLabel;
-    UILabel                  *_descLabel;
-    UIButton                 *_continueBtn;
-    NSInteger                 _stepIndex;
-    NSArray<NSDictionary *>  *_steps;
-    SKSettingsMenu           *_settingsMenu;
+    SKPanel                 *_panel;
+    UIView                  *_parent;
+    SKTutorialSpotlightView *_spotlight;   // dim layer — lives in _parent, below panel
+    UIView                  *_tooltipCard; // tooltip — lives in _parent, above everything
+    UIView                  *_lineView;    // arrow line — lives in _parent, above panel
+    UILabel                 *_stepLabel;
+    UILabel                 *_titleLabel;
+    UILabel                 *_descLabel;
+    UIButton                *_continueBtn;
+    NSInteger                _stepIndex;
+    NSArray<NSDictionary *> *_steps;
+    SKSettingsMenu          *_settingsMenu;
+    CGPoint                  _lineFromPt;
+    CGPoint                  _lineToPt;
 }
 
 + (void)showForPanel:(SKPanel *)panel inView:(UIView *)parent {
@@ -2264,140 +2216,142 @@ static const CGFloat kCH = 192;
     o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     o->_panel  = panel;
     o->_parent = parent;
-    [parent addSubview:o];
+
+    // ── 1. Dim spotlight — inserted BELOW the panel so panel stays visible ──
+    o->_spotlight = [[SKTutorialSpotlightView alloc] initWithFrame:parent.bounds];
+    o->_spotlight.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [parent insertSubview:o->_spotlight belowSubview:panel];
+
+    // ── 2. Arrow line view — above panel, drawn in drawRect ─────────────────
+    o->_lineView = [[UIView alloc] initWithFrame:parent.bounds];
+    o->_lineView.backgroundColor = [UIColor clearColor];
+    o->_lineView.opaque = NO;
+    o->_lineView.userInteractionEnabled = NO;
+    o->_lineView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [parent addSubview:o->_lineView];
+
+    // ── 3. Tooltip card — topmost ────────────────────────────────────────────
+    [o buildTooltipCardInParent:parent];
+
     o.alpha = 0;
-    [UIView animateWithDuration:0.25 animations:^{ o.alpha = 1; }
-                     completion:^(BOOL _){ [o setupStepsAndStart]; }];
+    [parent addSubview:o]; // invisible container just to hold the tap gesture / lifecycle
+    o.userInteractionEnabled = NO;
+    o.backgroundColor = [UIColor clearColor];
+
+    [UIView animateWithDuration:0.25 animations:^{
+        o->_spotlight.alpha = 1;
+        o->_tooltipCard.alpha = 1;
+    } completion:^(BOOL _){ [o setupStepsAndStart]; }];
 }
 
-- (instancetype)initWithFrame:(CGRect)f {
-    self = [super initWithFrame:f];
-    if (!self) return nil;
-    self.backgroundColor = [UIColor clearColor];
-
-    // Spotlight layer (fills self)
-    _spotlight = [[SKTutorialSpotlightView alloc] initWithFrame:self.bounds];
-    _spotlight.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self addSubview:_spotlight];
-
-    // Tooltip card
+// ── Build the floating tooltip card directly in _parent ──────────────────────
+- (void)buildTooltipCardInParent:(UIView *)parent {
     _tooltipCard = [UIView new];
-    _tooltipCard.backgroundColor    = [UIColor colorWithRed:0.06 green:0.08 blue:0.13 alpha:0.98];
-    _tooltipCard.layer.cornerRadius = 16;
-    _tooltipCard.layer.shadowColor  = [UIColor blackColor].CGColor;
-    _tooltipCard.layer.shadowOpacity = 0.88;
-    _tooltipCard.layer.shadowRadius  = 16;
+    _tooltipCard.backgroundColor     = [UIColor colorWithRed:0.06 green:0.08 blue:0.14 alpha:0.97];
+    _tooltipCard.layer.cornerRadius  = 16;
+    _tooltipCard.layer.shadowColor   = [UIColor blackColor].CGColor;
+    _tooltipCard.layer.shadowOpacity = 0.90;
+    _tooltipCard.layer.shadowRadius  = 18;
     _tooltipCard.layer.shadowOffset  = CGSizeMake(0, 5);
-    _tooltipCard.layer.borderColor   = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.30].CGColor;
-    _tooltipCard.layer.borderWidth   = 1;
+    // Subtle green border, no white
+    _tooltipCard.layer.borderColor   = [UIColor colorWithRed:0.30 green:0.85 blue:0.50 alpha:0.25].CGColor;
+    _tooltipCard.layer.borderWidth   = 1.0;
     _tooltipCard.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:_tooltipCard];
+    _tooltipCard.alpha = 0;
+    [parent addSubview:_tooltipCard];
 
-    // Step badge
     _stepLabel = [UILabel new];
-    _stepLabel.textColor  = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.70];
-    _stepLabel.font       = [UIFont boldSystemFontOfSize:10];
+    _stepLabel.textColor     = [UIColor colorWithRed:0.30 green:0.85 blue:0.50 alpha:0.75];
+    _stepLabel.font          = [UIFont boldSystemFontOfSize:10];
     _stepLabel.textAlignment = NSTextAlignmentLeft;
     _stepLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_stepLabel];
 
-    // Title
     _titleLabel = [UILabel new];
     _titleLabel.textColor  = [UIColor whiteColor];
-    _titleLabel.font       = [UIFont boldSystemFontOfSize:15];
+    _titleLabel.font       = [UIFont boldSystemFontOfSize:14];
     _titleLabel.numberOfLines = 1;
     _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_titleLabel];
 
-    // Description
     _descLabel = [UILabel new];
-    _descLabel.textColor  = [UIColor colorWithWhite:0.72 alpha:1];
-    _descLabel.font       = [UIFont systemFontOfSize:12];
+    _descLabel.textColor   = [UIColor colorWithWhite:0.72 alpha:1];
+    _descLabel.font        = [UIFont systemFontOfSize:11.5];
     _descLabel.numberOfLines = 0;
     _descLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_descLabel];
 
-    // Continue button
     _continueBtn = makeSymBtn(@"Continue", @"arrow.right.circle",
         [UIColor colorWithRed:0.14 green:0.52 blue:0.28 alpha:1], @selector(tapContinue), self);
     _continueBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_continueBtn];
 
-    // Tooltip constraints — fixed width, positioned dynamically via frame
     [NSLayoutConstraint activateConstraints:@[
-        [_stepLabel.topAnchor constraintEqualToAnchor:_tooltipCard.topAnchor constant:14],
-        [_stepLabel.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:16],
-        [_stepLabel.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-16],
-        [_titleLabel.topAnchor constraintEqualToAnchor:_stepLabel.bottomAnchor constant:4],
-        [_titleLabel.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:16],
-        [_titleLabel.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-16],
-        [_descLabel.topAnchor constraintEqualToAnchor:_titleLabel.bottomAnchor constant:8],
-        [_descLabel.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:16],
-        [_descLabel.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-16],
-        [_continueBtn.topAnchor constraintEqualToAnchor:_descLabel.bottomAnchor constant:14],
-        [_continueBtn.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:14],
-        [_continueBtn.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-14],
-        [_continueBtn.heightAnchor constraintEqualToConstant:40],
-        [_tooltipCard.bottomAnchor constraintEqualToAnchor:_continueBtn.bottomAnchor constant:14],
-        [_tooltipCard.widthAnchor constraintEqualToConstant:270],
+        [_tooltipCard.widthAnchor constraintEqualToConstant:210],
+        [_stepLabel.topAnchor constraintEqualToAnchor:_tooltipCard.topAnchor constant:12],
+        [_stepLabel.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:14],
+        [_stepLabel.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-14],
+        [_titleLabel.topAnchor constraintEqualToAnchor:_stepLabel.bottomAnchor constant:3],
+        [_titleLabel.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:14],
+        [_titleLabel.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-14],
+        [_descLabel.topAnchor constraintEqualToAnchor:_titleLabel.bottomAnchor constant:7],
+        [_descLabel.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:14],
+        [_descLabel.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-14],
+        [_continueBtn.topAnchor constraintEqualToAnchor:_descLabel.bottomAnchor constant:12],
+        [_continueBtn.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:12],
+        [_continueBtn.trailingAnchor constraintEqualToAnchor:_tooltipCard.trailingAnchor constant:-12],
+        [_continueBtn.heightAnchor constraintEqualToConstant:38],
+        [_tooltipCard.bottomAnchor constraintEqualToAnchor:_continueBtn.bottomAnchor constant:12],
     ]];
+}
+
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f];
     return self;
 }
 
-// ── Build step data ──────────────────────────────────────────────────────────
+// ── Steps ────────────────────────────────────────────────────────────────────
 - (void)setupStepsAndStart {
     _steps = @[
-        @{
-            @"title": @"Upload to Cloud ☁️",
-            @"desc":  @"Uploads your save data to the cloud for editing.\n\nBypasses iOS sandbox — works on non-jailbroken devices. After upload you'll get a shareable link to access and edit your data.",
-            @"target": @"upload"
-        },
-        @{
-            @"title": @"Load from Cloud ⬇️",
-            @"desc":  @"Downloads and applies the save data you edited in the cloud editor.\n\nUse this after you've made your changes via the web link.",
-            @"target": @"load"
-        },
-        @{
-            @"title": @"Settings ⚙️",
-            @"desc":  @"Configure auto-behaviours for the tool. Tap Continue to walk through each setting.",
-            @"target": @"settings"
-        },
-        @{
-            @"title": @"Auto Rij",
-            @"desc":  @"By default you'd need to manually edit the Rij value after uploading. When ON, this automatically sets all OpenRijTest_ flags to 0 — no manual step needed.\n\n✅ Enabled by default.",
-            @"target": @"rij"
-        },
-        @{
-            @"title": @"Auto Detect UID",
-            @"desc":  @"Reads the PlayerId of the account you're currently logged in as.\n\nExample: logged in as UID 123 → only .data files containing '123' are uploaded. No need to type UID manually.",
-            @"target": @"uid"
-        },
-        @{
-            @"title": @"Auto Close",
-            @"desc":  @"The app must be closed for edited .data files to take effect after loading from cloud.\n\nWith this ON, the app closes automatically — so you don't forget.",
-            @"target": @"close"
-        },
+        @{ @"title": @"Upload to Cloud ☁️",
+           @"desc":  @"Uploads your save data to the cloud for editing. Bypasses iOS sandbox — works without jailbreak. You'll get a link to access and edit your data.",
+           @"target": @"upload" },
+        @{ @"title": @"Load from Cloud ⬇️",
+           @"desc":  @"Downloads and applies the save data you edited via the web link.",
+           @"target": @"load" },
+        @{ @"title": @"Settings ⚙️",
+           @"desc":  @"Configure auto-behaviours. Tap Continue to walk through each setting.",
+           @"target": @"settings" },
+        @{ @"title": @"Auto Rij",
+           @"desc":  @"Automatically sets all OpenRijTest_ flags to 0 before uploading — no manual edit needed.
+
+✅ ON by default.",
+           @"target": @"rij" },
+        @{ @"title": @"Auto Detect UID",
+           @"desc":  @"Reads your current account PlayerId and only uploads .data files matching that UID.",
+           @"target": @"uid" },
+        @{ @"title": @"Auto Close",
+           @"desc":  @"After loading from cloud, the app must close for changes to apply. This does it automatically.",
+           @"target": @"close" },
     ];
     _stepIndex = -1;
     [self advance];
 }
 
-// ── Advance to next step ─────────────────────────────────────────────────────
 - (void)advance {
     _stepIndex++;
-    if (_stepIndex >= (NSInteger)_steps.count) {
-        [self finishTutorial];
-        return;
-    }
+    if (_stepIndex >= (NSInteger)_steps.count) { [self finishTutorial]; return; }
 
-    NSDictionary *step = _steps[_stepIndex];
-    NSString *target   = step[@"target"];
+    NSDictionary *step  = _steps[_stepIndex];
+    NSString     *target = step[@"target"];
 
-    // Open settings menu for steps 3-5
     if (_stepIndex == 3 && !_settingsMenu) {
+        // Open settings ABOVE the dim layer — addSubview goes above spotlight naturally
         _settingsMenu = [SKSettingsMenu showInView:_parent];
-        // Wait for settings to animate in
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+        // Bring tooltip and line above settings
+        [_parent bringSubviewToFront:_lineView];
+        [_parent bringSubviewToFront:_tooltipCard];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{ [self showStep:step target:target]; });
         return;
     }
@@ -2405,40 +2359,68 @@ static const CGFloat kCH = 192;
 }
 
 - (void)showStep:(NSDictionary *)step target:(NSString *)target {
-    CGRect spotRect = [self rectForTarget:target];
-
-    _stepLabel.text  = [NSString stringWithFormat:@"Step %ld of %lu",
+    // Update text
+    _stepLabel.text  = [NSString stringWithFormat:@"STEP %ld / %lu",
         (long)(_stepIndex + 1), (unsigned long)_steps.count];
     _titleLabel.text = step[@"title"];
     _descLabel.text  = step[@"desc"];
-
-    // Update continue button title on last step
     BOOL isLast = _stepIndex == (NSInteger)_steps.count - 1;
-    [_continueBtn setTitle:isLast ? @"  Done ✓" : @"  Continue" forState:UIControlStateNormal];
+    [_continueBtn setTitle:isLast ? @"  Done  ✓" : @"  Continue" forState:UIControlStateNormal];
 
-    // Layout tooltip first pass (need size before placing)
-    [self setNeedsLayout];
-    [self layoutIfNeeded];
-    CGSize cardSize = [_tooltipCard systemLayoutSizeFittingSize:UILayoutFittingCompressedSize];
+    // Get target rect in parent coordinates
+    CGRect spotRect = [self rectForTarget:target inView:_parent];
 
-    // Position tooltip: below target if target is in top 55%, else above
-    CGFloat screenH = self.bounds.size.height;
-    CGFloat screenW = self.bounds.size.width;
-    CGFloat pad = 16;
-    CGFloat cardH = cardSize.height;
-    CGFloat cardW = 270;
+    // ── Position tooltip BESIDE the panel, not above/below ──────────────────
+    // Force layout so we know the card's height
+    [_parent layoutIfNeeded];
+    CGFloat cardW  = 210;
+    CGFloat cardH  = [_tooltipCard systemLayoutSizeFittingSize:
+                          CGSizeMake(cardW, UILayoutFittingCompressedSize.height)].height;
+    CGFloat screenW = _parent.bounds.size.width;
+    CGFloat screenH = _parent.bounds.size.height;
+    CGFloat pad     = 12;
 
-    CGFloat spotCY = CGRectGetMidY(spotRect);
-    CGFloat cardY;
-    if (spotCY < screenH * 0.55) {
-        cardY = CGRectGetMaxY(spotRect) + 28;
+    // Determine which horizontal side of the PANEL has more free space
+    CGRect panelFrame = _panel.frame;
+    CGFloat spaceLeft  = CGRectGetMinX(panelFrame) - pad;
+    CGFloat spaceRight = screenW - CGRectGetMaxX(panelFrame) - pad;
+
+    CGFloat cardX;
+    CGPoint arrowFrom; // point on tooltip edge closest to target
+    CGPoint arrowTo;   // point on spotlight border closest to tooltip
+
+    if (spaceLeft >= cardW + 4) {
+        // Place tooltip to the LEFT of the panel
+        cardX      = CGRectGetMinX(panelFrame) - cardW - 12;
+        arrowFrom  = CGPointMake(cardX + cardW, 0); // right edge (Y filled in below)
+        arrowTo    = CGPointMake(CGRectGetMinX(spotRect) - 10,
+                                  CGRectGetMidY(spotRect));
+    } else if (spaceRight >= cardW + 4) {
+        // Place tooltip to the RIGHT of the panel
+        cardX      = CGRectGetMaxX(panelFrame) + 12;
+        arrowFrom  = CGPointMake(cardX, 0); // left edge (Y filled in below)
+        arrowTo    = CGPointMake(CGRectGetMaxX(spotRect) + 10,
+                                  CGRectGetMidY(spotRect));
     } else {
-        cardY = CGRectGetMinY(spotRect) - cardH - 28;
+        // Fallback — not enough horizontal room; centre horizontally on free area
+        // Pick the side with more room anyway
+        if (spaceLeft >= spaceRight) {
+            cardX  = MAX(pad, CGRectGetMinX(panelFrame) - cardW - 8);
+            arrowFrom = CGPointMake(cardX + cardW, 0);
+            arrowTo   = CGPointMake(CGRectGetMinX(spotRect) - 8, CGRectGetMidY(spotRect));
+        } else {
+            cardX  = MIN(screenW - cardW - pad, CGRectGetMaxX(panelFrame) + 8);
+            arrowFrom = CGPointMake(cardX, 0);
+            arrowTo   = CGPointMake(CGRectGetMaxX(spotRect) + 8, CGRectGetMidY(spotRect));
+        }
     }
-    cardY = MAX(pad, MIN(screenH - cardH - pad, cardY));
-    CGFloat cardX = MAX(pad, MIN(screenW - cardW - pad, CGRectGetMidX(spotRect) - cardW / 2));
 
-    // Animate tooltip card repositioning
+    // Vertically: centre the card alongside the target, clamped to screen
+    CGFloat cardY = MAX(pad, MIN(screenH - cardH - pad,
+                                  CGRectGetMidY(spotRect) - cardH * 0.5));
+    arrowFrom.y   = cardY + cardH * 0.5;
+
+    // Animate tooltip to new position
     [UIView animateWithDuration:0.22 delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{
@@ -2446,65 +2428,93 @@ static const CGFloat kCH = 192;
         self->_tooltipCard.alpha = 1;
     } completion:nil];
 
-    // Line endpoint = nearest edge of tooltip card to the spotlight
-    CGRect cardFrame = CGRectMake(cardX, cardY, cardW, cardH);
-    CGPoint lineEnd  = [self nearestEdgeOfRect:cardFrame toRect:spotRect];
+    // Update dim spotlight
+    // Convert spotRect back to spotlight view coords (spotlight fills parent so coords are same)
+    [_spotlight animateToSpot:spotRect completion:nil];
 
-    [_spotlight animateToSpot:spotRect lineEnd:lineEnd completion:nil];
+    // Redraw arrow line
+    _lineFromPt = arrowFrom;
+    _lineToPt   = arrowTo;
+    // Use a CAShapeLayer on lineView for the dashed arrow
+    [_lineView.layer.sublayers makeObjectsPerformSelector:@selector(removeFromSuperlayer)];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.28 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{ [self drawArrowFrom:arrowFrom to:arrowTo]; });
 }
 
-// ── Geometry helpers ─────────────────────────────────────────────────────────
-- (CGRect)rectForTarget:(NSString *)target {
-    if ([target isEqualToString:@"upload"] && _panel.uploadBtn) {
-        return [_panel.uploadBtn convertRect:_panel.uploadBtn.bounds toView:self];
-    }
-    if ([target isEqualToString:@"load"] && _panel.loadBtn) {
-        return [_panel.loadBtn convertRect:_panel.loadBtn.bounds toView:self];
-    }
-    if ([target isEqualToString:@"settings"] && _panel.settingsBtn) {
-        return [_panel.settingsBtn convertRect:_panel.settingsBtn.bounds toView:self];
-    }
-    if ([target isEqualToString:@"rij"] && _settingsMenu && _settingsMenu.tutRijRow) {
-        return [_settingsMenu.tutRijRow convertRect:_settingsMenu.tutRijRow.bounds toView:self];
-    }
-    if ([target isEqualToString:@"uid"] && _settingsMenu && _settingsMenu.tutUidRow) {
-        return [_settingsMenu.tutUidRow convertRect:_settingsMenu.tutUidRow.bounds toView:self];
-    }
-    if ([target isEqualToString:@"close"] && _settingsMenu && _settingsMenu.tutCloseRow) {
-        return [_settingsMenu.tutCloseRow convertRect:_settingsMenu.tutCloseRow.bounds toView:self];
-    }
-    // Fallback: centre of screen
-    return CGRectMake(self.bounds.size.width/2 - 60, self.bounds.size.height/2 - 20, 120, 40);
+- (void)drawArrowFrom:(CGPoint)from to:(CGPoint)to {
+    CAShapeLayer *lineLayer = [CAShapeLayer layer];
+    UIBezierPath *path = [UIBezierPath bezierPath];
+    [path moveToPoint:from];
+    // Slight cubic curve for a nice arc
+    CGFloat cx = (from.x + to.x) * 0.5;
+    CGFloat cy = (from.y + to.y) * 0.5 - 20;
+    [path addQuadCurveToPoint:to controlPoint:CGPointMake(cx, cy)];
+    lineLayer.path            = path.CGPath;
+    lineLayer.strokeColor     = [UIColor colorWithRed:0.30 green:0.85 blue:0.50 alpha:0.85].CGColor;
+    lineLayer.fillColor       = [UIColor clearColor].CGColor;
+    lineLayer.lineWidth       = 1.8;
+    lineLayer.lineDashPattern = @[@5, @4];
+    [_lineView.layer addSublayer:lineLayer];
+
+    // Arrowhead
+    CGFloat dx    = to.x - cx;
+    CGFloat dy    = to.y - cy;
+    CGFloat angle = atan2(dy, dx);
+    CGFloat aSize = 8.0;
+    CAShapeLayer *head = [CAShapeLayer layer];
+    UIBezierPath *ap   = [UIBezierPath bezierPath];
+    [ap moveToPoint:to];
+    [ap addLineToPoint:CGPointMake(to.x - aSize * cos(angle - M_PI/6),
+                                   to.y - aSize * sin(angle - M_PI/6))];
+    [ap moveToPoint:to];
+    [ap addLineToPoint:CGPointMake(to.x - aSize * cos(angle + M_PI/6),
+                                   to.y - aSize * sin(angle + M_PI/6))];
+    head.path        = ap.CGPath;
+    head.strokeColor = [UIColor colorWithRed:0.30 green:0.85 blue:0.50 alpha:1.0].CGColor;
+    head.fillColor   = [UIColor clearColor].CGColor;
+    head.lineWidth   = 2.0;
+    [_lineView.layer addSublayer:head];
+
+    // Fade in
+    CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    fade.fromValue = @0; fade.toValue = @1; fade.duration = 0.2;
+    [lineLayer addAnimation:fade forKey:nil];
+    [head      addAnimation:fade forKey:nil];
 }
 
-- (CGPoint)nearestEdgeOfRect:(CGRect)card toRect:(CGRect)spot {
-    CGPoint spotC = CGPointMake(CGRectGetMidX(spot), CGRectGetMidY(spot));
-    // Clamp to card edges
-    CGFloat cx = MAX(CGRectGetMinX(card), MIN(CGRectGetMaxX(card), spotC.x));
-    CGFloat cy = MAX(CGRectGetMinY(card), MIN(CGRectGetMaxY(card), spotC.y));
-    // Snap to closest edge
-    CGFloat dl = fabs(cx - CGRectGetMinX(card));
-    CGFloat dr = fabs(cx - CGRectGetMaxX(card));
-    CGFloat dt = fabs(cy - CGRectGetMinY(card));
-    CGFloat db = fabs(cy - CGRectGetMaxY(card));
-    CGFloat minD = MIN(MIN(dl, dr), MIN(dt, db));
-    if (minD == dl)      return CGPointMake(CGRectGetMinX(card), cy);
-    else if (minD == dr) return CGPointMake(CGRectGetMaxX(card), cy);
-    else if (minD == dt) return CGPointMake(cx, CGRectGetMinY(card));
-    else                 return CGPointMake(cx, CGRectGetMaxY(card));
+// ── Rect helpers ─────────────────────────────────────────────────────────────
+- (CGRect)rectForTarget:(NSString *)target inView:(UIView *)view {
+    UIView *src = nil;
+    if ([target isEqualToString:@"upload"])   src = _panel.uploadBtn;
+    else if ([target isEqualToString:@"load"]) src = _panel.loadBtn;
+    else if ([target isEqualToString:@"settings"]) src = _panel.settingsBtn;
+    else if ([target isEqualToString:@"rij"]   && _settingsMenu) src = _settingsMenu.tutRijRow;
+    else if ([target isEqualToString:@"uid"]   && _settingsMenu) src = _settingsMenu.tutUidRow;
+    else if ([target isEqualToString:@"close"] && _settingsMenu) src = _settingsMenu.tutCloseRow;
+    if (src) return [src convertRect:src.bounds toView:view];
+    // Fallback
+    return CGRectMake(view.bounds.size.width/2-60, view.bounds.size.height/2-20, 120, 40);
 }
 
 - (void)tapContinue {
-    // Animate tooltip out before advance
+    // Clear arrow line
+    [_lineView.layer.sublayers makeObjectsPerformSelector:@selector(removeFromSuperlayer)];
     [UIView animateWithDuration:0.12 animations:^{ self->_tooltipCard.alpha = 0; }
                      completion:^(BOOL _){ [self advance]; }];
 }
 
 - (void)finishTutorial {
-    // Dismiss settings menu if it was opened by tutorial
     if (_settingsMenu) { [_settingsMenu dismiss]; _settingsMenu = nil; }
-    [UIView animateWithDuration:0.22 animations:^{ self.alpha = 0; }
-                     completion:^(BOOL _){ [self removeFromSuperview]; }];
+    [UIView animateWithDuration:0.22 animations:^{
+        self->_spotlight.alpha   = 0;
+        self->_tooltipCard.alpha = 0;
+        self->_lineView.alpha    = 0;
+    } completion:^(BOOL _){
+        [self->_spotlight   removeFromSuperview];
+        [self->_tooltipCard removeFromSuperview];
+        [self->_lineView    removeFromSuperview];
+        [self removeFromSuperview];
+    }];
 }
 @end
 
