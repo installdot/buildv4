@@ -2,6 +2,8 @@
 // iOS 14+ | Theos/Logos | ARC
 // v11.3: SF Symbols, spinning app icon auth, panel guarded behind auth
 // v11.4: Welcome notification, step-by-step tutorial, Auto Rij default ON, live countdown
+// v11.5: Fix tutorial overlay z-order — always renders above panel + settings menu;
+//         Continue button now tappable even when settings menu is open.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -211,7 +213,6 @@ static NSTimeInterval loadLastSentTS(void) {
 // MARK: - Per-Device expiry cache
 // ─────────────────────────────────────────────────────────────────────────────
 static NSTimeInterval gDeviceExpiry = 0;
-// ── NEW: key expiry + welcome flag ───────────────────────────────────────────
 static NSTimeInterval gKeyExpiry            = 0;
 static BOOL           gWelcomeShownThisSession = NO;
 
@@ -255,11 +256,10 @@ static void setSetting(NSString *key, BOOL val) {
     NSMutableDictionary *d = loadSettingsDict(); d[key] = @(val); persistSettingsDict(d);
 }
 
-// ── NEW: initialise defaults (Auto Rij ON by default) ────────────────────────
 static void initDefaultSettings(void) {
     NSMutableDictionary *d = loadSettingsDict();
     BOOL changed = NO;
-    if (!d[@"autoRij"]) { d[@"autoRij"] = @YES; changed = YES; }  // ON by default
+    if (!d[@"autoRij"]) { d[@"autoRij"] = @YES; changed = YES; }
     if (changed) persistSettingsDict(d);
 }
 
@@ -734,7 +734,6 @@ static void startSpinAnimation(CALayer *layer) {
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
-    // ── breadd.png (spinning) ─────────────────────────────────────────────
     _appIconView = [[UIImageView alloc] init];
     _appIconView.contentMode = UIViewContentModeScaleAspectFit;
     _appIconView.clipsToBounds = YES;
@@ -922,7 +921,7 @@ static void startSpinAnimation(CALayer *layer) {
         if (ok) {
             saveSavedKey(key);
             gDeviceExpiry = devExpiry;
-            gKeyExpiry    = keyExpiry; // ── NEW: store key expiry globally
+            gKeyExpiry    = keyExpiry;
             saveDeviceExpiryLocally(devExpiry);
             UIImageView *iconView = weakIconView;
             if (iconView) [iconView.layer removeAnimationForKey:kSpinKey];
@@ -1231,10 +1230,10 @@ static void performLoad(SKProgressOverlay *ov, void (^done)(BOOL ok, NSString *m
 static const CGFloat kSWScale = 0.75f;
 
 @interface SKSettingsMenu : UIView
-// ── NEW: expose rows for tutorial pointer ────────────────────────────────────
 @property (nonatomic, strong, readonly) UIView *tutRijRow;
 @property (nonatomic, strong, readonly) UIView *tutUidRow;
 @property (nonatomic, strong, readonly) UIView *tutCloseRow;
+- (void)dismiss;
 @end
 
 @implementation SKSettingsMenu {
@@ -1242,7 +1241,6 @@ static const CGFloat kSWScale = 0.75f;
     UISwitch *_rijSwitch;
     UISwitch *_uidSwitch;
     UISwitch *_closeSwitch;
-    // ── NEW ivars ──────────────────────────────────────────────────────────
     UIView   *_tutRijRow;
     UIView   *_tutUidRow;
     UIView   *_tutCloseRow;
@@ -1365,21 +1363,21 @@ static const CGFloat kSWScale = 0.75f;
         symName:@"wand.and.stars"
         swRef:&_rijSwitch tag:1];
     [_card addSubview:rijRow];
-    _tutRijRow = rijRow; // ── NEW
+    _tutRijRow = rijRow;
 
     UIView *uidRow = [self rowWithTitle:@"Auto Detect UID"
         description:@"Reads PlayerId from SdkStateCache#1 — no manual UID entry needed."
         symName:@"person.badge.key"
         swRef:&_uidSwitch tag:2];
     [_card addSubview:uidRow];
-    _tutUidRow = uidRow; // ── NEW
+    _tutUidRow = uidRow;
 
     UIView *closeRow = [self rowWithTitle:@"Auto Close"
         description:@"Terminates the app once save data has finished loading from cloud."
         symName:@"power"
         swRef:&_closeSwitch tag:3];
     [_card addSubview:closeRow];
-    _tutCloseRow = closeRow; // ── NEW
+    _tutCloseRow = closeRow;
 
     UIButton *closeBtn = makeSymBtn(@"Close", @"xmark",
         [UIColor colorWithWhite:0.20 alpha:1], @selector(dismiss), self);
@@ -1491,9 +1489,10 @@ static const CGFloat kCH = 192;
 @property (nonatomic, strong) UILabel  *expiryLabel;
 @property (nonatomic, strong) UIButton *uploadBtn;
 @property (nonatomic, strong) UIButton *loadBtn;
-@property (nonatomic, strong) UIButton *settingsBtn; // ── NEW: exposed for tutorial
+@property (nonatomic, strong) UIButton *settingsBtn;
 @property (nonatomic, assign) BOOL     expanded;
 @property (nonatomic, strong) NSTimer  *expiryTimer;
+- (void)refreshStatus;
 @end
 
 @implementation SKPanel
@@ -1589,7 +1588,6 @@ static const CGFloat kCH = 192;
     [self.content addSubview:self.loadBtn];
 
     CGFloat halfW = (w - 6) / 2;
-    // ── Store settingsBtn as property for tutorial ─────────────────────────
     self.settingsBtn = [self btn:@"Settings"
                          symName:@"gearshape"
                            color:[UIColor colorWithRed:0.22 green:0.22 blue:0.30 alpha:1]
@@ -1630,7 +1628,6 @@ static const CGFloat kCH = 192;
 
 - (void)startExpiryTimer {
     [self.expiryTimer invalidate];
-    // ── Live 1-second countdown ───────────────────────────────────────────
     self.expiryTimer = [NSTimer scheduledTimerWithTimeInterval:1
         target:self selector:@selector(refreshExpiry) userInfo:nil repeats:YES];
 }
@@ -1638,8 +1635,6 @@ static const CGFloat kCH = 192;
 - (void)refreshExpiry {
     NSTimeInterval devExpiry = gDeviceExpiry > 0 ? gDeviceExpiry : loadDeviceExpiryLocally();
     if (devExpiry <= 0) { self.expiryLabel.text = @""; return; }
-
-    // Build a live countdown string with seconds
     NSTimeInterval left = devExpiry - [[NSDate date] timeIntervalSince1970];
     NSString *expiryStr;
     if (left <= 0) {
@@ -1653,7 +1648,6 @@ static const CGFloat kCH = 192;
         else if (h > 0) expiryStr = [NSString stringWithFormat:@"Device: %lldh %lldm %llds left", h, m, s];
         else            expiryStr = [NSString stringWithFormat:@"Device: %lldm %llds left", m, s];
     }
-
     self.expiryLabel.textColor = [expiryStr hasPrefix:@"Device: EXPIRED"]
         ? [UIColor colorWithRed:0.9 green:0.3 blue:0.3 alpha:1]
         : [UIColor colorWithRed:0.85 green:0.70 blue:0.20 alpha:1];
@@ -1686,7 +1680,6 @@ static const CGFloat kCH = 192;
             CGRect f = self.frame; f.size.height = kBH + kCH; self.frame = f;
             self.content.alpha = 1;
         } completion:^(BOOL _) {
-            // ── NEW: show first-time tutorial after expand animation ───────
             [self showTutorialIfNeeded];
         }];
     } else {
@@ -1699,7 +1692,6 @@ static const CGFloat kCH = 192;
     }
 }
 
-// ── NEW: trigger tutorial on very first panel open ────────────────────────────
 - (void)showTutorialIfNeeded {
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"SKTutorialV1Shown"]) return;
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"SKTutorialV1Shown"];
@@ -1886,10 +1878,7 @@ static const CGFloat kCH = 192;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - NEW: SKWelcomeNotification
-// Shown after successful key verification (first submit OR saved key re-auth).
-// Shows breadd image (static – not spinning), device name, device ID,
-// key+device expiry with live 1s countdown. Auto-hides after 5s, tap to dismiss.
+// MARK: - SKWelcomeNotification
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKWelcomeNotification : UIView
 + (void)showInView:(UIView *)parent
@@ -1918,13 +1907,10 @@ static const CGFloat kCH = 192;
                         options:UIViewAnimationOptionCurveEaseOut
                      animations:^{ n.alpha = 1; }
                      completion:nil];
-    // Auto-hide after 5 seconds
     n->_autoHideTimer = [NSTimer scheduledTimerWithTimeInterval:5.0
         target:n selector:@selector(dismiss) userInfo:nil repeats:NO];
-    // Live countdown every second
     n->_countdownTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
         target:n selector:@selector(tickCountdown) userInfo:nil repeats:YES];
-    // Tap anywhere to dismiss
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:n action:@selector(dismiss)];
     [n addGestureRecognizer:tap];
@@ -1932,7 +1918,6 @@ static const CGFloat kCH = 192;
 
 - (void)buildUI {
     self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.65];
-
     UIView *card = [UIView new];
     card.backgroundColor     = [UIColor colorWithRed:0.07 green:0.07 blue:0.12 alpha:1];
     card.layer.cornerRadius  = 22;
@@ -1944,7 +1929,6 @@ static const CGFloat kCH = 192;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
-    // ── breadd image (STATIC — no spin) ──────────────────────────────────
     UIImageView *iconView = [UIImageView new];
     iconView.contentMode     = UIViewContentModeScaleAspectFit;
     iconView.layer.cornerRadius = 14;
@@ -1970,7 +1954,6 @@ static const CGFloat kCH = 192;
         }] resume];
     }
 
-    // ── "Hello, {device name}" ────────────────────────────────────────────
     UILabel *greet = [UILabel new];
     NSString *dName = [UIDevice currentDevice].name ?: @"iPhone";
     greet.text          = [NSString stringWithFormat:@"Hello, %@", dName];
@@ -1988,13 +1971,11 @@ static const CGFloat kCH = 192;
     sub.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:sub];
 
-    // ── divider ───────────────────────────────────────────────────────────
     UIView *div1 = [UIView new];
     div1.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
     div1.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:div1];
 
-    // ── Device ID ─────────────────────────────────────────────────────────
     UILabel *devIDTitle = [UILabel new];
     devIDTitle.text          = @"DEVICE ID";
     devIDTitle.textColor     = [UIColor colorWithWhite:0.38 alpha:1];
@@ -2012,13 +1993,11 @@ static const CGFloat kCH = 192;
     devIDVal.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:devIDVal];
 
-    // ── divider ───────────────────────────────────────────────────────────
     UIView *div2 = [UIView new];
     div2.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
     div2.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:div2];
 
-    // ── Key expiry (live countdown) ───────────────────────────────────────
     _keyExpiryLabel = [UILabel new];
     _keyExpiryLabel.textColor     = [UIColor colorWithRed:0.85 green:0.70 blue:0.20 alpha:1];
     _keyExpiryLabel.font          = [UIFont boldSystemFontOfSize:11];
@@ -2027,7 +2006,6 @@ static const CGFloat kCH = 192;
     _keyExpiryLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_keyExpiryLabel];
 
-    // ── Device expiry (live countdown) ────────────────────────────────────
     _devExpiryLabel = [UILabel new];
     _devExpiryLabel.textColor     = [UIColor colorWithRed:0.70 green:0.82 blue:0.95 alpha:1];
     _devExpiryLabel.font          = [UIFont systemFontOfSize:11];
@@ -2036,9 +2014,8 @@ static const CGFloat kCH = 192;
     _devExpiryLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_devExpiryLabel];
 
-    [self tickCountdown]; // set initial text
+    [self tickCountdown];
 
-    // ── hint ──────────────────────────────────────────────────────────────
     UILabel *hint = [UILabel new];
     hint.text          = @"Tap anywhere to continue";
     hint.textColor     = [UIColor colorWithWhite:0.28 alpha:1];
@@ -2051,52 +2028,42 @@ static const CGFloat kCH = 192;
         [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
         [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
         [card.widthAnchor constraintEqualToConstant:290],
-        // icon
         [iconView.topAnchor constraintEqualToAnchor:card.topAnchor constant:24],
         [iconView.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
         [iconView.widthAnchor constraintEqualToConstant:60],
         [iconView.heightAnchor constraintEqualToConstant:60],
-        // greet
         [greet.topAnchor constraintEqualToAnchor:iconView.bottomAnchor constant:12],
         [greet.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [greet.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        // sub
         [sub.topAnchor constraintEqualToAnchor:greet.bottomAnchor constant:4],
         [sub.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [sub.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        // div1
         [div1.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:14],
         [div1.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [div1.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [div1.heightAnchor constraintEqualToConstant:1],
-        // device id title
         [devIDTitle.topAnchor constraintEqualToAnchor:div1.bottomAnchor constant:10],
         [devIDTitle.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [devIDTitle.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        // device id value
         [devIDVal.topAnchor constraintEqualToAnchor:devIDTitle.bottomAnchor constant:4],
         [devIDVal.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [devIDVal.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        // div2
         [div2.topAnchor constraintEqualToAnchor:devIDVal.bottomAnchor constant:12],
         [div2.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [div2.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [div2.heightAnchor constraintEqualToConstant:1],
-        // expiry labels
         [_keyExpiryLabel.topAnchor constraintEqualToAnchor:div2.bottomAnchor constant:10],
         [_keyExpiryLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [_keyExpiryLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
         [_devExpiryLabel.topAnchor constraintEqualToAnchor:_keyExpiryLabel.bottomAnchor constant:6],
         [_devExpiryLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
         [_devExpiryLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        // hint
         [hint.topAnchor constraintEqualToAnchor:_devExpiryLabel.bottomAnchor constant:14],
         [hint.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
         [card.bottomAnchor constraintEqualToAnchor:hint.bottomAnchor constant:20],
     ]];
 }
 
-// ── Live countdown helper ─────────────────────────────────────────────────────
 - (NSString *)countdownFrom:(NSTimeInterval)exp label:(NSString *)label emoji:(NSString *)emoji {
     if (exp <= 0) return @"";
     NSTimeInterval left = exp - [[NSDate date] timeIntervalSince1970];
@@ -2132,13 +2099,11 @@ static const CGFloat kCH = 192;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - NEW: SKTutorialSpotlightView
-// Custom view that dims the screen while cutting a "spotlight" hole over the
-// target element, and draws a dashed pointer line toward the tooltip card.
+// MARK: - SKTutorialSpotlightView
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKTutorialSpotlightView : UIView
 @property (nonatomic, assign) CGRect    spotRect;
-@property (nonatomic, assign) CGPoint   lineEnd;   // where the line should end (tooltip edge)
+@property (nonatomic, assign) CGPoint   lineEnd;
 @property (nonatomic, assign) BOOL      lineVisible;
 - (void)animateToSpot:(CGRect)newSpot lineEnd:(CGPoint)lp completion:(void(^)(void))done;
 @end
@@ -2150,17 +2115,17 @@ static const CGFloat kCH = 192;
     if (!self) return nil;
     self.backgroundColor = [UIColor clearColor];
     self.opaque = NO;
+    // ── FIX: spotlight layer should NOT consume touches in the tooltip area ──
+    // We override hitTest instead to let _tooltipCard get touches.
     return self;
 }
 
 - (void)drawRect:(CGRect)rect {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
-    // Draw dim overlay
     [[UIColor colorWithWhite:0 alpha:0.72] setFill];
     CGContextFillRect(ctx, self.bounds);
 
     if (!CGRectIsEmpty(_spotRect)) {
-        // Cut spotlight hole
         CGRect padded = CGRectInset(_spotRect, -10, -10);
         CGContextSetBlendMode(ctx, kCGBlendModeClear);
         UIBezierPath *hole = [UIBezierPath bezierPathWithRoundedRect:padded cornerRadius:14];
@@ -2169,8 +2134,6 @@ static const CGFloat kCH = 192;
         CGContextFillPath(ctx);
         CGContextSetBlendMode(ctx, kCGBlendModeNormal);
 
-        // Draw glowing border around spotlight
-        CGContextSetBlendMode(ctx, kCGBlendModeNormal);
         UIBezierPath *border = [UIBezierPath bezierPathWithRoundedRect:padded cornerRadius:14];
         CGContextAddPath(ctx, border.CGPath);
         [[UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.85] setStroke];
@@ -2179,10 +2142,8 @@ static const CGFloat kCH = 192;
         CGContextSetLineDash(ctx, 0, dashes, 2);
         CGContextStrokePath(ctx);
 
-        // Draw pointer line from spotlight edge toward tooltip
         if (_lineVisible && !CGPointEqualToPoint(_lineEnd, CGPointZero)) {
             CGPoint spotCenter = CGPointMake(CGRectGetMidX(padded), CGRectGetMidY(padded));
-            // Find nearest edge point of spotlight rect toward lineEnd
             CGPoint from = spotCenter;
             CGFloat dx = _lineEnd.x - spotCenter.x;
             CGFloat dy = _lineEnd.y - spotCenter.y;
@@ -2204,7 +2165,6 @@ static const CGFloat kCH = 192;
             CGContextAddLineToPoint(ctx, _lineEnd.x, _lineEnd.y);
             CGContextStrokePath(ctx);
 
-            // Arrowhead at lineEnd
             CGContextSetLineDash(ctx, 0, NULL, 0);
             CGFloat arrowSize = 7.0;
             CGFloat angle = atan2(dy, dx);
@@ -2237,17 +2197,34 @@ static const CGFloat kCH = 192;
         if (done) done();
     }];
 }
+
+// ── FIX: Pass touches through the spotlight so the tooltip card (sibling)
+//         can receive them. We never consume touches ourselves — the parent
+//         SKTutorialOverlay forwards them to the correct subview.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    return nil; // transparent to touches — parent handles routing
+}
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - NEW: SKTutorialOverlay
-// Step-by-step guide shown the very first time the user opens the panel.
-// Steps: Upload → Load → Settings → Auto Rij → Auto Detect UID → Auto Close
-// Each step highlights the target with a spotlight + dashed line + tooltip card.
+// MARK: - SKTutorialOverlay
+//
+// FIX SUMMARY (v11.5):
+//   1. Added to the key UIWindow directly (not the VC view), so it always
+//      renders above SKPanel (zPosition 9999) and SKSettingsMenu.
+//   2. layer.zPosition = 1000000 as extra insurance.
+//   3. Settings menu spawned by the tutorial is added to the WINDOW too,
+//      then the tutorial is immediately re-raised on top.
+//   4. SKTutorialSpotlightView returns nil from hitTest — it never blocks
+//      touches from reaching the _tooltipCard Continue button.
+//   5. hitTest on SKTutorialOverlay itself routes touches: if the point
+//      is inside _tooltipCard, deliver to _tooltipCard; otherwise swallow
+//      (blocks accidental taps on the settings menu and panel below).
 // ─────────────────────────────────────────────────────────────────────────────
 @implementation SKTutorialOverlay {
     SKPanel                  *_panel;
-    UIView                   *_parent;
+    UIView                   *_parent;           // original VC view (for coordinate conversion)
+    UIWindow                 *_hostWindow;        // window we're added to
     SKTutorialSpotlightView  *_spotlight;
     UIView                   *_tooltipCard;
     UILabel                  *_stepLabel;
@@ -2259,12 +2236,22 @@ static const CGFloat kCH = 192;
     SKSettingsMenu           *_settingsMenu;
 }
 
+// ── FIX 1: Attach to key window so we're above everything ────────────────────
 + (void)showForPanel:(SKPanel *)panel inView:(UIView *)parent {
-    SKTutorialOverlay *o = [[SKTutorialOverlay alloc] initWithFrame:parent.bounds];
+    // Find the key window to host the tutorial
+    UIWindow *hostWindow = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator)
+        if (!w.isHidden && w.alpha > 0) { hostWindow = w; break; }
+    UIView *container = hostWindow ?: parent;
+
+    SKTutorialOverlay *o = [[SKTutorialOverlay alloc] initWithFrame:container.bounds];
     o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    o->_panel  = panel;
-    o->_parent = parent;
-    [parent addSubview:o];
+    o->_panel       = panel;
+    o->_parent      = parent;       // keep VC view reference for coordinate mapping
+    o->_hostWindow  = hostWindow;
+    // ── FIX 2: Enormous zPosition so we're above SKPanel (9999) ──────────
+    o.layer.zPosition = 1000000;
+    [container addSubview:o];
     o.alpha = 0;
     [UIView animateWithDuration:0.25 animations:^{ o.alpha = 1; }
                      completion:^(BOOL _){ [o setupStepsAndStart]; }];
@@ -2274,13 +2261,13 @@ static const CGFloat kCH = 192;
     self = [super initWithFrame:f];
     if (!self) return nil;
     self.backgroundColor = [UIColor clearColor];
+    self.userInteractionEnabled = YES;
 
-    // Spotlight layer (fills self)
     _spotlight = [[SKTutorialSpotlightView alloc] initWithFrame:self.bounds];
     _spotlight.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _spotlight.userInteractionEnabled = NO; // ── FIX 4: never blocks touches
     [self addSubview:_spotlight];
 
-    // Tooltip card
     _tooltipCard = [UIView new];
     _tooltipCard.backgroundColor    = [UIColor colorWithRed:0.06 green:0.08 blue:0.13 alpha:0.98];
     _tooltipCard.layer.cornerRadius = 16;
@@ -2291,9 +2278,9 @@ static const CGFloat kCH = 192;
     _tooltipCard.layer.borderColor   = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.30].CGColor;
     _tooltipCard.layer.borderWidth   = 1;
     _tooltipCard.translatesAutoresizingMaskIntoConstraints = NO;
+    _tooltipCard.userInteractionEnabled = YES;
     [self addSubview:_tooltipCard];
 
-    // Step badge
     _stepLabel = [UILabel new];
     _stepLabel.textColor  = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.70];
     _stepLabel.font       = [UIFont boldSystemFontOfSize:10];
@@ -2301,7 +2288,6 @@ static const CGFloat kCH = 192;
     _stepLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_stepLabel];
 
-    // Title
     _titleLabel = [UILabel new];
     _titleLabel.textColor  = [UIColor whiteColor];
     _titleLabel.font       = [UIFont boldSystemFontOfSize:15];
@@ -2309,7 +2295,6 @@ static const CGFloat kCH = 192;
     _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_titleLabel];
 
-    // Description
     _descLabel = [UILabel new];
     _descLabel.textColor  = [UIColor colorWithWhite:0.72 alpha:1];
     _descLabel.font       = [UIFont systemFontOfSize:12];
@@ -2317,13 +2302,11 @@ static const CGFloat kCH = 192;
     _descLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_descLabel];
 
-    // Continue button
     _continueBtn = makeSymBtn(@"Continue", @"arrow.right.circle",
         [UIColor colorWithRed:0.14 green:0.52 blue:0.28 alpha:1], @selector(tapContinue), self);
     _continueBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [_tooltipCard addSubview:_continueBtn];
 
-    // Tooltip constraints — fixed width, positioned dynamically via frame
     [NSLayoutConstraint activateConstraints:@[
         [_stepLabel.topAnchor constraintEqualToAnchor:_tooltipCard.topAnchor constant:14],
         [_stepLabel.leadingAnchor constraintEqualToAnchor:_tooltipCard.leadingAnchor constant:16],
@@ -2344,7 +2327,16 @@ static const CGFloat kCH = 192;
     return self;
 }
 
-// ── Build step data ──────────────────────────────────────────────────────────
+// ── FIX 5: Smart hit-test — route to tooltip card, block everything else ─────
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // Let the tooltip card (and its Continue button) receive touches
+    UIView *cardHit = [_tooltipCard hitTest:[self convertPoint:point toView:_tooltipCard]
+                                  withEvent:event];
+    if (cardHit) return cardHit;
+    // Swallow all other touches (prevents tapping through to settings/panel)
+    return self;
+}
+
 - (void)setupStepsAndStart {
     _steps = @[
         @{
@@ -2382,7 +2374,6 @@ static const CGFloat kCH = 192;
     [self advance];
 }
 
-// ── Advance to next step ─────────────────────────────────────────────────────
 - (void)advance {
     _stepIndex++;
     if (_stepIndex >= (NSInteger)_steps.count) {
@@ -2393,10 +2384,13 @@ static const CGFloat kCH = 192;
     NSDictionary *step = _steps[_stepIndex];
     NSString *target   = step[@"target"];
 
-    // Open settings menu for steps 3-5
+    // Open settings menu for settings-related steps (index 3-5)
     if (_stepIndex == 3 && !_settingsMenu) {
-        _settingsMenu = [SKSettingsMenu showInView:_parent];
-        // Wait for settings to animate in
+        // ── FIX 3a: Add settings menu to the SAME window as us ───────────
+        UIView *menuHost = _hostWindow ?: _parent;
+        _settingsMenu = [SKSettingsMenu showInView:menuHost];
+        // ── FIX 3b: Re-raise tutorial overlay so it stays above the menu ─
+        [self.superview bringSubviewToFront:self];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{ [self showStep:step target:target]; });
         return;
@@ -2412,16 +2406,13 @@ static const CGFloat kCH = 192;
     _titleLabel.text = step[@"title"];
     _descLabel.text  = step[@"desc"];
 
-    // Update continue button title on last step
     BOOL isLast = _stepIndex == (NSInteger)_steps.count - 1;
     [_continueBtn setTitle:isLast ? @"  Done ✓" : @"  Continue" forState:UIControlStateNormal];
 
-    // Layout tooltip first pass (need size before placing)
     [self setNeedsLayout];
     [self layoutIfNeeded];
     CGSize cardSize = [_tooltipCard systemLayoutSizeFittingSize:UILayoutFittingCompressedSize];
 
-    // Position tooltip: below target if target is in top 55%, else above
     CGFloat screenH = self.bounds.size.height;
     CGFloat pad = 16;
     CGFloat cardH = cardSize.height;
@@ -2435,15 +2426,10 @@ static const CGFloat kCH = 192;
         cardY = CGRectGetMinY(spotRect) - cardH - 28;
     }
     cardY = MAX(pad, MIN(screenH - cardH - pad, cardY));
-    // Always position tooltip on LEFT side of spotlight
+
     CGFloat cardX = CGRectGetMinX(spotRect) - cardW - 24;
+    if (cardX < pad) cardX = pad;
 
-// Prevent going off-screen (hard clamp to left padding)
-    if (cardX < pad) {
-        cardX = pad;
-    }
-
-    // Animate tooltip card repositioning
     [UIView animateWithDuration:0.22 delay:0
                         options:UIViewAnimationOptionCurveEaseInOut
                      animations:^{
@@ -2451,15 +2437,13 @@ static const CGFloat kCH = 192;
         self->_tooltipCard.alpha = 1;
     } completion:nil];
 
-    // Line endpoint = nearest edge of tooltip card to the spotlight
     CGRect cardFrame = CGRectMake(cardX, cardY, cardW, cardH);
     CGPoint lineEnd  = [self nearestEdgeOfRect:cardFrame toRect:spotRect];
-
     [_spotlight animateToSpot:spotRect lineEnd:lineEnd completion:nil];
 }
 
-// ── Geometry helpers ─────────────────────────────────────────────────────────
 - (CGRect)rectForTarget:(NSString *)target {
+    // All coordinate conversions go toView:self (which is now window-level)
     if ([target isEqualToString:@"upload"] && _panel.uploadBtn) {
         return [_panel.uploadBtn convertRect:_panel.uploadBtn.bounds toView:self];
     }
@@ -2478,16 +2462,13 @@ static const CGFloat kCH = 192;
     if ([target isEqualToString:@"close"] && _settingsMenu && _settingsMenu.tutCloseRow) {
         return [_settingsMenu.tutCloseRow convertRect:_settingsMenu.tutCloseRow.bounds toView:self];
     }
-    // Fallback: centre of screen
     return CGRectMake(self.bounds.size.width/2 - 60, self.bounds.size.height/2 - 20, 120, 40);
 }
 
 - (CGPoint)nearestEdgeOfRect:(CGRect)card toRect:(CGRect)spot {
     CGPoint spotC = CGPointMake(CGRectGetMidX(spot), CGRectGetMidY(spot));
-    // Clamp to card edges
     CGFloat cx = MAX(CGRectGetMinX(card), MIN(CGRectGetMaxX(card), spotC.x));
     CGFloat cy = MAX(CGRectGetMinY(card), MIN(CGRectGetMaxY(card), spotC.y));
-    // Snap to closest edge
     CGFloat dl = fabs(cx - CGRectGetMinX(card));
     CGFloat dr = fabs(cx - CGRectGetMaxX(card));
     CGFloat dt = fabs(cy - CGRectGetMinY(card));
@@ -2500,13 +2481,11 @@ static const CGFloat kCH = 192;
 }
 
 - (void)tapContinue {
-    // Animate tooltip out before advance
     [UIView animateWithDuration:0.12 animations:^{ self->_tooltipCard.alpha = 0; }
                      completion:^(BOOL _){ [self advance]; }];
 }
 
 - (void)finishTutorial {
-    // Dismiss settings menu if it was opened by tutorial
     if (_settingsMenu) { [_settingsMenu dismiss]; _settingsMenu = nil; }
     [UIView animateWithDuration:0.22 animations:^{ self.alpha = 0; }
                      completion:^(BOOL _){ [self removeFromSuperview]; }];
@@ -2514,8 +2493,7 @@ static const CGFloat kCH = 192;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - NEW: showWelcomeIfNeeded
-// Called once per session after auth succeeds to show the welcome card.
+// MARK: - showWelcomeIfNeeded
 // ─────────────────────────────────────────────────────────────────────────────
 static void showWelcomeIfNeeded(UIView *parent) {
     if (gWelcomeShownThisSession) return;
@@ -2530,12 +2508,11 @@ static void showWelcomeIfNeeded(UIView *parent) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Injection
-// Panel is NEVER created or shown until auth fully succeeds.
 // ─────────────────────────────────────────────────────────────────────────────
 static SKPanel *gPanel = nil;
 
 static void showMainPanel(UIView *root) {
-    initDefaultSettings(); // ── NEW: ensure autoRij default is set
+    initDefaultSettings();
     if (gPanel) return;
     gPanel = [SKPanel new];
     gPanel.center = CGPointMake(root.bounds.size.width - gPanel.bounds.size.width/2 - 10, 88);
@@ -2551,7 +2528,6 @@ static void showMainPanel(UIView *root) {
         gPanel.alpha = 1;
         gPanel.transform = CGAffineTransformIdentity;
     } completion:^(BOOL _) {
-        // ── NEW: show welcome notification after panel appears ────────────
         showWelcomeIfNeeded(root);
     }];
 }
@@ -2581,7 +2557,7 @@ static void injectPanel(void) {
 
             if (ok) {
                 gDeviceExpiry = devExpiry;
-                gKeyExpiry    = keyExpiry; // ── NEW
+                gKeyExpiry    = keyExpiry;
                 saveDeviceExpiryLocally(devExpiry);
                 showMainPanel(root);
             } else {
