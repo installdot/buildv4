@@ -1,4 +1,4 @@
-// Tweak.xm  (or FakeUDID.xm)
+// Tweak.xm  (copy-paste this entire file — 100% fixed)
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <stdlib.h>
@@ -23,21 +23,26 @@ static uint8_t const kSuffix[kSuffixLength] = {
 static NSString *kPrefsFile = @"/var/mobile/Library/Preferences/com.bao.fakeudid.plist";
 static NSString *currentCustomUDID = nil;
 
-// Modern safe keyWindow (no deprecation)
+// FIXED: Modern keyWindow with pragma to silence -Wdeprecated-declarations under -Werror
 static UIWindow *getKeyWindow(void) {
-    UIWindow *keyWindow = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]] &&
                 scene.activationState == UISceneActivationStateForegroundActive) {
-                keyWindow = ((UIWindowScene *)scene).windows.firstObject;
-                if (keyWindow) break;
+                UIWindowScene *windowScene = (UIWindowScene *)scene;
+                for (UIWindow *w in windowScene.windows) {
+                    if (w.isKeyWindow) return w;
+                }
+                return windowScene.windows.firstObject;
             }
         }
+        return nil;
     } else {
-        keyWindow = [[UIApplication sharedApplication] keyWindow];
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        return [[UIApplication sharedApplication] keyWindow];
+        #pragma clang diagnostic pop
     }
-    return keyWindow;
 }
 
 static NSString *generateRandomUDID(void) {
