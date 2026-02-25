@@ -2436,18 +2436,13 @@ static const CGFloat kCH = 192;
         cardY = CGRectGetMinY(spotRect) - cardH - 28;
     }
     cardY = MAX(pad, MIN(screenH - cardH - pad, cardY));
-    CGFloat cardX;
+    // Always position tooltip on LEFT side of spotlight
+    CGFloat cardX = CGRectGetMinX(spotRect) - cardW - 24;
 
-// Try to place tooltip on LEFT of spotlight
-    cardX = CGRectGetMinX(spotRect) - cardW - 24;
-
-// If not enough space on the left, fallback to right side
+// Prevent going off-screen (hard clamp to left padding)
     if (cardX < pad) {
-        cardX = CGRectGetMaxX(spotRect) + 24;
+        cardX = pad;
     }
-
-// Final safety clamp
-    cardX = MAX(pad, MIN(screenW - cardW - pad, cardX));
 
     // Animate tooltip card repositioning
     [UIView animateWithDuration:0.22 delay:0
