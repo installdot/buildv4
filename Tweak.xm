@@ -1485,7 +1485,10 @@ static const CGFloat kSWScale = 0.75f;
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Forward declarations
 // ─────────────────────────────────────────────────────────────────────────────
-@class SKTutorialOverlay;
+@class SKPanel;
+@interface SKTutorialOverlay : UIView
++ (void)showForPanel:(SKPanel *)panel inView:(UIView *)parent;
+@end
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKPanel
@@ -2255,10 +2258,6 @@ static const CGFloat kCH = 192;
 // Steps: Upload → Load → Settings → Auto Rij → Auto Detect UID → Auto Close
 // Each step highlights the target with a spotlight + dashed line + tooltip card.
 // ─────────────────────────────────────────────────────────────────────────────
-@interface SKTutorialOverlay : UIView
-+ (void)showForPanel:(SKPanel *)panel inView:(UIView *)parent;
-@end
-
 @implementation SKTutorialOverlay {
     SKPanel                  *_panel;
     UIView                   *_parent;
