@@ -1,40 +1,39 @@
 // Tweak.xm
+#import <Foundation/Foundation.h>
 #include <substrate.h>
 #include <CommonCrypto/CommonCryptor.h>
 #include <stdio.h>
-#include <time.h>
 
 static void logToFile(NSString *message) {
     NSString *docPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/CCCryptLog.txt"];
     NSFileManager *fm = [NSFileManager defaultManager];
-    
+
     if (![fm fileExistsAtPath:docPath]) {
         [fm createFileAtPath:docPath contents:nil attributes:nil];
     }
-    
+
     NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:docPath];
     [handle seekToEndOfFile];
-    
-    NSString *timestamped = [NSString stringWithFormat:@"[%@] %@\n",
-        [NSDateFormatter localizedStringFromDate:[NSDate date]
-            dateStyle:NSDateFormatterShortStyle
-            timeStyle:NSDateFormatterMediumStyle],
-        message];
-    
-    [handle writeData:[timestamped dataUsingEncoding:NSUTF8StringEncoding]];
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    [fmt setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
+    NSString *timestamp = [fmt stringFromDate:[NSDate date]];
+
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", timestamp, message];
+    [handle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
     [handle closeFile];
 }
 
 static NSString *algorithmName(CCAlgorithm alg) {
     switch (alg) {
-        case kCCAlgorithmAES:       return @"AES";
-        case kCCAlgorithmDES:       return @"DES";
-        case kCCAlgorithm3DES:      return @"3DES";
-        case kCCAlgorithmCAST:      return @"CAST";
-        case kCCAlgorithmRC4:       return @"RC4";
-        case kCCAlgorithmRC2:       return @"RC2";
-        case kCCAlgorithmBlowfish:  return @"Blowfish";
-        default:                    return [NSString stringWithFormat:@"Unknown(%u)", alg];
+        case kCCAlgorithmAES:      return @"AES";
+        case kCCAlgorithmDES:      return @"DES";
+        case kCCAlgorithm3DES:     return @"3DES";
+        case kCCAlgorithmCAST:     return @"CAST";
+        case kCCAlgorithmRC4:      return @"RC4";
+        case kCCAlgorithmRC2:      return @"RC2";
+        case kCCAlgorithmBlowfish: return @"Blowfish";
+        default:                   return [NSString stringWithFormat:@"Unknown(%u)", (unsigned)alg];
     }
 }
 
@@ -46,7 +45,7 @@ static NSString *bytesToHex(const void *bytes, size_t len) {
     if (!bytes || len == 0) return @"<nil>";
     NSMutableString *hex = [NSMutableString stringWithCapacity:len * 2];
     const uint8_t *b = (const uint8_t *)bytes;
-    size_t display = MIN(len, 32); // cap at 32 bytes to avoid huge logs
+    size_t display = len < 32 ? len : 32;
     for (size_t i = 0; i < display; i++) {
         [hex appendFormat:@"%02x", b[i]];
     }
@@ -54,7 +53,8 @@ static NSString *bytesToHex(const void *bytes, size_t len) {
     return hex;
 }
 
-// Hook CCCrypt (one-shot)
+// ── CCCrypt (one-shot) ────────────────────────────────────────────────────────
+
 static CCCryptorStatus (*orig_CCCrypt)(
     CCOperation op, CCAlgorithm alg, CCOptions opts,
     const void *key, size_t keyLen,
@@ -75,21 +75,21 @@ static CCCryptorStatus replaced_CCCrypt(
     CCCryptorStatus result = orig_CCCrypt(op, alg, opts, key, keyLen, iv,
                                           dataIn, dataInLen, dataOut, dataOutAvail, dataOutMoved);
 
+    size_t outLen = (dataOutMoved) ? *dataOutMoved : 0;
+
     NSString *log = [NSString stringWithFormat:
         @"CCCrypt | Op: %@ | Algo: %@ | Opts: 0x%X\n"
-         "  Key  (%zu): %@\n"
-         "  IV        : %@\n"
-         "  Input (%zu): %@\n"
-         "  Output(%zu): %@\n"
-         "  Status: %d",
-        operationName(op),
-        algorithmName(alg),
-        (unsigned)opts,
-        keyLen,    bytesToHex(key, keyLen),
-        bytesToHex(iv, 16),
+         "  Key    (%zu bytes): %@\n"
+         "  IV              : %@\n"
+         "  Input  (%zu bytes): %@\n"
+         "  Output (%zu bytes): %@\n"
+         "  Status: %d\n"
+         "----------------------------------------",
+        operationName(op), algorithmName(alg), (unsigned)opts,
+        keyLen,  bytesToHex(key, keyLen),
+                 bytesToHex(iv, 16),
         dataInLen, bytesToHex(dataIn, dataInLen),
-        dataOutMoved ? *dataOutMoved : 0,
-        bytesToHex(dataOut, dataOutMoved ? *dataOutMoved : 0),
+        outLen,    bytesToHex(dataOut, outLen),
         result
     ];
 
@@ -97,7 +97,8 @@ static CCCryptorStatus replaced_CCCrypt(
     return result;
 }
 
-// Hook CCCryptorCreate (streaming)
+// ── CCCryptorCreate (streaming init) ─────────────────────────────────────────
+
 static CCCryptorStatus (*orig_CCCryptorCreate)(
     CCOperation op, CCAlgorithm alg, CCOptions opts,
     const void *key, size_t keyLen,
@@ -113,14 +114,13 @@ static CCCryptorStatus replaced_CCCryptorCreate(
 
     NSString *log = [NSString stringWithFormat:
         @"CCCryptorCreate | Op: %@ | Algo: %@ | Opts: 0x%X\n"
-         "  Key (%zu): %@\n"
-         "  IV       : %@\n"
-         "  Status: %d",
-        operationName(op),
-        algorithmName(alg),
-        (unsigned)opts,
+         "  Key (%zu bytes): %@\n"
+         "  IV            : %@\n"
+         "  Status: %d\n"
+         "----------------------------------------",
+        operationName(op), algorithmName(alg), (unsigned)opts,
         keyLen, bytesToHex(key, keyLen),
-        bytesToHex(iv, 16),
+                bytesToHex(iv, 16),
         result
     ];
 
@@ -128,10 +128,16 @@ static CCCryptorStatus replaced_CCCryptorCreate(
     return result;
 }
 
+// ── Constructor ───────────────────────────────────────────────────────────────
+
 %ctor {
-    // Use MSHookFunction for C functions
-    MSHookFunction((void *)CCCrypt,          (void *)replaced_CCCrypt,          (void **)&orig_CCCrypt);
-    MSHookFunction((void *)CCCryptorCreate,  (void *)replaced_CCCryptorCreate,  (void **)&orig_CCCryptorCreate);
+    MSHookFunction((void *)CCCrypt,
+                   (void *)replaced_CCCrypt,
+                   (void **)&orig_CCCrypt);
+
+    MSHookFunction((void *)CCCryptorCreate,
+                   (void *)replaced_CCCryptorCreate,
+                   (void **)&orig_CCCryptorCreate);
 
     logToFile(@"=== CCCrypt Hook Loaded ===");
 }
