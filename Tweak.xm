@@ -1,4 +1,3 @@
-// Tweak.xm
 #import <Foundation/Foundation.h>
 #include <substrate.h>
 #include <CommonCrypto/CommonCryptor.h>
@@ -6,7 +5,6 @@
 #include <time.h>
 #include <pthread.h>
 
-// ── Reentrancy guard (per-thread) ─────────────────────────────────────────────
 static pthread_key_t sInHookKey;
 static pthread_once_t sOnce = PTHREAD_ONCE_INIT;
 
@@ -24,29 +22,23 @@ static void setInHook(int val) {
     pthread_setspecific(sInHookKey, (void *)(uintptr_t)val);
 }
 
-// ── Pure-C logger (no Foundation, no CCCrypt re-entry risk) ───────────────────
 static void logToFile(const char *msg) {
-    // Resolve path once
     static char logPath[1024] = {0};
     if (logPath[0] == '\0') {
         NSString *home = NSHomeDirectory();
         snprintf(logPath, sizeof(logPath), "%s/Documents/CCCryptLog.txt",
                  [home UTF8String]);
     }
-
     FILE *f = fopen(logPath, "a");
     if (!f) return;
-
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
     fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-            t->tm_hour, t->tm_min, t->tm_sec,
-            msg);
+            t->tm_hour, t->tm_min, t->tm_sec, msg);
     fclose(f);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 static void bytesToHexBuf(const void *bytes, size_t len, char *out, size_t outSize) {
     if (!bytes || len == 0) { snprintf(out, outSize, "<nil>"); return; }
     size_t display = len < 32 ? len : 32;
@@ -73,7 +65,6 @@ static const char *algoName(CCAlgorithm a) {
     }
 }
 
-// ── CCCrypt hook ──────────────────────────────────────────────────────────────
 static CCCryptorStatus (*orig_CCCrypt)(
     CCOperation, CCAlgorithm, CCOptions,
     const void *, size_t,
@@ -90,13 +81,10 @@ static CCCryptorStatus replaced_CCCrypt(
     void *dataOut,      size_t dataOutAvail,
     size_t *dataOutMoved
 ) {
-    // Call original FIRST, before any logging
     CCCryptorStatus result = orig_CCCrypt(op, alg, opts,
                                           key, keyLen, iv,
                                           dataIn, dataInLen,
                                           dataOut, dataOutAvail, dataOutMoved);
-
-    // Guard against re-entrant logging
     if (isInHook()) return result;
     setInHook(1);
 
@@ -105,10 +93,10 @@ static CCCryptorStatus replaced_CCCrypt(
     char inHex[80]   = {0};
     char outHex[80]  = {0};
 
-    bytesToHexBuf(key,     keyLen,                          keyHex,  sizeof(keyHex));
-    bytesToHexBuf(iv,      iv ? 16 : 0,                     ivHex,   sizeof(ivHex));
-    bytesToHexBuf(dataIn,  dataInLen,                        inHex,   sizeof(inHex));
-    bytesToHexBuf(dataOut, dataOutMoved ? *dataOutMoved : 0, outHex,  sizeof(outHex));
+    bytesToHexBuf(key,     keyLen,                           keyHex,  sizeof(keyHex));
+    bytesToHexBuf(iv,      iv ? 16 : 0,                      ivHex,   sizeof(ivHex));
+    bytesToHexBuf(dataIn,  dataInLen,                         inHex,   sizeof(inHex));
+    bytesToHexBuf(dataOut, dataOutMoved ? *dataOutMoved : 0,  outHex,  sizeof(outHex));
 
     char buf[1024];
     snprintf(buf, sizeof(buf),
@@ -125,15 +113,13 @@ static CCCryptorStatus replaced_CCCrypt(
                  ivHex,
         dataInLen, inHex,
         dataOutMoved ? *dataOutMoved : 0, outHex,
-        result
-    );
+        result);
 
     logToFile(buf);
     setInHook(0);
     return result;
 }
 
-// ── CCCryptorCreate hook ──────────────────────────────────────────────────────
 static CCCryptorStatus (*orig_CCCryptorCreate)(
     CCOperation, CCAlgorithm, CCOptions,
     const void *, size_t,
@@ -152,8 +138,8 @@ static CCCryptorStatus replaced_CCCryptorCreate(
 
     char keyHex[80] = {0};
     char ivHex[80]  = {0};
-    bytesToHexBuf(key, keyLen,         keyHex, sizeof(keyHex));
-    bytesToHexBuf(iv,  iv ? 16 : 0,    ivHex,  sizeof(ivHex));
+    bytesToHexBuf(key, keyLen,       keyHex, sizeof(keyHex));
+    bytesToHexBuf(iv,  iv ? 16 : 0,  ivHex,  sizeof(ivHex));
 
     char buf[512];
     snprintf(buf, sizeof(buf),
@@ -165,15 +151,13 @@ static CCCryptorStatus replaced_CCCryptorCreate(
         (op == kCCEncrypt) ? "Encrypt" : "Decrypt",
         algoName(alg), (unsigned)opts,
         keyLen, keyHex, ivHex,
-        result
-    );
+        result);
 
     logToFile(buf);
     setInHook(0);
     return result;
 }
 
-// ── Constructor ───────────────────────────────────────────────────────────────
 %ctor {
     MSHookFunction((void *)CCCrypt,
                    (void *)replaced_CCCrypt,
@@ -185,17 +169,3 @@ static CCCryptorStatus replaced_CCCryptorCreate(
 
     logToFile("=== CCCrypt Hook Loaded ===");
 }
-```
-
----
-
-**Why it crashed and what was fixed:**
-
-The crash was **infinite recursion**. The call chain was:
-```
-App calls CCCrypt
-  → replaced_CCCrypt fires
-    → logToFile calls NSFileHandle/NSFileManager
-      → Foundation internally calls CCCrypt for crypto ops
-        → replaced_CCCrypt fires again
-          → ... → stack overflow → SIGABRT
