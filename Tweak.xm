@@ -545,33 +545,40 @@ static void startSpinAnimation(CALayer *layer) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKUDIDEnrollOverlay
-// FIX: Added to UIWindow directly so game engine can't eat touches.
-//      userInteractionEnabled = YES explicitly set.
-//      bringSubviewToFront called after addSubview.
+// REWRITE: Compact frame-based panel, same architecture as SKPanel.
+// ROOT CAUSE of old broken buttons: the full-screen UIView with dark
+// backgroundColor intercepted ALL game-engine touch events before UIKit
+// could route them to any subview. Fix: the view IS the card — no wrapper.
+// Pure CGRect frame layout (zero Auto Layout), added directly to UIWindow.
+// Key auth does NOT start until UDID confirmed in the completion block.
 // ─────────────────────────────────────────────────────────────────────────────
+static const CGFloat kEW = 258;   // enroll panel width (matches SKPanel kPW)
+
 @interface SKUDIDEnrollOverlay : UIView
-+ (instancetype)showInView:(UIView *)parent completion:(void (^)(NSString *udid))completion;
++ (instancetype)showInWindow:(UIWindow *)win completion:(void (^)(NSString *udid))completion;
 @end
 
 @implementation SKUDIDEnrollOverlay {
-    NSString        *_enrollToken;
-    UILabel         *_statusLabel;
-    UILabel         *_stepLabel;
-    UIButton        *_openSafariBtn;
-    UIButton        *_pollBtn;
-    UIActivityIndicatorView *_spinner;
-    BOOL             _polling;
+    NSString                 *_enrollToken;
+    UILabel                  *_statusLabel;
+    UIButton                 *_openSafariBtn;
+    UIButton                 *_pollBtn;
+    UIActivityIndicatorView  *_spinner;
+    BOOL                      _polling;
     void (^_completion)(NSString *);
 }
 
-+ (instancetype)showInView:(UIView *)parent completion:(void (^)(NSString *))completion {
-    SKUDIDEnrollOverlay *o = [[SKUDIDEnrollOverlay alloc] initWithFrame:parent.bounds];
-    o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    // FIX: explicitly enable interaction so game view doesn't swallow touches
-    o.userInteractionEnabled = YES;
++ (instancetype)showInWindow:(UIWindow *)win completion:(void (^)(NSString *))completion {
+    // Fixed height computed from content rows below
+    CGFloat h  = 44+1+8+66+4+28+4+20+6+42+6+36+10;  // = 275
+    CGFloat cx = win.bounds.size.width  / 2;
+    CGFloat cy = win.bounds.size.height / 2;
+    CGRect  f  = CGRectMake(cx - kEW/2, cy - h/2, kEW, h);
+    SKUDIDEnrollOverlay *o = [[SKUDIDEnrollOverlay alloc] initWithFrame:f];
     o->_completion = [completion copy];
-    [parent addSubview:o];
-    [parent bringSubviewToFront:o];
+    o.layer.zPosition = 9999;
+    [win addSubview:o];
+    [win bringSubviewToFront:o];
     o.alpha = 0;
     [UIView animateWithDuration:0.25 animations:^{ o.alpha = 1; }];
     return o;
@@ -580,158 +587,134 @@ static void startSpinAnimation(CALayer *layer) {
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
     if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.90];
-    self.userInteractionEnabled = YES;
 
     _enrollToken = loadEnrollToken();
     if (!_enrollToken.length) _enrollToken = newEnrollToken();
 
-    [self buildUI];
+    // The view IS the panel card — no full-screen wrapper at all.
+    self.backgroundColor    = [UIColor colorWithRed:0.06 green:0.06 blue:0.09 alpha:0.97];
+    self.layer.cornerRadius = 13;
+    self.layer.shadowColor  = [UIColor blackColor].CGColor;
+    self.layer.shadowOpacity = 0.86;
+    self.layer.shadowRadius  = 12;
+    self.layer.shadowOffset  = CGSizeMake(0, 4);
+    self.clipsToBounds       = NO;
 
-    if (loadEnrollToken().length) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), ^{ [self startPolling]; });
-    }
+    [self buildUI];
     return self;
 }
 
+// Frame-based button builder — identical pattern to SKPanel -btn:symName:color:frame:action:
+- (UIButton *)enrollBtn:(NSString *)title symName:(NSString *)sName
+                  color:(UIColor *)c frame:(CGRect)fr action:(SEL)s {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame              = fr;
+    b.backgroundColor    = c;
+    b.layer.cornerRadius = 9;
+    b.clipsToBounds      = YES;
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightMedium];
+    UIImage *img = [[UIImage systemImageNamed:sName withConfiguration:cfg]
+        imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    [b setImage:img forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    [b setTitle:[NSString stringWithFormat:@"  %@", title] forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor]                  forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor colorWithWhite:0.70 alpha:1] forState:UIControlStateHighlighted];
+    [b setTitleColor:[UIColor colorWithWhite:0.35 alpha:1] forState:UIControlStateDisabled];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
 - (void)buildUI {
-    // ── Card ─────────────────────────────────────────────────────────────────
-    // FIX: smaller card, safety anchors so it never overflows screen edges
-    // (overflowing caused buttons to fall outside the window hit-test area)
-    UIView *card = [UIView new];
-    card.backgroundColor    = [UIColor colorWithRed:0.07 green:0.07 blue:0.12 alpha:1];
-    card.layer.cornerRadius = 18;
-    card.layer.shadowColor  = [UIColor blackColor].CGColor;
-    card.layer.shadowOpacity = 0.92;
-    card.layer.shadowRadius  = 16;
-    card.layer.shadowOffset  = CGSizeMake(0, 6);
-    card.clipsToBounds       = NO;
-    card.translatesAutoresizingMaskIntoConstraints = NO;
-    card.userInteractionEnabled = YES;
-    [self addSubview:card];
+    CGFloat W   = kEW;
+    CGFloat pad = 10;
+    CGFloat bw  = W - pad * 2;
+    CGFloat y   = 0;
 
-    // ── Icon (smaller) ───────────────────────────────────────────────────────
-    UIImageView *iconView = symView(@"iphone.badge.play", 22,
-        [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1]);
-    [card addSubview:iconView];
+    // ── Header bar (mirrors SKPanel buildBar) ─────────────────────────────────
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 44)];
+    bar.backgroundColor    = [UIColor colorWithRed:0.08 green:0.08 blue:0.13 alpha:1];
+    bar.userInteractionEnabled = NO;
+    [self addSubview:bar];
 
-    // ── Title (smaller font) ─────────────────────────────────────────────────
-    UILabel *title = [UILabel new];
-    title.text          = @"Device Registration";
-    title.textColor     = [UIColor whiteColor];
-    title.font          = [UIFont boldSystemFontOfSize:15];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:title];
+    UIImageView *icon = [[UIImageView alloc] initWithImage:sym(@"iphone.badge.play", 11)];
+    icon.tintColor    = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
+    icon.contentMode  = UIViewContentModeScaleAspectFit;
+    icon.frame        = CGRectMake(12, 14, 16, 16);
+    [bar addSubview:icon];
 
-    // ── Divider ──────────────────────────────────────────────────────────────
-    UIView *div = [UIView new];
-    div.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
-    div.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:div];
+    UILabel *titleL      = [UILabel new];
+    titleL.text          = @"iSKE - Device Registration";
+    titleL.textColor     = [UIColor colorWithWhite:0.82 alpha:1];
+    titleL.font          = [UIFont boldSystemFontOfSize:12];
+    titleL.textAlignment = NSTextAlignmentCenter;
+    titleL.frame         = CGRectMake(0, 14, W, 18);
+    titleL.userInteractionEnabled = NO;
+    [bar addSubview:titleL];
+    y = 44;
 
-    // ── Step label — compact 4-line list, no verbose intro paragraph ─────────
-    _stepLabel = [UILabel new];
-    _stepLabel.numberOfLines = 0;
-    _stepLabel.textColor     = [UIColor colorWithWhite:0.58 alpha:1];
-    _stepLabel.font          = [UIFont systemFontOfSize:11.5];
-    _stepLabel.textAlignment = NSTextAlignmentLeft;
-    _stepLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _stepLabel.text =
+    // ── Divider ───────────────────────────────────────────────────────────────
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(0, y, W, 1)];
+    div.backgroundColor        = [UIColor colorWithWhite:0.16 alpha:1];
+    div.userInteractionEnabled = NO;
+    [self addSubview:div];
+    y += 1;
+
+    // ── Step instructions ─────────────────────────────────────────────────────
+    UILabel *steps      = [[UILabel alloc] initWithFrame:CGRectMake(pad, y+8, bw, 66)];
+    steps.numberOfLines = 0;
+    steps.textColor     = [UIColor colorWithWhite:0.54 alpha:1];
+    steps.font          = [UIFont systemFontOfSize:11];
+    steps.text          =
         @"① Tap \"Get UDID\" below\n"
         @"② Safari opens — tap Allow / Install\n"
         @"③ Settings → Profile → Install\n"
-        @"④ Return here — detected automatically";
-    [card addSubview:_stepLabel];
+        @"④ Return here — auto detected";
+    steps.userInteractionEnabled = NO;
+    [self addSubview:steps];
+    y += 8 + 66;
 
-    // ── Status label ─────────────────────────────────────────────────────────
-    _statusLabel = [UILabel new];
-    _statusLabel.text          = @"";
+    // ── Status label ──────────────────────────────────────────────────────────
+    _statusLabel               = [[UILabel alloc] initWithFrame:CGRectMake(pad, y+4, bw, 28)];
     _statusLabel.textColor     = [UIColor colorWithRed:0.90 green:0.35 blue:0.35 alpha:1];
-    _statusLabel.font          = [UIFont systemFontOfSize:11];
+    _statusLabel.font          = [UIFont systemFontOfSize:10.5];
     _statusLabel.textAlignment = NSTextAlignmentCenter;
     _statusLabel.numberOfLines = 2;
-    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:_statusLabel];
+    _statusLabel.text          = @"";
+    _statusLabel.userInteractionEnabled = NO;
+    [self addSubview:_statusLabel];
+    y += 4 + 28;
 
-    // ── Spinner — fixed height so it doesn't collapse layout when hidden ─────
-    _spinner = [[UIActivityIndicatorView alloc]
+    // ── Spinner ───────────────────────────────────────────────────────────────
+    _spinner       = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     _spinner.color  = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
     _spinner.hidden = YES;
-    _spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:_spinner];
+    _spinner.frame  = CGRectMake(W/2 - 10, y+4, 20, 20);
+    _spinner.userInteractionEnabled = NO;
+    [self addSubview:_spinner];
+    y += 4 + 20 + 6;
 
-    // ── Buttons — FIX: userInteractionEnabled = YES explicitly on each button
-    _openSafariBtn = makeSymBtn(@"Get UDID (opens Safari)", @"safari",
-        [UIColor colorWithRed:0.14 green:0.52 blue:0.28 alpha:1], @selector(tapGetUDID), self);
-    _openSafariBtn.userInteractionEnabled = YES;
-    [card addSubview:_openSafariBtn];
+    // ── Get UDID button ───────────────────────────────────────────────────────
+    _openSafariBtn = [self enrollBtn:@"Get UDID (opens Safari)"
+                             symName:@"safari"
+                               color:[UIColor colorWithRed:0.14 green:0.52 blue:0.28 alpha:1]
+                               frame:CGRectMake(pad, y, bw, 42)
+                              action:@selector(tapGetUDID)];
+    [self addSubview:_openSafariBtn];
+    y += 42 + 6;
 
-    _pollBtn = makeSymBtn(@"Already Installed Profile", @"checkmark.circle",
-        [UIColor colorWithRed:0.18 green:0.35 blue:0.55 alpha:1], @selector(tapAlreadyDone), self);
-    _pollBtn.userInteractionEnabled = YES;
-    [card addSubview:_pollBtn];
-
-    [NSLayoutConstraint activateConstraints:@[
-        // ── Card position: centred, width 296, clamped to safe screen bounds ──
-        // FIX: top/bottom safety constraints stop card from overflowing the
-        //      window, which was the root cause of buttons being un-tappable.
-        [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-        [card.widthAnchor   constraintEqualToConstant:296],
-        [card.topAnchor     constraintGreaterThanOrEqualToAnchor:self.topAnchor    constant:32],
-        [card.bottomAnchor  constraintLessThanOrEqualToAnchor:self.bottomAnchor   constant:-32],
-
-        // ── Icon ──────────────────────────────────────────────────────────────
-        [iconView.topAnchor     constraintEqualToAnchor:card.topAnchor constant:16],
-        [iconView.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
-        [iconView.widthAnchor   constraintEqualToConstant:32],
-        [iconView.heightAnchor  constraintEqualToConstant:32],
-
-        // ── Title ─────────────────────────────────────────────────────────────
-        [title.topAnchor      constraintEqualToAnchor:iconView.bottomAnchor constant:8],
-        [title.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
-        [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-
-        // ── Divider ───────────────────────────────────────────────────────────
-        [div.topAnchor      constraintEqualToAnchor:title.bottomAnchor constant:10],
-        [div.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
-        [div.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-        [div.heightAnchor   constraintEqualToConstant:1],
-
-        // ── Step list ─────────────────────────────────────────────────────────
-        [_stepLabel.topAnchor      constraintEqualToAnchor:div.bottomAnchor constant:10],
-        [_stepLabel.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:18],
-        [_stepLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-18],
-
-        // ── Status ────────────────────────────────────────────────────────────
-        [_statusLabel.topAnchor      constraintEqualToAnchor:_stepLabel.bottomAnchor constant:8],
-        [_statusLabel.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
-        [_statusLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-
-        // ── Spinner: fixed 20 pt height keeps layout stable when hidden ───────
-        [_spinner.topAnchor     constraintEqualToAnchor:_statusLabel.bottomAnchor constant:6],
-        [_spinner.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
-        [_spinner.heightAnchor  constraintEqualToConstant:20],
-
-        // ── Get UDID button ───────────────────────────────────────────────────
-        [_openSafariBtn.topAnchor      constraintEqualToAnchor:_spinner.bottomAnchor constant:8],
-        [_openSafariBtn.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
-        [_openSafariBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-        [_openSafariBtn.heightAnchor   constraintEqualToConstant:44],
-
-        // ── Already installed button ──────────────────────────────────────────
-        [_pollBtn.topAnchor      constraintEqualToAnchor:_openSafariBtn.bottomAnchor constant:7],
-        [_pollBtn.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
-        [_pollBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
-        [_pollBtn.heightAnchor   constraintEqualToConstant:38],
-
-        // ── Card bottom ───────────────────────────────────────────────────────
-        [card.bottomAnchor constraintEqualToAnchor:_pollBtn.bottomAnchor constant:16],
-    ]];
+    // ── Already installed button ──────────────────────────────────────────────
+    _pollBtn = [self enrollBtn:@"Already Installed Profile"
+                       symName:@"checkmark.circle"
+                         color:[UIColor colorWithRed:0.18 green:0.35 blue:0.55 alpha:1]
+                         frame:CGRectMake(pad, y, bw, 36)
+                        action:@selector(tapAlreadyDone)];
+    [self addSubview:_pollBtn];
 }
+
 
 - (void)tapGetUDID {
     NSString *profileURL = [NSString stringWithFormat:@"%@?action=profile&token=%@",
@@ -2828,7 +2811,9 @@ static void injectPanel(void) {
     } else {
         // No UDID yet → show enrollment on window directly
         // FIX: use win instead of vc.view so buttons are tappable
-        [SKUDIDEnrollOverlay showInView:win completion:^(NSString *udid) {
+        // Use showInWindow: — compact frame-based panel, no full-screen overlay.
+        // proceedWithAuth (key input/auth) only fires AFTER UDID is confirmed.
+        [SKUDIDEnrollOverlay showInWindow:win completion:^(NSString *udid) {
             proceedWithAuth();
         }];
     }
