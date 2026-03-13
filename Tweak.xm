@@ -596,58 +596,56 @@ static void startSpinAnimation(CALayer *layer) {
 }
 
 - (void)buildUI {
+    // ── Card ─────────────────────────────────────────────────────────────────
+    // FIX: smaller card, safety anchors so it never overflows screen edges
+    // (overflowing caused buttons to fall outside the window hit-test area)
     UIView *card = [UIView new];
     card.backgroundColor    = [UIColor colorWithRed:0.07 green:0.07 blue:0.12 alpha:1];
-    card.layer.cornerRadius = 22;
+    card.layer.cornerRadius = 18;
     card.layer.shadowColor  = [UIColor blackColor].CGColor;
     card.layer.shadowOpacity = 0.92;
-    card.layer.shadowRadius  = 22;
-    card.layer.shadowOffset  = CGSizeMake(0, 8);
+    card.layer.shadowRadius  = 16;
+    card.layer.shadowOffset  = CGSizeMake(0, 6);
     card.clipsToBounds       = NO;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     card.userInteractionEnabled = YES;
     [self addSubview:card];
 
-    UIImageView *iconView = symView(@"iphone.badge.play", 34,
+    // ── Icon (smaller) ───────────────────────────────────────────────────────
+    UIImageView *iconView = symView(@"iphone.badge.play", 22,
         [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1]);
     [card addSubview:iconView];
 
+    // ── Title (smaller font) ─────────────────────────────────────────────────
     UILabel *title = [UILabel new];
     title.text          = @"Device Registration";
     title.textColor     = [UIColor whiteColor];
-    title.font          = [UIFont boldSystemFontOfSize:18];
+    title.font          = [UIFont boldSystemFontOfSize:15];
     title.textAlignment = NSTextAlignmentCenter;
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:title];
 
-    UILabel *sub = [UILabel new];
-    sub.text          = @"One-time setup • Survives reinstalls";
-    sub.textColor     = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.75];
-    sub.font          = [UIFont systemFontOfSize:12];
-    sub.textAlignment = NSTextAlignmentCenter;
-    sub.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:sub];
-
+    // ── Divider ──────────────────────────────────────────────────────────────
     UIView *div = [UIView new];
     div.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
     div.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:div];
 
+    // ── Step label — compact 4-line list, no verbose intro paragraph ─────────
     _stepLabel = [UILabel new];
     _stepLabel.numberOfLines = 0;
-    _stepLabel.textColor     = [UIColor colorWithWhite:0.60 alpha:1];
-    _stepLabel.font          = [UIFont systemFontOfSize:12];
-    _stepLabel.textAlignment = NSTextAlignmentCenter;
+    _stepLabel.textColor     = [UIColor colorWithWhite:0.58 alpha:1];
+    _stepLabel.font          = [UIFont systemFontOfSize:11.5];
+    _stepLabel.textAlignment = NSTextAlignmentLeft;
     _stepLabel.translatesAutoresizingMaskIntoConstraints = NO;
     _stepLabel.text =
-        @"To identify your device permanently (even if you reinstall the app), "
-        @"you need to install a short iOS profile.\n\n"
         @"① Tap \"Get UDID\" below\n"
         @"② Safari opens — tap Allow / Install\n"
-        @"③ Go to Settings → Profile → Install\n"
-        @"④ Return here — we detect it automatically";
+        @"③ Settings → Profile → Install\n"
+        @"④ Return here — detected automatically";
     [card addSubview:_stepLabel];
 
+    // ── Status label ─────────────────────────────────────────────────────────
     _statusLabel = [UILabel new];
     _statusLabel.text          = @"";
     _statusLabel.textColor     = [UIColor colorWithRed:0.90 green:0.35 blue:0.35 alpha:1];
@@ -657,6 +655,7 @@ static void startSpinAnimation(CALayer *layer) {
     _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_statusLabel];
 
+    // ── Spinner — fixed height so it doesn't collapse layout when hidden ─────
     _spinner = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     _spinner.color  = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
@@ -664,71 +663,73 @@ static void startSpinAnimation(CALayer *layer) {
     _spinner.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_spinner];
 
+    // ── Buttons — FIX: userInteractionEnabled = YES explicitly on each button
     _openSafariBtn = makeSymBtn(@"Get UDID (opens Safari)", @"safari",
         [UIColor colorWithRed:0.14 green:0.52 blue:0.28 alpha:1], @selector(tapGetUDID), self);
+    _openSafariBtn.userInteractionEnabled = YES;
     [card addSubview:_openSafariBtn];
 
-    _pollBtn = makeSymBtn(@"I Already Installed the Profile", @"checkmark.circle",
+    _pollBtn = makeSymBtn(@"Already Installed Profile", @"checkmark.circle",
         [UIColor colorWithRed:0.18 green:0.35 blue:0.55 alpha:1], @selector(tapAlreadyDone), self);
+    _pollBtn.userInteractionEnabled = YES;
     [card addSubview:_pollBtn];
 
-    UILabel *footer = [UILabel new];
-    footer.text          = @"Profile can be removed from Settings after registration.";
-    footer.textColor     = [UIColor colorWithWhite:0.22 alpha:1];
-    footer.font          = [UIFont systemFontOfSize:9];
-    footer.textAlignment = NSTextAlignmentCenter;
-    footer.numberOfLines = 2;
-    footer.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:footer];
-
     [NSLayoutConstraint activateConstraints:@[
+        // ── Card position: centred, width 296, clamped to safe screen bounds ──
+        // FIX: top/bottom safety constraints stop card from overflowing the
+        //      window, which was the root cause of buttons being un-tappable.
         [card.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor constant:-10],
-        [card.widthAnchor   constraintEqualToConstant:320],
+        [card.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [card.widthAnchor   constraintEqualToConstant:296],
+        [card.topAnchor     constraintGreaterThanOrEqualToAnchor:self.topAnchor    constant:32],
+        [card.bottomAnchor  constraintLessThanOrEqualToAnchor:self.bottomAnchor   constant:-32],
 
-        [iconView.topAnchor    constraintEqualToAnchor:card.topAnchor constant:28],
+        // ── Icon ──────────────────────────────────────────────────────────────
+        [iconView.topAnchor     constraintEqualToAnchor:card.topAnchor constant:16],
         [iconView.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
-        [iconView.widthAnchor  constraintEqualToConstant:44],
-        [iconView.heightAnchor constraintEqualToConstant:44],
+        [iconView.widthAnchor   constraintEqualToConstant:32],
+        [iconView.heightAnchor  constraintEqualToConstant:32],
 
-        [title.topAnchor      constraintEqualToAnchor:iconView.bottomAnchor constant:12],
-        [title.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        // ── Title ─────────────────────────────────────────────────────────────
+        [title.topAnchor      constraintEqualToAnchor:iconView.bottomAnchor constant:8],
+        [title.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
+        [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
 
-        [sub.topAnchor      constraintEqualToAnchor:title.bottomAnchor constant:4],
-        [sub.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [sub.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-
-        [div.topAnchor      constraintEqualToAnchor:sub.bottomAnchor constant:14],
-        [div.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [div.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        // ── Divider ───────────────────────────────────────────────────────────
+        [div.topAnchor      constraintEqualToAnchor:title.bottomAnchor constant:10],
+        [div.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
+        [div.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
         [div.heightAnchor   constraintEqualToConstant:1],
 
-        [_stepLabel.topAnchor      constraintEqualToAnchor:div.bottomAnchor constant:14],
-        [_stepLabel.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:20],
-        [_stepLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        // ── Step list ─────────────────────────────────────────────────────────
+        [_stepLabel.topAnchor      constraintEqualToAnchor:div.bottomAnchor constant:10],
+        [_stepLabel.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:18],
+        [_stepLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-18],
 
-        [_statusLabel.topAnchor      constraintEqualToAnchor:_stepLabel.bottomAnchor constant:10],
-        [_statusLabel.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [_statusLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        // ── Status ────────────────────────────────────────────────────────────
+        [_statusLabel.topAnchor      constraintEqualToAnchor:_stepLabel.bottomAnchor constant:8],
+        [_statusLabel.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
+        [_statusLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
 
-        [_spinner.topAnchor    constraintEqualToAnchor:_statusLabel.bottomAnchor constant:8],
+        // ── Spinner: fixed 20 pt height keeps layout stable when hidden ───────
+        [_spinner.topAnchor     constraintEqualToAnchor:_statusLabel.bottomAnchor constant:6],
         [_spinner.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
+        [_spinner.heightAnchor  constraintEqualToConstant:20],
 
+        // ── Get UDID button ───────────────────────────────────────────────────
         [_openSafariBtn.topAnchor      constraintEqualToAnchor:_spinner.bottomAnchor constant:8],
-        [_openSafariBtn.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [_openSafariBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [_openSafariBtn.heightAnchor   constraintEqualToConstant:46],
+        [_openSafariBtn.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
+        [_openSafariBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [_openSafariBtn.heightAnchor   constraintEqualToConstant:44],
 
-        [_pollBtn.topAnchor      constraintEqualToAnchor:_openSafariBtn.bottomAnchor constant:8],
-        [_pollBtn.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [_pollBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [_pollBtn.heightAnchor   constraintEqualToConstant:40],
+        // ── Already installed button ──────────────────────────────────────────
+        [_pollBtn.topAnchor      constraintEqualToAnchor:_openSafariBtn.bottomAnchor constant:7],
+        [_pollBtn.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor  constant:14],
+        [_pollBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14],
+        [_pollBtn.heightAnchor   constraintEqualToConstant:38],
 
-        [footer.topAnchor      constraintEqualToAnchor:_pollBtn.bottomAnchor constant:12],
-        [footer.leadingAnchor  constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [footer.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [card.bottomAnchor     constraintEqualToAnchor:footer.bottomAnchor constant:18],
+        // ── Card bottom ───────────────────────────────────────────────────────
+        [card.bottomAnchor constraintEqualToAnchor:_pollBtn.bottomAnchor constant:16],
     ]];
 }
 
