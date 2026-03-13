@@ -1,171 +1,203 @@
-#import <Foundation/Foundation.h>
-#include <substrate.h>
-#include <CommonCrypto/CommonCryptor.h>
-#include <stdio.h>
-#include <time.h>
-#include <pthread.h>
+#import "SKFramework.h"
 
-static pthread_key_t sInHookKey;
-static pthread_once_t sOnce = PTHREAD_ONCE_INIT;
+static SKPanel *gPanel;
+static SKSettingsMenu *gMenu;
 
-static void makeKey(void) {
-    pthread_key_create(&sInHookKey, NULL);
+#pragma mark - Auth UI
+
+static void showKeyPrompt(UIView *root) {
+
+    UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    while (vc.presentedViewController)
+        vc = vc.presentedViewController;
+
+    UIAlertController *alert =
+    [UIAlertController alertControllerWithTitle:@"Enter License Key"
+                                        message:@"Input your authentication key."
+                                 preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"XXXX-XXXX-XXXX";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    }];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Login"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a){
+
+        NSString *key = alert.textFields.firstObject.text;
+        if (!key.length) return;
+
+        SKProgressOverlay *ov =
+        [SKProgressOverlay showInView:root title:@"Authenticating…"];
+
+        SK_performKeyAuth(key, ^(BOOL ok,
+                                 NSTimeInterval keyExp,
+                                 NSTimeInterval devExp,
+                                 NSString *err) {
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+
+                if (ok) {
+
+                    SK_saveSavedKey(key);
+
+                    [ov finish:YES
+                       message:@"Authentication successful."
+                          link:nil];
+
+                    [gPanel setLabelText:@"Authenticated" forKey:@"status"];
+
+                } else {
+
+                    [ov finish:NO
+                       message:err ?: @"Auth failed."
+                          link:nil];
+                }
+
+            });
+
+        });
+
+    }]];
+
+    [vc presentViewController:alert animated:YES completion:nil];
 }
 
-static int isInHook(void) {
-    pthread_once(&sOnce, makeKey);
-    return (int)(uintptr_t)pthread_getspecific(sInHookKey);
+#pragma mark - Panel Builder
+
+static void buildPanel(UIView *root) {
+
+    if (gPanel) return;
+
+    // Settings menu
+    gMenu = [SKSettingsMenu new];
+    gMenu.menuTitle = @"Auth Test";
+    gMenu.footerText = @"SKFramework Demo";
+
+    [gMenu addToggle:@"autoLogin"
+               title:@"Auto Login"
+         description:@"Try login automatically if key saved"
+              symbol:@"person.crop.circle.badge.checkmark"
+         defaultValue:YES
+             onChange:nil];
+
+    [gMenu addButtonRow:@"clearKey"
+                  title:@"Clear Saved Key"
+                 symbol:@"trash"
+                  color:SKColorRed()
+                 action:^{
+        SK_clearSavedKey();
+        [SKAlert showTitle:@"Done" message:@"Saved key removed."];
+    }];
+
+    // Panel
+    gPanel = [SKPanel new];
+    gPanel.panelTitle = @"Auth Tester";
+
+    [gPanel addLabel:@"status" text:@"Not authenticated"];
+
+    // Login button
+    [gPanel addButton:@"Login"
+               symbol:@"person.crop.circle.badge.key"
+                color:SKColorBlue()
+               action:^{
+        showKeyPrompt(root);
+    }];
+
+    // Check saved key
+    [gPanel addButton:@"Check Saved Key"
+               symbol:@"checkmark.shield"
+                color:SKColorGreen()
+               action:^{
+
+        NSString *key = SK_loadSavedKey();
+
+        if (!key) {
+            [SKAlert showTitle:@"No Key"
+                       message:@"No saved key found."];
+            return;
+        }
+
+        SKProgressOverlay *ov =
+        [SKProgressOverlay showInView:root title:@"Revalidating…"];
+
+        SK_performKeyAuth(key, ^(BOOL ok,
+                                 NSTimeInterval k,
+                                 NSTimeInterval d,
+                                 NSString *err) {
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+
+                if (ok) {
+
+                    [ov finish:YES
+                       message:@"Key still valid."
+                          link:nil];
+
+                    [gPanel setLabelText:@"Authenticated" forKey:@"status"];
+
+                } else {
+
+                    [ov finish:NO
+                       message:err ?: @"Invalid key."
+                          link:nil];
+
+                    SK_clearSavedKey();
+                }
+
+            });
+
+        });
+
+    }];
+
+    [gPanel addDivider];
+
+    [gPanel addSettingsButton:@"Settings" menu:gMenu];
+
+    [gPanel addSmallButtonsRow:@[
+        [SKButton buttonWithTitle:@"Hide"
+                           symbol:@"eye.slash"
+                            color:SKColorRed()
+                           action:^{ [gPanel hide]; }]
+    ]];
+
+    [gPanel showInView:root];
 }
 
-static void setInHook(int val) {
-    pthread_once(&sOnce, makeKey);
-    pthread_setspecific(sInHookKey, (void *)(uintptr_t)val);
+#pragma mark - Injection
+
+%hook UIViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.7 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+
+            UIWindow *win = nil;
+
+            for (UIWindow *w in UIApplication.sharedApplication.windows)
+                if (!w.hidden && w.alpha > 0) {
+                    win = w;
+                    break;
+                }
+
+            if (!win) return;
+
+            buildPanel(win.rootViewController.view ?: win);
+
+        });
+
+    });
 }
 
-static void logToFile(const char *msg) {
-    static char logPath[1024] = {0};
-    if (logPath[0] == '\0') {
-        NSString *home = NSHomeDirectory();
-        snprintf(logPath, sizeof(logPath), "%s/Documents/CCCryptLog.txt",
-                 [home UTF8String]);
-    }
-    FILE *f = fopen(logPath, "a");
-    if (!f) return;
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
-            t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-            t->tm_hour, t->tm_min, t->tm_sec, msg);
-    fclose(f);
-}
-
-static void bytesToHexBuf(const void *bytes, size_t len, char *out, size_t outSize) {
-    if (!bytes || len == 0) { snprintf(out, outSize, "<nil>"); return; }
-    size_t display = len < 32 ? len : 32;
-    size_t pos = 0;
-    const uint8_t *b = (const uint8_t *)bytes;
-    for (size_t i = 0; i < display && pos + 3 < outSize; i++) {
-        pos += snprintf(out + pos, outSize - pos, "%02x", b[i]);
-    }
-    if (len > 32 && pos + 4 < outSize) {
-        snprintf(out + pos, outSize - pos, "...");
-    }
-}
-
-static const char *algoName(CCAlgorithm a) {
-    switch (a) {
-        case kCCAlgorithmAES:      return "AES";
-        case kCCAlgorithmDES:      return "DES";
-        case kCCAlgorithm3DES:     return "3DES";
-        case kCCAlgorithmCAST:     return "CAST";
-        case kCCAlgorithmRC4:      return "RC4";
-        case kCCAlgorithmRC2:      return "RC2";
-        case kCCAlgorithmBlowfish: return "Blowfish";
-        default:                   return "Unknown";
-    }
-}
-
-static CCCryptorStatus (*orig_CCCrypt)(
-    CCOperation, CCAlgorithm, CCOptions,
-    const void *, size_t,
-    const void *,
-    const void *, size_t,
-    void *, size_t, size_t *
-);
-
-static CCCryptorStatus replaced_CCCrypt(
-    CCOperation op, CCAlgorithm alg, CCOptions opts,
-    const void *key,    size_t keyLen,
-    const void *iv,
-    const void *dataIn, size_t dataInLen,
-    void *dataOut,      size_t dataOutAvail,
-    size_t *dataOutMoved
-) {
-    CCCryptorStatus result = orig_CCCrypt(op, alg, opts,
-                                          key, keyLen, iv,
-                                          dataIn, dataInLen,
-                                          dataOut, dataOutAvail, dataOutMoved);
-    if (isInHook()) return result;
-    setInHook(1);
-
-    char keyHex[80]  = {0};
-    char ivHex[80]   = {0};
-    char inHex[80]   = {0};
-    char outHex[80]  = {0};
-
-    bytesToHexBuf(key,     keyLen,                           keyHex,  sizeof(keyHex));
-    bytesToHexBuf(iv,      iv ? 16 : 0,                      ivHex,   sizeof(ivHex));
-    bytesToHexBuf(dataIn,  dataInLen,                         inHex,   sizeof(inHex));
-    bytesToHexBuf(dataOut, dataOutMoved ? *dataOutMoved : 0,  outHex,  sizeof(outHex));
-
-    char buf[1024];
-    snprintf(buf, sizeof(buf),
-        "CCCrypt | Op: %s | Algo: %s | Opts: 0x%X\n"
-        "  Key   (%zu): %s\n"
-        "  IV         : %s\n"
-        "  Input (%zu): %s\n"
-        "  Output(%zu): %s\n"
-        "  Status: %d\n"
-        "----------------------------------------",
-        (op == kCCEncrypt) ? "Encrypt" : "Decrypt",
-        algoName(alg), (unsigned)opts,
-        keyLen,  keyHex,
-                 ivHex,
-        dataInLen, inHex,
-        dataOutMoved ? *dataOutMoved : 0, outHex,
-        result);
-
-    logToFile(buf);
-    setInHook(0);
-    return result;
-}
-
-static CCCryptorStatus (*orig_CCCryptorCreate)(
-    CCOperation, CCAlgorithm, CCOptions,
-    const void *, size_t,
-    const void *, CCCryptorRef *
-);
-
-static CCCryptorStatus replaced_CCCryptorCreate(
-    CCOperation op, CCAlgorithm alg, CCOptions opts,
-    const void *key, size_t keyLen,
-    const void *iv,  CCCryptorRef *ref
-) {
-    CCCryptorStatus result = orig_CCCryptorCreate(op, alg, opts, key, keyLen, iv, ref);
-
-    if (isInHook()) return result;
-    setInHook(1);
-
-    char keyHex[80] = {0};
-    char ivHex[80]  = {0};
-    bytesToHexBuf(key, keyLen,       keyHex, sizeof(keyHex));
-    bytesToHexBuf(iv,  iv ? 16 : 0,  ivHex,  sizeof(ivHex));
-
-    char buf[512];
-    snprintf(buf, sizeof(buf),
-        "CCCryptorCreate | Op: %s | Algo: %s | Opts: 0x%X\n"
-        "  Key (%zu): %s\n"
-        "  IV       : %s\n"
-        "  Status: %d\n"
-        "----------------------------------------",
-        (op == kCCEncrypt) ? "Encrypt" : "Decrypt",
-        algoName(alg), (unsigned)opts,
-        keyLen, keyHex, ivHex,
-        result);
-
-    logToFile(buf);
-    setInHook(0);
-    return result;
-}
-
-%ctor {
-    MSHookFunction((void *)CCCrypt,
-                   (void *)replaced_CCCrypt,
-                   (void **)&orig_CCCrypt);
-
-    MSHookFunction((void *)CCCryptorCreate,
-                   (void *)replaced_CCCryptorCreate,
-                   (void **)&orig_CCCryptorCreate);
-
-    logToFile("=== CCCrypt Hook Loaded ===");
-}
+%end
