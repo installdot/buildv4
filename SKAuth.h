@@ -14,6 +14,9 @@
 //   • skPost() — generic upload-task POST → NSDictionary callback
 
 #pragma once
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <sys/utsname.h>
@@ -397,3 +400,5 @@ static void SK_performKeyAuth(NSString *keyValue,
         });
     }] resume];
 }
+
+#pragma clang diagnostic pop
