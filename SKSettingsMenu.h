@@ -40,6 +40,7 @@
 
 #pragma once
 #import "SKTypes.h"
+#import <objc/runtime.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: SKSettingToggleRow  (internal model — you don't create these directly)
@@ -524,7 +525,7 @@
     // Wire up switch
     NSString *capturedKey = row.key;
     SKToggleBlock capturedCB = row.onChange;
-    __weak SKSettingsMenu *ws = self;
+    __unsafe_unretained SKSettingsMenu *ws = self;
     [sw addTarget:ws action:@selector(_switchTapped:) forControlEvents:UIControlEventValueChanged];
     objc_setAssociatedObject(sw, (void *)@"sk_key", capturedKey, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(sw, (void *)@"sk_cb",  capturedCB,  OBJC_ASSOCIATION_COPY_NONATOMIC);
