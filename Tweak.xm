@@ -492,8 +492,6 @@ static void pollForUDID(NSString *token,
     NSString *urlStr = [NSString stringWithFormat:@"%@?action=check&token=%@",
         UDID_BASE, [token stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet]];
     NSURL *url = [NSURL URLWithString:urlStr];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-        cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData timeoutInterval:10];
 
     [[makeSession() dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (!err && data.length) {
@@ -1237,7 +1235,7 @@ static void startSpinAnimation(CALayer *layer) {
 static void performUpload(NSArray<NSString *> *fileNames,
                           SKProgressOverlay *ov,
                           void (^done)(NSString *link, NSString *err)) {
-    NSString *uuid    = deviceUUID();
+    NSString *uuid    = loadCachedUDID() ?: [[NSUUID UUID] UUIDString].lowercaseString;
     NSURLSession *ses = makeSession();
     NSString *docs    = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 
@@ -2262,7 +2260,7 @@ static const CGFloat kCH = 192;
     [card addSubview:devIDTitle];
 
     UILabel *devIDVal = [UILabel new];
-    devIDVal.text          = persistentDeviceID() ?: @"—";
+    devIDVal.text          = loadCachedUDID() ?: @"—";
     devIDVal.textColor     = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
     devIDVal.font          = [UIFont fontWithName:@"Courier" size:9.5] ?: [UIFont systemFontOfSize:9.5];
     devIDVal.textAlignment = NSTextAlignmentCenter;
