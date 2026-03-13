@@ -18,10 +18,10 @@
 #define UDID_BASE     @"https://chillysilly.frfrnocap.men/udid.php"
 
 static NSString *authAESKeyHex(void) {
-    return @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // CHANGE
+    return @"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee"; // CHANGE
 }
 static NSString *authHMACKeyHex(void) {
-    return @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"; // CHANGE
+    return @"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543211"; // CHANGE
 }
 
 #define kMaxTsDrift  60
