@@ -15,6 +15,9 @@
 //              XXX_EXTRA_FRAMEWORKS = CommonCrypto   (usually implicit on iOS)
 
 #pragma once
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
+
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
@@ -284,3 +287,5 @@ static NSTimeInterval SK_loadLastSentTS(void) {
                                              encoding:NSUTF8StringEncoding error:nil];
     return s.doubleValue;
 }
+
+#pragma clang diagnostic pop
