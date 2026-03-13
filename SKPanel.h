@@ -275,8 +275,8 @@
 }
 
 - (SKButton *)addSettingsButton:(NSString *)title menu:(SKSettingsMenu *)menu {
-    __weak SKPanel *ws   = self;
-    __weak SKSettingsMenu *wm = menu;
+    __unsafe_unretained SKPanel *ws   = self;
+    __unsafe_unretained SKSettingsMenu *wm = menu;
     SKButton *btn = [self addButton:title
                              symbol:@"gearshape"
                               color:SKColorGray()
@@ -286,10 +286,6 @@
     }];
     return btn;
 }
-
-// ── Value updaters ──
-
-- (void)setLabelText:(NSString *)text forKey:(NSString *)key __attribute__((objc_direct)) {}
 
 // ── showInView ──
 
