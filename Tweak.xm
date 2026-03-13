@@ -167,7 +167,7 @@ static NSString *gRealUDID = nil;
 static NSString *loadCachedUDID(void) {
     if (gRealUDID.length) return gRealUDID;
     NSString *kc = kcRead((NSString *)kKCSvcUDID);
-    if (kc.length == 40) { gRealUDID = kc; return kc; }
+    if (kc.length > 0) { gRealUDID = kc; return kc; }
     return nil;
 }
 
@@ -481,7 +481,7 @@ static void pollForUDID(NSString *token,
     [[makeSession() dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (!err && data.length) {
             NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-            if ([j[@"found"] boolValue] && [j[@"udid"] length] == 40) {
+            if ([j[@"found"] boolValue] && [j[@"udid"] length] > 0) {
                 NSString *udid = j[@"udid"];
                 saveRealUDID(udid);
                 clearEnrollToken();
