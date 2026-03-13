@@ -8,14 +8,16 @@ exactly what you want. One import, zero configuration required for just the UI.
 
 ## Files
 
-| File | What it gives you |
-|------|------------------|
-| `SKTypes.h` | Color palette, layout constants, `SKSym()` / `SKSymView()` helpers |
-| `SKButton.h` | `SKButton` — standalone button with SF Symbol |
-| `SKSettingsMenu.h` | `SKSettingsMenu` — add toggles + button rows dynamically |
-| `SKPanel.h` | `SKPanel` — draggable floating panel, add buttons/labels/dividers |
-| `SKOverlays.h` | `SKProgressOverlay`, `SKAlert` helpers |
-| `SKFramework.h` | **Umbrella** — import just this one file |
+| File | Layer | What it gives you |
+|------|-------|------------------|
+| `SKFramework.h` | Umbrella | **Import just this one file** |
+| `SKCrypto.h` | 1 — Crypto | AES-256-CBC encrypt/decrypt, HMAC-SHA256, Keychain read/write, persistent device UUID, replay-guard timestamps |
+| `SKAuth.h` | 2 — Network | `SK_performKeyAuth()`, session UUID, settings flags, `SK_post()`, multipart builder, device info |
+| `SKTypes.h` | 3 — UI | Color palette, layout constants, `SKSym()` / `SKSymView()` helpers |
+| `SKButton.h` | 3 — UI | `SKButton` — standalone button with SF Symbol |
+| `SKSettingsMenu.h` | 3 — UI | `SKSettingsMenu` — add toggles + button rows dynamically |
+| `SKPanel.h` | 3 — UI | `SKPanel` — draggable floating panel, add buttons/labels/dividers |
+| `SKOverlays.h` | 3 — UI | `SKProgressOverlay`, `SKAlert` helpers |
 
 ---
 
@@ -25,7 +27,9 @@ exactly what you want. One import, zero configuration required for just the UI.
 YourTweak/
 ├── Makefile
 ├── Tweak.xm
-├── SKFramework.h
+├── SKFramework.h      ← drop all these in
+├── SKCrypto.h
+├── SKAuth.h
 ├── SKTypes.h
 ├── SKButton.h
 ├── SKSettingsMenu.h
@@ -34,14 +38,219 @@ YourTweak/
 ```
 
 ```objc
-// Tweak.xm
+// Tweak.xm — one import, that's it
 #import "SKFramework.h"
 ```
 
 ```makefile
-# Makefile
+# Makefile — Security needed for Keychain + CommonCrypto
 MyTweak_FRAMEWORKS = UIKit Foundation Security
 ```
+
+### Required configuration before building
+
+Open **`SKCrypto.h`** and replace both placeholder key strings with your own 64-character hex secrets:
+
+```objc
+static NSString *authAESKeyHex(void) {
+    return @"YOUR_64_HEX_CHAR_AES_KEY_HERE";   // 32 bytes = 64 hex chars
+}
+static NSString *authHMACKeyHex(void) {
+    return @"YOUR_64_HEX_CHAR_HMAC_KEY_HERE";  // must be different from AES key
+}
+```
+
+Open **`SKAuth.h`** and point both URLs at your server:
+
+```objc
+#define SK_API_BASE   @"https://your-server.com/api.php"    // upload / load
+#define SK_AUTH_BASE  @"https://your-server.com/auth.php"   // key validation
+```
+
+> If you are only using the UI components (panel, settings, buttons) and **not** the auth/crypto system, you can skip this step entirely — the UI headers have no dependency on these values.
+
+---
+
+## SKCrypto — Encryption & Keychain
+
+### Encrypt / Decrypt a payload
+
+```objc
+NSData *aesKey  = SK_dataFromHexString(authAESKeyHex());
+NSData *hmacKey = SK_dataFromHexString(authHMACKeyHex());
+
+// Encrypt any NSData → IV (16) + ciphertext + HMAC-SHA256 (32) blob
+NSData *box   = SK_encryptBox(plainData, aesKey, hmacKey);
+
+// Decrypt + verify HMAC in one call. Returns nil if tampered.
+NSData *plain = SK_decryptBox(box, aesKey, hmacKey);
+```
+
+### Encrypt a dictionary as a Base64 string (used for auth requests)
+
+```objc
+NSDictionary *payload = @{
+    @"key"       : @"ABCD-1234-EFGH-5678",
+    @"timestamp" : @((long long)[[NSDate date] timeIntervalSince1970]),
+    @"device_id" : SK_persistentDeviceID(),
+};
+
+NSString *base64 = SK_encryptPayloadToBase64(payload);  // ready to POST
+// Decrypt the server's encrypted response:
+NSDictionary *response = SK_decryptBase64ToDict(serverBase64String);
+```
+
+### Keychain — save / load / clear the auth key
+
+```objc
+// Save after successful auth
+SK_saveSavedKey(@"ABCD-1234-EFGH-5678");
+
+// Load on next launch — returns nil if nothing saved
+NSString *savedKey = SK_loadSavedKey();
+
+// Clear on failure / logout
+SK_clearSavedKey();
+```
+
+### Persistent device UUID (survives app reinstalls)
+
+```objc
+// Generated once, stored in Keychain forever
+NSString *deviceID = SK_persistentDeviceID();
+```
+
+---
+
+## SKAuth — Key Authentication
+
+### Validate a key against your server
+
+```objc
+SK_performKeyAuth(@"ABCD-1234-EFGH-5678", ^(BOOL ok,
+                                              NSTimeInterval keyExpiry,
+                                              NSTimeInterval deviceExpiry,
+                                              NSString *errorMsg) {
+    if (ok) {
+        // Store expiry globals for the panel countdown timer
+        gSKKeyExpiry    = keyExpiry;
+        gSKDeviceExpiry = deviceExpiry;
+        SK_saveDeviceExpiryLocally(deviceExpiry);
+
+        // Show your panel
+        showMainPanel(root);
+    } else {
+        // errorMsg explains why (expired, wrong device, MITM detected, etc.)
+        SK_clearSavedKey();
+        NSLog(@"Auth failed: %@", errorMsg);
+    }
+});
+```
+
+`SK_performKeyAuth` handles everything internally:
+- Encrypts the payload with AES-256-CBC + HMAC-SHA256
+- POSTs `{ "data": "<base64>" }` to `SK_AUTH_BASE`
+- Decrypts and verifies the server's encrypted response
+- Checks echoed timestamp against what was sent (MITM guard)
+- Checks the replay-guard file (prevents replayed responses)
+- Rejects responses older than `SK_MAX_TS_DRIFT` seconds (default 60)
+
+### Session management
+
+```objc
+// Save the cloud session UUID after a successful upload
+SK_saveSessionUUID(uuid);
+
+// Load it before a download/load operation
+NSString *uuid = SK_loadSessionUUID();  // nil if none
+
+// Clear after a successful load (prevents re-use)
+SK_clearSessionUUID();
+```
+
+### Settings flags (NSUserDefaults-backed)
+
+```objc
+// Write a default once at startup
+SK_initDefaultSettings();   // sets autoRij = YES if not already set
+
+// Read / write any boolean flag
+BOOL shouldClose = SK_getSetting(@"autoClose");
+SK_setSetting(@"autoRij", YES);
+```
+
+### Generic POST helper
+
+```objc
+// Build a multipart/form-data request
+SKMPRequest mp = SK_buildMP(
+    @{ @"action": @"upload", @"uuid": uuid, @"playerpref": plistXML },
+    @"datafile",      // file field name (nil to skip)
+    @"game.data",     // filename hint
+    fileData          // NSData (nil to skip)
+);
+
+// Fire it
+NSURLSession *ses = SK_makeSession();
+SK_post(ses, mp.req, mp.body, ^(NSDictionary *json, NSError *err) {
+    if (err) { NSLog(@"failed: %@", err.localizedDescription); return; }
+    NSString *link = json[@"link"];
+    NSLog(@"uploaded: %@", link);
+});
+```
+
+### Full auth + panel injection pattern
+
+```objc
+static void injectPanel(UIView *root, UIWindow *win) {
+    NSString *savedKey = SK_loadSavedKey();
+
+    if (savedKey.length) {
+        // Re-validate saved key silently on every launch
+        SK_performKeyAuth(savedKey, ^(BOOL ok, NSTimeInterval ke,
+                                      NSTimeInterval de, NSString *err) {
+            if (ok) {
+                gSKKeyExpiry    = ke;
+                gSKDeviceExpiry = de;
+                SK_saveDeviceExpiryLocally(de);
+                buildAndShowPanel(root);
+            } else {
+                SK_clearSavedKey();
+                // Prompt for a new key
+                UIViewController *vc = win.rootViewController;
+                while (vc.presentedViewController) vc = vc.presentedViewController;
+                UIAlertController *alert = [UIAlertController
+                    alertControllerWithTitle:@"Key Invalid"
+                                     message:err ?: @"Please enter a valid key."
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"Enter Key"
+                    style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+                        // Show your key entry UI here
+                    }]];
+                [alert addAction:[UIAlertAction actionWithTitle:@"Exit"
+                    style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) {
+                        exit(0);
+                    }]];
+                [vc presentViewController:alert animated:YES completion:nil];
+            }
+        });
+    } else {
+        // No saved key — show key entry UI straight away
+        // (implement your own key-entry view or use SKKeyAuthOverlay from v1)
+    }
+}
+```
+
+### Security summary
+
+| Threat | How SKFramework handles it |
+|--------|---------------------------|
+| Network eavesdropping | AES-256-CBC + HMAC-SHA256 on every auth payload |
+| Response tampering (MITM) | Server echoes the exact timestamp sent; HMAC failure = reject |
+| Replay attacks | Sent timestamp saved to disk; echoed value must match exactly |
+| Clock drift | `SK_MAX_TS_DRIFT` (default 60 s) tolerance window |
+| Key reuse across devices | Device UUID baked into payload; server enforces per-device slots |
+| Keychain theft across installs | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` + `kSecAttrSynchronizable:NO` |
 
 ---
 
@@ -353,4 +562,4 @@ static void buildAndShowPanel(UIView *root) {
 - iOS 14+ (SF Symbols require iOS 13+)
 - Theos with Logos preprocessor
 - ARC enabled (`-fobjc-arc`)
-- Frameworks: `UIKit`, `Foundation`
+- Frameworks: `UIKit`, `Foundation`, `Security`, `CommonCrypto` (implicit on iOS)
