@@ -120,8 +120,8 @@
     [_btn setTitleColor:[UIColor colorWithWhite:0.70 alpha:1] forState:UIControlStateHighlighted];
     _btn.titleLabel.font = [UIFont boldSystemFontOfSize:_fontSize];
 
-    __weak SKButton *weakSelf = self;
-    [_btn addTarget:weakSelf action:@selector(_tapped) forControlEvents:UIControlEventTouchUpInside];
+    // UIButton does not retain its target, so passing self directly is safe here.
+    [_btn addTarget:self action:@selector(_tapped) forControlEvents:UIControlEventTouchUpInside];
 }
 
 - (UIButton *)view { return _btn; }
