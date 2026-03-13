@@ -7,7 +7,9 @@ static SKSettingsMenu *gMenu;
 
 static void showKeyPrompt(UIView *root) {
 
-    UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    UIViewController *vc = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows)
+        if (!w.hidden && w.alpha > 0 && w.rootViewController) { vc = w.rootViewController; break; }
     while (vc.presentedViewController)
         vc = vc.presentedViewController;
 
@@ -184,12 +186,8 @@ static void buildPanel(UIView *root) {
                        dispatch_get_main_queue(), ^{
 
             UIWindow *win = nil;
-
             for (UIWindow *w in UIApplication.sharedApplication.windows)
-                if (!w.hidden && w.alpha > 0) {
-                    win = w;
-                    break;
-                }
+                if (!w.hidden && w.alpha > 0) { win = w; break; }
 
             if (!win) return;
 
