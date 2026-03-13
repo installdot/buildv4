@@ -281,7 +281,7 @@ static NSString *detectPlayerUID(void) {
     if (![root isKindOfClass:[NSDictionary class]]) return nil;
     id user = root[@"User"];
     if (![user isKindOfClass:[NSDictionary class]]) return nil;
-    id pid = ((NSDictionary *)user)[@"PlayerId"];
+    id pid = ((NSDictionary *)user)[@"Id"];
     return pid ? [NSString stringWithFormat:@"%@", pid] : nil;
 }
 
@@ -1618,7 +1618,7 @@ static const CGFloat kSWScale = 0.75f;
     _tutRijRow = rijRow;
 
     UIView *uidRow = [self rowWithTitle:@"Auto Detect UID"
-        description:@"Reads PlayerId from SdkStateCache#1 — no manual UID entry needed."
+        description:@"Reads Id from SdkStateCache#1 — no manual UID entry needed."
         symName:@"person.badge.key"
         swRef:&_uidSwitch tag:2];
     [_card addSubview:uidRow];
@@ -2000,7 +2000,7 @@ static const CGFloat kCH = 192;
             if (getSetting(@"autoDetectUID")) {
                 NSString *uid = detectPlayerUID();
                 if (!uid.length) {
-                    [self showAlert:@"Auto Detect UID" message:@"PlayerId not found.\nPlease enter UID manually."];
+                    [self showAlert:@"Auto Detect UID" message:@"Id not found.\nPlease enter UID manually."];
                     [self askUIDThenUpload:dataFiles]; return;
                 }
                 NSMutableArray<NSString*> *filtered = [NSMutableArray new];
@@ -2592,7 +2592,7 @@ static const CGFloat kCH = 192;
         },
         @{
             @"title": @"Auto Detect UID",
-            @"desc":  @"Reads the PlayerId of the account you're currently logged in as.\n\nExample: logged in as UID 123 → only .data files containing '123' are uploaded. No need to type UID manually.",
+            @"desc":  @"Reads the Id of the account you're currently logged in as.\n\nExample: logged in as UID 123 → only .data files containing '123' are uploaded. No need to type UID manually.",
             @"target": @"uid"
         },
         @{
