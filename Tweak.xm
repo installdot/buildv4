@@ -115,8 +115,8 @@ static NSDictionary *decryptBase64ToDict(NSString *b64) {
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Keychain helpers
 // ─────────────────────────────────────────────────────────────────────────────
-static const NSString *kKCSvcUDID       = @"SKToolsRealUDID";      // ← permanent device UDID
-static const NSString *kKCSvcEnrollTok  = @"SKToolsEnrollToken";   // ← temp enroll session token
+static const NSString *kKCSvcUDID       = @"SKToolsRealUDID";
+static const NSString *kKCSvcEnrollTok  = @"SKToolsEnrollToken";
 static const NSString *kKCSvcKey        = @"SKToolsAuthKey";
 static const NSString *kKCAccount       = @"sktools";
 
@@ -125,8 +125,6 @@ static NSDictionary *kcBaseQuery(NSString *service) {
         (__bridge id)kSecClass:              (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrService:        service,
         (__bridge id)kSecAttrAccount:        kKCAccount,
-        // kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly survives reboot but NOT
-        // backup/restore to another device — which is exactly what we want.
         (__bridge id)kSecAttrAccessible:     (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         (__bridge id)kSecAttrSynchronizable: @NO,
     };
@@ -163,16 +161,9 @@ static void kcDelete(NSString *service) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Real UDID (profile-based, survives reinstall)
-//
-// Priority:
-//   1. Keychain cache  → fastest path, no network
-//   2. Poll server with stored enroll token → UDID arrived while app was closed
-//   3. Show enrollment UI → open Safari → user installs profile → poll until done
 // ─────────────────────────────────────────────────────────────────────────────
+static NSString *gRealUDID = nil;
 
-static NSString *gRealUDID = nil;  // in-memory cache once resolved
-
-/// Returns the UDID synchronously from keychain, or nil if not yet enrolled.
 static NSString *loadCachedUDID(void) {
     if (gRealUDID.length) return gRealUDID;
     NSString *kc = kcRead((NSString *)kKCSvcUDID);
@@ -180,20 +171,16 @@ static NSString *loadCachedUDID(void) {
     return nil;
 }
 
-/// Save a successfully-resolved UDID to keychain and memory.
 static void saveRealUDID(NSString *udid) {
     if (!udid.length) return;
     gRealUDID = udid;
     kcWrite((NSString *)kKCSvcUDID, udid);
 }
 
-/// The enrollment session token ties one profile installation to one device.
-/// It is stored in the keychain so we can resume polling after an app restart.
 static NSString *loadEnrollToken(void) { return kcRead((NSString *)kKCSvcEnrollTok); }
 static void saveEnrollToken(NSString *t) { kcWrite((NSString *)kKCSvcEnrollTok, t); }
 static void clearEnrollToken(void)       { kcDelete((NSString *)kKCSvcEnrollTok); }
 
-/// Generate a new enrollment token (UUID v4 string).
 static NSString *newEnrollToken(void) {
     NSString *t = [[NSUUID UUID] UUIDString].lowercaseString;
     saveEnrollToken(t);
@@ -415,7 +402,7 @@ static void performKeyAuth(NSString *keyValue,
     NSDictionary *payload = @{
         @"key"       : keyValue ?: @"",
         @"timestamp" : @((long long)sendTS),
-        @"device_id" : udid,            // ← real UDID, not identifierForVendor
+        @"device_id" : udid,
         @"model"     : deviceModel(),
         @"sys_ver"   : systemVersion(),
     };
@@ -476,9 +463,6 @@ static void performKeyAuth(NSString *keyValue,
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Poll server for UDID (after profile install)
 // ─────────────────────────────────────────────────────────────────────────────
-// Polls GET /udid.php?action=check&token=TOKEN every 2 seconds up to maxAttempts.
-// Calls completion on main queue when UDID found or timeout.
-
 static void pollForUDID(NSString *token,
                          NSInteger attempt,
                          NSInteger maxAttempts,
@@ -493,6 +477,7 @@ static void pollForUDID(NSString *token,
         UDID_BASE, [token stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLQueryAllowedCharacterSet]];
     NSURL *url = [NSURL URLWithString:urlStr];
 
+    // FIX: removed unused NSMutableURLRequest *req variable — use dataTaskWithURL directly
     [[makeSession() dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         if (!err && data.length) {
             NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -560,8 +545,9 @@ static void startSpinAnimation(CALayer *layer) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKUDIDEnrollOverlay
-// Shows when no UDID is enrolled yet. Opens Safari → user installs profile →
-// polls server → on success dismisses and calls completion.
+// FIX: Added to UIWindow directly so game engine can't eat touches.
+//      userInteractionEnabled = YES explicitly set.
+//      bringSubviewToFront called after addSubview.
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKUDIDEnrollOverlay : UIView
 + (instancetype)showInView:(UIView *)parent completion:(void (^)(NSString *udid))completion;
@@ -581,8 +567,11 @@ static void startSpinAnimation(CALayer *layer) {
 + (instancetype)showInView:(UIView *)parent completion:(void (^)(NSString *))completion {
     SKUDIDEnrollOverlay *o = [[SKUDIDEnrollOverlay alloc] initWithFrame:parent.bounds];
     o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // FIX: explicitly enable interaction so game view doesn't swallow touches
+    o.userInteractionEnabled = YES;
     o->_completion = [completion copy];
     [parent addSubview:o];
+    [parent bringSubviewToFront:o];
     o.alpha = 0;
     [UIView animateWithDuration:0.25 animations:^{ o.alpha = 1; }];
     return o;
@@ -592,14 +581,13 @@ static void startSpinAnimation(CALayer *layer) {
     self = [super initWithFrame:f];
     if (!self) return nil;
     self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.90];
+    self.userInteractionEnabled = YES;
 
-    // Reuse existing token if we were in the middle of an enrollment
     _enrollToken = loadEnrollToken();
     if (!_enrollToken.length) _enrollToken = newEnrollToken();
 
     [self buildUI];
 
-    // Auto-resume polling if we had an in-progress session
     if (loadEnrollToken().length) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{ [self startPolling]; });
@@ -617,14 +605,13 @@ static void startSpinAnimation(CALayer *layer) {
     card.layer.shadowOffset  = CGSizeMake(0, 8);
     card.clipsToBounds       = NO;
     card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.userInteractionEnabled = YES;
     [self addSubview:card];
 
-    // Icon
     UIImageView *iconView = symView(@"iphone.badge.play", 34,
         [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1]);
     [card addSubview:iconView];
 
-    // Title
     UILabel *title = [UILabel new];
     title.text          = @"Device Registration";
     title.textColor     = [UIColor whiteColor];
@@ -633,7 +620,6 @@ static void startSpinAnimation(CALayer *layer) {
     title.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:title];
 
-    // Subtitle
     UILabel *sub = [UILabel new];
     sub.text          = @"One-time setup • Survives reinstalls";
     sub.textColor     = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:0.75];
@@ -642,13 +628,11 @@ static void startSpinAnimation(CALayer *layer) {
     sub.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:sub];
 
-    // Divider
     UIView *div = [UIView new];
     div.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
     div.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:div];
 
-    // Step label
     _stepLabel = [UILabel new];
     _stepLabel.numberOfLines = 0;
     _stepLabel.textColor     = [UIColor colorWithWhite:0.60 alpha:1];
@@ -664,7 +648,6 @@ static void startSpinAnimation(CALayer *layer) {
         @"④ Return here — we detect it automatically";
     [card addSubview:_stepLabel];
 
-    // Status label
     _statusLabel = [UILabel new];
     _statusLabel.text          = @"";
     _statusLabel.textColor     = [UIColor colorWithRed:0.90 green:0.35 blue:0.35 alpha:1];
@@ -674,7 +657,6 @@ static void startSpinAnimation(CALayer *layer) {
     _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_statusLabel];
 
-    // Spinner
     _spinner = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     _spinner.color  = [UIColor colorWithRed:0.18 green:0.78 blue:0.44 alpha:1];
@@ -682,17 +664,14 @@ static void startSpinAnimation(CALayer *layer) {
     _spinner.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:_spinner];
 
-    // Open Safari button
     _openSafariBtn = makeSymBtn(@"Get UDID (opens Safari)", @"safari",
         [UIColor colorWithRed:0.14 green:0.52 blue:0.28 alpha:1], @selector(tapGetUDID), self);
     [card addSubview:_openSafariBtn];
 
-    // Already installed button
     _pollBtn = makeSymBtn(@"I Already Installed the Profile", @"checkmark.circle",
         [UIColor colorWithRed:0.18 green:0.35 blue:0.55 alpha:1], @selector(tapAlreadyDone), self);
     [card addSubview:_pollBtn];
 
-    // Footer
     UILabel *footer = [UILabel new];
     footer.text          = @"Profile can be removed from Settings after registration.";
     footer.textColor     = [UIColor colorWithWhite:0.22 alpha:1];
@@ -754,7 +733,6 @@ static void startSpinAnimation(CALayer *layer) {
 }
 
 - (void)tapGetUDID {
-    // Open the profile URL in Safari so iOS can install it
     NSString *profileURL = [NSString stringWithFormat:@"%@?action=profile&token=%@",
         UDID_BASE, _enrollToken];
     NSURL *url = [NSURL URLWithString:profileURL];
@@ -765,7 +743,6 @@ static void startSpinAnimation(CALayer *layer) {
 
     [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
         if (success) {
-            // Give user time to install, then start polling
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                 dispatch_get_main_queue(), ^{ [self startPolling]; });
         } else {
@@ -790,10 +767,8 @@ static void startSpinAnimation(CALayer *layer) {
     _openSafariBtn.enabled = NO;
     _pollBtn.enabled       = NO;
 
-    // 60 attempts × 2 sec = 2 minutes timeout
     pollForUDID(_enrollToken, 0, 60,
         ^(NSString *udid) {
-            // ── Success ──
             [self->_spinner stopAnimating];
             self->_spinner.hidden = YES;
             self->_statusLabel.text      = [NSString stringWithFormat:@"✓ Registered: %@…%@",
@@ -810,7 +785,6 @@ static void startSpinAnimation(CALayer *layer) {
                 });
         },
         ^{
-            // ── Timeout ──
             self->_polling = NO;
             [self->_spinner stopAnimating];
             self->_spinner.hidden = YES;
@@ -823,7 +797,7 @@ static void startSpinAnimation(CALayer *layer) {
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SKProgressOverlay  (unchanged from v11)
+// MARK: - SKProgressOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKProgressOverlay : UIView
 @property (nonatomic, strong) UILabel        *titleLabel;
@@ -985,7 +959,8 @@ static void startSpinAnimation(CALayer *layer) {
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - SKKeyAuthOverlay  (updated: uses UDID from gRealUDID)
+// MARK: - SKKeyAuthOverlay
+// FIX: showInView now receives UIWindow directly from caller
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKKeyAuthOverlay : UIView
 + (instancetype)showInView:(UIView *)parent completion:(void (^)(NSString *key))completion;
@@ -1004,8 +979,11 @@ static void startSpinAnimation(CALayer *layer) {
 + (instancetype)showInView:(UIView *)parent completion:(void (^)(NSString *))completion {
     SKKeyAuthOverlay *o = [[SKKeyAuthOverlay alloc] initWithFrame:parent.bounds];
     o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // FIX: ensure touches aren't swallowed by game view
+    o.userInteractionEnabled = YES;
     o->_completion = [completion copy];
     [parent addSubview:o];
+    [parent bringSubviewToFront:o];
     o.alpha = 0;
     [UIView animateWithDuration:0.25 animations:^{ o.alpha = 1; }];
     return o;
@@ -1014,6 +992,7 @@ static void startSpinAnimation(CALayer *layer) {
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f]; if (!self) return nil;
     self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.88];
+    self.userInteractionEnabled = YES;
     [self buildUI];
     return self;
 }
@@ -1026,6 +1005,7 @@ static void startSpinAnimation(CALayer *layer) {
     card.layer.shadowOpacity = 0.9; card.layer.shadowRadius = 22;
     card.layer.shadowOffset  = CGSizeMake(0, 8);
     card.clipsToBounds = NO;
+    card.userInteractionEnabled = YES;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [self addSubview:card];
 
@@ -1066,7 +1046,7 @@ static void startSpinAnimation(CALayer *layer) {
         }] resume];
     }
 
-    // Show which UDID this device is bound to
+    // FIX: use loadCachedUDID() — persistentDeviceID() was removed in v12
     NSString *udid = loadCachedUDID();
     UILabel *udidBadge = [UILabel new];
     udidBadge.text = udid ? [NSString stringWithFormat:@"UDID: %@…%@",
@@ -1231,10 +1211,12 @@ static void startSpinAnimation(CALayer *layer) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Upload
+// FIX: replaced deviceUUID() with loadCachedUDID() — deviceUUID was removed in v12
 // ─────────────────────────────────────────────────────────────────────────────
 static void performUpload(NSArray<NSString *> *fileNames,
                           SKProgressOverlay *ov,
                           void (^done)(NSString *link, NSString *err)) {
+    // FIX: use loadCachedUDID(); fall back to new UUID if somehow missing
     NSString *uuid    = loadCachedUDID() ?: [[NSUUID UUID] UUIDString].lowercaseString;
     NSURLSession *ses = makeSession();
     NSString *docs    = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -2154,6 +2136,7 @@ static const CGFloat kCH = 192;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKWelcomeNotification
+// FIX: replaced persistentDeviceID() with loadCachedUDID()
 // ─────────────────────────────────────────────────────────────────────────────
 @interface SKWelcomeNotification : UIView
 + (void)showInView:(UIView *)parent
@@ -2260,6 +2243,7 @@ static const CGFloat kCH = 192;
     [card addSubview:devIDTitle];
 
     UILabel *devIDVal = [UILabel new];
+    // FIX: use loadCachedUDID() — persistentDeviceID() was removed in v12
     devIDVal.text          = loadCachedUDID() ?: @"—";
     devIDVal.textColor     = [UIColor colorWithRed:0.35 green:0.90 blue:0.55 alpha:1];
     devIDVal.font          = [UIFont fontWithName:@"Courier" size:9.5] ?: [UIFont systemFontOfSize:9.5];
@@ -2390,8 +2374,6 @@ static const CGFloat kCH = 192;
     if (!self) return nil;
     self.backgroundColor = [UIColor clearColor];
     self.opaque = NO;
-    // ── FIX: spotlight layer should NOT consume touches in the tooltip area ──
-    // We override hitTest instead to let _tooltipCard get touches.
     return self;
 }
 
@@ -2473,33 +2455,18 @@ static const CGFloat kCH = 192;
     }];
 }
 
-// ── FIX: Pass touches through the spotlight so the tooltip card (sibling)
-//         can receive them. We never consume touches ourselves — the parent
-//         SKTutorialOverlay forwards them to the correct subview.
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    return nil; // transparent to touches — parent handles routing
+    return nil;
 }
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKTutorialOverlay
-//
-// FIX SUMMARY (v11.5):
-//   1. Added to the key UIWindow directly (not the VC view), so it always
-//      renders above SKPanel (zPosition 9999) and SKSettingsMenu.
-//   2. layer.zPosition = 1000000 as extra insurance.
-//   3. Settings menu spawned by the tutorial is added to the WINDOW too,
-//      then the tutorial is immediately re-raised on top.
-//   4. SKTutorialSpotlightView returns nil from hitTest — it never blocks
-//      touches from reaching the _tooltipCard Continue button.
-//   5. hitTest on SKTutorialOverlay itself routes touches: if the point
-//      is inside _tooltipCard, deliver to _tooltipCard; otherwise swallow
-//      (blocks accidental taps on the settings menu and panel below).
 // ─────────────────────────────────────────────────────────────────────────────
 @implementation SKTutorialOverlay {
     SKPanel                  *_panel;
-    UIView                   *_parent;           // original VC view (for coordinate conversion)
-    UIWindow                 *_hostWindow;        // window we're added to
+    UIView                   *_parent;
+    UIWindow                 *_hostWindow;
     SKTutorialSpotlightView  *_spotlight;
     UIView                   *_tooltipCard;
     UILabel                  *_stepLabel;
@@ -2511,9 +2478,7 @@ static const CGFloat kCH = 192;
     SKSettingsMenu           *_settingsMenu;
 }
 
-// ── FIX 1: Attach to key window so we're above everything ────────────────────
 + (void)showForPanel:(SKPanel *)panel inView:(UIView *)parent {
-    // Find the key window to host the tutorial
     UIWindow *hostWindow = nil;
     for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator)
         if (!w.isHidden && w.alpha > 0) { hostWindow = w; break; }
@@ -2522,9 +2487,8 @@ static const CGFloat kCH = 192;
     SKTutorialOverlay *o = [[SKTutorialOverlay alloc] initWithFrame:container.bounds];
     o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     o->_panel       = panel;
-    o->_parent      = parent;       // keep VC view reference for coordinate mapping
+    o->_parent      = parent;
     o->_hostWindow  = hostWindow;
-    // ── FIX 2: Enormous zPosition so we're above SKPanel (9999) ──────────
     o.layer.zPosition = 1000000;
     [container addSubview:o];
     o.alpha = 0;
@@ -2540,7 +2504,7 @@ static const CGFloat kCH = 192;
 
     _spotlight = [[SKTutorialSpotlightView alloc] initWithFrame:self.bounds];
     _spotlight.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _spotlight.userInteractionEnabled = NO; // ── FIX 4: never blocks touches
+    _spotlight.userInteractionEnabled = NO;
     [self addSubview:_spotlight];
 
     _tooltipCard = [UIView new];
@@ -2602,13 +2566,10 @@ static const CGFloat kCH = 192;
     return self;
 }
 
-// ── FIX 5: Smart hit-test — route to tooltip card, block everything else ─────
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    // Let the tooltip card (and its Continue button) receive touches
     UIView *cardHit = [_tooltipCard hitTest:[self convertPoint:point toView:_tooltipCard]
                                   withEvent:event];
     if (cardHit) return cardHit;
-    // Swallow all other touches (prevents tapping through to settings/panel)
     return self;
 }
 
@@ -2659,12 +2620,9 @@ static const CGFloat kCH = 192;
     NSDictionary *step = _steps[_stepIndex];
     NSString *target   = step[@"target"];
 
-    // Open settings menu for settings-related steps (index 3-5)
     if (_stepIndex == 3 && !_settingsMenu) {
-        // ── FIX 3a: Add settings menu to the SAME window as us ───────────
         UIView *menuHost = _hostWindow ?: _parent;
         _settingsMenu = [SKSettingsMenu showInView:menuHost];
-        // ── FIX 3b: Re-raise tutorial overlay so it stays above the menu ─
         [self.superview bringSubviewToFront:self];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
             dispatch_get_main_queue(), ^{ [self showStep:step target:target]; });
@@ -2718,7 +2676,6 @@ static const CGFloat kCH = 192;
 }
 
 - (CGRect)rectForTarget:(NSString *)target {
-    // All coordinate conversions go toView:self (which is now window-level)
     if ([target isEqualToString:@"upload"] && _panel.uploadBtn) {
         return [_panel.uploadBtn convertRect:_panel.uploadBtn.bounds toView:self];
     }
@@ -2781,9 +2738,10 @@ static void showWelcomeIfNeeded(UIView *parent) {
         });
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Injection entry point  (v12 UDID-first gate)
+// FIX: All overlays now added directly to UIWindow so game engine cannot
+//      intercept touches. Buttons are fully clickable.
 // ─────────────────────────────────────────────────────────────────────────────
 static SKPanel *gPanel = nil;
 
@@ -2804,21 +2762,16 @@ static void showMainPanel(UIView *root) {
                      completion:^(BOOL _){ showWelcomeIfNeeded(root); }];
 }
 
-/// Step 1 of startup: ensure real UDID is available.
-/// Step 2: run key auth.
-/// Step 3: show panel.
 static void injectPanel(void) {
+    // Get the key UIWindow — adding to window bypasses game engine touch interception
     UIWindow *win = nil;
     for (UIWindow *w in UIApplication.sharedApplication.windows)
         if (!w.isHidden && w.alpha > 0) { win = w; break; }
     if (!win) return;
     UIView *root = win.rootViewController.view ?: win;
 
-    // ── STEP 1: UDID gate ────────────────────────────────────────────────────
-    NSString *cachedUDID = loadCachedUDID();
-
+    // ── STEP 2: Key auth gate (called after UDID confirmed) ─────────────────
     void (^proceedWithAuth)(void) = ^{
-        // ── STEP 2: Key auth gate ─────────────────────────────────────────
         NSString *savedKey = loadSavedKey();
         if (savedKey.length) {
             // Silent re-auth spinner
@@ -2845,9 +2798,8 @@ static void injectPanel(void) {
                                   preferredStyle:UIAlertControllerStyleAlert];
                     [alert addAction:[UIAlertAction actionWithTitle:@"Enter Key" style:UIAlertActionStyleDefault
                         handler:^(UIAlertAction *_) {
-                            UIViewController *vc = win.rootViewController;
-                            while (vc.presentedViewController) vc = vc.presentedViewController;
-                            [SKKeyAuthOverlay showInView:vc.view completion:^(NSString *newKey) {
+                            // FIX: use win directly so touches work over game view
+                            [SKKeyAuthOverlay showInView:win completion:^(NSString *newKey) {
                                 showMainPanel(root);
                             }];
                         }]];
@@ -2859,25 +2811,23 @@ static void injectPanel(void) {
                 }
             });
         } else {
-            // No saved key → show key entry
-            UIViewController *vc = win.rootViewController;
-            while (vc.presentedViewController) vc = vc.presentedViewController;
-            [SKKeyAuthOverlay showInView:(vc.view ?: root) completion:^(NSString *key) {
+            // No saved key → show key entry directly on window
+            // FIX: use win instead of vc.view so game engine can't eat touches
+            [SKKeyAuthOverlay showInView:win completion:^(NSString *key) {
                 showMainPanel(root);
             }];
         }
     };
 
+    // ── STEP 1: UDID gate ────────────────────────────────────────────────────
+    NSString *cachedUDID = loadCachedUDID();
     if (cachedUDID.length) {
         // Already enrolled → go straight to auth
         proceedWithAuth();
     } else {
-        // No UDID yet → show enrollment first
-        UIViewController *vc = win.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        UIView *enrollParent = vc.view ?: root;
-        [SKUDIDEnrollOverlay showInView:enrollParent completion:^(NSString *udid) {
-            // UDID is now stored in keychain; proceed to key auth
+        // No UDID yet → show enrollment on window directly
+        // FIX: use win instead of vc.view so buttons are tappable
+        [SKUDIDEnrollOverlay showInView:win completion:^(NSString *udid) {
             proceedWithAuth();
         }];
     }
