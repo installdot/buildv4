@@ -82,7 +82,7 @@ static DevToolView *gOverlay = nil;
     [self addSubview:titleIcon];
 
     UILabel *titleText      = [[UILabel alloc] initWithFrame:CGRectMake(40,12,W-80,18)];
-    titleText.text          = @"Unitoreios Dev Tool";
+    titleText.text          = @"Dev Tool";
     titleText.font          = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     titleText.textColor     = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
     [self addSubview:titleText];
@@ -100,7 +100,7 @@ static DevToolView *gOverlay = nil;
 
     // ── section: timer ────────────────────────────────────────────────────────
     UILabel *secTitle       = [[UILabel alloc] initWithFrame:CGRectMake(14,46,W-28,13)];
-    secTitle.text           = @"MEMORY TIMER";
+    secTitle.text           = @"MEMORY PATCH";
     secTitle.font           = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
     secTitle.textColor      = [UIColor colorWithWhite:0.35 alpha:1.0];
     [self addSubview:secTitle];
@@ -126,7 +126,7 @@ static DevToolView *gOverlay = nil;
     // ── +7 days button ────────────────────────────────────────────────────────
     self.addButton          = [UIButton buttonWithType:UIButtonTypeSystem];
     self.addButton.frame    = CGRectMake(14, 128, W-28, 36);
-    [self.addButton setTitle:@"+ Add 7 Days to Memory" forState:UIControlStateNormal];
+    [self.addButton setTitle:@"Patch Memory" forState:UIControlStateNormal];
     self.addButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     self.addButton.tintColor       = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
     self.addButton.backgroundColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
@@ -140,7 +140,7 @@ static DevToolView *gOverlay = nil;
 
     // ── section: force offline ────────────────────────────────────────────────
     UILabel *offTitle       = [[UILabel alloc] initWithFrame:CGRectMake(14,182,W-28,13)];
-    offTitle.text           = @"FORCE OFFLINE AUTH";
+    offTitle.text           = @"FORCE AUTH";
     offTitle.font           = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
     offTitle.textColor      = [UIColor colorWithWhite:0.35 alpha:1.0];
     [self addSubview:offTitle];
@@ -242,7 +242,7 @@ static DevToolView *gOverlay = nil;
 
     // pill
     BOOL fOff = forceOfflineEnabled();
-    NSString *indicator = fOff ? @"📵" : @"📶";
+    NSString *indicator = fOff ? @"🐱" : @"😹";
     self.pillLabel.text = hasSession
         ? [NSString stringWithFormat:@"%@ %@", indicator, fmtSeconds(sec)]
         : [NSString stringWithFormat:@"%@ --", indicator];
