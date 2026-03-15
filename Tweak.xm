@@ -1,253 +1,353 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <SystemConfiguration/SystemConfiguration.h>
 
-#define SEVEN_DAYS 604800
+// ═════════════════════════════════════════════════════════════════════════════
+//  UNITOREIOS DEV TOOL — Offline Auth Tester
+//  • Force offline mode on/off (persistent across restarts)
+//  • Live remainingSeconds counter from memory
+//  • +7 days button
+//  • Draggable, minimisable overlay
+// ═════════════════════════════════════════════════════════════════════════════
 
-// ── forward-declare the private ivar ──────────────────────────────────────────
+#define SEVEN_DAYS        604800
+#define kForceOfflineKey  @"com.yourname.devtool.forceOffline"
+
+// ── singleton refs ────────────────────────────────────────────────────────────
 @interface Unitoreios : NSObject
 @property (nonatomic, assign) NSInteger remainingSeconds;
 - (void)startUpdateTimer;
 @end
 
-// ── floating overlay window ───────────────────────────────────────────────────
-@interface OTOverlayWindow : UIWindow
-@end
+static Unitoreios *gExtraInfo = nil;
 
-@interface OTOverlayView : UIView
-@property (nonatomic, strong) UILabel      *timeLabel;
-@property (nonatomic, strong) UILabel      *titleLabel;
-@property (nonatomic, strong) UIButton     *addButton;
-@property (nonatomic, strong) UIButton     *closeButton;
-@property (nonatomic, strong) NSTimer      *displayTimer;
-@property (nonatomic, assign) BOOL          minimised;
-@property (nonatomic, strong) UIView       *pill;   // minimised pill
-- (void)refresh;
-@end
+// ── persistence helpers ───────────────────────────────────────────────────────
+static BOOL forceOfflineEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kForceOfflineKey];
+}
+static void setForceOffline(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kForceOfflineKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSLog(@"[DevTool] ForceOffline → %@", on ? @"ON" : @"OFF");
+}
 
-static OTOverlayWindow *gWindow      = nil;
-static OTOverlayView   *gOverlay     = nil;
-static Unitoreios      *gExtraInfo   = nil;   // grabbed from hook
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-static NSString *formatSeconds(NSInteger s) {
-    if (s <= 0) return @"00d 00h 00m 00s  EXPIRED";
-    NSInteger d  = s / 86400; s %= 86400;
-    NSInteger h  = s / 3600;  s %= 3600;
-    NSInteger m  = s / 60;    s %= 60;
+// ── format helpers ────────────────────────────────────────────────────────────
+static NSString *fmtSeconds(NSInteger s) {
+    if (s <= 0) return @"EXPIRED";
+    NSInteger d = s/86400; s %= 86400;
+    NSInteger h = s/3600;  s %= 3600;
+    NSInteger m = s/60;    s %= 60;
     return [NSString stringWithFormat:@"%02ldd %02ldh %02ldm %02lds",
             (long)d,(long)h,(long)m,(long)s];
 }
 
-static void addSevenDays(void) {
-    if (!gExtraInfo) return;
-    gExtraInfo.remainingSeconds += SEVEN_DAYS;
-    NSLog(@"[OT] +7d → remainingSeconds = %ld", (long)gExtraInfo.remainingSeconds);
-}
+// ═════════════════════════════════════════════════════════════════════════════
+//  OVERLAY VIEW
+// ═════════════════════════════════════════════════════════════════════════════
+@interface DevToolView : UIView
+@property (nonatomic, strong) UILabel  *timeLabel;
+@property (nonatomic, strong) UILabel  *rawLabel;
+@property (nonatomic, strong) UILabel  *sessionLabel;
+@property (nonatomic, strong) UILabel  *offlineStateLabel;
+@property (nonatomic, strong) UIView   *toggleTrack;
+@property (nonatomic, strong) UIView   *toggleThumb;
+@property (nonatomic, strong) UIButton *addButton;
+@property (nonatomic, strong) NSTimer  *displayTimer;
+@property (nonatomic, assign) BOOL      minimised;
+@property (nonatomic, strong) UIView   *pillView;
+@property (nonatomic, strong) UILabel  *pillLabel;
+@end
 
-// ── overlay view ──────────────────────────────────────────────────────────────
-@implementation OTOverlayView
+static UIWindow    *gWindow  = nil;
+static DevToolView *gOverlay = nil;
+
+@implementation DevToolView
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
 
-    self.backgroundColor    = [UIColor colorWithWhite:0.08 alpha:0.92];
+    CGFloat W = frame.size.width;
+
+    self.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.94];
     self.layer.cornerRadius = 18;
     self.layer.borderWidth  = 1;
-    self.layer.borderColor  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.6].CGColor;
+    self.layer.borderColor  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.55].CGColor;
     self.clipsToBounds      = YES;
 
-    // ── title bar ─────────────────────────────────────────────────────────────
-    self.titleLabel                 = [[UILabel alloc] initWithFrame:CGRectMake(14,12,frame.size.width-60,20)];
-    self.titleLabel.text            = @"⏱ Offline Time Test";
-    self.titleLabel.font            = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    self.titleLabel.textColor       = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-    [self addSubview:self.titleLabel];
+    // ── header ────────────────────────────────────────────────────────────────
+    UILabel *titleIcon      = [[UILabel alloc] initWithFrame:CGRectMake(14,12,24,20)];
+    titleIcon.text          = @"🛠";
+    titleIcon.font          = [UIFont systemFontOfSize:14];
+    [self addSubview:titleIcon];
 
-    // ── close / minimise button ───────────────────────────────────────────────
-    self.closeButton                = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.closeButton.frame          = CGRectMake(frame.size.width-40, 8, 30, 28);
-    [self.closeButton setTitle:@"—" forState:UIControlStateNormal];
-    self.closeButton.tintColor      = [UIColor colorWithWhite:0.6 alpha:1.0];
-    self.closeButton.titleLabel.font= [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    [self.closeButton addTarget:self action:@selector(toggleMinimise) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:self.closeButton];
+    UILabel *titleText      = [[UILabel alloc] initWithFrame:CGRectMake(40,12,W-80,18)];
+    titleText.text          = @"Unitoreios Dev Tool";
+    titleText.font          = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    titleText.textColor     = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+    [self addSubview:titleText];
 
-    // ── divider ───────────────────────────────────────────────────────────────
-    UIView *div         = [[UIView alloc] initWithFrame:CGRectMake(0,40,frame.size.width,0.5)];
-    div.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-    [self addSubview:div];
+    UIButton *minBtn        = [UIButton buttonWithType:UIButtonTypeSystem];
+    minBtn.frame            = CGRectMake(W-36, 8, 28, 28);
+    [minBtn setTitle:@"—" forState:UIControlStateNormal];
+    minBtn.tintColor        = [UIColor colorWithWhite:0.5 alpha:1.0];
+    minBtn.titleLabel.font  = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    [minBtn addTarget:self action:@selector(toggleMinimise) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:minBtn];
 
-    // ── time label ────────────────────────────────────────────────────────────
-    self.timeLabel                  = [[UILabel alloc] initWithFrame:CGRectMake(0,50,frame.size.width,36)];
-    self.timeLabel.text             = @"-- waiting --";
-    self.timeLabel.font             = [UIFont monospacedDigitSystemFontOfSize:17 weight:UIFontWeightMedium];
-    self.timeLabel.textColor        = [UIColor colorWithWhite:0.92 alpha:1.0];
-    self.timeLabel.textAlignment    = NSTextAlignmentCenter;
+    // ── divider 1 ─────────────────────────────────────────────────────────────
+    [self addDividerAt:38 width:W];
+
+    // ── section: timer ────────────────────────────────────────────────────────
+    UILabel *secTitle       = [[UILabel alloc] initWithFrame:CGRectMake(14,46,W-28,13)];
+    secTitle.text           = @"MEMORY TIMER";
+    secTitle.font           = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    secTitle.textColor      = [UIColor colorWithWhite:0.35 alpha:1.0];
+    [self addSubview:secTitle];
+
+    self.timeLabel          = [[UILabel alloc] initWithFrame:CGRectMake(0,62,W,32)];
+    self.timeLabel.text     = @"-- no session --";
+    self.timeLabel.font     = [UIFont monospacedDigitSystemFontOfSize:18 weight:UIFontWeightMedium];
+    self.timeLabel.textColor= [UIColor colorWithWhite:0.90 alpha:1.0];
+    self.timeLabel.textAlignment = NSTextAlignmentCenter;
     [self addSubview:self.timeLabel];
 
-    // ── sub label (raw seconds) ───────────────────────────────────────────────
-    UILabel *sub        = [[UILabel alloc] initWithFrame:CGRectMake(0,84,frame.size.width,16)];
-    sub.tag             = 99;
-    sub.font            = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightRegular];
-    sub.textColor       = [UIColor colorWithWhite:0.45 alpha:1.0];
-    sub.textAlignment   = NSTextAlignmentCenter;
-    [self addSubview:sub];
+    self.rawLabel           = [[UILabel alloc] initWithFrame:CGRectMake(0,94,W,14)];
+    self.rawLabel.font      = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.rawLabel.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
+    self.rawLabel.textAlignment = NSTextAlignmentCenter;
+    [self addSubview:self.rawLabel];
+
+    self.sessionLabel       = [[UILabel alloc] initWithFrame:CGRectMake(0,110,W,13)];
+    self.sessionLabel.font  = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+    self.sessionLabel.textAlignment = NSTextAlignmentCenter;
+    [self addSubview:self.sessionLabel];
 
     // ── +7 days button ────────────────────────────────────────────────────────
-    self.addButton                  = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.addButton.frame            = CGRectMake(14, 110, frame.size.width-28, 40);
-    [self.addButton setTitle:@"+ Add 7 Days" forState:UIControlStateNormal];
-    self.addButton.titleLabel.font  = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    self.addButton.tintColor        = [UIColor colorWithRed:0.08 green:0.10 blue:0.14 alpha:1.0];
-    self.addButton.backgroundColor  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+    self.addButton          = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.addButton.frame    = CGRectMake(14, 128, W-28, 36);
+    [self.addButton setTitle:@"+ Add 7 Days to Memory" forState:UIControlStateNormal];
+    self.addButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    self.addButton.tintColor       = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
+    self.addButton.backgroundColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
     self.addButton.layer.cornerRadius = 10;
     self.addButton.clipsToBounds    = YES;
     [self.addButton addTarget:self action:@selector(didTapAdd) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.addButton];
 
-    // ── status strip ──────────────────────────────────────────────────────────
-    UILabel *status     = [[UILabel alloc] initWithFrame:CGRectMake(0,158,frame.size.width,14)];
-    status.tag          = 98;
-    status.font         = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
-    status.textColor    = [UIColor colorWithWhite:0.35 alpha:1.0];
-    status.textAlignment= NSTextAlignmentCenter;
-    status.text         = @"no session yet";
-    [self addSubview:status];
+    // ── divider 2 ─────────────────────────────────────────────────────────────
+    [self addDividerAt:174 width:W];
 
-    // ── pill (minimised state) ─────────────────────────────────────────────────
-    self.pill               = [[UIView alloc] initWithFrame:CGRectMake(0,0,frame.size.width,36)];
-    self.pill.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
-    self.pill.layer.cornerRadius = 18;
-    self.pill.layer.borderWidth = 1;
-    self.pill.layer.borderColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.5].CGColor;
-    self.pill.clipsToBounds = YES;
-    self.pill.hidden        = YES;
+    // ── section: force offline ────────────────────────────────────────────────
+    UILabel *offTitle       = [[UILabel alloc] initWithFrame:CGRectMake(14,182,W-28,13)];
+    offTitle.text           = @"FORCE OFFLINE AUTH";
+    offTitle.font           = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    offTitle.textColor      = [UIColor colorWithWhite:0.35 alpha:1.0];
+    [self addSubview:offTitle];
 
-    UILabel *pillLabel      = [[UILabel alloc] initWithFrame:CGRectMake(12,0,frame.size.width-24,36)];
-    pillLabel.tag           = 97;
-    pillLabel.font          = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
-    pillLabel.textColor     = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-    pillLabel.text          = @"⏱ --";
-    [self.pill addSubview:pillLabel];
+    // state label (ON / OFF)
+    self.offlineStateLabel  = [[UILabel alloc] initWithFrame:CGRectMake(14,200,80,28)];
+    self.offlineStateLabel.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
+    [self addSubview:self.offlineStateLabel];
 
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleMinimise)];
-    [self.pill addGestureRecognizer:tap];
-    [self addSubview:self.pill];
+    // toggle track
+    CGFloat trackW=52, trackH=30, trackX=W-trackW-14, trackY=198;
+    self.toggleTrack        = [[UIView alloc] initWithFrame:CGRectMake(trackX,trackY,trackW,trackH)];
+    self.toggleTrack.layer.cornerRadius = trackH/2;
+    self.toggleTrack.clipsToBounds      = YES;
+    [self addSubview:self.toggleTrack];
 
-    // ── drag gesture ─────────────────────────────────────────────────────────
+    self.toggleThumb        = [[UIView alloc] initWithFrame:CGRectMake(2,2,trackH-4,trackH-4)];
+    self.toggleThumb.layer.cornerRadius = (trackH-4)/2;
+    self.toggleThumb.backgroundColor    = [UIColor whiteColor];
+    [self.toggleTrack addSubview:self.toggleThumb];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(didTapToggle)];
+    [self.toggleTrack addGestureRecognizer:tap];
+
+    UILabel *hint           = [[UILabel alloc] initWithFrame:CGRectMake(0,234,W,13)];
+    hint.text               = @"Persists across app restarts";
+    hint.font               = [UIFont systemFontOfSize:9 weight:UIFontWeightRegular];
+    hint.textColor          = [UIColor colorWithWhite:0.28 alpha:1.0];
+    hint.textAlignment      = NSTextAlignmentCenter;
+    [self addSubview:hint];
+
+    // ── pill (minimised) ──────────────────────────────────────────────────────
+    self.pillView               = [[UIView alloc] initWithFrame:CGRectMake(0,0,W,36)];
+    self.pillView.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.94];
+    self.pillView.layer.cornerRadius = 18;
+    self.pillView.layer.borderWidth  = 1;
+    self.pillView.layer.borderColor  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.5].CGColor;
+    self.pillView.clipsToBounds      = YES;
+    self.pillView.hidden             = YES;
+
+    self.pillLabel          = [[UILabel alloc] initWithFrame:CGRectMake(10,0,W-20,36)];
+    self.pillLabel.font     = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
+    self.pillLabel.textColor= [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+    self.pillLabel.text     = @"⏱ --";
+    [self.pillView addSubview:self.pillLabel];
+
+    UITapGestureRecognizer *pillTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleMinimise)];
+    [self.pillView addGestureRecognizer:pillTap];
+    [self addSubview:self.pillView];
+
+    // ── drag ──────────────────────────────────────────────────────────────────
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [self addGestureRecognizer:pan];
 
-    // ── display refresh timer ─────────────────────────────────────────────────
+    // ── boot state ────────────────────────────────────────────────────────────
+    [self applyToggleState:NO];
+
+    // ── refresh timer ─────────────────────────────────────────────────────────
     self.displayTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                          target:self
                                                        selector:@selector(refresh)
                                                        userInfo:nil
                                                         repeats:YES];
+    [self refresh];
     return self;
 }
 
-- (void)refresh {
-    NSInteger sec = gExtraInfo ? gExtraInfo.remainingSeconds : 0;
-
-    self.timeLabel.text = formatSeconds(sec);
-    self.timeLabel.textColor = sec > 0
-        ? [UIColor colorWithWhite:0.92 alpha:1.0]
-        : [UIColor colorWithRed:0.9 green:0.3 blue:0.3 alpha:1.0];
-
-    UILabel *sub    = (UILabel *)[self viewWithTag:99];
-    sub.text        = [NSString stringWithFormat:@"%ld raw seconds in memory", (long)sec];
-
-    UILabel *status = (UILabel *)[self viewWithTag:98];
-    UILabel *pill   = (UILabel *)[self viewWithTag:97];
-
-    if (gExtraInfo) {
-        status.text  = @"session active — live memory";
-        status.textColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.8];
-        pill.text    = [NSString stringWithFormat:@"⏱ %@", formatSeconds(sec)];
-    } else {
-        status.text  = @"no session yet";
-        status.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
-        pill.text    = @"⏱ no session";
-    }
+// ── helpers ───────────────────────────────────────────────────────────────────
+- (void)addDividerAt:(CGFloat)y width:(CGFloat)w {
+    UIView *d       = [[UIView alloc] initWithFrame:CGRectMake(0,y,w,0.5)];
+    d.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
+    [self addSubview:d];
 }
 
-- (void)didTapAdd {
-    addSevenDays();
+// ── refresh (every second) ────────────────────────────────────────────────────
+- (void)refresh {
+    NSInteger sec = gExtraInfo ? gExtraInfo.remainingSeconds : 0;
+    BOOL hasSession = gExtraInfo != nil;
 
-    // flash button green briefly
+    // time label
+    self.timeLabel.text = hasSession ? fmtSeconds(sec) : @"-- no session --";
+    self.timeLabel.textColor = (hasSession && sec > 0)
+        ? [UIColor colorWithWhite:0.90 alpha:1.0]
+        : [UIColor colorWithRed:0.85 green:0.30 blue:0.30 alpha:1.0];
+
+    // raw seconds
+    self.rawLabel.text = hasSession
+        ? [NSString stringWithFormat:@"%ld seconds raw", (long)sec]
+        : @"waiting for session…";
+
+    // session status
+    if (hasSession) {
+        self.sessionLabel.text      = @"● live memory";
+        self.sessionLabel.textColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.9];
+    } else {
+        self.sessionLabel.text      = @"○ no session yet";
+        self.sessionLabel.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
+    }
+
+    // pill
+    BOOL fOff = forceOfflineEnabled();
+    NSString *indicator = fOff ? @"📵" : @"📶";
+    self.pillLabel.text = hasSession
+        ? [NSString stringWithFormat:@"%@ %@", indicator, fmtSeconds(sec)]
+        : [NSString stringWithFormat:@"%@ --", indicator];
+}
+
+// ── +7 days ───────────────────────────────────────────────────────────────────
+- (void)didTapAdd {
+    if (!gExtraInfo) return;
+    gExtraInfo.remainingSeconds += SEVEN_DAYS;
+    NSLog(@"[DevTool] +7d → remainingSeconds = %ld", (long)gExtraInfo.remainingSeconds);
+
     UIColor *orig = self.addButton.backgroundColor;
-    [UIView animateWithDuration:0.1 animations:^{
-        self.addButton.backgroundColor = [UIColor colorWithRed:0.05 green:0.55 blue:0.35 alpha:1.0];
-    } completion:^(BOOL _) {
-        [UIView animateWithDuration:0.4 animations:^{
+    [UIView animateWithDuration:0.10 animations:^{
+        self.addButton.backgroundColor = [UIColor colorWithRed:0.05 green:0.50 blue:0.32 alpha:1.0];
+    } completion:^(BOOL _){
+        [UIView animateWithDuration:0.35 animations:^{
             self.addButton.backgroundColor = orig;
         }];
     }];
-
     [self refresh];
 }
 
+// ── toggle ────────────────────────────────────────────────────────────────────
+- (void)didTapToggle {
+    setForceOffline(!forceOfflineEnabled());
+    [self applyToggleState:YES];
+    [self refresh];
+}
+
+- (void)applyToggleState:(BOOL)animated {
+    BOOL on           = forceOfflineEnabled();
+    UIColor *trackOn  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+    UIColor *trackOff = [UIColor colorWithWhite:0.24 alpha:1.0];
+
+    CGFloat tW = self.toggleTrack.frame.size.width;
+    CGFloat tH = self.toggleThumb.frame.size.width;
+
+    void (^upd)(void) = ^{
+        self.toggleTrack.backgroundColor = on ? trackOn : trackOff;
+        CGRect tf = self.toggleThumb.frame;
+        tf.origin.x = on ? (tW - tH - 2) : 2;
+        self.toggleThumb.frame = tf;
+
+        self.offlineStateLabel.text      = on ? @"ON"  : @"OFF";
+        self.offlineStateLabel.textColor = on
+            ? [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0]
+            : [UIColor colorWithWhite:0.38 alpha:1.0];
+
+        self.layer.borderColor = on
+            ? [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.8].CGColor
+            : [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.35].CGColor;
+    };
+
+    animated
+        ? [UIView animateWithDuration:0.22 delay:0
+               usingSpringWithDamping:0.7 initialSpringVelocity:0.5
+                              options:UIViewAnimationOptionCurveEaseInOut
+                           animations:upd completion:nil]
+        : upd();
+}
+
+// ── minimise / expand ─────────────────────────────────────────────────────────
 - (void)toggleMinimise {
     self.minimised = !self.minimised;
-
     if (self.minimised) {
-        // shrink to pill
-        [UIView animateWithDuration:0.22 animations:^{
-            CGRect f = gWindow.frame;
-            f.size.height = 36;
-            gWindow.frame = f;
+        [UIView animateWithDuration:0.20 animations:^{
+            CGRect f = gWindow.frame; f.size.height = 36; gWindow.frame = f;
             self.frame = CGRectMake(0,0,f.size.width,36);
-        } completion:^(BOOL _) {
-            self.titleLabel.hidden = YES;
-            self.closeButton.hidden = YES;
-            self.timeLabel.hidden = YES;
-            [self viewWithTag:99].hidden = YES;
-            self.addButton.hidden = YES;
-            [self viewWithTag:98].hidden = YES;
-            self.pill.hidden = NO;
+        } completion:^(BOOL _){
+            for (UIView *v in self.subviews) v.hidden = (v != self.pillView);
+            self.pillView.hidden = NO;
             self.layer.cornerRadius = 18;
         }];
     } else {
-        // expand back
-        self.titleLabel.hidden = NO;
-        self.closeButton.hidden = NO;
-        self.timeLabel.hidden = NO;
-        [self viewWithTag:99].hidden = NO;
-        self.addButton.hidden = NO;
-        [self viewWithTag:98].hidden = NO;
-        self.pill.hidden = YES;
-
-        [UIView animateWithDuration:0.22 animations:^{
-            CGRect f = gWindow.frame;
-            f.size.height = 178;
-            gWindow.frame = f;
-            self.frame = CGRectMake(0,0,f.size.width,178);
+        for (UIView *v in self.subviews) v.hidden = NO;
+        self.pillView.hidden = YES;
+        [UIView animateWithDuration:0.20 animations:^{
+            CGRect f = gWindow.frame; f.size.height = 252; gWindow.frame = f;
+            self.frame = CGRectMake(0,0,f.size.width,252);
         }];
     }
 }
 
+// ── drag ──────────────────────────────────────────────────────────────────────
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint delta = [pan translationInView:self.superview];
-    CGRect f = gWindow.frame;
-    f.origin.x += delta.x;
-    f.origin.y += delta.y;
-
-    // keep on screen
-    CGRect screen = [UIScreen mainScreen].bounds;
-    f.origin.x = MAX(0, MIN(f.origin.x, screen.size.width  - f.size.width));
-    f.origin.y = MAX(20, MIN(f.origin.y, screen.size.height - f.size.height - 20));
-    gWindow.frame = f;
+    CGPoint delta  = [pan translationInView:self.superview];
+    CGRect f       = gWindow.frame;
+    f.origin.x    += delta.x;
+    f.origin.y    += delta.y;
+    CGRect screen  = [UIScreen mainScreen].bounds;
+    f.origin.x     = MAX(0, MIN(f.origin.x, screen.size.width  - f.size.width));
+    f.origin.y     = MAX(20, MIN(f.origin.y, screen.size.height - f.size.height - 20));
+    gWindow.frame  = f;
     [pan setTranslation:CGPointZero inView:self.superview];
 }
 
 @end
 
-// ── overlay window (stays on top) ────────────────────────────────────────────
-@implementation OTOverlayWindow
+// ═════════════════════════════════════════════════════════════════════════════
+//  WINDOW (pass-through touches outside overlay)
+// ═════════════════════════════════════════════════════════════════════════════
+@interface DevToolWindow : UIWindow
+@end
+@implementation DevToolWindow
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    // only intercept touches that land on our subviews
     for (UIView *sub in self.subviews) {
         if (!sub.hidden && [sub pointInside:[self convertPoint:point toView:sub] withEvent:event])
             return YES;
@@ -256,15 +356,18 @@ static void addSevenDays(void) {
 }
 @end
 
-// ── spawn the overlay ─────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  SPAWN
+// ═════════════════════════════════════════════════════════════════════════════
 static void spawnOverlay(void) {
     if (gWindow) return;
-
-    CGFloat w = 220, h = 178;
+    CGFloat w = 230, h = 252;
     CGRect screen = [UIScreen mainScreen].bounds;
-    gWindow = [[OTOverlayWindow alloc] initWithFrame:CGRectMake(screen.size.width - w - 12,
-                                                                 screen.size.height * 0.30,
-                                                                 w, h)];
+    gWindow = [[DevToolWindow alloc] initWithFrame:CGRectMake(
+        screen.size.width - w - 12,
+        screen.size.height * 0.28,
+        w, h)];
+
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
@@ -273,41 +376,48 @@ static void spawnOverlay(void) {
             }
         }
     }
-    gWindow.windowLevel   = UIWindowLevelAlert + 100;
-    gWindow.backgroundColor = [UIColor clearColor];
 
-    gOverlay = [[OTOverlayView alloc] initWithFrame:CGRectMake(0,0,w,h)];
+    gWindow.windowLevel     = UIWindowLevelAlert + 100;
+    gWindow.backgroundColor = [UIColor clearColor];
+    gOverlay = [[DevToolView alloc] initWithFrame:CGRectMake(0,0,w,h)];
     [gWindow addSubview:gOverlay];
     gWindow.hidden = NO;
     [gWindow makeKeyAndVisible];
-    NSLog(@"[OT] overlay spawned");
+    NSLog(@"[DevTool] overlay ready");
 }
 
-// ── hooks ─────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  HOOKS
+// ═════════════════════════════════════════════════════════════════════════════
 %hook Unitoreios
 
-// Called right after server sets remainingSeconds — grab self == extraInfo
+// ── grab extraInfo singleton + spawn overlay after first valid session ─────
 - (void)startUpdateTimer {
     %orig;
     if (!gExtraInfo) {
         gExtraInfo = self;
-        NSLog(@"[OT] grabbed extraInfo singleton: %@", self);
+        NSLog(@"[DevTool] extraInfo captured: %@", self);
         dispatch_async(dispatch_get_main_queue(), ^{ spawnOverlay(); });
     }
 }
 
-// Also hook updateTime so remainingSeconds stays in sync with display
-- (void)updateTime {
-    %orig;
-    // gOverlay refreshes itself via its own NSTimer — nothing needed here
+// ── force offline gate ────────────────────────────────────────────────────
+- (BOOL)isNetworkAvailable {
+    if (forceOfflineEnabled()) {
+        return NO;
+    }
+    return %orig;
 }
 
 %end
 
-// ── constructor ───────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  CONSTRUCTOR
+// ═════════════════════════════════════════════════════════════════════════════
 %ctor {
-    NSLog(@"[OT] OfflineTimeTest loaded");
-    // Spawn overlay early so it appears even before key validation
+    NSLog(@"[DevTool] loaded — forceOffline=%@",
+          forceOfflineEnabled() ? @"ON" : @"OFF");
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         spawnOverlay();
