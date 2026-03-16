@@ -1,159 +1,204 @@
 /*
- * KeychainSpy — Network Interceptor + Keychain Dumper + UDID Patcher
+ * NetCapture — Universal Request Logger
+ *
+ * Captures EVERY outgoing HTTP/HTTPS request the app makes:
+ *   - URL, method, headers, body
+ *   - Response status, headers, body
+ *   - Timing (ms)
+ *
+ * Output : NSDocumentDirectory/net_capture.txt
+ *          Appended in real-time, one entry per request
+ *
+ * Load order:
+ *   constructor(101) → NSURLProtocol registered before ANY app code runs
+ *   %ctor           → Logos hooks + overlay
  */
 
 #import <UIKit/UIKit.h>
-#import <Security/Security.h>
 #import <Foundation/Foundation.h>
 
 // =============================================================================
 //  MARK: - Constants
 // =============================================================================
 
-static NSString *const kInterceptHost = @"app.tnspike.com";
-static NSString *const kInterceptPath = @"/verify_udid";
-static NSString *const kHandledKey    = @"KSSpoofHandled";
-static NSString *const kBypassKey     = @"KSSpoofBypass";
-
-#define kTargetService  @"com.tnnguy.auth"
-#define kTargetAccount  @"device_udid"
-#define kTargetGroup    @"6HV9UPZCN4.*"
-#define kNewUDID        @"00008020-F41FCBF78457528B"
+static NSString *const kNCBypassKey  = @"NCBypassCapture";
+static NSString *const kNCHandledKey = @"NCHandled";
+static NSString *const kLogFileName  = @"net_capture.txt";
 
 // =============================================================================
-//  MARK: - Spoof JSON builder
+//  MARK: - Log writer (thread-safe, append-only)
 // =============================================================================
 
-static NSData *BuildSpoofedResponse(void) {
-    NSDate *now       = [NSDate date];
-    NSDate *expiresAt = [now dateByAddingTimeInterval:100.0 * 365.25 * 86400.0];
+static dispatch_queue_t gLogQueue;
 
-    NSDateComponents *diff =
-        [[NSCalendar currentCalendar] components:NSCalendarUnitDay
-                                        fromDate:now
-                                          toDate:expiresAt
-                                         options:0];
-    NSInteger days = diff.day;
+static NSString *LogFilePath(void) {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    return [docs stringByAppendingPathComponent:kLogFileName];
+}
 
-    NSDateFormatter *fmt = [NSDateFormatter new];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    fmt.locale     = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    fmt.timeZone   = [NSTimeZone timeZoneWithName:@"UTC"];
+static void NCLog(NSString *entry) {
+    dispatch_async(gLogQueue, ^{
+        NSString *path = LogFilePath();
+        NSFileManager *fm = [NSFileManager defaultManager];
 
-    NSDictionary *json = @{
-        @"status"         : @"active",
-        @"activation_key" : @"TNK-7D-CEBADEDF",
-        @"client_version" : @"2.0.2",
-        @"activated_at"   : [fmt stringFromDate:now],
-        @"expires_at"     : [fmt stringFromDate:expiresAt],
-        @"message"        : [NSString stringWithFormat:
-                                @"UDID is valid - %ld days remaining", (long)days],
-        @"update_notes"   : @[
-            @"Fixed skill search filter not working",
-            @"Added Key Info card in DATA MOD tab",
-            @"Improved menu height and layout",
-            @"Added Contact button in Data Mod tab"
-        ],
-        @"remaining"      : [NSString stringWithFormat:@"%ld days", (long)days],
-        @"package_type"   : @"BASIC"
-    };
+        // Create file with header if it doesn't exist yet
+        if (![fm fileExistsAtPath:path]) {
+            NSString *header = [NSString stringWithFormat:
+                @"╔══════════════════════════════════════════════════════════╗\n"
+                 "║             NetCapture — Universal Request Log            ║\n"
+                 "║  Bundle : %-46@  ║\n"
+                 "║  Start  : %-46@  ║\n"
+                 "╚══════════════════════════════════════════════════════════╝\n\n",
+                [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown",
+                [NSDate date]];
+            [header writeToFile:path atomically:YES
+                       encoding:NSUTF8StringEncoding error:nil];
+        }
 
-    NSError *e    = nil;
-    NSData  *data = [NSJSONSerialization dataWithJSONObject:json
-                                                    options:0
-                                                      error:&e];
-    NSLog(@"[KeychainSpy] SpoofJSON: %@",
-          [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
-    return data;
+        // Append entry
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            NSData *d = [entry dataUsingEncoding:NSUTF8StringEncoding];
+            if (d) [fh writeData:d];
+            [fh closeFile];
+        }
+    });
+}
+
+static NSString *HexDumpPreview(NSData *data, NSUInteger maxBytes) {
+    if (!data || data.length == 0) return @"<empty>";
+    NSUInteger len  = MIN(data.length, maxBytes);
+    NSString  *utf8 = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, len)]
+                                            encoding:NSUTF8StringEncoding];
+    if (utf8) {
+        // Sanitise control chars for log readability
+        NSMutableString *s = [utf8 mutableCopy];
+        [s replaceOccurrencesOfString:@"\n" withString:@"↵"
+                              options:0 range:NSMakeRange(0, s.length)];
+        [s replaceOccurrencesOfString:@"\r" withString:@""
+                              options:0 range:NSMakeRange(0, s.length)];
+        return (data.length > maxBytes)
+            ? [NSString stringWithFormat:@"%@ …(+%lu B)", s,
+               (unsigned long)(data.length - maxBytes)]
+            : s;
+    }
+    // Binary fallback — hex preview
+    NSMutableString *hex = [NSMutableString string];
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    for (NSUInteger i = 0; i < MIN(len, 64); i++)
+        [hex appendFormat:@"%02X ", bytes[i]];
+    return [NSString stringWithFormat:@"<binary %lu B> %@",
+            (unsigned long)data.length, hex];
 }
 
 // =============================================================================
-//  MARK: - NSURLProtocol — PRIMARY interface (must come before extension)
+//  MARK: - Capture Protocol (PRIMARY interface first, then extension)
 // =============================================================================
 
-@interface KSSpoofProtocol : NSURLProtocol
+@interface NCCaptureProtocol : NSURLProtocol
 @property (nonatomic, strong) NSURLSessionDataTask *realTask;
+@property (nonatomic, strong) NSMutableData        *responseData;
+@property (nonatomic, strong) NSHTTPURLResponse    *responseHTTP;
+@property (nonatomic, assign) NSTimeInterval        startTime;
+@property (nonatomic, assign) NSUInteger            reqIndex;
 @end
 
-// Class extension — adds protocol conformance after primary interface exists
-@interface KSSpoofProtocol () <NSURLSessionDataDelegate>
+@interface NCCaptureProtocol () <NSURLSessionDataDelegate>
 @end
 
-@implementation KSSpoofProtocol
+// Monotonic request counter (atomic)
+static _Atomic(NSUInteger) gReqCounter = 0;
+
+@implementation NCCaptureProtocol
+
+// ── Registration ─────────────────────────────────────────────────────────────
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if ([NSURLProtocol propertyForKey:kBypassKey  inRequest:request]) return NO;
-    if ([NSURLProtocol propertyForKey:kHandledKey inRequest:request]) return NO;
-
-    NSURL *url = request.URL;
-    if ([url.host isEqualToString:kInterceptHost] &&
-        [url.path isEqualToString:kInterceptPath]) {
-        NSLog(@"[KeychainSpy] 🛡 Intercepted: %@", url.absoluteString);
-        return YES;
-    }
-    return NO;
+    // Skip our own forwarded copies
+    if ([NSURLProtocol propertyForKey:kNCBypassKey  inRequest:request]) return NO;
+    if ([NSURLProtocol propertyForKey:kNCHandledKey inRequest:request]) return NO;
+    // Capture everything HTTP/HTTPS
+    NSString *scheme = request.URL.scheme.lowercaseString;
+    return ([scheme isEqualToString:@"http"] ||
+            [scheme isEqualToString:@"https"]);
 }
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
 + (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a
                        toRequest:(NSURLRequest *)b { return NO; }
 
-- (void)startLoading {
+// ── Start ─────────────────────────────────────────────────────────────────────
 
-    // ── 1. Fire the REAL request in the background ──────────────────────────
-    NSMutableURLRequest *realReq = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:kBypassKey inRequest:realReq];
+- (void)startLoading {
+    self.startTime    = [NSDate date].timeIntervalSince1970;
+    self.responseData = [NSMutableData data];
+    self.reqIndex     = ++gReqCounter;
+
+    // ── Log REQUEST ──────────────────────────────────────────────────────────
+    NSURLRequest *req = self.request;
+    NSMutableString *reqLog = [NSMutableString string];
+
+    [reqLog appendFormat:
+        @"┌─────────────────────────────────────────────────────────────\n"
+         "│  #%-6lu  REQUEST\n"
+         "│  Time   : %@\n"
+         "│  Method : %@\n"
+         "│  URL    : %@\n",
+        (unsigned long)self.reqIndex,
+        [NSDate date],
+        req.HTTPMethod ?: @"GET",
+        req.URL.absoluteString ?: @"?"];
+
+    // Request headers
+    NSDictionary *rhdrs = req.allHTTPHeaderFields;
+    if (rhdrs.count) {
+        [reqLog appendString:@"│  Headers:\n"];
+        for (NSString *k in rhdrs)
+            [reqLog appendFormat:@"│    %@ : %@\n", k, rhdrs[k]];
+    }
+
+    // Request body
+    NSData *body = req.HTTPBody;
+    if (!body && req.HTTPBodyStream) {
+        // Read stream into data (max 8 KB preview)
+        NSInputStream *stream = req.HTTPBodyStream;
+        [stream open];
+        NSMutableData *bd = [NSMutableData data];
+        uint8_t buf[4096]; NSInteger nb;
+        while ([stream hasBytesAvailable] && bd.length < 8192) {
+            nb = [stream read:buf maxLength:sizeof(buf)];
+            if (nb > 0) [bd appendBytes:buf length:nb]; else break;
+        }
+        [stream close];
+        body = bd.length ? bd : nil;
+    }
+    if (body.length) {
+        [reqLog appendFormat:@"│  Body (%lu B):\n│    %@\n",
+            (unsigned long)body.length,
+            HexDumpPreview(body, 512)];
+    } else {
+        [reqLog appendString:@"│  Body : <none>\n"];
+    }
+    [reqLog appendString:@"│\n"];
+    NCLog(reqLog);
+
+    // ── Forward real request on bypass session ────────────────────────────
+    NSMutableURLRequest *fwdReq = [req mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:kNCBypassKey  inRequest:fwdReq];
+    [NSURLProtocol setProperty:@YES forKey:kNCHandledKey inRequest:fwdReq];
 
     NSURLSessionConfiguration *cfg =
         [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.protocolClasses = @[];   // strip all custom protocols — loop-proof
+    cfg.protocolClasses = @[];   // no custom protocols on bypass session
 
-    NSURLSession *bypassSession =
+    NSURLSession *session =
         [NSURLSession sessionWithConfiguration:cfg
-                                      delegate:nil
+                                      delegate:self
                                  delegateQueue:nil];
-
-    NSURLSessionDataTask *fireAndForget =
-        [bypassSession dataTaskWithRequest:realReq
-                         completionHandler:^(NSData        *data,
-                                             NSURLResponse *response,
-                                             NSError       *error) {
-            // Real response — silently discard
-            if (error) {
-                NSLog(@"[KeychainSpy] Real req error (discarded): %@",
-                      error.localizedDescription);
-            } else {
-                NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-                NSLog(@"[KeychainSpy] Real resp %ld (discarded, %lu B)",
-                      (long)http.statusCode, (unsigned long)data.length);
-            }
-        }];
-    [fireAndForget resume];
-    self.realTask = fireAndForget;
-
-    // ── 2. Return spoofed response to the app IMMEDIATELY ───────────────────
-    NSData *body = BuildSpoofedResponse();
-
-    NSDictionary *headers = @{
-        @"Content-Type"   : @"application/json; charset=utf-8",
-        @"Content-Length" : [NSString stringWithFormat:@"%lu",
-                                (unsigned long)body.length],
-        @"X-Spoofed"      : @"KeychainSpy"
-    };
-
-    NSHTTPURLResponse *spoofedResp =
-        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
-                                    statusCode:200
-                                   HTTPVersion:@"HTTP/1.1"
-                                  headerFields:headers];
-
-    [self.client URLProtocol:self
-          didReceiveResponse:spoofedResp
-          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:body];
-    [self.client URLProtocolDidFinishLoading:self];
-
-    NSLog(@"[KeychainSpy] ✓ Spoofed response delivered to app");
+    self.realTask = [session dataTaskWithRequest:fwdReq];
+    [self.realTask resume];
 }
 
 - (void)stopLoading {
@@ -161,407 +206,290 @@ static NSData *BuildSpoofedResponse(void) {
     self.realTask = nil;
 }
 
+// ── NSURLSessionDataDelegate ──────────────────────────────────────────────────
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)task
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+
+    self.responseHTTP = [response isKindOfClass:[NSHTTPURLResponse class]]
+        ? (NSHTTPURLResponse *)response : nil;
+
+    // Forward to app
+    [self.client URLProtocol:self
+          didReceiveResponse:response
+          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)task
+    didReceiveData:(NSData *)data {
+    [self.responseData appendData:data];
+    [self.client URLProtocol:self didLoadData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+
+    NSTimeInterval elapsed =
+        ([NSDate date].timeIntervalSince1970 - self.startTime) * 1000.0;
+
+    // ── Log RESPONSE ─────────────────────────────────────────────────────────
+    NSMutableString *respLog = [NSMutableString string];
+
+    if (error) {
+        [respLog appendFormat:
+            @"│  #%-6lu  RESPONSE  (%.1f ms)\n"
+             "│  ERROR  : %@ (code %ld)\n"
+             "└─────────────────────────────────────────────────────────────\n\n",
+            (unsigned long)self.reqIndex, elapsed,
+            error.localizedDescription, (long)error.code];
+        NCLog(respLog);
+        [self.client URLProtocol:self didFailWithError:error];
+        return;
+    }
+
+    NSHTTPURLResponse *http = self.responseHTTP;
+    [respLog appendFormat:
+        @"│  #%-6lu  RESPONSE  (%.1f ms)\n"
+         "│  Status : %ld\n",
+        (unsigned long)self.reqIndex, elapsed,
+        http ? (long)http.statusCode : 0L];
+
+    // Response headers
+    NSDictionary *phdrs = http.allHeaderFields;
+    if (phdrs.count) {
+        [respLog appendString:@"│  Headers:\n"];
+        for (NSString *k in phdrs)
+            [respLog appendFormat:@"│    %@ : %@\n", k, phdrs[k]];
+    }
+
+    // Response body preview
+    if (self.responseData.length) {
+        [respLog appendFormat:@"│  Body (%lu B):\n│    %@\n",
+            (unsigned long)self.responseData.length,
+            HexDumpPreview(self.responseData, 1024)];
+    } else {
+        [respLog appendString:@"│  Body : <none>\n"];
+    }
+
+    [respLog appendString:
+        @"└─────────────────────────────────────────────────────────────\n\n"];
+    NCLog(respLog);
+
+    [self.client URLProtocolDidFinishLoading:self];
+}
+
+// Auth challenge passthrough
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
+ completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition,
+                             NSURLCredential *))completionHandler {
+    completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
+}
+
 @end
 
 // =============================================================================
 //  MARK: - HIGH PRIORITY CONSTRUCTOR (101)
+//  Executes BEFORE +load, BEFORE application:didFinishLaunchingWithOptions:
+//  Protocol is capturing from the very first network call the app makes.
 // =============================================================================
 
 __attribute__((constructor(101)))
-static void ksNetworkInit(void) {
-    [NSURLProtocol registerClass:[KSSpoofProtocol class]];
-    NSLog(@"[KeychainSpy][P101] NSURLProtocol registered — intercept LIVE");
+static void ncNetworkInit(void) {
+    // Serial queue for all log I/O
+    gLogQueue = dispatch_queue_create("com.netcapture.logq",
+                                      DISPATCH_QUEUE_SERIAL);
+    [NSURLProtocol registerClass:[NCCaptureProtocol class]];
+    NSLog(@"[NetCapture][P101] Protocol registered — capturing ALL requests");
+    NSLog(@"[NetCapture] Log -> %@", LogFilePath());
 }
 
 // =============================================================================
-//  MARK: - Dump helpers
+//  MARK: - Overlay (minimisable HUD showing live count + log path)
 // =============================================================================
 
-static BOOL gInsideDump = NO;
-
-static NSString *DocumentsPath(void) {
-    return [NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-}
-
-static void DumpAllKeychainItems(void) {
-    NSMutableString *report = [NSMutableString string];
-    [report appendFormat:
-        @"========================================\n"
-         "KEYCHAIN FULL DUMP\n"
-         "Date  : %@\n"
-         "Bundle: %@\n"
-         "========================================\n\n",
-        [NSDate date],
-        [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown"];
-
-    gInsideDump = YES;
-
-    CFTypeRef classes[] = {
-        kSecClassGenericPassword, kSecClassInternetPassword,
-        kSecClassCertificate,     kSecClassKey,
-        kSecClassIdentity
-    };
-    NSArray *names = @[
-        @"GenericPassword", @"InternetPassword",
-        @"Certificate",     @"Key",
-        @"Identity"
-    ];
-
-    for (int i = 0; i < 5; i++) {
-        [report appendFormat:@"--- %@ ---\n", names[i]];
-        NSDictionary *q = @{
-            (__bridge id)kSecClass           : (__bridge id)classes[i],
-            (__bridge id)kSecMatchLimit       : (__bridge id)kSecMatchLimitAll,
-            (__bridge id)kSecReturnAttributes : @YES,
-            (__bridge id)kSecReturnData       : @YES
-        };
-        CFTypeRef cfr = NULL;
-        OSStatus  s   = SecItemCopyMatching((__bridge CFDictionaryRef)q, &cfr);
-        if (s == errSecSuccess && cfr) {
-            id      raw   = CFBridgingRelease(cfr);
-            NSArray *items = [raw isKindOfClass:[NSArray class]] ? raw : @[raw];
-            [report appendFormat:@"  Count: %lu\n", (unsigned long)items.count];
-            for (NSDictionary *item in items) {
-                [report appendString:@"  +------------------------------------\n"];
-                for (NSString *key in item) {
-                    id val = item[key];
-                    if ([val isKindOfClass:[NSData class]]) {
-                        NSData   *d   = (NSData *)val;
-                        NSString *str = [[NSString alloc] initWithData:d
-                                            encoding:NSUTF8StringEncoding];
-                        if (str) [report appendFormat:@"  | %-28@ = \"%@\"\n", key, str];
-                        else     [report appendFormat:@"  | %-28@ = <data %lu B> %@\n",
-                                     key, (unsigned long)d.length, d.description];
-                    } else {
-                        [report appendFormat:@"  | %-28@ = %@\n", key, val];
-                    }
-                }
-                [report appendString:@"  +------------------------------------\n"];
-            }
-        } else if (s == errSecItemNotFound) {
-            [report appendString:@"  (no items)\n"];
-        } else {
-            [report appendFormat:@"  OSStatus: %d\n", (int)s];
-        }
-        [report appendString:@"\n"];
-    }
-    gInsideDump = NO;
-
-    NSString *path = [DocumentsPath()
-        stringByAppendingPathComponent:@"keychain_dump.txt"];
-    NSError *err = nil;
-    BOOL ok = [report writeToFile:path
-                        atomically:YES
-                          encoding:NSUTF8StringEncoding
-                             error:&err];
-    NSLog(@"[KeychainSpy] Dump %@ -> %@", ok ? @"OK" : @"FAILED", path);
-}
-
-// =============================================================================
-//  MARK: - Patch UDID
-// =============================================================================
-
-static int PatchUDID(void) {
-    NSData *newData = [kNewUDID dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *search = @{
-        (__bridge id)kSecClass           : (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService     : kTargetService,
-        (__bridge id)kSecAttrAccount     : kTargetAccount,
-        (__bridge id)kSecAttrAccessGroup : kTargetGroup
-    };
-    NSDictionary *upd = @{ (__bridge id)kSecValueData : newData };
-    OSStatus s = SecItemUpdate((__bridge CFDictionaryRef)search,
-                               (__bridge CFDictionaryRef)upd);
-    if (s == errSecSuccess)      return 0;
-    if (s == errSecItemNotFound) {
-        NSMutableDictionary *add = [search mutableCopy];
-        add[(__bridge id)kSecValueData]          = newData;
-        add[(__bridge id)kSecAttrSynchronizable] = @NO;
-        OSStatus as = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
-        return (as == errSecSuccess) ? 0 : 3;
-    }
-    return 2;
-}
-
-static NSString *ReadCurrentUDID(void) {
-    NSDictionary *q = @{
-        (__bridge id)kSecClass           : (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService     : kTargetService,
-        (__bridge id)kSecAttrAccount     : kTargetAccount,
-        (__bridge id)kSecAttrAccessGroup : kTargetGroup,
-        (__bridge id)kSecMatchLimit      : (__bridge id)kSecMatchLimitOne,
-        (__bridge id)kSecReturnData      : @YES
-    };
-    CFTypeRef r = NULL;
-    OSStatus  s = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
-    if (s == errSecSuccess && r) {
-        NSData *d = CFBridgingRelease(r);
-        return [[NSString alloc] initWithData:d
-                                     encoding:NSUTF8StringEncoding] ?: @"<non-utf8>";
-    }
-    return [NSString stringWithFormat:@"not found (%d)", (int)s];
-}
-
-// =============================================================================
-//  MARK: - Overlay View
-// =============================================================================
-
-@interface KSOverlayView : UIView
-@property (nonatomic, strong) UIButton *dumpButton;
-@property (nonatomic, strong) UIButton *patchButton;
-@property (nonatomic, strong) UILabel  *statusLabel;
-@property (nonatomic, strong) UILabel  *udidLabel;
-@property (nonatomic, strong) UILabel  *interceptLabel;
+@interface NCOverlayView : UIView
+@property (nonatomic, strong) UILabel  *countLabel;
+@property (nonatomic, strong) UILabel  *pathLabel;
 @property (nonatomic, strong) UIView   *pillView;
 @property (nonatomic, strong) UILabel  *pillLabel;
 @property (nonatomic, assign) BOOL      minimised;
 @end
 
-static UIWindow      *gWindow  = nil;
-static KSOverlayView *gOverlay = nil;
+static UIWindow     *gNCWindow  = nil;
+static NCOverlayView *gNCOverlay = nil;
 
-@implementation KSOverlayView
+@implementation NCOverlayView
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
     CGFloat W = frame.size.width;
 
-    self.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.94];
-    self.layer.cornerRadius = 18;
+    self.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.95];
+    self.layer.cornerRadius = 16;
     self.layer.borderWidth  = 1;
     self.layer.borderColor  =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.55].CGColor;
+        [UIColor colorWithRed:0.20 green:0.55 blue:1.00 alpha:0.60].CGColor;
     self.clipsToBounds = YES;
 
-    // Header
-    UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(14, 12, 24, 20)];
-    icon.text = @"🔑"; icon.font = [UIFont systemFontOfSize:14];
-    [self addSubview:icon];
+    // Header icon + title
+    UILabel *ico = [[UILabel alloc] initWithFrame:CGRectMake(12, 10, 22, 18)];
+    ico.text = @"🌐"; ico.font = [UIFont systemFontOfSize:13];
+    [self addSubview:ico];
 
-    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(40, 12, W - 80, 18)];
-    ttl.text      = @"KeychainSpy";
+    UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(36, 10, W - 72, 18)];
+    ttl.text      = @"NetCapture";
     ttl.font      = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    ttl.textColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+    ttl.textColor = [UIColor colorWithRed:0.20 green:0.55 blue:1.00 alpha:1.0];
     [self addSubview:ttl];
 
+    // Minimise button
     UIButton *minBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    minBtn.frame = CGRectMake(W - 36, 8, 28, 28);
+    minBtn.frame = CGRectMake(W - 34, 6, 26, 26);
     [minBtn setTitle:@"—" forState:UIControlStateNormal];
-    minBtn.tintColor       = [UIColor colorWithWhite:0.5 alpha:1.0];
-    minBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    minBtn.tintColor       = [UIColor colorWithWhite:0.45 alpha:1.0];
+    minBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     [minBtn addTarget:self action:@selector(toggleMinimise)
      forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:minBtn];
 
-    // Network Intercept section
-    [self dividerAt:38 W:W];
-    [self sectionLabel:@"NETWORK INTERCEPT  [P101 — LIVE]" y:46 W:W];
+    // Divider
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(0, 34, W, 0.5)];
+    div.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
+    [self addSubview:div];
 
-    self.interceptLabel =
-        [[UILabel alloc] initWithFrame:CGRectMake(8, 62, W - 16, 26)];
-    self.interceptLabel.font          = [UIFont systemFontOfSize:9];
-    self.interceptLabel.textColor     =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-    self.interceptLabel.textAlignment = NSTextAlignmentCenter;
-    self.interceptLabel.numberOfLines = 2;
-    self.interceptLabel.text          =
-        @"✓ Real req fired · Server sees legit call\n"
-         "App gets VIP spoof · Real resp discarded";
-    [self addSubview:self.interceptLabel];
+    // Request counter
+    UILabel *cLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 40, 90, 13)];
+    cLbl.text      = @"CAPTURED";
+    cLbl.font      = [UIFont systemFontOfSize:8 weight:UIFontWeightSemibold];
+    cLbl.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
+    [self addSubview:cLbl];
 
-    // Dump section
-    [self dividerAt:94 W:W];
-    [self sectionLabel:@"KEYCHAIN DUMP" y:102 W:W];
+    self.countLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 53, W - 24, 22)];
+    self.countLabel.text      = @"0 requests";
+    self.countLabel.font      = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+    self.countLabel.textColor = [UIColor colorWithRed:0.20 green:0.55 blue:1.00 alpha:1.0];
+    [self addSubview:self.countLabel];
 
-    self.statusLabel =
-        [[UILabel alloc] initWithFrame:CGRectMake(0, 118, W, 14)];
-    self.statusLabel.text          = @"Ready";
-    self.statusLabel.font          = [UIFont systemFontOfSize:10];
-    self.statusLabel.textColor     = [UIColor colorWithWhite:0.40 alpha:1.0];
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    [self addSubview:self.statusLabel];
+    // Divider 2
+    UIView *div2 = [[UIView alloc] initWithFrame:CGRectMake(0, 80, W, 0.5)];
+    div2.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.08];
+    [self addSubview:div2];
 
-    self.dumpButton =
-        [self mkBtn:@"Dump All Keychain" y:135 W:W
-             action:@selector(didTapDump)
-              color:[UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0]];
-    [self addSubview:self.dumpButton];
+    // Log path
+    UILabel *pLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 86, W - 24, 13)];
+    pLbl.text      = @"OUTPUT FILE";
+    pLbl.font      = [UIFont systemFontOfSize:8 weight:UIFontWeightSemibold];
+    pLbl.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
+    [self addSubview:pLbl];
 
-    // Patch UDID section
-    [self dividerAt:182 W:W];
-    [self sectionLabel:@"PATCH UDID" y:190 W:W];
+    self.pathLabel                = [[UILabel alloc] initWithFrame:CGRectMake(12, 100, W - 24, 28)];
+    self.pathLabel.text           = LogFilePath();
+    self.pathLabel.font           = [UIFont monospacedSystemFontOfSize:7
+                                                                weight:UIFontWeightRegular];
+    self.pathLabel.textColor      = [UIColor colorWithWhite:0.45 alpha:1.0];
+    self.pathLabel.numberOfLines  = 2;
+    self.pathLabel.adjustsFontSizeToFitWidth = YES;
+    [self addSubview:self.pathLabel];
 
-    self.udidLabel =
-        [[UILabel alloc] initWithFrame:CGRectMake(8, 206, W - 16, 22)];
-    self.udidLabel.font          =
-        [UIFont monospacedSystemFontOfSize:8 weight:UIFontWeightRegular];
-    self.udidLabel.textColor     = [UIColor colorWithWhite:0.40 alpha:1.0];
-    self.udidLabel.textAlignment = NSTextAlignmentCenter;
-    self.udidLabel.numberOfLines = 2;
-    self.udidLabel.text          =
-        [NSString stringWithFormat:@"-> %@", kNewUDID];
-    [self addSubview:self.udidLabel];
+    // Clear button
+    UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    clearBtn.frame = CGRectMake(12, 134, W - 24, 30);
+    [clearBtn setTitle:@"Clear Log" forState:UIControlStateNormal];
+    clearBtn.titleLabel.font    = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    clearBtn.tintColor          = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
+    clearBtn.backgroundColor    = [UIColor colorWithRed:0.85 green:0.25 blue:0.25 alpha:1.0];
+    clearBtn.layer.cornerRadius = 9;
+    clearBtn.clipsToBounds      = YES;
+    [clearBtn addTarget:self action:@selector(didTapClear)
+      forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:clearBtn];
 
-    self.patchButton =
-        [self mkBtn:@"Set UDID" y:230 W:W
-             action:@selector(didTapPatch)
-              color:[UIColor colorWithRed:0.85 green:0.50 blue:0.10 alpha:1.0]];
-    [self addSubview:self.patchButton];
-
-    // Pill (minimised state)
-    self.pillView =
-        [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 36)];
-    self.pillView.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.94];
-    self.pillView.layer.cornerRadius = 18;
+    // Pill (minimised)
+    self.pillView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 32)];
+    self.pillView.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.95];
+    self.pillView.layer.cornerRadius = 16;
     self.pillView.layer.borderWidth  = 1;
     self.pillView.layer.borderColor  =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.5].CGColor;
+        [UIColor colorWithRed:0.20 green:0.55 blue:1.00 alpha:0.50].CGColor;
     self.pillView.clipsToBounds          = YES;
     self.pillView.hidden                 = YES;
     self.pillView.userInteractionEnabled = YES;
 
-    self.pillLabel =
-        [[UILabel alloc] initWithFrame:CGRectMake(10, 0, W - 20, 36)];
-    self.pillLabel.font      =
-        [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    self.pillLabel.textColor =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-    self.pillLabel.text      = @"🔑 KeychainSpy  ✓ VIP";
+    self.pillLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, W - 20, 32)];
+    self.pillLabel.font      = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
+    self.pillLabel.textColor = [UIColor colorWithRed:0.20 green:0.55 blue:1.00 alpha:1.0];
+    self.pillLabel.text      = @"🌐 NetCapture  0 req";
     [self.pillView addSubview:self.pillLabel];
 
-    UITapGestureRecognizer *t =
+    UITapGestureRecognizer *tap =
         [[UITapGestureRecognizer alloc]
             initWithTarget:self action:@selector(toggleMinimise)];
-    [self.pillView addGestureRecognizer:t];
+    [self.pillView addGestureRecognizer:tap];
     [self addSubview:self.pillView];
 
+    // Drag
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc]
             initWithTarget:self action:@selector(handlePan:)];
     [self addGestureRecognizer:pan];
 
+    // Tick counter every second
+    [NSTimer scheduledTimerWithTimeInterval:1.0
+                                     target:self
+                                   selector:@selector(refreshCount)
+                                   userInfo:nil
+                                    repeats:YES];
     return self;
 }
 
-- (void)dividerAt:(CGFloat)y W:(CGFloat)W {
-    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(0, y, W, 0.5)];
-    d.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
-    [self addSubview:d];
-}
-
-- (void)sectionLabel:(NSString *)text y:(CGFloat)y W:(CGFloat)W {
-    UILabel *l  = [[UILabel alloc] initWithFrame:CGRectMake(14, y, W - 28, 13)];
-    l.text      = text;
-    l.font      = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
-    l.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
-    [self addSubview:l];
-}
-
-- (UIButton *)mkBtn:(NSString *)t y:(CGFloat)y W:(CGFloat)W
-             action:(SEL)a color:(UIColor *)c {
-    UIButton *b  = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame      = CGRectMake(14, y, W - 28, 34);
-    [b setTitle:t forState:UIControlStateNormal];
-    b.titleLabel.font    = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    b.tintColor          = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
-    b.backgroundColor    = c;
-    b.layer.cornerRadius = 10;
-    b.clipsToBounds      = YES;
-    [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
-- (void)didTapDump {
-    self.dumpButton.enabled = NO;
-    [self.dumpButton setTitle:@"Dumping..." forState:UIControlStateNormal];
-    self.dumpButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-    self.statusLabel.text           = @"Working...";
-
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        DumpAllKeychainItems();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIColor *green =
-                [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-            UIColor *blue  =
-                [UIColor colorWithRed:0.08 green:0.45 blue:0.90 alpha:1.0];
-            [self.dumpButton setTitle:@"Saved!" forState:UIControlStateNormal];
-            self.dumpButton.backgroundColor = blue;
-            self.statusLabel.text           = @"keychain_dump.txt written";
-            self.statusLabel.textColor      = blue;
-            dispatch_after(
-                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                dispatch_get_main_queue(), ^{
-                    [self.dumpButton setTitle:@"Dump All Keychain"
-                                     forState:UIControlStateNormal];
-                    self.dumpButton.backgroundColor = green;
-                    self.dumpButton.enabled         = YES;
-                    self.statusLabel.text           = @"Ready";
-                    self.statusLabel.textColor      =
-                        [UIColor colorWithWhite:0.40 alpha:1.0];
-                });
-        });
+- (void)refreshCount {
+    NSUInteger n = gReqCounter;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.countLabel.text = [NSString stringWithFormat:@"%lu request%@",
+                                (unsigned long)n, n == 1 ? @"" : @"s"];
+        self.pillLabel.text  = [NSString stringWithFormat:@"🌐 NetCapture  %lu req",
+                                (unsigned long)n];
     });
 }
 
-- (void)didTapPatch {
-    self.patchButton.enabled = NO;
-    [self.patchButton setTitle:@"Patching..." forState:UIControlStateNormal];
-    self.patchButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        int       result = PatchUDID();
-        NSString *read   = ReadCurrentUDID();
+- (void)didTapClear {
+    dispatch_async(gLogQueue, ^{
+        [@"" writeToFile:LogFilePath()
+              atomically:YES
+                encoding:NSUTF8StringEncoding
+                   error:nil];
+        gReqCounter = 0;
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIColor *orange =
-                [UIColor colorWithRed:0.85 green:0.50 blue:0.10 alpha:1.0];
-            UIColor *green  =
-                [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-            UIColor *red    =
-                [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1.0];
-            if (result == 0) {
-                [self.patchButton setTitle:@"Patched!" forState:UIControlStateNormal];
-                self.patchButton.backgroundColor = green;
-                self.udidLabel.text      =
-                    [NSString stringWithFormat:@"✓ %@", read];
-                self.udidLabel.textColor = green;
-            } else {
-                [self.patchButton setTitle:@"Failed" forState:UIControlStateNormal];
-                self.patchButton.backgroundColor = red;
-                self.udidLabel.text      =
-                    [NSString stringWithFormat:@"✗ err=%d  got=%@", result, read];
-                self.udidLabel.textColor = red;
-            }
-            dispatch_after(
-                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
-                dispatch_get_main_queue(), ^{
-                    [self.patchButton setTitle:@"Set UDID"
-                                      forState:UIControlStateNormal];
-                    self.patchButton.backgroundColor = orange;
-                    self.patchButton.enabled         = YES;
-                });
+            [self refreshCount];
         });
     });
 }
 
 - (void)toggleMinimise {
     self.minimised = !self.minimised;
-    CGFloat fullH  = 276;
+    CGFloat fullH = 172;
     if (self.minimised) {
-        [UIView animateWithDuration:0.20 animations:^{
-            CGRect f = gWindow.frame; f.size.height = 36; gWindow.frame = f;
-            self.frame = CGRectMake(0, 0, f.size.width, 36);
+        [UIView animateWithDuration:0.18 animations:^{
+            CGRect f = gNCWindow.frame; f.size.height = 32; gNCWindow.frame = f;
+            self.frame = CGRectMake(0, 0, f.size.width, 32);
         } completion:^(BOOL _) {
             for (UIView *v in self.subviews) v.hidden = (v != self.pillView);
             self.pillView.hidden    = NO;
-            self.layer.cornerRadius = 18;
+            self.layer.cornerRadius = 16;
         }];
     } else {
         for (UIView *v in self.subviews) v.hidden = NO;
         self.pillView.hidden = YES;
-        [UIView animateWithDuration:0.20 animations:^{
-            CGRect f = gWindow.frame; f.size.height = fullH; gWindow.frame = f;
+        [UIView animateWithDuration:0.18 animations:^{
+            CGRect f = gNCWindow.frame; f.size.height = fullH; gNCWindow.frame = f;
             self.frame = CGRectMake(0, 0, f.size.width, fullH);
         }];
     }
@@ -569,13 +497,12 @@ static KSOverlayView *gOverlay = nil;
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     CGPoint d = [pan translationInView:self.superview];
-    CGRect  f = gWindow.frame;
-    f.origin.x += d.x;
-    f.origin.y += d.y;
+    CGRect  f = gNCWindow.frame;
+    f.origin.x += d.x; f.origin.y += d.y;
     CGRect sc = [UIScreen mainScreen].bounds;
     f.origin.x = MAX(0,  MIN(f.origin.x, sc.size.width  - f.size.width));
     f.origin.y = MAX(20, MIN(f.origin.y, sc.size.height - f.size.height - 20));
-    gWindow.frame = f;
+    gNCWindow.frame = f;
     [pan setTranslation:CGPointZero inView:self.superview];
 }
 
@@ -585,10 +512,9 @@ static KSOverlayView *gOverlay = nil;
 //  MARK: - Window pass-through
 // =============================================================================
 
-@interface KSWindow : UIWindow
+@interface NCWindow : UIWindow
 @end
-
-@implementation KSWindow
+@implementation NCWindow
 - (BOOL)pointInside:(CGPoint)pt withEvent:(UIEvent *)ev {
     for (UIView *s in self.subviews)
         if (!s.hidden &&
@@ -602,33 +528,30 @@ static KSOverlayView *gOverlay = nil;
 //  MARK: - Spawn overlay
 // =============================================================================
 
-static void spawnOverlay(void) {
-    if (gWindow) return;
-    CGFloat W  = 240, H = 276;
-    CGRect  sc = [UIScreen mainScreen].bounds;
+static void spawnNCOverlay(void) {
+    if (gNCWindow) return;
+    CGFloat W = 220, H = 172;
+    CGRect sc = [UIScreen mainScreen].bounds;
 
-    gWindow = [[KSWindow alloc] initWithFrame:
-        CGRectMake(sc.size.width - W - 12, sc.size.height * 0.18, W, H)];
+    gNCWindow = [[NCWindow alloc] initWithFrame:
+        CGRectMake(sc.size.width - W - 10, sc.size.height * 0.12, W, H)];
 
     if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in
-             [UIApplication sharedApplication].connectedScenes) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]] &&
-                scene.activationState ==
-                    UISceneActivationStateForegroundActive) {
-                gWindow.windowScene = (UIWindowScene *)scene;
+                scene.activationState == UISceneActivationStateForegroundActive) {
+                gNCWindow.windowScene = (UIWindowScene *)scene;
                 break;
             }
         }
     }
-
-    gWindow.windowLevel     = UIWindowLevelAlert + 100;
-    gWindow.backgroundColor = [UIColor clearColor];
-    gOverlay = [[KSOverlayView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
-    [gWindow addSubview:gOverlay];
-    gWindow.hidden = NO;
-    [gWindow makeKeyAndVisible];
-    NSLog(@"[KeychainSpy] Overlay ready");
+    gNCWindow.windowLevel     = UIWindowLevelAlert + 200;
+    gNCWindow.backgroundColor = [UIColor clearColor];
+    gNCOverlay = [[NCOverlayView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
+    [gNCWindow addSubview:gNCOverlay];
+    gNCWindow.hidden = NO;
+    [gNCWindow makeKeyAndVisible];
+    NSLog(@"[NetCapture] Overlay ready");
 }
 
 // =============================================================================
@@ -639,9 +562,8 @@ static void spawnOverlay(void) {
 - (BOOL)application:(UIApplication *)app
     didFinishLaunchingWithOptions:(NSDictionary *)opts {
     BOOL r = %orig;
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{ spawnOverlay(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ spawnNCOverlay(); });
     return r;
 }
 %end
@@ -652,9 +574,8 @@ static void spawnOverlay(void) {
 
 %ctor {
     %init;
-    NSLog(@"[KeychainSpy][%%ctor] hooks live in %@",
+    NSLog(@"[NetCapture][%%ctor] hooks live — %@",
           [[NSBundle mainBundle] bundleIdentifier]);
-    dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{ spawnOverlay(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ spawnNCOverlay(); });
 }
