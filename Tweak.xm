@@ -1,10 +1,12 @@
 /*
- * tweak.xm — UDID Memory Spoof Tweak
+ * tweak.xm — UDID Call Observer
  * Target UDID : 00008020-000640860179002E
- * Spoof Value : UDID-GOT-SPOOF-KID
+ * Purpose     : Log EVERY place the UDID is accessed, read,
+ *               compared, passed, or returned — with full
+ *               stack trace, class name, method, and caller.
+ * NO spoofing. Observe only.
  *
- * Build deps  : Theos + CydiaSubstrate / libhooker
- * Arch target : arm64
+ * Build : Theos + CydiaSubstrate / libhooker (arm64)
  */
 
 #import <substrate.h>
@@ -14,205 +16,460 @@
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <mach/mach_vm.h>
-#include <sys/mman.h>
+#include <execinfo.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <string.h>
-#include <stdint.h>
 
-// ─────────────────────────────────────────────
-//  CONSTANTS
-// ─────────────────────────────────────────────
-#define TARGET_UDID   "00008020-000640860179002E"
-#define SPOOF_UDID    "UDID-GOT-SPOOF-KID"
+// ─────────────────────────────────────────────────────────────
+//  CONFIG
+// ─────────────────────────────────────────────────────────────
+#define TARGET_UDID  "00008020-000640860179002E"
+#define TARGET_UDID_NS @"00008020-000640860179002E"
+#define LOG_TAG      "[UDIDObserver]"
 
-// Pad spoof value to same length as target so we
-// never touch allocation boundaries.
-#define TARGET_LEN    (sizeof(TARGET_UDID) - 1)   // 25 chars
-#define SPOOF_LEN     (sizeof(SPOOF_UDID)  - 1)   // 18 chars
+// How many stack frames to capture per hit
+#define STACK_DEPTH  20
 
-// ─────────────────────────────────────────────
-//  MEMORY SCANNER
-//  Walks every readable/writable vm region of
-//  the current task and patches every occurrence
-//  of TARGET_UDID in-place.
-// ─────────────────────────────────────────────
-static uint64_t patchCount = 0;
+// ─────────────────────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────────────────────
 
-static void scanAndPatchMemory(void) {
+// Print a symbolicated stack trace to NSLog
+static void logStackTrace(const char *label) {
+    void *frames[STACK_DEPTH];
+    int count = backtrace(frames, STACK_DEPTH);
+    char **symbols = backtrace_symbols(frames, count);
+
+    NSMutableString *trace = [NSMutableString stringWithFormat:
+        @"\n%s 📍 %s\n", LOG_TAG, label];
+
+    for (int i = 2; i < count; i++) {   // skip frame 0 (this fn) + frame 1 (hook)
+        // Attempt dladdr for better symbol names
+        Dl_info info;
+        if (dladdr(frames[i], &info) && info.dli_sname) {
+            [trace appendFormat:@"  #%02d  %s  +%td  [%s]\n",
+                i - 2,
+                info.dli_sname,
+                (char *)frames[i] - (char *)info.dli_saddr,
+                info.dli_fname ? info.dli_fname : "?"];
+        } else {
+            [trace appendFormat:@"  #%02d  %s\n", i - 2,
+                symbols ? symbols[i] : "??"];
+        }
+    }
+
+    NSLog(@"%@", trace);
+    if (symbols) free(symbols);
+}
+
+// Convenience: log a hit with context string
+static void logHit(NSString *context, id value) {
+    NSLog(@"%s ─────────────────────────────────", LOG_TAG);
+    NSLog(@"%s 🎯 HIT  context : %@", LOG_TAG, context);
+    NSLog(@"%s         value   : %@", LOG_TAG, value);
+    NSLog(@"%s         thread  : %@", LOG_TAG, [NSThread currentThread]);
+    logStackTrace(context.UTF8String);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  HOOK 1 — UIDevice (identifierForVendor is the closest
+//            modern public API; legacy -uniqueIdentifier removed
+//            in iOS 7 but still present in some SDKs via private)
+// ─────────────────────────────────────────────────────────────
+%hook UIDevice
+
+- (NSUUID *)identifierForVendor {
+    NSUUID *result = %orig;
+    NSLog(@"%s Hook: [UIDevice identifierForVendor] → %@",
+          LOG_TAG, result);
+    logStackTrace("UIDevice -identifierForVendor");
+    return result;
+}
+
+// Private legacy selector still linked by old SDKs
+- (NSString *)uniqueIdentifier {
+    NSString *result = %orig;
+    if ([result isEqualToString:TARGET_UDID_NS]) {
+        logHit(@"UIDevice -uniqueIdentifier", result);
+    } else {
+        NSLog(@"%s Hook: [UIDevice uniqueIdentifier] → %@",
+              LOG_TAG, result);
+    }
+    return result;
+}
+
+%end
+
+// ─────────────────────────────────────────────────────────────
+//  HOOK 2 — NSString equality checks for the target UDID
+// ─────────────────────────────────────────────────────────────
+%hook NSString
+
+- (BOOL)isEqualToString:(NSString *)other {
+    BOOL result = %orig;
+    // Catch either side being the target
+    if ([self isKindOfClass:[NSString class]] &&
+        ([self isEqual:TARGET_UDID_NS] || [other isEqual:TARGET_UDID_NS])) {
+        logHit([NSString stringWithFormat:
+            @"NSString -isEqualToString: (self=%@ other=%@)", self, other],
+               @(result));
+    }
+    return result;
+}
+
+- (NSComparisonResult)compare:(NSString *)other {
+    NSComparisonResult result = %orig;
+    if ([self isEqual:TARGET_UDID_NS] || [other isEqual:TARGET_UDID_NS]) {
+        logHit([NSString stringWithFormat:
+            @"NSString -compare: (self=%@ other=%@)", self, other],
+               @(result));
+    }
+    return result;
+}
+
+- (NSRange)rangeOfString:(NSString *)searchStr {
+    NSRange result = %orig;
+    if ([searchStr isEqual:TARGET_UDID_NS] ||
+        [self isEqual:TARGET_UDID_NS]) {
+        logHit([NSString stringWithFormat:
+            @"NSString -rangeOfString: (self=%@ search=%@)", self, searchStr],
+               NSStringFromRange(result));
+    }
+    return result;
+}
+
+- (BOOL)containsString:(NSString *)other {
+    BOOL result = %orig;
+    if ([other isEqual:TARGET_UDID_NS] || [self isEqual:TARGET_UDID_NS]) {
+        logHit([NSString stringWithFormat:
+            @"NSString -containsString: (self=%@ other=%@)", self, other],
+               @(result));
+    }
+    return result;
+}
+
+%end
+
+// ─────────────────────────────────────────────────────────────
+//  HOOK 3 — NSUserDefaults (many apps cache UDID here)
+// ─────────────────────────────────────────────────────────────
+%hook NSUserDefaults
+
+- (id)objectForKey:(NSString *)key {
+    id result = %orig;
+    if ([result isKindOfClass:[NSString class]] &&
+        [result isEqual:TARGET_UDID_NS]) {
+        logHit([NSString stringWithFormat:
+            @"NSUserDefaults -objectForKey: key=%@", key], result);
+    }
+    return result;
+}
+
+- (NSString *)stringForKey:(NSString *)key {
+    NSString *result = %orig;
+    if ([result isEqual:TARGET_UDID_NS]) {
+        logHit([NSString stringWithFormat:
+            @"NSUserDefaults -stringForKey: key=%@", key], result);
+    }
+    return result;
+}
+
+- (void)setObject:(id)value forKey:(NSString *)key {
+    if ([value isKindOfClass:[NSString class]] &&
+        [value isEqual:TARGET_UDID_NS]) {
+        logHit([NSString stringWithFormat:
+            @"NSUserDefaults -setObject:forKey: key=%@", key], value);
+    }
+    %orig;
+}
+
+%end
+
+// ─────────────────────────────────────────────────────────────
+//  HOOK 4 — Keychain (SecItem* C functions via MSHookFunction)
+//  Apps store UDID in keychain between installs.
+// ─────────────────────────────────────────────────────────────
+#include <Security/Security.h>
+
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef, CFTypeRef *) = NULL;
+
+static OSStatus hook_SecItemCopyMatching(CFDictionaryRef query,
+                                          CFTypeRef *result) {
+    OSStatus status = orig_SecItemCopyMatching(query, result);
+    if (status == errSecSuccess && result && *result) {
+        NSString *str = nil;
+        if (CFGetTypeID(*result) == CFStringGetTypeID()) {
+            str = (__bridge NSString *)*result;
+        } else if (CFGetTypeID(*result) == CFDataGetTypeID()) {
+            str = [[NSString alloc]
+                initWithData:(__bridge NSData *)*result
+                    encoding:NSUTF8StringEncoding];
+        }
+        if ([str isEqual:TARGET_UDID_NS]) {
+            logHit(@"SecItemCopyMatching → returned target UDID", str);
+        }
+    }
+    return status;
+}
+
+static OSStatus hook_SecItemAdd(CFDictionaryRef attrs, CFTypeRef *result) {
+    // Walk attrs for the target UDID string/data
+    NSDictionary *d = (__bridge NSDictionary *)attrs;
+    [d enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+        NSString *str = nil;
+        if ([v isKindOfClass:[NSString class]]) str = v;
+        else if ([v isKindOfClass:[NSData class]])
+            str = [[NSString alloc] initWithData:v
+                                        encoding:NSUTF8StringEncoding];
+        if ([str isEqual:TARGET_UDID_NS]) {
+            logHit([NSString stringWithFormat:
+                @"SecItemAdd storing UDID under key=%@", k], str);
+            *stop = YES;
+        }
+    }];
+    return orig_SecItemAdd(attrs, result);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  HOOK 5 — NSURLRequest / NSURLSession
+//  Catch UDID being sent in HTTP headers or body
+// ─────────────────────────────────────────────────────────────
+%hook NSURLRequest
+
+- (NSDictionary *)allHTTPHeaderFields {
+    NSDictionary *headers = %orig;
+    [headers enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+        if ([v isKindOfClass:[NSString class]] &&
+            [v containsString:TARGET_UDID_NS]) {
+            logHit([NSString stringWithFormat:
+                @"NSURLRequest header key=%@ contains UDID", k], v);
+        }
+    }];
+    return headers;
+}
+
+%end
+
+%hook NSMutableURLRequest
+
+- (void)setValue:(NSString *)value forHTTPHeaderField:(NSString *)field {
+    if ([value containsString:TARGET_UDID_NS]) {
+        logHit([NSString stringWithFormat:
+            @"NSMutableURLRequest -setValue:forHTTPHeaderField: field=%@",
+            field], value);
+    }
+    %orig;
+}
+
+- (void)setHTTPBody:(NSData *)data {
+    if (data) {
+        NSString *body = [[NSString alloc] initWithData:data
+                                               encoding:NSUTF8StringEncoding];
+        if ([body containsString:TARGET_UDID_NS]) {
+            logHit(@"NSMutableURLRequest -setHTTPBody: contains UDID", body);
+        }
+    }
+    %orig;
+}
+
+%end
+
+// ─────────────────────────────────────────────────────────────
+//  HOOK 6 — NSFileManager (reading plist/files containing UDID)
+// ─────────────────────────────────────────────────────────────
+%hook NSFileManager
+
+- (NSData *)contentsAtPath:(NSString *)path {
+    NSData *data = %orig;
+    if (data) {
+        NSString *str = [[NSString alloc] initWithData:data
+                                              encoding:NSUTF8StringEncoding];
+        if ([str containsString:TARGET_UDID_NS]) {
+            logHit([NSString stringWithFormat:
+                @"NSFileManager -contentsAtPath: path=%@", path], path);
+        }
+    }
+    return data;
+}
+
+%end
+
+// ─────────────────────────────────────────────────────────────
+//  DYNAMIC METHOD OBSERVER
+//  Scans all loaded classes for selectors that commonly return
+//  a UDID string and wraps them with a logging IMP at runtime.
+// ─────────────────────────────────────────────────────────────
+static SEL observedSelectors[] = {
+    // clang-format off
+    @selector(udid),
+    @selector(UDID),
+    @selector(getUDID),
+    @selector(deviceUDID),
+    @selector(uniqueDeviceIdentifier),
+    @selector(uniqueIdentifier),
+    @selector(deviceIdentifier),
+    @selector(hardwareIdentifier),
+    @selector(serialNumber),
+    @selector(deviceId),
+    @selector(getDeviceId),
+    @selector(platformUDID),
+    @selector(advertisingIdentifier),   // IDFA — log if it returns target
+    // clang-format on
+};
+static const int kObservedSelectorCount =
+    sizeof(observedSelectors) / sizeof(observedSelectors[0]);
+
+static void installDynamicObservers(void) {
+    unsigned int classCount = 0;
+    Class *classList = objc_copyClassList(&classCount);
+
+    int hookedCount = 0;
+
+    for (unsigned int c = 0; c < classCount; c++) {
+        Class cls = classList[c];
+
+        for (int s = 0; s < kObservedSelectorCount; s++) {
+            SEL sel = observedSelectors[s];
+
+            // Check instance and class methods
+            for (int isClassMethod = 0; isClassMethod <= 1; isClassMethod++) {
+                Method m = isClassMethod
+                    ? class_getClassMethod(cls, sel)
+                    : class_getInstanceMethod(cls, sel);
+                if (!m) continue;
+
+                const char *retType = method_getTypeEncoding(m);
+                if (!retType || retType[0] != '@') continue;  // must return object
+
+                IMP orig = method_getImplementation(m);
+                SEL capturedSel = sel;
+                Class capturedCls = cls;
+                BOOL capturedIsClass = isClassMethod;
+
+                IMP observer = imp_implementationWithBlock(^id(id self) {
+                    id result = ((id (*)(id, SEL))orig)(self, capturedSel);
+                    NSString *str = nil;
+                    if ([result isKindOfClass:[NSString class]])
+                        str = result;
+                    else if ([result isKindOfClass:[NSUUID class]])
+                        str = [(NSUUID *)result UUIDString];
+
+                    // Log ALL calls to these selectors (not just matching)
+                    NSLog(@"%s Dynamic hook: %@%@[%@ %@] → %@",
+                          LOG_TAG,
+                          capturedIsClass ? @"+" : @"-",
+                          capturedIsClass ? @"" : @"",
+                          NSStringFromClass(capturedCls),
+                          NSStringFromSelector(capturedSel),
+                          str ?: result);
+
+                    if ([str isEqual:TARGET_UDID_NS]) {
+                        logHit([NSString stringWithFormat:
+                            @"Dynamic: %@[%@ %@] returned target UDID",
+                            capturedIsClass ? @"+" : @"-",
+                            NSStringFromClass(capturedCls),
+                            NSStringFromSelector(capturedSel)], str);
+                    }
+                    return result;
+                });
+
+                method_setImplementation(m, observer);
+                hookedCount++;
+            }
+        }
+    }
+
+    free(classList);
+    NSLog(@"%s 🪝 Dynamic observers installed on %d method(s).",
+          LOG_TAG, hookedCount);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  MEMORY SCANNER (read-only — scan & log, no patching)
+// ─────────────────────────────────────────────────────────────
+static void scanMemoryForUDID(void) {
     task_t task = mach_task_self();
     mach_vm_address_t addr = 0;
     mach_vm_size_t    size = 0;
     natural_t         depth = 0;
     vm_region_submap_info_data_64_t info;
     mach_msg_type_number_t infoCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+    uint64_t hitCount = 0;
 
     while (1) {
         kern_return_t kr = mach_vm_region_recurse(
             task, &addr, &size, &depth,
             (vm_region_recurse_info_t)&info, &infoCount);
-
         if (kr != KERN_SUCCESS) break;
 
-        // Only look at regions we can actually read
-        if (info.is_submap) {
-            depth++;
-            continue;
-        }
+        if (info.is_submap) { depth++; continue; }
 
-        vm_prot_t prot = info.protection;
-        BOOL readable = (prot & VM_PROT_READ) != 0;
-        BOOL writable = (prot & VM_PROT_WRITE) != 0;
-
-        if (readable) {
-            uint8_t *base = (uint8_t *)(uintptr_t)addr;
-            vm_size_t remaining = (vm_size_t)size;
-
-            // Scan for needle
-            for (vm_size_t i = 0; i + TARGET_LEN <= remaining; i++) {
-                if (memcmp(base + i, TARGET_UDID, TARGET_LEN) == 0) {
-
-                    // Make page writable if needed
-                    mach_vm_address_t pageAddr = (mach_vm_address_t)(
-                        ((uintptr_t)(base + i)) & ~(PAGE_SIZE - 1));
-                    mach_vm_size_t pageSize = PAGE_SIZE;
-
-                    if (!writable) {
-                        mach_vm_protect(task, pageAddr, pageSize,
-                                        FALSE,
-                                        VM_PROT_READ | VM_PROT_WRITE);
-                    }
-
-                    // Patch: overwrite with spoof, then null-fill remainder
-                    memcpy(base + i, SPOOF_UDID, SPOOF_LEN);
-                    if (SPOOF_LEN < TARGET_LEN)
-                        memset(base + i + SPOOF_LEN, 0,
-                               TARGET_LEN - SPOOF_LEN);
-
-                    // Restore original protection
-                    if (!writable) {
-                        mach_vm_protect(task, pageAddr, pageSize,
-                                        FALSE, prot);
-                    }
-
-                    patchCount++;
-                    NSLog(@"[UDIDSpoof] ✅ Patched occurrence #%llu "
-                          @"at %p", patchCount, (void *)(base + i));
+        if (info.protection & VM_PROT_READ) {
+            const uint8_t *base = (const uint8_t *)(uintptr_t)addr;
+            for (vm_size_t i = 0; i + 25 <= (vm_size_t)size; i++) {
+                if (memcmp(base + i, TARGET_UDID, 25) == 0) {
+                    hitCount++;
+                    Dl_info dli;
+                    const char *owner = "unknown";
+                    if (dladdr(base + i, &dli) && dli.dli_fname)
+                        owner = dli.dli_fname;
+                    NSLog(@"%s 🔍 Memory hit #%llu at %p | region [%p-%p] "
+                          @"prot=%d | owner: %s",
+                          LOG_TAG, hitCount,
+                          (void *)(base + i),
+                          (void *)(uintptr_t)addr,
+                          (void *)((uintptr_t)addr + size),
+                          info.protection, owner);
                 }
             }
         }
 
         addr += size;
-        infoCount = VM_REGION_SUBMAP_INFO_COUNT_64;   // reset for next call
+        infoCount = VM_REGION_SUBMAP_INFO_COUNT_64;
     }
 
-    NSLog(@"[UDIDSpoof] 🔍 Scan complete — %llu patch(es) applied.", patchCount);
+    NSLog(@"%s 🔍 Memory scan done — %llu occurrence(s) found.", LOG_TAG, hitCount);
 }
 
-// ─────────────────────────────────────────────
-//  HOOKS — high-priority ObjC intercepts
-// ─────────────────────────────────────────────
-
-// 1) UIDevice -identifierForVendor  (not UDID but apps sometimes confuse them)
-%hook UIDevice
-- (NSUUID *)identifierForVendor {
-    NSLog(@"[UDIDSpoof] Hook: -identifierForVendor called");
-    return [[NSUUID alloc] initWithUUIDString:@"UDID-GOT-0000-SPOO-FKID00000000"];
-}
-%end
-
-// 2) Any NSString that equals the target UDID
-%hook NSString
-- (BOOL)isEqualToString:(NSString *)aString {
-    if ([aString isEqualToString:@TARGET_UDID]) {
-        NSLog(@"[UDIDSpoof] Hook: isEqualToString matched target UDID");
-    }
-    return %orig;
-}
-%end
-
-// 3) Hook common UDID retrieval selectors via forwardedClass
-// Covers third-party analytics SDKs that call [SomeClass udid] / [SomeClass getUDID]
-static void hookUDIDSelectors(void) {
-    SEL selectors[] = {
-        @selector(udid),
-        @selector(UDID),
-        @selector(getUDID),
-        @selector(uniqueDeviceIdentifier),
-        @selector(deviceUDID),
-    };
-
-    unsigned int classCount = 0;
-    Class *classList = objc_copyClassList(&classCount);
-
-    for (unsigned int c = 0; c < classCount; c++) {
-        Class cls = classList[c];
-        for (int s = 0; s < 5; s++) {
-            Method m = class_getInstanceMethod(cls, selectors[s]);
-            if (!m) m = class_getClassMethod(cls, selectors[s]);
-            if (!m) continue;
-
-            // Only patch methods that return id/NSString
-            const char *retType = method_getTypeEncoding(m);
-            if (retType && retType[0] == '@') {
-                IMP orig = method_getImplementation(m);
-                IMP patch = imp_implementationWithBlock(^id(id self) {
-                    id result = ((id(*)(id,SEL))orig)(self, selectors[s]);
-                    if ([result isKindOfClass:[NSString class]] &&
-                        [result isEqualToString:@TARGET_UDID]) {
-                        NSLog(@"[UDIDSpoof] Hook: %@ -[%@ %@] → spoofed",
-                              NSStringFromClass([self class]),
-                              NSStringFromClass(cls),
-                              NSStringFromSelector(selectors[s]));
-                        return @SPOOF_UDID;
-                    }
-                    return result;
-                });
-                method_setImplementation(m, patch);
-            }
-        }
-    }
-    free(classList);
-    NSLog(@"[UDIDSpoof] 🪝 Dynamic selector hooks installed.");
-}
-
-// ─────────────────────────────────────────────
-//  CONSTRUCTOR — runs before main(), +load, etc.
-//  __attribute__((constructor)) fires at dylib
-//  injection time, before any app code.
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+//  CONSTRUCTOR
+// ─────────────────────────────────────────────────────────────
 %ctor {
-    // Highest-priority dispatch — before app delegate
-    NSLog(@"[UDIDSpoof] 🚀 Constructor fired — target: %s → spoof: %s",
-          TARGET_UDID, SPOOF_UDID);
+    NSLog(@"%s ──────────────────────────────────────", LOG_TAG);
+    NSLog(@"%s 🚀 Observer loaded. Watching for UDID:", LOG_TAG);
+    NSLog(@"%s    %s", LOG_TAG, TARGET_UDID);
+    NSLog(@"%s ──────────────────────────────────────", LOG_TAG);
 
     @autoreleasepool {
-        // Step 1: immediate memory scan + patch
-        scanAndPatchMemory();
 
-        // Step 2: install dynamic ObjC hooks
-        hookUDIDSelectors();
+        // Hook Keychain C functions
+        MSHookFunction((void *)SecItemCopyMatching,
+                       (void *)hook_SecItemCopyMatching,
+                       (void **)&orig_SecItemCopyMatching);
+        MSHookFunction((void *)SecItemAdd,
+                       (void *)hook_SecItemAdd,
+                       (void **)&orig_SecItemAdd);
+        NSLog(@"%s 🔐 Keychain hooks installed.", LOG_TAG);
 
-        // Step 3: schedule a re-scan shortly after launch
-        // (some frameworks load lazily and populate UDID after main)
+        // Install dynamic ObjC method observers
+        installDynamicObservers();
+
+        // Initial memory scan
+        scanMemoryForUDID();
+
+        // Re-scan after frameworks finish loading
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
-                          (int64_t)(0.5 * NSEC_PER_SEC)),
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
-            ^{
-                NSLog(@"[UDIDSpoof] 🔄 Post-launch re-scan…");
-                scanAndPatchMemory();
-            }
-        );
+                          (int64_t)(1.0 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+            ^{ scanMemoryForUDID(); });
 
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW,
-                          (int64_t)(2.0 * NSEC_PER_SEC)),
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
-            ^{
-                NSLog(@"[UDIDSpoof] 🔄 Late re-scan (SDK init window)…");
-                scanAndPatchMemory();
-            }
-        );
+                          (int64_t)(3.0 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+            ^{ scanMemoryForUDID(); });
     }
 }
