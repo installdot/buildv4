@@ -71,7 +71,7 @@ static NSData *BuildSpoofedResponse(void) {
         @"expires_at"      : expiresAt,
         @"remaining"       : [NSString stringWithFormat:@"%ld days", (long)days],
         @"package_type"    : @"BASIC",
-        @"activation_key"  : [NSString stringWithFormat:@"TNK-7D-CEBADEDF",
+        @"activation_key"  : @"TNK-7D-CEBADEDF",
         @"client_version"  : @"2.0.2",
         @"update_notes"    : @[
             @"Fixed skill search filter not working",
