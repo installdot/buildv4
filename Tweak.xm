@@ -1,171 +1,82 @@
 /*
- * KeychainSpy — Network Interceptor + Keychain Dumper + UDID Patcher
+ * AppDumper - Comprehensive App Data Harvester
  *
- * Intercepts: https://app.tnspike.com:2087/verify_udid
+ * Dumps everything the app holds:
+ *   - Keychain (all classes)
+ *   - NSUserDefaults (all suites + standard)
+ *   - All files in app container (Documents, Library, tmp, Caches)
+ *   - Named + general UIPasteboard
+ *   - HTTP cookies (NSHTTPCookieStorage)
+ *   - Loaded ObjC classes + key methods
+ *   - NSURLCache cached responses
+ *   - CoreData stores found on disk
+ *   - SQLite databases found on disk
+ *   - /var/mobile/Library/Preferences plists
+ *   - Environment variables + process info
+ *   - Memory scan for target UDID string
+ *     "00008020-000640860179002E"
  *
- * Returns EXACT original JSON structure with only these fields updated:
- *   package_type   -> "VIP"
- *   expires_at     -> activated_at + 100 years (real formatted date)
- *   remaining      -> real day count computed at runtime
- *   message        -> updated with real day count
- *   activation_key -> "TNK-VIP-<days>D"
- *   All other fields preserved exactly as original
+ * Output: <App Documents>/full_dump.txt
  *
- * Load order:
- *   constructor(101) -> NSURLProtocol registered FIRST, before any app code
- *   %ctor            -> Logos hooks + overlay spawn
- *
- * Random UDID: 00008020-F41FCBF78457528B
+ * Auto-runs on app launch via %ctor + UIApplication hook
  */
 
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
 
-static NSString *const kInterceptHost = @"app.tnspike.com";
-static NSString *const kInterceptPath = @"/verify_udid";
-static NSString *const kHandledKey    = @"KSSpoofHandled";
+// ─────────────────────────────────────────────
+#define TARGET_UDID  @"00008020-000640860179002E"
+#define TARGET_C     "00008020-000640860179002E"
+// ─────────────────────────────────────────────
 
-#define kTargetService  @"com.tnnguy.auth"
-#define kTargetAccount  @"device_udid"
-#define kTargetGroup    @"6HV9UPZCN4.*"
-#define kNewUDID        @"00008020-F41FCBF78457528B"
+static NSMutableString *gReport   = nil;
+static BOOL             gDumping  = NO;
 
 // =============================================================================
-//  MARK: - Spoof JSON
-//  Base = exact original JSON the user provided.
-//  Only package_type, expires_at, remaining, message, activation_key are
-//  overwritten at runtime. Every other field is preserved verbatim.
+//  MARK: - Report helpers
 // =============================================================================
 
-static NSData *BuildSpoofedResponse(void) {
-    NSDateFormatter *fmt = [NSDateFormatter new];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    fmt.locale     = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    fmt.timeZone   = [NSTimeZone timeZoneWithName:@"UTC"];
+static void rHeader(NSString *title) {
+    [gReport appendFormat:
+        @"\n╔══════════════════════════════════════════╗\n"
+          "║  %@\n"
+          "╚══════════════════════════════════════════╝\n",
+        title];
+}
 
-    // activated_at stays exactly as original
-    NSString *activatedAt = @"2026-03-15 20:00:23";
+static void rLine(NSString *s) {
+    [gReport appendFormat:@"  %@\n", s];
+}
 
-    // expires_at = activated_at + 100 years
-    NSDate *activatedDate = [fmt dateFromString:activatedAt];
-    NSDate *expiresDate   = [activatedDate dateByAddingTimeInterval:
-                                100.0 * 365.25 * 86400.0];
-    NSString *expiresAt   = [fmt stringFromDate:expiresDate];
+static void rFound(NSString *where, NSString *context) {
+    [gReport appendFormat:
+        @"\n  ★★★ TARGET UDID FOUND ★★★\n"
+          "  Location : %@\n"
+          "  Context  : %@\n\n",
+        where, context];
+    NSLog(@"[AppDumper] ★ FOUND: %@ in %@", TARGET_UDID, where);
+}
 
-    // remaining = days from NOW to expiresAt (always live/accurate)
-    NSDate *now = [NSDate date];
-    NSDateComponents *diff =
-        [[NSCalendar currentCalendar] components:NSCalendarUnitDay
-                                        fromDate:now
-                                          toDate:expiresDate
-                                         options:0];
-    NSInteger days = diff.day;
-
-    // Build the response — identical structure to original JSON
-    NSDictionary *json = @{
-        @"message"         : [NSString stringWithFormat:
-                                @"UDID is valid - %ld days remaining", (long)days],
-        @"status"          : @"active",
-        @"activated_at"    : activatedAt,
-        @"expires_at"      : expiresAt,
-        @"remaining"       : [NSString stringWithFormat:@"%ld days", (long)days],
-        @"package_type"    : @"BASIC",
-        @"activation_key"  : @"TNK-7D-CEBADEDF",
-        @"client_version"  : @"2.0.2",
-        @"update_notes"    : @[
-            @"Fixed skill search filter not working",
-            @"Added Key Info card in DATA MOD tab",
-            @"Improved menu height and layout",
-            @"Added Contact button in Data Mod tab"
-        ]
-    };
-
-    NSError *e = nil;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:json
-                                                   options:NSJSONWritingPrettyPrinted
-                                                     error:&e];
-    NSLog(@"[KeychainSpy] Spoofed response:\n%@",
-          [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
-    return data;
+static void checkForUDID(NSString *where, NSString *value) {
+    if (!value) return;
+    if ([value rangeOfString:TARGET_UDID options:NSCaseInsensitiveSearch].location
+            != NSNotFound)
+        rFound(where, value);
 }
 
 // =============================================================================
-//  MARK: - NSURLProtocol interceptor
+//  MARK: - 1. Keychain dump
 // =============================================================================
 
-@interface KSSpoofProtocol : NSURLProtocol
-@end
+static void dumpKeychain(void) {
+    rHeader(@"KEYCHAIN");
+    gDumping = YES;
 
-@implementation KSSpoofProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if ([NSURLProtocol propertyForKey:kHandledKey inRequest:request]) return NO;
-    NSURL *url = request.URL;
-    BOOL hit = [url.host isEqualToString:kInterceptHost]
-            && [url.path isEqualToString:kInterceptPath];
-    if (hit) NSLog(@"[KeychainSpy] 🛡 Intercepted: %@", url.absoluteString);
-    return hit;
-}
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
-+ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b { return NO; }
-
-- (void)startLoading {
-    NSData *body = BuildSpoofedResponse();
-    NSHTTPURLResponse *resp =
-        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
-                                    statusCode:200
-                                   HTTPVersion:@"HTTP/1.1"
-                                  headerFields:@{
-            @"Content-Type"   : @"application/json; charset=utf-8",
-            @"Content-Length" : [NSString stringWithFormat:@"%lu",
-                                    (unsigned long)body.length]
-        }];
-    [self.client URLProtocol:self didReceiveResponse:resp
-          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:body];
-    [self.client URLProtocolDidFinishLoading:self];
-}
-
-- (void)stopLoading {}
-
-@end
-
-// =============================================================================
-//  MARK: - HIGH PRIORITY CONSTRUCTOR (101)
-//  Runs before %ctor, before +load, before any app network call.
-// =============================================================================
-
-__attribute__((constructor(101)))
-static void ksNetworkInit(void) {
-    [NSURLProtocol registerClass:[KSSpoofProtocol class]];
-    NSLog(@"[KeychainSpy][P101] Protocol registered — intercept LIVE");
-}
-
-// =============================================================================
-//  MARK: - Keychain Dump
-// =============================================================================
-
-static BOOL gInsideDump = NO;
-
-static NSString *DocumentsPath(void) {
-    return [NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-}
-
-static void DumpAllKeychainItems(void) {
-    NSMutableString *r = [NSMutableString string];
-    [r appendFormat:
-        @"========================================\n"
-         "KEYCHAIN FULL DUMP\n"
-         "Date  : %@\n"
-         "Bundle: %@\n"
-         "========================================\n\n",
-        [NSDate date],
-        [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown"];
-
-    gInsideDump = YES;
     CFTypeRef classes[] = {
         kSecClassGenericPassword, kSecClassInternetPassword,
         kSecClassCertificate, kSecClassKey, kSecClassIdentity
@@ -174,7 +85,7 @@ static void DumpAllKeychainItems(void) {
                        @"Certificate",@"Key",@"Identity"];
 
     for (int i = 0; i < 5; i++) {
-        [r appendFormat:@"--- %@ ---\n", names[i]];
+        [gReport appendFormat:@"\n  ── %@ ──\n", names[i]];
         NSDictionary *q = @{
             (__bridge id)kSecClass           : (__bridge id)classes[i],
             (__bridge id)kSecMatchLimit       : (__bridge id)kSecMatchLimitAll,
@@ -186,125 +97,459 @@ static void DumpAllKeychainItems(void) {
         if (s == errSecSuccess && cfr) {
             id raw = CFBridgingRelease(cfr);
             NSArray *items = [raw isKindOfClass:[NSArray class]] ? raw : @[raw];
-            [r appendFormat:@"  Count: %lu\n", (unsigned long)items.count];
+            [gReport appendFormat:@"  Count: %lu\n", (unsigned long)items.count];
             for (NSDictionary *item in items) {
-                [r appendString:@"  +------------------------------------\n"];
+                [gReport appendString:@"  ┌──────────────────────────────────\n"];
                 for (NSString *key in item) {
                     id val = item[key];
+                    NSString *strVal = nil;
                     if ([val isKindOfClass:[NSData class]]) {
-                        NSData *d = (NSData *)val;
-                        NSString *str = [[NSString alloc] initWithData:d
-                                            encoding:NSUTF8StringEncoding];
-                        if (str) [r appendFormat:@"  | %-28@ = \"%@\"\n", key, str];
-                        else     [r appendFormat:@"  | %-28@ = <data %lu B>\n",
-                                     key, (unsigned long)d.length];
+                        strVal = [[NSString alloc] initWithData:(NSData *)val
+                                      encoding:NSUTF8StringEncoding];
+                        if (!strVal) strVal = [NSString stringWithFormat:
+                            @"<data %lu B>", (unsigned long)[(NSData*)val length]];
                     } else {
-                        [r appendFormat:@"  | %-28@ = %@\n", key, val];
+                        strVal = [NSString stringWithFormat:@"%@", val];
                     }
+                    [gReport appendFormat:@"  │ %-24@ = %@\n", key, strVal];
+                    checkForUDID([NSString stringWithFormat:@"Keychain[%@].%@",
+                                    names[i], key], strVal);
                 }
-                [r appendString:@"  +------------------------------------\n"];
+                [gReport appendString:@"  └──────────────────────────────────\n"];
             }
         } else if (s == errSecItemNotFound) {
-            [r appendString:@"  (no items)\n"];
+            [gReport appendString:@"  (no items)\n"];
         } else {
-            [r appendFormat:@"  OSStatus: %d\n", (int)s];
+            [gReport appendFormat:@"  OSStatus: %d\n", (int)s];
         }
-        [r appendString:@"\n"];
     }
-    gInsideDump = NO;
+    gDumping = NO;
+}
 
-    NSString *path = [DocumentsPath()
-        stringByAppendingPathComponent:@"keychain_dump.txt"];
+// =============================================================================
+//  MARK: - 2. NSUserDefaults
+// =============================================================================
+
+static void dumpUserDefaults(void) {
+    rHeader(@"NSUSERDEFAULTS");
+
+    // Standard defaults
+    NSDictionary *std = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    [gReport appendFormat:@"\n  [Standard]  %lu keys\n", (unsigned long)std.count];
+    for (NSString *key in std) {
+        NSString *val = [NSString stringWithFormat:@"%@", std[key]];
+        [gReport appendFormat:@"  %-40@ = %@\n", key, val];
+        checkForUDID([NSString stringWithFormat:@"UserDefaults.standard[%@]", key], val);
+    }
+
+    // App group suites — probe common bundle-derived names
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    NSArray *suites = @[
+        [NSString stringWithFormat:@"group.%@", bundleID],
+        [NSString stringWithFormat:@"%@.shared", bundleID],
+        @"group.com.tnspike",
+        @"group.com.tnnguy",
+        @"com.tnnguy.auth",
+        @"com.tnspike.shared"
+    ];
+    for (NSString *suite in suites) {
+        NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:suite];
+        NSDictionary *d = [ud dictionaryRepresentation];
+        if (d.count == 0) continue;
+        [gReport appendFormat:@"\n  [Suite: %@]  %lu keys\n", suite, (unsigned long)d.count];
+        for (NSString *key in d) {
+            NSString *val = [NSString stringWithFormat:@"%@", d[key]];
+            [gReport appendFormat:@"  %-40@ = %@\n", key, val];
+            checkForUDID([NSString stringWithFormat:@"UserDefaults[%@][%@]", suite, key], val);
+        }
+    }
+}
+
+// =============================================================================
+//  MARK: - 3. File system scan
+// =============================================================================
+
+static void scanDirectory(NSString *dir, int depth) {
+    if (depth > 6) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
     NSError *err = nil;
-    BOOL ok = [r writeToFile:path atomically:YES
-                    encoding:NSUTF8StringEncoding error:&err];
-    NSLog(@"[KeychainSpy] Dump %@ -> %@", ok ? @"OK" : @"FAILED", path);
+    NSArray *contents = [fm contentsOfDirectoryAtPath:dir error:&err];
+    if (!contents) return;
+
+    for (NSString *name in contents) {
+        NSString *full = [dir stringByAppendingPathComponent:name];
+        BOOL isDir = NO;
+        [fm fileExistsAtPath:full isDirectory:&isDir];
+
+        if (isDir) {
+            scanDirectory(full, depth + 1);
+        } else {
+            // Log the file
+            NSDictionary *attr = [fm attributesOfItemAtPath:full error:nil];
+            unsigned long long sz = [attr[NSFileSize] unsignedLongLongValue];
+            [gReport appendFormat:@"  [FILE] %@  (%llu B)\n", full, sz];
+
+            // Try to read small text files and search for UDID
+            if (sz > 0 && sz < 512 * 1024) {
+                NSString *ext = full.pathExtension.lowercaseString;
+                BOOL isText = [@[@"txt",@"plist",@"json",@"db",@"sqlite",
+                                 @"log",@"xml",@"dat",@"cfg",@"conf",
+                                 @"realm",@""] containsObject:ext];
+                if (isText) {
+                    NSData *data = [NSData dataWithContentsOfFile:full];
+                    if (data) {
+                        // Search raw bytes for UDID string
+                        NSData *target = [TARGET_UDID
+                            dataUsingEncoding:NSUTF8StringEncoding];
+                        NSRange found = [data rangeOfData:target
+                            options:0
+                            range:NSMakeRange(0, data.length)];
+                        if (found.location != NSNotFound) {
+                            rFound([NSString stringWithFormat:@"File: %@", full],
+                                   [NSString stringWithFormat:
+                                    @"bytes offset %lu", (unsigned long)found.location]);
+                        }
+
+                        // Also try as UTF8 string
+                        NSString *str = [[NSString alloc]
+                            initWithData:data encoding:NSUTF8StringEncoding];
+                        if (str)
+                            checkForUDID([NSString stringWithFormat:@"File: %@", full], str);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void dumpFileSystem(void) {
+    rHeader(@"FILE SYSTEM SCAN");
+
+    NSArray *roots = @[
+        NSHomeDirectory(),
+        NSTemporaryDirectory(),
+        @"/var/mobile/Library/Preferences",
+        @"/var/mobile/Library/Application Support",
+        @"/var/mobile/Library/Caches/com.apple.UIKit.pboard",
+        @"/var/jb/var/mobile/Library/Preferences"
+    ];
+
+    for (NSString *root in roots) {
+        [gReport appendFormat:@"\n  ── Scanning: %@ ──\n", root];
+        scanDirectory(root, 0);
+    }
 }
 
 // =============================================================================
-//  MARK: - Patch UDID
+//  MARK: - 4. UIPasteboard
 // =============================================================================
 
-static int PatchUDID(void) {
-    NSData *newData = [kNewUDID dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *search = @{
-        (__bridge id)kSecClass           : (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService     : kTargetService,
-        (__bridge id)kSecAttrAccount     : kTargetAccount,
-        (__bridge id)kSecAttrAccessGroup : kTargetGroup
-    };
-    OSStatus s = SecItemUpdate(
-        (__bridge CFDictionaryRef)search,
-        (__bridge CFDictionaryRef)@{(__bridge id)kSecValueData : newData});
-    if (s == errSecSuccess) return 0;
-    if (s == errSecItemNotFound) {
-        NSMutableDictionary *add = [search mutableCopy];
-        add[(__bridge id)kSecValueData]          = newData;
-        add[(__bridge id)kSecAttrSynchronizable] = @NO;
-        return SecItemAdd((__bridge CFDictionaryRef)add, NULL) == errSecSuccess ? 0 : 3;
+static void dumpPasteboard(void) {
+    rHeader(@"UIPASTEBOARD");
+
+    // General pasteboard
+    UIPasteboard *gen = [UIPasteboard generalPasteboard];
+    NSString *genStr  = [gen string];
+    rLine([NSString stringWithFormat:@"[General] changeCount=%ld  string=%@",
+           (long)gen.changeCount, genStr ?: @"(nil)"]);
+    checkForUDID(@"UIPasteboard.general", genStr ?: @"");
+
+    // Known named pasteboards
+    NSArray *names = @[
+        @"com.persist.data",
+        @"com.tnspike.pb",
+        @"com.tnnguy.pb",
+        [NSString stringWithFormat:@"%@.pb",
+            [[NSBundle mainBundle] bundleIdentifier] ?: @"app"]
+    ];
+    for (NSString *n in names) {
+        UIPasteboard *pb = [UIPasteboard pasteboardWithName:n create:NO];
+        if (!pb) continue;
+        NSString *s = [pb string];
+        rLine([NSString stringWithFormat:@"[%@] = %@", n, s ?: @"(nil)"]);
+        checkForUDID([NSString stringWithFormat:@"UIPasteboard[%@]", n], s ?: @"");
     }
-    return 2;
 }
 
-static NSString *ReadCurrentUDID(void) {
-    NSDictionary *q = @{
-        (__bridge id)kSecClass           : (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService     : kTargetService,
-        (__bridge id)kSecAttrAccount     : kTargetAccount,
-        (__bridge id)kSecAttrAccessGroup : kTargetGroup,
-        (__bridge id)kSecMatchLimit      : (__bridge id)kSecMatchLimitOne,
-        (__bridge id)kSecReturnData      : @YES
-    };
-    CFTypeRef r = NULL;
-    OSStatus s = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
-    if (s == errSecSuccess && r) {
-        NSData *d = CFBridgingRelease(r);
-        return [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"<non-utf8>";
+// =============================================================================
+//  MARK: - 5. HTTP Cookies
+// =============================================================================
+
+static void dumpCookies(void) {
+    rHeader(@"HTTP COOKIES");
+    NSArray *cookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies];
+    [gReport appendFormat:@"  Count: %lu\n", (unsigned long)cookies.count];
+    for (NSHTTPCookie *c in cookies) {
+        NSString *line = [NSString stringWithFormat:
+            @"  domain=%-30@  name=%-24@  value=%@",
+            c.domain, c.name, c.value];
+        rLine(line);
+        checkForUDID([NSString stringWithFormat:@"Cookie[%@][%@]", c.domain, c.name],
+                     c.value);
     }
-    return [NSString stringWithFormat:@"not found (%d)", (int)s];
+}
+
+// =============================================================================
+//  MARK: - 6. NSURLCache
+// =============================================================================
+
+static void dumpURLCache(void) {
+    rHeader(@"NSURLCACHE");
+    NSURLCache *cache = [NSURLCache sharedURLCache];
+    rLine([NSString stringWithFormat:
+        @"currentMemoryUsage=%lu B  currentDiskUsage=%lu B",
+        (unsigned long)cache.currentMemoryUsage,
+        (unsigned long)cache.currentDiskUsage]);
+}
+
+// =============================================================================
+//  MARK: - 7. Loaded ObjC classes (app-specific)
+// =============================================================================
+
+static void dumpClasses(void) {
+    rHeader(@"LOADED OBJC CLASSES (app bundle)");
+
+    NSString *execPath = [[NSBundle mainBundle] executablePath];
+    unsigned int classCount = 0;
+    Class *classes = objc_copyClassList(&classCount);
+
+    int logged = 0;
+    for (unsigned int i = 0; i < classCount && logged < 300; i++) {
+        Class cls = classes[i];
+        // Only log classes from the main bundle image
+        const char *imgName = class_getImageName(cls);
+        if (!imgName) continue;
+        NSString *img = [NSString stringWithUTF8String:imgName];
+        if (![img isEqualToString:execPath]) continue;
+
+        NSString *name = [NSString stringWithUTF8String:class_getName(cls)];
+
+        // Log class + interesting properties/methods
+        unsigned int propCount = 0;
+        objc_property_t *props = class_copyPropertyList(cls, &propCount);
+        NSMutableArray *propNames = [NSMutableArray array];
+        for (unsigned int p = 0; p < propCount && p < 20; p++) {
+            [propNames addObject:[NSString stringWithUTF8String:
+                property_getName(props[p])]];
+        }
+        free(props);
+
+        [gReport appendFormat:@"  %@  {%@}\n",
+            name, [propNames componentsJoinedByString:@", "]];
+        logged++;
+    }
+    free(classes);
+    [gReport appendFormat:@"\n  Total app classes logged: %d\n", logged];
+}
+
+// =============================================================================
+//  MARK: - 8. Process / environment info
+// =============================================================================
+
+static void dumpProcessInfo(void) {
+    rHeader(@"PROCESS INFO");
+
+    NSProcessInfo *pi = [NSProcessInfo processInfo];
+    rLine([NSString stringWithFormat:@"processName    : %@", pi.processName]);
+    rLine([NSString stringWithFormat:@"processID      : %d", pi.processIdentifier]);
+    rLine([NSString stringWithFormat:@"bundleID       : %@",
+           [[NSBundle mainBundle] bundleIdentifier]]);
+    rLine([NSString stringWithFormat:@"appVersion     : %@",
+           [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"]]);
+    rLine([NSString stringWithFormat:@"build          : %@",
+           [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"]]);
+    rLine([NSString stringWithFormat:@"systemVersion  : %@ %@",
+           [UIDevice currentDevice].systemName,
+           [UIDevice currentDevice].systemVersion]);
+    rLine([NSString stringWithFormat:@"deviceModel    : %@",
+           [UIDevice currentDevice].model]);
+    rLine([NSString stringWithFormat:@"identifierFVD  : %@",
+           [UIDevice currentDevice].identifierForVendor.UUIDString]);
+
+    // Environment
+    NSDictionary *env = pi.environment;
+    [gReport appendFormat:@"\n  Environment (%lu vars):\n", (unsigned long)env.count];
+    for (NSString *key in env) {
+        NSString *val = env[key];
+        [gReport appendFormat:@"    %-30@ = %@\n", key, val];
+        checkForUDID([NSString stringWithFormat:@"ENV[%@]", key], val);
+    }
+}
+
+// =============================================================================
+//  MARK: - 9. Loaded dylibs / frameworks
+// =============================================================================
+
+static void dumpDylibs(void) {
+    rHeader(@"LOADED DYLIBS");
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name) rLine([NSString stringWithUTF8String:name]);
+    }
+}
+
+// =============================================================================
+//  MARK: - 10. Memory scan for target UDID
+//  Scans readable VM regions of this process for the UDID string
+// =============================================================================
+
+static void memoryScan(void) {
+    rHeader([NSString stringWithFormat:@"MEMORY SCAN FOR: %@", TARGET_UDID]);
+
+    const char *needle  = TARGET_C;
+    size_t      needleLen = strlen(needle);
+
+    mach_port_t task  = mach_task_self();
+    vm_address_t addr = 0;
+    vm_size_t    size = 0;
+    natural_t    depth = 1;
+
+    int found = 0;
+
+    while (1) {
+        struct vm_region_submap_info_64 info;
+        mach_msg_type_number_t infoCount = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+        kern_return_t kr = vm_region_recurse_64(
+            task, &addr, &size, &depth,
+            (vm_region_recurse_info_t)&info, &infoCount);
+
+        if (kr != KERN_SUCCESS) break;
+
+        // Only scan readable, non-executable regions to avoid crashes
+        BOOL readable   = (info.protection & VM_PROT_READ)    != 0;
+        BOOL executable = (info.protection & VM_PROT_EXECUTE) != 0;
+        BOOL writable   = (info.protection & VM_PROT_WRITE)   != 0;
+
+        if (readable && !executable && size > 0 && size < 128 * 1024 * 1024) {
+            // Try to read region
+            vm_offset_t   data = 0;
+            mach_msg_type_number_t dataCnt = 0;
+            kern_return_t readKR = vm_read(task, addr, size, &data, &dataCnt);
+
+            if (readKR == KERN_SUCCESS && data && dataCnt >= needleLen) {
+                uint8_t *buf = (uint8_t *)data;
+                for (mach_msg_type_number_t i = 0;
+                     i + needleLen <= dataCnt; i++) {
+                    if (memcmp(buf + i, needle, needleLen) == 0) {
+                        found++;
+                        rFound(
+                            [NSString stringWithFormat:
+                                @"Memory 0x%llx (rw=%d size=%lluKB)",
+                                (uint64_t)(addr + i),
+                                writable ? 1 : 0,
+                                (uint64_t)(size / 1024)],
+                            [NSString stringWithFormat:
+                                @"at region addr=0x%llx offset=%u",
+                                (uint64_t)addr, i]
+                        );
+                        i += needleLen - 1; // skip past this match
+                    }
+                }
+                vm_deallocate(task, data, dataCnt);
+            }
+        }
+
+        addr += size;
+    }
+
+    if (found == 0)
+        rLine([NSString stringWithFormat:
+            @"Not found in any readable memory region"]);
+    else
+        rLine([NSString stringWithFormat:@"Total occurrences found: %d", found]);
+}
+
+// =============================================================================
+//  MARK: - Master dump function
+// =============================================================================
+
+static void RunFullDump(void) {
+    gReport = [NSMutableString string];
+
+    [gReport appendFormat:
+        @"╔══════════════════════════════════════════════════╗\n"
+          "║          AppDumper — Full Harvest Report         ║\n"
+          "╠══════════════════════════════════════════════════╣\n"
+          "║  Date   : %-38@ ║\n"
+          "║  Bundle : %-38@ ║\n"
+          "║  PID    : %-38d ║\n"
+          "║  Target : %-38@ ║\n"
+          "╚══════════════════════════════════════════════════╝\n",
+        [NSDate date],
+        [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown",
+        (int)getpid(),
+        TARGET_UDID];
+
+    dumpProcessInfo();
+    dumpKeychain();
+    dumpUserDefaults();
+    dumpPasteboard();
+    dumpCookies();
+    dumpURLCache();
+    dumpFileSystem();
+    dumpClasses();
+    dumpDylibs();
+    memoryScan();
+
+    [gReport appendString:
+        @"\n╔══════════════════════════════════════════════════╗\n"
+          "║                   END OF DUMP                   ║\n"
+          "╚══════════════════════════════════════════════════╝\n"];
+
+    // Write output
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docDir = [paths firstObject];
+    NSString *path   = [docDir stringByAppendingPathComponent:@"full_dump.txt"];
+
+    NSError *err = nil;
+    BOOL ok = [gReport writeToFile:path atomically:YES
+                          encoding:NSUTF8StringEncoding error:&err];
+    NSLog(@"[AppDumper] Dump %@ -> %@  err=%@",
+          ok ? @"OK" : @"FAILED", path, err);
+
+    gReport = nil;
 }
 
 // =============================================================================
 //  OVERLAY VIEW
 // =============================================================================
 
-@interface KSOverlayView : UIView
+@interface ADOverlayView : UIView
 @property (nonatomic, strong) UIButton *dumpButton;
-@property (nonatomic, strong) UIButton *patchButton;
 @property (nonatomic, strong) UILabel  *statusLabel;
-@property (nonatomic, strong) UILabel  *udidLabel;
-@property (nonatomic, strong) UILabel  *interceptLabel;
 @property (nonatomic, strong) UIView   *pillView;
 @property (nonatomic, strong) UILabel  *pillLabel;
 @property (nonatomic, assign) BOOL      minimised;
 @end
 
 static UIWindow      *gWindow  = nil;
-static KSOverlayView *gOverlay = nil;
+static ADOverlayView *gOverlay = nil;
 
-@implementation KSOverlayView
+@implementation ADOverlayView
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
     CGFloat W = frame.size.width;
 
-    self.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.94];
+    self.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.95];
     self.layer.cornerRadius = 18;
     self.layer.borderWidth  = 1;
     self.layer.borderColor  =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.55].CGColor;
+        [UIColor colorWithRed:0.85 green:0.30 blue:0.10 alpha:0.7].CGColor;
     self.clipsToBounds = YES;
 
-    // Header
     UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(14,12,24,20)];
-    icon.text = @"🔑"; icon.font = [UIFont systemFontOfSize:14];
+    icon.text = @"🕵️"; icon.font = [UIFont systemFontOfSize:14];
     [self addSubview:icon];
 
     UILabel *ttl = [[UILabel alloc] initWithFrame:CGRectMake(40,12,W-80,18)];
-    ttl.text      = @"KeychainSpy";
+    ttl.text      = @"AppDumper";
     ttl.font      = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    ttl.textColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+    ttl.textColor = [UIColor colorWithRed:1.0 green:0.55 blue:0.10 alpha:1.0];
     [self addSubview:ttl];
 
     UIButton *minBtn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -316,50 +561,47 @@ static KSOverlayView *gOverlay = nil;
      forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:minBtn];
 
-    [self divAt:38 W:W];
-    [self secLbl:@"NETWORK INTERCEPT  [P101 · LIVE]" y:46 W:W];
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(0,38,W,0.5)];
+    div.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
+    [self addSubview:div];
 
-    self.interceptLabel = [[UILabel alloc] initWithFrame:CGRectMake(8,62,W-16,26)];
-    self.interceptLabel.font          = [UIFont systemFontOfSize:9];
-    self.interceptLabel.textColor     =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-    self.interceptLabel.textAlignment = NSTextAlignmentCenter;
-    self.interceptLabel.numberOfLines = 2;
-    self.interceptLabel.text          =
-        @"✓ tnspike.com:2087/verify_udid spoofed\nVIP · 100yr · original JSON structure";
-    [self addSubview:self.interceptLabel];
+    UILabel *sec = [[UILabel alloc] initWithFrame:CGRectMake(14,46,W-28,13)];
+    sec.text      = @"FULL APP HARVEST + MEMORY SCAN";
+    sec.font      = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    sec.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
+    [self addSubview:sec];
 
-    [self divAt:94 W:W];
-    [self secLbl:@"KEYCHAIN DUMP" y:102 W:W];
-
-    self.statusLabel               = [[UILabel alloc] initWithFrame:CGRectMake(0,118,W,14)];
-    self.statusLabel.text          = @"Ready";
-    self.statusLabel.font          = [UIFont systemFontOfSize:10];
+    self.statusLabel               = [[UILabel alloc] initWithFrame:CGRectMake(0,62,W,14)];
+    self.statusLabel.text          = @"Ready — auto-dumped on launch";
+    self.statusLabel.font          = [UIFont systemFontOfSize:9];
     self.statusLabel.textColor     = [UIColor colorWithWhite:0.40 alpha:1.0];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
     [self addSubview:self.statusLabel];
 
-    self.dumpButton = [self mkBtn:@"Dump All Keychain" y:135 W:W
-                           action:@selector(didTapDump)
-                            color:[UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0]];
+    // Target UDID display
+    UILabel *udidLbl = [[UILabel alloc] initWithFrame:CGRectMake(8,78,W-16,20)];
+    udidLbl.font          = [UIFont monospacedSystemFontOfSize:8
+                                                        weight:UIFontWeightRegular];
+    udidLbl.textColor     = [UIColor colorWithRed:1.0 green:0.55 blue:0.10 alpha:0.8];
+    udidLbl.textAlignment = NSTextAlignmentCenter;
+    udidLbl.numberOfLines = 1;
+    udidLbl.adjustsFontSizeToFitWidth = YES;
+    udidLbl.text          = [NSString stringWithFormat:@"🔍 %@", TARGET_UDID];
+    [self addSubview:udidLbl];
+
+    self.dumpButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.dumpButton.frame = CGRectMake(14, 102, W-28, 36);
+    [self.dumpButton setTitle:@"Dump Everything Now" forState:UIControlStateNormal];
+    self.dumpButton.titleLabel.font    = [UIFont systemFontOfSize:12
+                                                           weight:UIFontWeightSemibold];
+    self.dumpButton.tintColor          = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
+    [self.dumpButton setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+    self.dumpButton.backgroundColor    = [UIColor colorWithRed:1.0 green:0.55 blue:0.10 alpha:1.0];
+    self.dumpButton.layer.cornerRadius = 10;
+    self.dumpButton.clipsToBounds      = YES;
+    [self.dumpButton addTarget:self action:@selector(didTapDump)
+              forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:self.dumpButton];
-
-    [self divAt:182 W:W];
-    [self secLbl:@"PATCH UDID" y:190 W:W];
-
-    self.udidLabel               = [[UILabel alloc] initWithFrame:CGRectMake(8,206,W-16,22)];
-    self.udidLabel.font          = [UIFont monospacedSystemFontOfSize:8
-                                                               weight:UIFontWeightRegular];
-    self.udidLabel.textColor     = [UIColor colorWithWhite:0.40 alpha:1.0];
-    self.udidLabel.textAlignment = NSTextAlignmentCenter;
-    self.udidLabel.numberOfLines = 2;
-    self.udidLabel.text          = [NSString stringWithFormat:@"-> %@", kNewUDID];
-    [self addSubview:self.udidLabel];
-
-    self.patchButton = [self mkBtn:@"Set UDID" y:230 W:W
-                            action:@selector(didTapPatch)
-                             color:[UIColor colorWithRed:0.85 green:0.50 blue:0.10 alpha:1.0]];
-    [self addSubview:self.patchButton];
 
     // Pill
     self.pillView = [[UIView alloc] initWithFrame:CGRectMake(0,0,W,36)];
@@ -367,14 +609,14 @@ static KSOverlayView *gOverlay = nil;
     self.pillView.layer.cornerRadius = 18;
     self.pillView.layer.borderWidth  = 1;
     self.pillView.layer.borderColor  =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.5].CGColor;
+        [UIColor colorWithRed:1.0 green:0.55 blue:0.10 alpha:0.5].CGColor;
     self.pillView.clipsToBounds = YES;
     self.pillView.hidden        = YES;
 
     self.pillLabel = [[UILabel alloc] initWithFrame:CGRectMake(10,0,W-20,36)];
     self.pillLabel.font      = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    self.pillLabel.textColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-    self.pillLabel.text      = @"🔑 KeychainSpy  ✓ VIP";
+    self.pillLabel.textColor = [UIColor colorWithRed:1.0 green:0.55 blue:0.10 alpha:1.0];
+    self.pillLabel.text      = @"🕵️ AppDumper";
     [self.pillView addSubview:self.pillLabel];
 
     UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc]
@@ -389,87 +631,33 @@ static KSOverlayView *gOverlay = nil;
     return self;
 }
 
-- (void)divAt:(CGFloat)y W:(CGFloat)W {
-    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(0,y,W,0.5)];
-    d.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
-    [self addSubview:d];
-}
-
-- (void)secLbl:(NSString *)text y:(CGFloat)y W:(CGFloat)W {
-    UILabel *l  = [[UILabel alloc] initWithFrame:CGRectMake(14,y,W-28,13)];
-    l.text      = text;
-    l.font      = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
-    l.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
-    [self addSubview:l];
-}
-
-- (UIButton *)mkBtn:(NSString *)t y:(CGFloat)y W:(CGFloat)W
-             action:(SEL)a color:(UIColor *)c {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame     = CGRectMake(14, y, W-28, 34);
-    [b setTitle:t forState:UIControlStateNormal];
-    b.titleLabel.font    = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    b.tintColor          = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
-    b.backgroundColor    = c;
-    b.layer.cornerRadius = 10;
-    b.clipsToBounds      = YES;
-    [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
 - (void)didTapDump {
     self.dumpButton.enabled = NO;
-    [self.dumpButton setTitle:@"Dumping..." forState:UIControlStateNormal];
-    self.dumpButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-    self.statusLabel.text = @"Working...";
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        DumpAllKeychainItems();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIColor *green = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-            UIColor *blue  = [UIColor colorWithRed:0.08 green:0.45 blue:0.90 alpha:1.0];
-            [self.dumpButton setTitle:@"Saved!" forState:UIControlStateNormal];
-            self.dumpButton.backgroundColor = blue;
-            self.statusLabel.text = @"keychain_dump.txt written";
-            self.statusLabel.textColor = blue;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3.0*NSEC_PER_SEC)),
-                dispatch_get_main_queue(), ^{
-                [self.dumpButton setTitle:@"Dump All Keychain" forState:UIControlStateNormal];
-                self.dumpButton.backgroundColor = green;
-                self.dumpButton.enabled = YES;
-                self.statusLabel.text = @"Ready";
-                self.statusLabel.textColor = [UIColor colorWithWhite:0.40 alpha:1.0];
-            });
-        });
-    });
-}
+    [self.dumpButton setTitle:@"Dumping everything..." forState:UIControlStateNormal];
+    self.dumpButton.backgroundColor =
+        [UIColor colorWithWhite:0.25 alpha:1.0];
+    self.statusLabel.text      = @"Scanning memory + storage...";
+    self.statusLabel.textColor = [UIColor colorWithRed:1.0 green:0.55 blue:0.10 alpha:1.0];
 
-- (void)didTapPatch {
-    self.patchButton.enabled = NO;
-    [self.patchButton setTitle:@"Patching..." forState:UIControlStateNormal];
-    self.patchButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        int result     = PatchUDID();
-        NSString *read = ReadCurrentUDID();
+        RunFullDump();
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIColor *orange = [UIColor colorWithRed:0.85 green:0.50 blue:0.10 alpha:1.0];
+            UIColor *orange = [UIColor colorWithRed:1.0 green:0.55 blue:0.10 alpha:1.0];
             UIColor *green  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-            UIColor *red    = [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1.0];
-            if (result == 0) {
-                [self.patchButton setTitle:@"Patched!" forState:UIControlStateNormal];
-                self.patchButton.backgroundColor = green;
-                self.udidLabel.text = [NSString stringWithFormat:@"✓ %@", read];
-                self.udidLabel.textColor = green;
-            } else {
-                [self.patchButton setTitle:@"Failed" forState:UIControlStateNormal];
-                self.patchButton.backgroundColor = red;
-                self.udidLabel.text = [NSString stringWithFormat:@"✗ err=%d got=%@",result,read];
-                self.udidLabel.textColor = red;
-            }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(3.5*NSEC_PER_SEC)),
+            [self.dumpButton setTitle:@"Saved to full_dump.txt!"
+                             forState:UIControlStateNormal];
+            self.dumpButton.backgroundColor = green;
+            self.statusLabel.text      = @"Documents/full_dump.txt";
+            self.statusLabel.textColor = green;
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW,(int64_t)(4.0*NSEC_PER_SEC)),
                 dispatch_get_main_queue(), ^{
-                [self.patchButton setTitle:@"Set UDID" forState:UIControlStateNormal];
-                self.patchButton.backgroundColor = orange;
-                self.patchButton.enabled = YES;
+                    [self.dumpButton setTitle:@"Dump Everything Now"
+                                     forState:UIControlStateNormal];
+                    self.dumpButton.backgroundColor = orange;
+                    self.dumpButton.enabled = YES;
+                    self.statusLabel.text = @"Ready";
+                    self.statusLabel.textColor = [UIColor colorWithWhite:0.40 alpha:1.0];
             });
         });
     });
@@ -477,7 +665,7 @@ static KSOverlayView *gOverlay = nil;
 
 - (void)toggleMinimise {
     self.minimised = !self.minimised;
-    CGFloat fullH = 276;
+    CGFloat fullH = 150;
     if (self.minimised) {
         [UIView animateWithDuration:0.20 animations:^{
             CGRect f = gWindow.frame; f.size.height = 36; gWindow.frame = f;
@@ -511,12 +699,12 @@ static KSOverlayView *gOverlay = nil;
 @end
 
 // =============================================================================
-//  WINDOW pass-through
+//  WINDOW
 // =============================================================================
 
-@interface KSWindow : UIWindow
+@interface ADWindow : UIWindow
 @end
-@implementation KSWindow
+@implementation ADWindow
 - (BOOL)pointInside:(CGPoint)pt withEvent:(UIEvent *)ev {
     for (UIView *s in self.subviews)
         if (!s.hidden && [s pointInside:[self convertPoint:pt toView:s] withEvent:ev])
@@ -531,10 +719,10 @@ static KSOverlayView *gOverlay = nil;
 
 static void spawnOverlay(void) {
     if (gWindow) return;
-    CGFloat W = 240, H = 276;
+    CGFloat W = 250, H = 150;
     CGRect sc = [UIScreen mainScreen].bounds;
-    gWindow = [[KSWindow alloc] initWithFrame:CGRectMake(
-        sc.size.width - W - 12, sc.size.height * 0.18, W, H)];
+    gWindow = [[ADWindow alloc] initWithFrame:CGRectMake(
+        sc.size.width - W - 10, sc.size.height * 0.20, W, H)];
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]] &&
@@ -545,11 +733,11 @@ static void spawnOverlay(void) {
     }
     gWindow.windowLevel     = UIWindowLevelAlert + 100;
     gWindow.backgroundColor = [UIColor clearColor];
-    gOverlay = [[KSOverlayView alloc] initWithFrame:CGRectMake(0,0,W,H)];
+    gOverlay = [[ADOverlayView alloc] initWithFrame:CGRectMake(0,0,W,H)];
     [gWindow addSubview:gOverlay];
     gWindow.hidden = NO;
     [gWindow makeKeyAndVisible];
-    NSLog(@"[KeychainSpy] Overlay ready");
+    NSLog(@"[AppDumper] Overlay ready");
 }
 
 // =============================================================================
@@ -560,19 +748,28 @@ static void spawnOverlay(void) {
 - (BOOL)application:(UIApplication *)app
     didFinishLaunchingWithOptions:(NSDictionary *)opts {
     BOOL r = %orig;
+
+    // Auto-dump on every launch (background thread, 2s delay to let app init)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(2.0*NSEC_PER_SEC)),
+        dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            NSLog(@"[AppDumper] Auto-dumping on launch...");
+            RunFullDump();
+    });
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.0*NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ spawnOverlay(); });
+
     return r;
 }
 %end
 
 // =============================================================================
-//  LOGOS CONSTRUCTOR
+//  CONSTRUCTOR
 // =============================================================================
 
 %ctor {
     %init;
-    NSLog(@"[KeychainSpy][%%ctor] hooks live in %@",
+    NSLog(@"[AppDumper] Loaded in %@",
           [[NSBundle mainBundle] bundleIdentifier]);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ spawnOverlay(); });
