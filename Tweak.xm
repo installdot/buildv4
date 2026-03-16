@@ -1,7 +1,8 @@
 /*
- * KeychainSpy - iOS Keychain Dumper
- * Overlay/injection pattern based on DevTool reference
- * Dump button -> <App Documents>/keychain_dump.txt
+ * KeychainSpy - iOS Keychain Dumper + Patcher
+ * - Dump All Keychain -> Documents/keychain_dump.txt
+ * - Patch UDID: sets v_Data of com.tnnguy.auth / device_udid
+ *   to "00008020-00161D3E0288003A"
  */
 
 #import <UIKit/UIKit.h>
@@ -10,9 +11,9 @@
 
 static BOOL gInsideDump = NO;
 
-// ─────────────────────────────────────────────
-// MARK: - Dump
-// ─────────────────────────────────────────────
+// =============================================================================
+//  MARK: - Dump
+// =============================================================================
 
 static NSString *DocumentsPath(void) {
     return [NSSearchPathForDirectoriesInDomains(
@@ -103,12 +104,90 @@ static void DumpAllKeychainItems(void) {
 }
 
 // =============================================================================
+//  MARK: - Patch UDID
+//  Targets: service=com.tnnguy.auth  account=device_udid
+//  Sets v_Data to "00008020-00161D3E0288003A"
+// =============================================================================
+
+#define kTargetService  @"com.tnnguy.auth"
+#define kTargetAccount  @"device_udid"
+#define kTargetGroup    @"6HV9UPZCN4.*"
+#define kNewUDID        @"00008020-00161D3E0288003A"
+
+// Returns: 0=success, 1=not found, 2=update failed, 3=add failed
+static int PatchUDID(void) {
+    NSData *newData = [kNewUDID dataUsingEncoding:NSUTF8StringEncoding];
+
+    // ── Try update first (item already exists) ───────────────────────────────
+    NSDictionary *searchQuery = @{
+        (__bridge id)kSecClass           : (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService     : kTargetService,
+        (__bridge id)kSecAttrAccount     : kTargetAccount,
+        (__bridge id)kSecAttrAccessGroup : kTargetGroup
+    };
+
+    NSDictionary *updateAttrs = @{
+        (__bridge id)kSecValueData : newData
+    };
+
+    OSStatus status = SecItemUpdate(
+        (__bridge CFDictionaryRef)searchQuery,
+        (__bridge CFDictionaryRef)updateAttrs);
+
+    NSLog(@"[KeychainSpy] SecItemUpdate status=%d", (int)status);
+
+    if (status == errSecSuccess) {
+        return 0; // patched via update
+    }
+
+    if (status == errSecItemNotFound) {
+        // Item doesn't exist yet — add it fresh
+        NSDictionary *addQuery = @{
+            (__bridge id)kSecClass           : (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService     : kTargetService,
+            (__bridge id)kSecAttrAccount     : kTargetAccount,
+            (__bridge id)kSecAttrAccessGroup : kTargetGroup,
+            (__bridge id)kSecValueData       : newData,
+            (__bridge id)kSecAttrSynchronizable : @NO
+        };
+        OSStatus addStatus = SecItemAdd(
+            (__bridge CFDictionaryRef)addQuery, NULL);
+        NSLog(@"[KeychainSpy] SecItemAdd status=%d", (int)addStatus);
+        return (addStatus == errSecSuccess) ? 0 : 3;
+    }
+
+    return 2;
+}
+
+// Read back to verify
+static NSString *ReadCurrentUDID(void) {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass           : (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService     : kTargetService,
+        (__bridge id)kSecAttrAccount     : kTargetAccount,
+        (__bridge id)kSecAttrAccessGroup : kTargetGroup,
+        (__bridge id)kSecMatchLimit      : (__bridge id)kSecMatchLimitOne,
+        (__bridge id)kSecReturnData      : @YES
+    };
+    CFTypeRef cfResult = NULL;
+    OSStatus s = SecItemCopyMatching((__bridge CFDictionaryRef)query, &cfResult);
+    if (s == errSecSuccess && cfResult) {
+        NSData *data = CFBridgingRelease(cfResult);
+        return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+               ?: @"<non-utf8>";
+    }
+    return [NSString stringWithFormat:@"not found (status %d)", (int)s];
+}
+
+// =============================================================================
 //  OVERLAY VIEW
 // =============================================================================
 
 @interface KSOverlayView : UIView
 @property (nonatomic, strong) UIButton *dumpButton;
+@property (nonatomic, strong) UIButton *patchButton;
 @property (nonatomic, strong) UILabel  *statusLabel;
+@property (nonatomic, strong) UILabel  *udidLabel;
 @property (nonatomic, strong) UIView   *pillView;
 @property (nonatomic, strong) UILabel  *pillLabel;
 @property (nonatomic, assign) BOOL      minimised;
@@ -132,71 +211,68 @@ static KSOverlayView *gOverlay = nil;
         [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.55].CGColor;
     self.clipsToBounds = YES;
 
-    // Header icon
+    // ── Header ───────────────────────────────────────────────────────────────
     UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(14, 12, 24, 20)];
     icon.text = @"🔑";
     icon.font = [UIFont systemFontOfSize:14];
     [self addSubview:icon];
 
-    // Header title
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(40, 12, W - 80, 18)];
     title.text      = @"KeychainSpy";
     title.font      = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     title.textColor = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
     [self addSubview:title];
 
-    // Minimise button
-    UIButton *minBtn     = [UIButton buttonWithType:UIButtonTypeSystem];
-    minBtn.frame         = CGRectMake(W - 36, 8, 28, 28);
+    UIButton *minBtn       = [UIButton buttonWithType:UIButtonTypeSystem];
+    minBtn.frame           = CGRectMake(W - 36, 8, 28, 28);
     [minBtn setTitle:@"—" forState:UIControlStateNormal];
-    minBtn.tintColor          = [UIColor colorWithWhite:0.5 alpha:1.0];
-    minBtn.titleLabel.font    = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    minBtn.tintColor           = [UIColor colorWithWhite:0.5 alpha:1.0];
+    minBtn.titleLabel.font     = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     [minBtn addTarget:self action:@selector(toggleMinimise)
      forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:minBtn];
 
-    // Divider
-    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(0, 38, W, 0.5)];
-    div.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
-    [self addSubview:div];
+    // ── Divider 1 ─────────────────────────────────────────────────────────────
+    [self dividerAt:38 W:W];
 
-    // Section label
-    UILabel *sec  = [[UILabel alloc] initWithFrame:CGRectMake(14, 46, W - 28, 13)];
-    sec.text      = @"KEYCHAIN DUMP";
-    sec.font      = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
-    sec.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
-    [self addSubview:sec];
+    // ── Section: Dump ─────────────────────────────────────────────────────────
+    [self sectionLabel:@"KEYCHAIN DUMP" y:46 W:W];
 
-    // Status label
-    self.statusLabel               = [[UILabel alloc] initWithFrame:CGRectMake(0, 62, W, 20)];
-    self.statusLabel.text          = @"Ready to dump";
-    self.statusLabel.font          = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-    self.statusLabel.textColor     = [UIColor colorWithWhite:0.45 alpha:1.0];
+    self.statusLabel               = [[UILabel alloc] initWithFrame:CGRectMake(0, 62, W, 16)];
+    self.statusLabel.text          = @"Ready";
+    self.statusLabel.font          = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+    self.statusLabel.textColor     = [UIColor colorWithWhite:0.40 alpha:1.0];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
     [self addSubview:self.statusLabel];
 
-    // Path hint
-    UILabel *pathHint          = [[UILabel alloc] initWithFrame:CGRectMake(0, 80, W, 13)];
-    pathHint.text              = @"Documents/keychain_dump.txt";
-    pathHint.font              = [UIFont systemFontOfSize:9 weight:UIFontWeightRegular];
-    pathHint.textColor         = [UIColor colorWithWhite:0.28 alpha:1.0];
-    pathHint.textAlignment     = NSTextAlignmentCenter;
-    [self addSubview:pathHint];
-
-    // Dump button
-    self.dumpButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.dumpButton.frame = CGRectMake(14, 100, W - 28, 38);
-    [self.dumpButton setTitle:@"Dump All Keychain" forState:UIControlStateNormal];
-    self.dumpButton.titleLabel.font    = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    self.dumpButton.tintColor          = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
-    self.dumpButton.backgroundColor    = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
-    self.dumpButton.layer.cornerRadius = 10;
-    self.dumpButton.clipsToBounds      = YES;
-    [self.dumpButton addTarget:self action:@selector(didTapDump)
-              forControlEvents:UIControlEventTouchUpInside];
+    self.dumpButton = [self makeButton:@"Dump All Keychain"
+                                     y:80 W:W
+                                action:@selector(didTapDump)
+                                 color:[UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0]];
     [self addSubview:self.dumpButton];
 
-    // Pill (minimised state)
+    // ── Divider 2 ─────────────────────────────────────────────────────────────
+    [self dividerAt:126 W:W];
+
+    // ── Section: Patch ────────────────────────────────────────────────────────
+    [self sectionLabel:@"PATCH UDID" y:134 W:W];
+
+    // Current UDID display
+    self.udidLabel               = [[UILabel alloc] initWithFrame:CGRectMake(8, 150, W - 16, 26)];
+    self.udidLabel.font          = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    self.udidLabel.textColor     = [UIColor colorWithWhite:0.40 alpha:1.0];
+    self.udidLabel.textAlignment = NSTextAlignmentCenter;
+    self.udidLabel.numberOfLines = 2;
+    self.udidLabel.text          = [NSString stringWithFormat:@"→ %@", kNewUDID];
+    [self addSubview:self.udidLabel];
+
+    self.patchButton = [self makeButton:@"Set UDID"
+                                      y:180 W:W
+                                 action:@selector(didTapPatch)
+                                  color:[UIColor colorWithRed:0.85 green:0.50 blue:0.10 alpha:1.0]];
+    [self addSubview:self.patchButton];
+
+    // ── Pill ─────────────────────────────────────────────────────────────────
     self.pillView                    = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 36)];
     self.pillView.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.94];
     self.pillView.layer.cornerRadius = 18;
@@ -218,7 +294,7 @@ static KSOverlayView *gOverlay = nil;
     [self.pillView addGestureRecognizer:pillTap];
     [self addSubview:self.pillView];
 
-    // Drag
+    // ── Drag ─────────────────────────────────────────────────────────────────
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(handlePan:)];
     [self addGestureRecognizer:pan];
@@ -226,33 +302,53 @@ static KSOverlayView *gOverlay = nil;
     return self;
 }
 
+// ── UI helpers ────────────────────────────────────────────────────────────────
+
+- (void)dividerAt:(CGFloat)y W:(CGFloat)W {
+    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(0, y, W, 0.5)];
+    d.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.09];
+    [self addSubview:d];
+}
+
+- (void)sectionLabel:(NSString *)text y:(CGFloat)y W:(CGFloat)W {
+    UILabel *l  = [[UILabel alloc] initWithFrame:CGRectMake(14, y, W - 28, 13)];
+    l.text      = text;
+    l.font      = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    l.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
+    [self addSubview:l];
+}
+
+- (UIButton *)makeButton:(NSString *)title y:(CGFloat)y W:(CGFloat)W
+                  action:(SEL)action color:(UIColor *)color {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame     = CGRectMake(14, y, W - 28, 36);
+    [btn setTitle:title forState:UIControlStateNormal];
+    btn.titleLabel.font    = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    btn.tintColor          = [UIColor colorWithRed:0.07 green:0.09 blue:0.12 alpha:1.0];
+    btn.backgroundColor    = color;
+    btn.layer.cornerRadius = 10;
+    btn.clipsToBounds      = YES;
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return btn;
+}
+
+// ── Dump ──────────────────────────────────────────────────────────────────────
+
 - (void)didTapDump {
     self.dumpButton.enabled = NO;
     [self.dumpButton setTitle:@"Dumping..." forState:UIControlStateNormal];
     self.dumpButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
-    self.statusLabel.text           = @"Working...";
-    self.statusLabel.textColor      =
-        [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+    self.statusLabel.text = @"Working...";
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         DumpAllKeychainItems();
         dispatch_async(dispatch_get_main_queue(), ^{
             UIColor *green = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
             UIColor *blue  = [UIColor colorWithRed:0.08 green:0.45 blue:0.90 alpha:1.0];
-
-            [self.dumpButton setTitle:@"Saved to Documents!" forState:UIControlStateNormal];
+            [self.dumpButton setTitle:@"Saved!" forState:UIControlStateNormal];
             self.dumpButton.backgroundColor = blue;
-            self.statusLabel.text           = @"keychain_dump.txt written";
-            self.statusLabel.textColor      = blue;
-
-            [UIView animateWithDuration:0.10 animations:^{
-                self.dumpButton.backgroundColor =
-                    [UIColor colorWithRed:0.05 green:0.30 blue:0.65 alpha:1.0];
-            } completion:^(BOOL _) {
-                [UIView animateWithDuration:0.30 animations:^{
-                    self.dumpButton.backgroundColor = blue;
-                }];
-            }];
+            self.statusLabel.text = @"keychain_dump.txt written";
+            self.statusLabel.textColor = blue;
 
             dispatch_after(
                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
@@ -260,17 +356,60 @@ static KSOverlayView *gOverlay = nil;
                     [self.dumpButton setTitle:@"Dump All Keychain"
                                     forState:UIControlStateNormal];
                     self.dumpButton.backgroundColor = green;
-                    self.dumpButton.enabled         = YES;
-                    self.statusLabel.text           = @"Ready to dump";
-                    self.statusLabel.textColor      =
-                        [UIColor colorWithWhite:0.45 alpha:1.0];
+                    self.dumpButton.enabled = YES;
+                    self.statusLabel.text = @"Ready";
+                    self.statusLabel.textColor = [UIColor colorWithWhite:0.40 alpha:1.0];
             });
         });
     });
 }
 
+// ── Patch UDID ────────────────────────────────────────────────────────────────
+
+- (void)didTapPatch {
+    self.patchButton.enabled = NO;
+    [self.patchButton setTitle:@"Patching..." forState:UIControlStateNormal];
+    self.patchButton.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int result = PatchUDID();
+        NSString *verified = ReadCurrentUDID();
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIColor *orange = [UIColor colorWithRed:0.85 green:0.50 blue:0.10 alpha:1.0];
+            UIColor *red    = [UIColor colorWithRed:0.85 green:0.20 blue:0.20 alpha:1.0];
+            UIColor *green  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0];
+
+            if (result == 0) {
+                [self.patchButton setTitle:@"Patched!" forState:UIControlStateNormal];
+                self.patchButton.backgroundColor = green;
+                self.udidLabel.text  = [NSString stringWithFormat:@"✓ %@", verified];
+                self.udidLabel.textColor = green;
+                NSLog(@"[KeychainSpy] UDID patched. Verified: %@", verified);
+            } else {
+                [self.patchButton setTitle:@"Failed (see log)" forState:UIControlStateNormal];
+                self.patchButton.backgroundColor = red;
+                self.udidLabel.text  = [NSString stringWithFormat:@"✗ err=%d  now=%@", result, verified];
+                self.udidLabel.textColor = red;
+                NSLog(@"[KeychainSpy] Patch FAILED result=%d verified=%@", result, verified);
+            }
+
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
+                dispatch_get_main_queue(), ^{
+                    [self.patchButton setTitle:@"Set UDID" forState:UIControlStateNormal];
+                    self.patchButton.backgroundColor = orange;
+                    self.patchButton.enabled = YES;
+            });
+        });
+    });
+}
+
+// ── Minimise / expand ─────────────────────────────────────────────────────────
+
 - (void)toggleMinimise {
     self.minimised = !self.minimised;
+    CGFloat fullH  = 226;
     if (self.minimised) {
         [UIView animateWithDuration:0.20 animations:^{
             CGRect f = gWindow.frame; f.size.height = 36; gWindow.frame = f;
@@ -284,11 +423,13 @@ static KSOverlayView *gOverlay = nil;
         for (UIView *v in self.subviews) v.hidden = NO;
         self.pillView.hidden = YES;
         [UIView animateWithDuration:0.20 animations:^{
-            CGRect f = gWindow.frame; f.size.height = 152; gWindow.frame = f;
-            self.frame = CGRectMake(0, 0, f.size.width, 152);
+            CGRect f = gWindow.frame; f.size.height = fullH; gWindow.frame = f;
+            self.frame = CGRectMake(0, 0, f.size.width, fullH);
         }];
     }
 }
+
+// ── Drag ──────────────────────────────────────────────────────────────────────
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     CGPoint delta  = [pan translationInView:self.superview];
@@ -305,7 +446,7 @@ static KSOverlayView *gOverlay = nil;
 @end
 
 // =============================================================================
-//  WINDOW (pass-through touches outside overlay)
+//  WINDOW (pass-through)
 // =============================================================================
 
 @interface KSWindow : UIWindow
@@ -315,8 +456,7 @@ static KSOverlayView *gOverlay = nil;
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
     for (UIView *sub in self.subviews)
         if (!sub.hidden &&
-            [sub pointInside:[self convertPoint:point toView:sub]
-                   withEvent:event])
+            [sub pointInside:[self convertPoint:point toView:sub] withEvent:event])
             return YES;
     return NO;
 }
@@ -329,7 +469,7 @@ static KSOverlayView *gOverlay = nil;
 static void spawnOverlay(void) {
     if (gWindow) return;
 
-    CGFloat W = 230, H = 152;
+    CGFloat W = 240, H = 226;
     CGRect screen = [UIScreen mainScreen].bounds;
 
     gWindow = [[KSWindow alloc] initWithFrame:CGRectMake(
@@ -380,7 +520,6 @@ static void spawnOverlay(void) {
 %ctor {
     NSLog(@"[KeychainSpy] Loaded in %@",
           [[NSBundle mainBundle] bundleIdentifier]);
-
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{ spawnOverlay(); });
