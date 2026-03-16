@@ -1,21 +1,5 @@
 /*
  * KeychainSpy — Network Interceptor + Keychain Dumper + UDID Patcher
- *
- * Load order:
- *   1. ksNetworkInit()  __attribute__((constructor(101)))
- *      → registers NSURLProtocol IMMEDIATELY, before any app code runs
- *      → no hook, no delay, intercept is live from first byte
- *
- *   2. %ctor  (Logos constructor, runs after all __attribute__ constructors)
- *      → registers Logos hooks
- *      → spawns overlay after 1.5s
- *
- * Intercept target : https://app.tnspike.com:2087/verify_udid
- * Behaviour        : fires the REAL request in background (server sees legit
- *                    call), immediately returns spoofed VIP response to app,
- *                    real server reply is silently discarded.
- *
- * Random UDID (generated): 00008020-F41FCBF78457528B
  */
 
 #import <UIKit/UIKit.h>
@@ -74,7 +58,7 @@ static NSData *BuildSpoofedResponse(void) {
         @"package_type"   : @"BASIC"
     };
 
-    NSError *e   = nil;
+    NSError *e    = nil;
     NSData  *data = [NSJSONSerialization dataWithJSONObject:json
                                                     options:0
                                                       error:&e];
@@ -84,23 +68,21 @@ static NSData *BuildSpoofedResponse(void) {
 }
 
 // =============================================================================
-//  MARK: - NSURLProtocol interceptor
-//  • Fires the real request on a bypass-tagged ephemeral session so the
-//    server sees a legitimate call.
-//  • Immediately returns the spoofed VIP response to the app.
-//  • Real server reply arrives in a background block and is discarded.
+//  MARK: - NSURLProtocol — PRIMARY interface (must come before extension)
 // =============================================================================
 
-@interface KSSpoofProtocol () <NSURLSessionDataDelegate>
+@interface KSSpoofProtocol : NSURLProtocol
 @property (nonatomic, strong) NSURLSessionDataTask *realTask;
+@end
+
+// Class extension — adds protocol conformance after primary interface exists
+@interface KSSpoofProtocol () <NSURLSessionDataDelegate>
 @end
 
 @implementation KSSpoofProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    // Our own forwarded copy — let it through untouched
     if ([NSURLProtocol propertyForKey:kBypassKey  inRequest:request]) return NO;
-    // Already processed
     if ([NSURLProtocol propertyForKey:kHandledKey inRequest:request]) return NO;
 
     NSURL *url = request.URL;
@@ -114,21 +96,17 @@ static NSData *BuildSpoofedResponse(void) {
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
 + (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a
-                       toRequest:(NSURLRequest *)b  { return NO; }
+                       toRequest:(NSURLRequest *)b { return NO; }
 
 - (void)startLoading {
 
     // ── 1. Fire the REAL request in the background ──────────────────────────
     NSMutableURLRequest *realReq = [self.request mutableCopy];
-
-    // Tag so canInitWithRequest: ignores our own forwarded copy
     [NSURLProtocol setProperty:@YES forKey:kBypassKey inRequest:realReq];
 
-    // Ephemeral session with an empty protocol stack — bypasses ALL custom
-    // NSURLProtocols including this one, giving a second loop-prevention layer
     NSURLSessionConfiguration *cfg =
         [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    cfg.protocolClasses = @[];
+    cfg.protocolClasses = @[];   // strip all custom protocols — loop-proof
 
     NSURLSession *bypassSession =
         [NSURLSession sessionWithConfiguration:cfg
@@ -140,8 +118,7 @@ static NSData *BuildSpoofedResponse(void) {
                          completionHandler:^(NSData        *data,
                                              NSURLResponse *response,
                                              NSError       *error) {
-            // Real response arrives here — silently discard it.
-            // The app has already received the spoofed reply.
+            // Real response — silently discard
             if (error) {
                 NSLog(@"[KeychainSpy] Real req error (discarded): %@",
                       error.localizedDescription);
@@ -152,9 +129,9 @@ static NSData *BuildSpoofedResponse(void) {
             }
         }];
     [fireAndForget resume];
-    self.realTask = fireAndForget;   // retain until stopLoading
+    self.realTask = fireAndForget;
 
-    // ── 2. Return the spoofed response to the app IMMEDIATELY ───────────────
+    // ── 2. Return spoofed response to the app IMMEDIATELY ───────────────────
     NSData *body = BuildSpoofedResponse();
 
     NSDictionary *headers = @{
@@ -188,8 +165,6 @@ static NSData *BuildSpoofedResponse(void) {
 
 // =============================================================================
 //  MARK: - HIGH PRIORITY CONSTRUCTOR (101)
-//  Runs BEFORE %ctor and BEFORE any app +load / application:didFinish...
-//  NSURLProtocol is live from the first network call the app ever makes.
 // =============================================================================
 
 __attribute__((constructor(101)))
@@ -236,15 +211,15 @@ static void DumpAllKeychainItems(void) {
     for (int i = 0; i < 5; i++) {
         [report appendFormat:@"--- %@ ---\n", names[i]];
         NSDictionary *q = @{
-            (__bridge id)kSecClass            : (__bridge id)classes[i],
-            (__bridge id)kSecMatchLimit        : (__bridge id)kSecMatchLimitAll,
-            (__bridge id)kSecReturnAttributes  : @YES,
-            (__bridge id)kSecReturnData        : @YES
+            (__bridge id)kSecClass           : (__bridge id)classes[i],
+            (__bridge id)kSecMatchLimit       : (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes : @YES,
+            (__bridge id)kSecReturnData       : @YES
         };
         CFTypeRef cfr = NULL;
         OSStatus  s   = SecItemCopyMatching((__bridge CFDictionaryRef)q, &cfr);
         if (s == errSecSuccess && cfr) {
-            id     raw   = CFBridgingRelease(cfr);
+            id      raw   = CFBridgingRelease(cfr);
             NSArray *items = [raw isKindOfClass:[NSArray class]] ? raw : @[raw];
             [report appendFormat:@"  Count: %lu\n", (unsigned long)items.count];
             for (NSDictionary *item in items) {
@@ -318,8 +293,8 @@ static NSString *ReadCurrentUDID(void) {
         (__bridge id)kSecMatchLimit      : (__bridge id)kSecMatchLimitOne,
         (__bridge id)kSecReturnData      : @YES
     };
-    CFTypeRef r  = NULL;
-    OSStatus  s  = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
+    CFTypeRef r = NULL;
+    OSStatus  s = SecItemCopyMatching((__bridge CFDictionaryRef)q, &r);
     if (s == errSecSuccess && r) {
         NSData *d = CFBridgingRelease(r);
         return [[NSString alloc] initWithData:d
@@ -360,8 +335,8 @@ static KSOverlayView *gOverlay = nil;
         [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.55].CGColor;
     self.clipsToBounds = YES;
 
-    // ── Header ────────────────────────────────────────────────────────────
-    UILabel *icon  = [[UILabel alloc] initWithFrame:CGRectMake(14, 12, 24, 20)];
+    // Header
+    UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(14, 12, 24, 20)];
     icon.text = @"🔑"; icon.font = [UIFont systemFontOfSize:14];
     [self addSubview:icon];
 
@@ -374,13 +349,13 @@ static KSOverlayView *gOverlay = nil;
     UIButton *minBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     minBtn.frame = CGRectMake(W - 36, 8, 28, 28);
     [minBtn setTitle:@"—" forState:UIControlStateNormal];
-    minBtn.tintColor           = [UIColor colorWithWhite:0.5 alpha:1.0];
-    minBtn.titleLabel.font     = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    minBtn.tintColor       = [UIColor colorWithWhite:0.5 alpha:1.0];
+    minBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     [minBtn addTarget:self action:@selector(toggleMinimise)
      forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:minBtn];
 
-    // ── Network Intercept section ─────────────────────────────────────────
+    // Network Intercept section
     [self dividerAt:38 W:W];
     [self sectionLabel:@"NETWORK INTERCEPT  [P101 — LIVE]" y:46 W:W];
 
@@ -396,11 +371,11 @@ static KSOverlayView *gOverlay = nil;
          "App gets VIP spoof · Real resp discarded";
     [self addSubview:self.interceptLabel];
 
-    // ── Dump section ──────────────────────────────────────────────────────
+    // Dump section
     [self dividerAt:94 W:W];
     [self sectionLabel:@"KEYCHAIN DUMP" y:102 W:W];
 
-    self.statusLabel               =
+    self.statusLabel =
         [[UILabel alloc] initWithFrame:CGRectMake(0, 118, W, 14)];
     self.statusLabel.text          = @"Ready";
     self.statusLabel.font          = [UIFont systemFontOfSize:10];
@@ -414,7 +389,7 @@ static KSOverlayView *gOverlay = nil;
               color:[UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1.0]];
     [self addSubview:self.dumpButton];
 
-    // ── Patch UDID section ────────────────────────────────────────────────
+    // Patch UDID section
     [self dividerAt:182 W:W];
     [self sectionLabel:@"PATCH UDID" y:190 W:W];
 
@@ -435,7 +410,7 @@ static KSOverlayView *gOverlay = nil;
               color:[UIColor colorWithRed:0.85 green:0.50 blue:0.10 alpha:1.0]];
     [self addSubview:self.patchButton];
 
-    // ── Pill (minimised state) ─────────────────────────────────────────────
+    // Pill (minimised state)
     self.pillView =
         [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 36)];
     self.pillView.backgroundColor    = [UIColor colorWithWhite:0.07 alpha:0.94];
@@ -462,7 +437,6 @@ static KSOverlayView *gOverlay = nil;
     [self.pillView addGestureRecognizer:t];
     [self addSubview:self.pillView];
 
-    // ── Pan gesture (drag overlay) ────────────────────────────────────────
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc]
             initWithTarget:self action:@selector(handlePan:)];
@@ -470,8 +444,6 @@ static KSOverlayView *gOverlay = nil;
 
     return self;
 }
-
-// ── Layout helpers ─────────────────────────────────────────────────────────
 
 - (void)dividerAt:(CGFloat)y W:(CGFloat)W {
     UIView *d = [[UIView alloc] initWithFrame:CGRectMake(0, y, W, 0.5)];
@@ -501,8 +473,6 @@ static KSOverlayView *gOverlay = nil;
     return b;
 }
 
-// ── Button actions ─────────────────────────────────────────────────────────
-
 - (void)didTapDump {
     self.dumpButton.enabled = NO;
     [self.dumpButton setTitle:@"Dumping..." forState:UIControlStateNormal];
@@ -518,8 +488,8 @@ static KSOverlayView *gOverlay = nil;
                 [UIColor colorWithRed:0.08 green:0.45 blue:0.90 alpha:1.0];
             [self.dumpButton setTitle:@"Saved!" forState:UIControlStateNormal];
             self.dumpButton.backgroundColor = blue;
-            self.statusLabel.text      = @"keychain_dump.txt written";
-            self.statusLabel.textColor = blue;
+            self.statusLabel.text           = @"keychain_dump.txt written";
+            self.statusLabel.textColor      = blue;
             dispatch_after(
                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                 dispatch_get_main_queue(), ^{
@@ -575,8 +545,6 @@ static KSOverlayView *gOverlay = nil;
     });
 }
 
-// ── Minimise / expand ──────────────────────────────────────────────────────
-
 - (void)toggleMinimise {
     self.minimised = !self.minimised;
     CGFloat fullH  = 276;
@@ -586,8 +554,8 @@ static KSOverlayView *gOverlay = nil;
             self.frame = CGRectMake(0, 0, f.size.width, 36);
         } completion:^(BOOL _) {
             for (UIView *v in self.subviews) v.hidden = (v != self.pillView);
-            self.pillView.hidden        = NO;
-            self.layer.cornerRadius     = 18;
+            self.pillView.hidden    = NO;
+            self.layer.cornerRadius = 18;
         }];
     } else {
         for (UIView *v in self.subviews) v.hidden = NO;
@@ -599,11 +567,9 @@ static KSOverlayView *gOverlay = nil;
     }
 }
 
-// ── Drag ──────────────────────────────────────────────────────────────────
-
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint d  = [pan translationInView:self.superview];
-    CGRect  f  = gWindow.frame;
+    CGPoint d = [pan translationInView:self.superview];
+    CGRect  f = gWindow.frame;
     f.origin.x += d.x;
     f.origin.y += d.y;
     CGRect sc = [UIScreen mainScreen].bounds;
@@ -682,7 +648,6 @@ static void spawnOverlay(void) {
 
 // =============================================================================
 //  MARK: - Logos constructor
-//  %ctor runs after all __attribute__((constructor)) functions
 // =============================================================================
 
 %ctor {
