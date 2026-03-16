@@ -12,12 +12,7 @@ static NSString *const kFakeResponse = @"{"
     "\"package_type\":\"VIP\","
     "\"activation_key\":\"TNK-7D-CEBADEDF\","
     "\"client_version\":\"2.0.2\","
-    "\"update_notes\":["
-        "\"Fixed skill search filter not working\","
-        "\"Added Key Info card in DATA MOD tab\","
-        "\"Improved menu height and layout\","
-        "\"Added Contact button in Data Mod tab\""
-    "]"
+    "\"update_notes\":[\"Fixed skill search filter not working\",\"Added Key Info card in DATA MOD tab\",\"Improved menu height and layout\",\"Added Contact button in Data Mod tab\"]"
 "}";
 
 %hook NSURLSession
