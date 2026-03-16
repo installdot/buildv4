@@ -2,19 +2,26 @@
 #import <Foundation/Foundation.h>
 
 // ============================================================
-//  TNSpikeSpoof — network intercept for app.tnspike.com UDID
-//  Spoofs /verify_udid response with a valid 7-day activation.
-//  Dates are always computed at intercept-time (always +7 days).
+//  TNSpikeSpoof — NSURLSession-level intercept
+//  Hooks dataTask methods directly so the request never reaches
+//  the network. NSURLProtocol alone does NOT intercept modern
+//  NSURLSession traffic — that's why the old version failed.
 // ============================================================
 
 static NSString *const kTargetHost = @"app.tnspike.com";
 static NSString *const kTargetPath = @"/verify_udid";
-static NSString *const kHandledKey = @"TNSpikeHandled";
 
-// ── Dynamic response builder ─────────────────────────────────
-// activated_at = NOW  |  expires_at = NOW + 7 days
-// Both values recalculate on every intercepted request.
-static NSDictionary *BuildSpoofedResponse(void) {
+// ── URL match check (host + path, any port) ───────────────────
+static BOOL IsTargetURL(NSURL *url) {
+    if (!url) return NO;
+    NSString *host = url.host ?: @"";
+    NSString *path = url.path ?: @"";
+    return [host isEqualToString:kTargetHost] &&
+           [path hasPrefix:kTargetPath];
+}
+
+// ── Dynamic spoofed JSON ──────────────────────────────────────
+static NSData *BuildSpoofedJSON(void) {
     NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
     fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
     fmt.timeZone   = [NSTimeZone timeZoneWithName:@"UTC"];
@@ -22,7 +29,7 @@ static NSDictionary *BuildSpoofedResponse(void) {
     NSDate *now     = [NSDate date];
     NSDate *expires = [now dateByAddingTimeInterval:7.0 * 24 * 60 * 60];
 
-    return @{
+    NSDictionary *payload = @{
         @"message"        : @"UDID is valid - 7 days remaining",
         @"status"         : @"active",
         @"activated_at"   : [fmt stringFromDate:now],
@@ -38,32 +45,45 @@ static NSDictionary *BuildSpoofedResponse(void) {
             @"Added Contact button in Data Mod tab"
         ]
     };
+
+    return [NSJSONSerialization dataWithJSONObject:payload
+                                           options:0
+                                             error:nil];
 }
 
-// ── Top-most presented view controller helper ─────────────────
-static UIViewController *TopViewController(void) {
-    UIViewController *root = nil;
+// ── Fake HTTP 200 response ────────────────────────────────────
+static NSHTTPURLResponse *BuildFakeResponse(NSURL *url, NSUInteger length) {
+    return [[NSHTTPURLResponse alloc] initWithURL:url
+                                       statusCode:200
+                                      HTTPVersion:@"HTTP/1.1"
+                                     headerFields:@{
+                                         @"Content-Type"   : @"application/json; charset=utf-8",
+                                         @"Content-Length" : [@(length) stringValue],
+                                         @"X-Spoofed-By"   : @"TNSpikeSpoof"
+                                     }];
+}
 
+// ── Top view controller ───────────────────────────────────────
+static UIViewController *TopVC(void) {
+    UIViewController *root = nil;
     if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            UIWindowScene *ws = (UIWindowScene *)scene;
-            for (UIWindow *w in ws.windows) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
                 if (w.isKeyWindow) { root = w.rootViewController; break; }
             }
             if (root) break;
         }
     }
-    if (!root) root = [UIApplication sharedApplication].keyWindow.rootViewController;
-
+    if (!root) root = UIApplication.sharedApplication.keyWindow.rootViewController;
     while (root.presentedViewController) root = root.presentedViewController;
     return root;
 }
 
-// ── Custom popup ─────────────────────────────────────────────
+// ── Popup ─────────────────────────────────────────────────────
 static void ShowSpoofPopup(NSDictionary *resp) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = TopViewController();
+        UIViewController *vc = TopVC();
         if (!vc) return;
 
         NSString *body = [NSString stringWithFormat:
@@ -94,98 +114,84 @@ static void ShowSpoofPopup(NSDictionary *resp) {
                                                 handler:nil]];
 
         [vc presentViewController:alert animated:YES completion:nil];
-        NSLog(@"[TNSpikeSpoof] ✅ Popup shown — expires %@", resp[@"expires_at"]);
     });
 }
 
-// ── NSURLProtocol subclass ────────────────────────────────────
-@interface TNSpikeURLProtocol : NSURLProtocol
-@end
-
-@implementation TNSpikeURLProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if ([NSURLProtocol propertyForKey:kHandledKey inRequest:request]) return NO;
-
-    NSString *host = request.URL.host ?: @"";
-    NSString *path = request.URL.path ?: @"";
-
-    BOOL match = [host isEqualToString:kTargetHost] &&
-                 [path hasPrefix:kTargetPath];
-
-    if (match) NSLog(@"[TNSpikeSpoof] 🎯 Intercepted: %@", request.URL.absoluteString);
-    return match;
+static void ShowSpoofPopupFromData(NSData *json) {
+    NSDictionary *d = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
+    if (d) ShowSpoofPopup(d);
 }
 
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
+// ============================================================
+//  HOOKS — all four NSURLSession data-task entry points
+// ============================================================
+
+%hook NSURLSession
+
+// ── (1) dataTaskWithRequest:completionHandler: ───────────────
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
+    if (!IsTargetURL(request.URL) || !handler) return %orig;
+
+    NSLog(@"[TNSpikeSpoof] 🎯 Intercepted (req+handler): %@", request.URL);
+
+    NSData            *json     = BuildSpoofedJSON();
+    NSHTTPURLResponse *fakeResp = BuildFakeResponse(request.URL, json.length);
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        handler(json, fakeResp, nil);
+        ShowSpoofPopupFromData(json);
+    });
+
+    // Return a valid-but-harmless dummy task; pass nil handler so real network is never called
+    NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
+    return %orig(dummy, nil);
 }
 
-+ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
-    return NO;
+// ── (2) dataTaskWithURL:completionHandler: ───────────────────
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
+                        completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
+    if (!IsTargetURL(url) || !handler) return %orig;
+
+    NSLog(@"[TNSpikeSpoof] 🎯 Intercepted (url+handler): %@", url);
+
+    NSData            *json     = BuildSpoofedJSON();
+    NSHTTPURLResponse *fakeResp = BuildFakeResponse(url, json.length);
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        handler(json, fakeResp, nil);
+        ShowSpoofPopupFromData(json);
+    });
+
+    NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
+    return %orig(dummy, nil);
 }
 
-- (void)startLoading {
-    NSLog(@"[TNSpikeSpoof] 🔄 Building spoofed payload…");
-
-    NSDictionary *payload = BuildSpoofedResponse();
-
-    NSError *err  = nil;
-    NSData  *json = [NSJSONSerialization dataWithJSONObject:payload
-                                                    options:NSJSONWritingPrettyPrinted
-                                                      error:&err];
-    if (!json || err) {
-        NSLog(@"[TNSpikeSpoof] ❌ JSON error: %@", err);
-        [self.client URLProtocol:self didFailWithError:
-            err ?: [NSError errorWithDomain:@"TNSpikeSpoof" code:-1 userInfo:nil]];
-        return;
-    }
-
-    NSHTTPURLResponse *fakeResp =
-        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
-                                    statusCode:200
-                                   HTTPVersion:@"HTTP/1.1"
-                                  headerFields:@{
-                                      @"Content-Type"   : @"application/json; charset=utf-8",
-                                      @"Content-Length" : [@(json.length) stringValue],
-                                      @"X-Spoofed-By"   : @"TNSpikeSpoof"
-                                  }];
-
-    [self.client URLProtocol:self didReceiveResponse:fakeResp
-          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:json];
-    [self.client URLProtocolDidFinishLoading:self];
-
-    ShowSpoofPopup(payload);
+// ── (3) dataTaskWithRequest: (delegate-based) ────────────────
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    if (!IsTargetURL(request.URL)) return %orig;
+    NSLog(@"[TNSpikeSpoof] 🎯 Intercepted (req, delegate): %@", request.URL);
+    NSURLRequest *spoofed = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
+    return %orig(spoofed);
 }
 
-- (void)stopLoading {
-    // No real network request was made; nothing to cancel.
-}
-
-@end
-
-// ── Hook NSURLSessionConfiguration to inject protocol into sessions ──
-%hook NSURLSessionConfiguration
-
-- (void)setProtocolClasses:(NSArray *)protocolClasses {
-    NSMutableArray *patched = [NSMutableArray arrayWithObject:[TNSpikeURLProtocol class]];
-    if (protocolClasses) [patched addObjectsFromArray:protocolClasses];
-    %orig(patched);
+// ── (4) dataTaskWithURL: (delegate-based) ────────────────────
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
+    if (!IsTargetURL(url)) return %orig;
+    NSLog(@"[TNSpikeSpoof] 🎯 Intercepted (url, delegate): %@", url);
+    return %orig([NSURL URLWithString:@"about:blank"]);
 }
 
 %end
 
-// ── Constructor / Destructor ──────────────────────────────────
+// ── Constructor ───────────────────────────────────────────────
 %ctor {
     @autoreleasepool {
-        [NSURLProtocol registerClass:[TNSpikeURLProtocol class]];
-        NSLog(@"[TNSpikeSpoof] 🚀 Loaded — intercepting https://%@%@",
+        NSLog(@"[TNSpikeSpoof] 🚀 Loaded — hooking NSURLSession for https://%@%@",
               kTargetHost, kTargetPath);
     }
 }
 
 %dtor {
-    [NSURLProtocol unregisterClass:[TNSpikeURLProtocol class]];
     NSLog(@"[TNSpikeSpoof] 🛑 Unloaded");
 }
