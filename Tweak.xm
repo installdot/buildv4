@@ -5,13 +5,13 @@
 //  TNSpikeSpoof — NSURLSession-level intercept
 //  Hooks dataTask methods directly so the request never reaches
 //  the network. NSURLProtocol alone does NOT intercept modern
-//  NSURLSession traffic — that's why the old version failed.
+//  NSURLSession traffic.
 // ============================================================
 
 static NSString *const kTargetHost = @"app.tnspike.com";
 static NSString *const kTargetPath = @"/verify_udid";
 
-// ── URL match check (host + path, any port) ───────────────────
+// ── URL match check ───────────────────────────────────────────
 static BOOL IsTargetURL(NSURL *url) {
     if (!url) return NO;
     NSString *host = url.host ?: @"";
@@ -46,9 +46,7 @@ static NSData *BuildSpoofedJSON(void) {
         ]
     };
 
-    return [NSJSONSerialization dataWithJSONObject:payload
-                                           options:0
-                                             error:nil];
+    return [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
 }
 
 // ── Fake HTTP 200 response ────────────────────────────────────
@@ -123,7 +121,7 @@ static void ShowSpoofPopupFromData(NSData *json) {
 }
 
 // ============================================================
-//  HOOKS — all four NSURLSession data-task entry points
+//  HOOKS
 // ============================================================
 
 %hook NSURLSession
@@ -143,9 +141,9 @@ static void ShowSpoofPopupFromData(NSData *json) {
         ShowSpoofPopupFromData(json);
     });
 
-    // Return a valid-but-harmless dummy task; pass nil handler so real network is never called
-    NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
-    return %orig(dummy, nil);
+    // Dummy NSURLRequest for the real call — handler is nil so nothing fires
+    NSURLRequest *dummyReq = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
+    return %orig(dummyReq, nil);
 }
 
 // ── (2) dataTaskWithURL:completionHandler: ───────────────────
@@ -163,16 +161,17 @@ static void ShowSpoofPopupFromData(NSData *json) {
         ShowSpoofPopupFromData(json);
     });
 
-    NSURLRequest *dummy = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
-    return %orig(dummy, nil);
+    // Must pass NSURL* here — not NSURLRequest*
+    NSURL *dummyURL = [NSURL URLWithString:@"about:blank"];
+    return %orig(dummyURL, nil);
 }
 
 // ── (3) dataTaskWithRequest: (delegate-based) ────────────────
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     if (!IsTargetURL(request.URL)) return %orig;
     NSLog(@"[TNSpikeSpoof] 🎯 Intercepted (req, delegate): %@", request.URL);
-    NSURLRequest *spoofed = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
-    return %orig(spoofed);
+    NSURLRequest *dummyReq = [NSURLRequest requestWithURL:[NSURL URLWithString:@"about:blank"]];
+    return %orig(dummyReq);
 }
 
 // ── (4) dataTaskWithURL: (delegate-based) ────────────────────
