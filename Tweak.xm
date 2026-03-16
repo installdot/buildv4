@@ -68,7 +68,7 @@ static NSData *BuildSpoofedResponse(void) {
                      @"Improved menu height and layout",
                      @"Added Contact button in Data Mod tab"
             ],
-           @"remaining"      : [NSString stringWithFormat:@"%ld days", (long)days],
+            @"remaining"      : [NSString stringWithFormat:@"%ld days", (long)days],
             @"package_type"   : @"BASIC"
     };
     NSError *e = nil;
