@@ -1,5 +1,5 @@
 // Tweak.xm
-
+#import <Foundation/Foundation.h>
 @interface APIClient : NSObject
 - (void) paid:(void (^)(void))execute;
 + (instancetype)sharedAPIClient;
