@@ -2,6 +2,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = iSK
 iSK_FILES = Tweak.xm 
+iSK_LOAD_PRIORITY  = 1
 FRAMEWORKS = Foundation UIKit Security DeviceCheck UserNotifications OpenGLES GLKit AVFoundation
 LIBRARIES = crypto
 iSK_CFLAGS = -fobjc-arc -Wno-error -Wno-deprecated-declarations -Werror -Wno-unused-but-set-variable
