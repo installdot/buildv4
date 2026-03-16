@@ -1,16 +1,25 @@
-// tweak.xm - Spoof verify_udid.php response for local testing
-
 #import <Foundation/Foundation.h>
 
-// The fake response your server would return on a valid UDID
-// Change this to match your actual server's success response format
-static NSString *const kFakeResponse = @"{\"status\":\"valid\",\"message\":\"ok\"}";
-static NSString *const kTargetHost   = @"chillysilly.frfrnocap.men";
-static NSString *const kTargetPath   = @"/verify_udid.php";
+static NSString *const kTargetHost = @"app.tnspike.com:2087";
+static NSString *const kTargetPath = @"/verify_udid";
 
-// ─────────────────────────────────────────────────────────────
-// Hook NSURLSession dataTaskWithRequest to intercept the call
-// ─────────────────────────────────────────────────────────────
+static NSString *const kFakeResponse = @"{"
+    "\"message\":\"UDID is valid - 365 days remaining\","
+    "\"status\":\"active\","
+    "\"activated_at\":\"2026-03-15 20:00:23\","
+    "\"expires_at\":\"2027-03-22 20:00:23\","
+    "\"remaining\":\"365 days\","
+    "\"package_type\":\"VIP\","
+    "\"activation_key\":\"TNK-7D-CEBADEDF\","
+    "\"client_version\":\"2.0.2\","
+    "\"update_notes\":["
+        "\"Fixed skill search filter not working\","
+        "\"Added Key Info card in DATA MOD tab\","
+        "\"Improved menu height and layout\","
+        "\"Added Contact button in Data Mod tab\""
+    "]"
+"}";
+
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
@@ -18,12 +27,12 @@ static NSString *const kTargetPath   = @"/verify_udid.php";
 
     NSURL *url = request.URL;
 
-    if ([url.host containsString:kTargetHost] &&
+    if (completionHandler &&
+        [url.host containsString:kTargetHost] &&
         [url.path containsString:kTargetPath]) {
 
-        NSLog(@"[VPNSpoofer] Intercepted verify_udid request: %@", url.absoluteString);
+        NSLog(@"[UDIDSpoofer] Intercepted: %@", url.absoluteString);
 
-        // Build a fake 200 OK response
         NSHTTPURLResponse *fakeResponse = [[NSHTTPURLResponse alloc]
             initWithURL:url
              statusCode:200
@@ -32,28 +41,24 @@ static NSString *const kTargetPath   = @"/verify_udid.php";
 
         NSData *fakeData = [kFakeResponse dataUsingEncoding:NSUTF8StringEncoding];
 
-        // Dispatch async to mimic real network behavior
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             completionHandler(fakeData, fakeResponse, nil);
         });
 
-        // Return a dummy task (never resumed)
         return %orig(request, nil);
     }
 
     return %orig(request, completionHandler);
 }
 
-// ─────────────────────────────────────────────────────────────
-// Also hook the delegate-based API in case the app uses that
-// ─────────────────────────────────────────────────────────────
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
                         completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 
-    if ([url.host containsString:kTargetHost] &&
+    if (completionHandler &&
+        [url.host containsString:kTargetHost] &&
         [url.path containsString:kTargetPath]) {
 
-        NSLog(@"[VPNSpoofer] Intercepted verify_udid URL: %@", url.absoluteString);
+        NSLog(@"[UDIDSpoofer] Intercepted URL: %@", url.absoluteString);
 
         NSHTTPURLResponse *fakeResponse = [[NSHTTPURLResponse alloc]
             initWithURL:url
