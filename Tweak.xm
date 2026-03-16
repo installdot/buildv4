@@ -1,6 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-
+#import <zlib.h>
 // ============================================================
 //  TNSpikeSpoof — redirect intercept
 //  Redirects app.tnspike.com/verify_udid to our spoof server.
