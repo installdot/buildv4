@@ -559,3 +559,4 @@ static BOOL KI_UpdateKeychainItem(NSDictionary *item, NSString *newValue) {
         });
     });
 }
+%end
