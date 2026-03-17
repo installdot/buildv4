@@ -3,7 +3,35 @@
 #import <CommonCrypto/CommonCrypto.h>
 #import <substrate.h>
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── AES Ref Tracker ─────────────────────────────────────────────────────────
+// CCCryptorUpdate/Final/Reset have no alg param, so we track which refs are AES
+
+static NSMutableSet *aesRefs = nil;
+static dispatch_semaphore_t aesRefsLock;
+
+static void trackAESRef(CCCryptorRef ref) {
+    if (!ref) return;
+    dispatch_semaphore_wait(aesRefsLock, DISPATCH_TIME_FOREVER);
+    [aesRefs addObject:[NSValue valueWithPointer:ref]];
+    dispatch_semaphore_signal(aesRefsLock);
+}
+
+static BOOL isAESRef(CCCryptorRef ref) {
+    if (!ref) return NO;
+    dispatch_semaphore_wait(aesRefsLock, DISPATCH_TIME_FOREVER);
+    BOOL found = [aesRefs containsObject:[NSValue valueWithPointer:ref]];
+    dispatch_semaphore_signal(aesRefsLock);
+    return found;
+}
+
+static void untrackAESRef(CCCryptorRef ref) {
+    if (!ref) return;
+    dispatch_semaphore_wait(aesRefsLock, DISPATCH_TIME_FOREVER);
+    [aesRefs removeObject:[NSValue valueWithPointer:ref]];
+    dispatch_semaphore_signal(aesRefsLock);
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 NSString* hexString(const void *bytes, size_t length) {
     if (!bytes || length == 0) return @"<empty>";
@@ -14,32 +42,8 @@ NSString* hexString(const void *bytes, size_t length) {
     return hex;
 }
 
-NSString* algorithmName(CCAlgorithm alg) {
-    switch (alg) {
-        case kCCAlgorithmAES:       return @"AES";
-        case kCCAlgorithmDES:       return @"DES";
-        case kCCAlgorithm3DES:      return @"3DES";
-        case kCCAlgorithmCAST:      return @"CAST";
-        case kCCAlgorithmRC4:       return @"RC4";
-        case kCCAlgorithmRC2:       return @"RC2";
-        case kCCAlgorithmBlowfish:  return @"Blowfish";
-        default:                    return [NSString stringWithFormat:@"Unknown(%u)", alg];
-    }
-}
-
 NSString* operationName(CCOperation op) {
     return (op == kCCDecrypt) ? @"DECRYPT" : @"ENCRYPT";
-}
-
-size_t ivSizeForAlgorithm(CCAlgorithm alg) {
-    switch (alg) {
-        case kCCAlgorithm3DES:  return kCCBlockSize3DES;
-        case kCCAlgorithmDES:   return kCCBlockSizeDES;
-        case kCCAlgorithmCAST:  return kCCBlockSizeCAST;
-        case kCCAlgorithmRC2:   return kCCBlockSizeRC2;
-        case kCCAlgorithmAES:
-        default:                return kCCBlockSizeAES128;
-    }
 }
 
 void saveLog(NSString *text) {
@@ -57,33 +61,7 @@ void saveLog(NSString *text) {
     }
 }
 
-void logEntry(NSString *tag, CCOperation op, CCAlgorithm alg,
-              const void *key, size_t keyLen,
-              const void *iv, NSString *extra) {
-
-    size_t ivSize = ivSizeForAlgorithm(alg);
-    NSString *ivHex = iv ? hexString(iv, ivSize) : @"NULL";
-
-    NSString *log = [NSString stringWithFormat:
-        @"\n[%@] %@ | Algo: %@\n"
-         "  Key (%zu bytes): %@\n"
-         "  IV:              %@\n"
-         "%@"
-         "────────────────────────────────",
-        tag,
-        operationName(op),
-        algorithmName(alg),
-        keyLen,
-        hexString(key, keyLen),
-        ivHex,
-        extra ? extra : @""
-    ];
-
-    saveLog(log);
-    NSLog(@"[CryptoHook]%@", log);
-}
-
-// ─── CCCrypt (one-shot) ──────────────────────────────────────────────────────
+// ─── CCCrypt (one-shot) ───────────────────────────────────────────────────────
 
 static CCCryptorStatus (*orig_CCCrypt)(
     CCOperation, CCAlgorithm, CCOptions,
@@ -100,34 +78,35 @@ CCCryptorStatus replaced_CCCrypt(
     const void *dataIn, size_t dataInLen,
     void *dataOut, size_t dataOutAvail, size_t *dataOutMoved
 ) {
-    NSString *extra = [NSString stringWithFormat:
-        @"  Input  (%zu bytes): %@\n",
-        dataInLen, hexString(dataIn, dataInLen)];
-
-    logEntry(@"CCCrypt", op, alg, key, keyLen, iv, extra);
-
     CCCryptorStatus status = orig_CCCrypt(op, alg, options, key, keyLen, iv,
                                           dataIn, dataInLen, dataOut, dataOutAvail, dataOutMoved);
 
-    // Also log the full output after the operation completes
-    NSString *outputLog = [NSString stringWithFormat:
-        @"\n[CCCrypt OUTPUT] %@ | Algo: %@\n"
-         "  Output (%zu bytes): %@\n"
+    if (alg != kCCAlgorithmAES) return status;
+
+    NSString *ivHex = iv ? hexString(iv, kCCBlockSizeAES128) : @"NULL";
+
+    NSString *log = [NSString stringWithFormat:
+        @"\n[CCCrypt] %@\n"
+         "  Key   (%zu bytes): %@\n"
+         "  IV:               %@\n"
+         "  Input (%zu bytes): %@\n"
+         "  Output(%zu bytes): %@\n"
          "  Status: %d\n"
          "────────────────────────────────",
         operationName(op),
-        algorithmName(alg),
-        *dataOutMoved,
-        hexString(dataOut, *dataOutMoved),
+        keyLen,   hexString(key, keyLen),
+        ivHex,
+        dataInLen, hexString(dataIn, dataInLen),
+        *dataOutMoved, hexString(dataOut, *dataOutMoved),
         status];
 
-    saveLog(outputLog);
-    NSLog(@"[CryptoHook]%@", outputLog);
+    saveLog(log);
+    NSLog(@"[CryptoHook]%@", log);
 
     return status;
 }
 
-// ─── CCCryptorCreate ─────────────────────────────────────────────────────────
+// ─── CCCryptorCreate ──────────────────────────────────────────────────────────
 
 static CCCryptorStatus (*orig_CCCryptorCreate)(
     CCOperation, CCAlgorithm, CCOptions,
@@ -142,11 +121,35 @@ CCCryptorStatus replaced_CCCryptorCreate(
     const void *iv,
     CCCryptorRef *cryptorRef
 ) {
-    logEntry(@"CCCryptorCreate", op, alg, key, keyLen, iv, nil);
-    return orig_CCCryptorCreate(op, alg, options, key, keyLen, iv, cryptorRef);
+    CCCryptorStatus status = orig_CCCryptorCreate(op, alg, options, key, keyLen, iv, cryptorRef);
+
+    if (alg != kCCAlgorithmAES) return status;
+
+    if (status == kCCSuccess && cryptorRef && *cryptorRef)
+        trackAESRef(*cryptorRef);
+
+    NSString *ivHex = iv ? hexString(iv, kCCBlockSizeAES128) : @"NULL";
+
+    NSString *log = [NSString stringWithFormat:
+        @"\n[CCCryptorCreate] %@\n"
+         "  Key (%zu bytes): %@\n"
+         "  IV:              %@\n"
+         "  Ref: %p\n"
+         "  Status: %d\n"
+         "────────────────────────────────",
+        operationName(op),
+        keyLen, hexString(key, keyLen),
+        ivHex,
+        cryptorRef ? *cryptorRef : NULL,
+        status];
+
+    saveLog(log);
+    NSLog(@"[CryptoHook]%@", log);
+
+    return status;
 }
 
-// ─── CCCryptorCreateFromData ─────────────────────────────────────────────────
+// ─── CCCryptorCreateFromData ──────────────────────────────────────────────────
 
 static CCCryptorStatus (*orig_CCCryptorCreateFromData)(
     CCOperation, CCAlgorithm, CCOptions,
@@ -163,12 +166,36 @@ CCCryptorStatus replaced_CCCryptorCreateFromData(
     const void *data, size_t dataLen,
     CCCryptorRef *cryptorRef, size_t *dataUsed
 ) {
-    logEntry(@"CCCryptorCreateFromData", op, alg, key, keyLen, iv, nil);
-    return orig_CCCryptorCreateFromData(op, alg, options, key, keyLen, iv,
-                                        data, dataLen, cryptorRef, dataUsed);
+    CCCryptorStatus status = orig_CCCryptorCreateFromData(op, alg, options, key, keyLen, iv,
+                                                          data, dataLen, cryptorRef, dataUsed);
+
+    if (alg != kCCAlgorithmAES) return status;
+
+    if (status == kCCSuccess && cryptorRef && *cryptorRef)
+        trackAESRef(*cryptorRef);
+
+    NSString *ivHex = iv ? hexString(iv, kCCBlockSizeAES128) : @"NULL";
+
+    NSString *log = [NSString stringWithFormat:
+        @"\n[CCCryptorCreateFromData] %@\n"
+         "  Key (%zu bytes): %@\n"
+         "  IV:              %@\n"
+         "  Ref: %p\n"
+         "  Status: %d\n"
+         "────────────────────────────────",
+        operationName(op),
+        keyLen, hexString(key, keyLen),
+        ivHex,
+        cryptorRef ? *cryptorRef : NULL,
+        status];
+
+    saveLog(log);
+    NSLog(@"[CryptoHook]%@", log);
+
+    return status;
 }
 
-// ─── CCCryptorUpdate ─────────────────────────────────────────────────────────
+// ─── CCCryptorUpdate ──────────────────────────────────────────────────────────
 
 static CCCryptorStatus (*orig_CCCryptorUpdate)(
     CCCryptorRef, const void *, size_t,
@@ -180,33 +207,29 @@ CCCryptorStatus replaced_CCCryptorUpdate(
     const void *dataIn, size_t dataInLen,
     void *dataOut, size_t dataOutAvail, size_t *dataOutMoved
 ) {
-    NSString *inputLog = [NSString stringWithFormat:
-        @"\n[CCCryptorUpdate]\n"
-         "  Input (%zu bytes): %@\n"
-         "────────────────────────────────",
-        dataInLen, hexString(dataIn, dataInLen)];
-    saveLog(inputLog);
-    NSLog(@"[CryptoHook]%@", inputLog);
-
     CCCryptorStatus status = orig_CCCryptorUpdate(cryptorRef, dataIn, dataInLen,
                                                    dataOut, dataOutAvail, dataOutMoved);
 
-    // Log output produced by this update chunk
-    NSString *outputLog = [NSString stringWithFormat:
-        @"\n[CCCryptorUpdate OUTPUT]\n"
-         "  Output (%zu bytes): %@\n"
+    if (!isAESRef(cryptorRef)) return status;
+
+    NSString *log = [NSString stringWithFormat:
+        @"\n[CCCryptorUpdate] Ref: %p\n"
+         "  Input (%zu bytes):  %@\n"
+         "  Output(%zu bytes):  %@\n"
          "  Status: %d\n"
          "────────────────────────────────",
-        *dataOutMoved,
-        hexString(dataOut, *dataOutMoved),
+        cryptorRef,
+        dataInLen,    hexString(dataIn, dataInLen),
+        *dataOutMoved, hexString(dataOut, *dataOutMoved),
         status];
-    saveLog(outputLog);
-    NSLog(@"[CryptoHook]%@", outputLog);
+
+    saveLog(log);
+    NSLog(@"[CryptoHook]%@", log);
 
     return status;
 }
 
-// ─── CCCryptorFinal ──────────────────────────────────────────────────────────
+// ─── CCCryptorFinal ───────────────────────────────────────────────────────────
 
 static CCCryptorStatus (*orig_CCCryptorFinal)(
     CCCryptorRef, void *, size_t, size_t *
@@ -219,49 +242,75 @@ CCCryptorStatus replaced_CCCryptorFinal(
     CCCryptorStatus status = orig_CCCryptorFinal(cryptorRef, dataOut,
                                                   dataOutAvail, dataOutMoved);
 
+    if (!isAESRef(cryptorRef)) return status;
+
     NSString *log = [NSString stringWithFormat:
-        @"\n[CCCryptorFinal]\n"
-         "  Output (%zu bytes): %@\n"
+        @"\n[CCCryptorFinal] Ref: %p\n"
+         "  Output(%zu bytes): %@\n"
          "  Status: %d\n"
          "────────────────────────────────",
-        *dataOutMoved,
-        hexString(dataOut, *dataOutMoved),
+        cryptorRef,
+        *dataOutMoved, hexString(dataOut, *dataOutMoved),
         status];
+
     saveLog(log);
     NSLog(@"[CryptoHook]%@", log);
 
     return status;
 }
 
-// ─── CCCryptorReset ──────────────────────────────────────────────────────────
+// ─── CCCryptorReset ───────────────────────────────────────────────────────────
 
 static CCCryptorStatus (*orig_CCCryptorReset)(CCCryptorRef, const void *);
 
 CCCryptorStatus replaced_CCCryptorReset(CCCryptorRef cryptorRef, const void *iv) {
+    CCCryptorStatus status = orig_CCCryptorReset(cryptorRef, iv);
+
+    if (!isAESRef(cryptorRef)) return status;
+
     NSString *log = [NSString stringWithFormat:
-        @"\n[CCCryptorReset]\n"
+        @"\n[CCCryptorReset] Ref: %p\n"
          "  New IV: %@\n"
+         "  Status: %d\n"
          "────────────────────────────────",
-        iv ? hexString(iv, 16) : @"NULL"];
+        cryptorRef,
+        iv ? hexString(iv, kCCBlockSizeAES128) : @"NULL",
+        status];
+
     saveLog(log);
     NSLog(@"[CryptoHook]%@", log);
 
-    return orig_CCCryptorReset(cryptorRef, iv);
+    return status;
 }
 
-// ─── CCCryptorRelease ────────────────────────────────────────────────────────
+// ─── CCCryptorRelease ─────────────────────────────────────────────────────────
 
 static CCCryptorStatus (*orig_CCCryptorRelease)(CCCryptorRef);
 
 CCCryptorStatus replaced_CCCryptorRelease(CCCryptorRef cryptorRef) {
-    saveLog(@"\n[CCCryptorRelease] Cryptor destroyed\n────────────────────────────────");
-    NSLog(@"[CryptoHook] CCCryptorRelease called");
-    return orig_CCCryptorRelease(cryptorRef);
+    BOOL wasAES = isAESRef(cryptorRef);
+
+    CCCryptorStatus status = orig_CCCryptorRelease(cryptorRef);
+
+    if (wasAES) {
+        untrackAESRef(cryptorRef);
+        NSString *log = [NSString stringWithFormat:
+            @"\n[CCCryptorRelease] AES ref %p destroyed\n"
+             "────────────────────────────────",
+            cryptorRef];
+        saveLog(log);
+        NSLog(@"[CryptoHook]%@", log);
+    }
+
+    return status;
 }
 
-// ─── Constructor ─────────────────────────────────────────────────────────────
+// ─── Constructor ──────────────────────────────────────────────────────────────
 
 %ctor {
+    aesRefs = [NSMutableSet new];
+    aesRefsLock = dispatch_semaphore_create(1);
+
     MSHookFunction((void *)CCCrypt,
                    (void *)replaced_CCCrypt,
                    (void **)&orig_CCCrypt);
@@ -290,6 +339,6 @@ CCCryptorStatus replaced_CCCryptorRelease(CCCryptorRef cryptorRef) {
                    (void *)replaced_CCCryptorRelease,
                    (void **)&orig_CCCryptorRelease);
 
-    saveLog(@"========== CryptoHook Loaded ==========");
-    NSLog(@"[CryptoHook] All hooks installed");
+    saveLog(@"========== CryptoHook Loaded (AES only) ==========");
+    NSLog(@"[CryptoHook] All hooks installed — AES filter active");
 }
