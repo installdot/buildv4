@@ -1,120 +1,105 @@
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
+#import <Security/Security.h>
 
-@interface APIClient : NSObject
-- (void)setUDID:(NSString *)uid;
-- (NSString *)getUDID;
-- (void)paid:(void (^)(void))execute;
-- (void)setToken:(NSString *)token;
-@end
+static NSString *service = @"com.tnnguy.auth";
+static NSString *account = @"device_udid";
 
-// ── Saved UDID storage ──
-static NSString *_savedUDID = nil;
+void deleteKeychainItem() {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: service,
+        (__bridge id)kSecAttrAccount: account
+    };
 
-// ── Simple alert helper ──
-static void showUDID() {
+    OSStatus status = SecItemDelete((__bridge CFDictionaryRef)query);
+    NSLog(@"[TWEAK] Delete status: %d", (int)status);
+}
+
+void setUDID(NSString *udid) {
+    NSData *data = [udid dataUsingEncoding:NSUTF8StringEncoding];
+
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: service,
+        (__bridge id)kSecAttrAccount: account
+    };
+
+    // delete old first
+    SecItemDelete((__bridge CFDictionaryRef)query);
+
+    NSDictionary *add = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: service,
+        (__bridge id)kSecAttrAccount: account,
+        (__bridge id)kSecValueData: data,
+        (__bridge id)kSecAttrAccessible: (__bridge id)kSecAttrAccessibleWhenUnlocked
+    };
+
+    OSStatus status = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+    NSLog(@"[TWEAK] Set UDID status: %d", (int)status);
+}
+
+void showMenu() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = UIApplication.sharedApplication.keyWindow;
-        if (!window) return;
+        UIWindow *window = [UIApplication sharedApplication].keyWindow;
+        UIViewController *root = window.rootViewController;
 
-        UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"Saved UDID"
-            message:_savedUDID ?: @"No UDID captured yet."
-            preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Keychain Tool"
+                                                                       message:@"Choose action"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
 
-        // Copy button
-        if (_savedUDID) {
-            [alert addAction:[UIAlertAction actionWithTitle:@"Copy"
-                style:UIAlertActionStyleDefault
-                handler:^(UIAlertAction *a) {
-                    [UIPasteboard generalPasteboard].string = _savedUDID;
+        // Button 1: Clear
+        [alert addAction:[UIAlertAction actionWithTitle:@"Clear UDID"
+                                                  style:UIAlertActionStyleDestructive
+                                                handler:^(UIAlertAction * _Nonnull action) {
+            deleteKeychainItem();
+        }]];
+
+        // Button 2: Set
+        [alert addAction:[UIAlertAction actionWithTitle:@"Set UDID"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction * _Nonnull action) {
+
+            UIAlertController *input = [UIAlertController alertControllerWithTitle:@"Set UDID"
+                                                                           message:@"Enter new UDID"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+
+            [input addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+                textField.placeholder = @"00008020-XXXXXXXXXXXX";
+            }];
+
+            [input addAction:[UIAlertAction actionWithTitle:@"Save"
+                                                     style:UIAlertActionStyleDefault
+                                                   handler:^(UIAlertAction * _Nonnull action) {
+                NSString *udid = input.textFields.firstObject.text;
+                if (udid.length > 0) {
+                    setUDID(udid);
+                }
             }]];
-        }
 
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-            style:UIAlertActionStyleCancel handler:nil]];
+            [input addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                     style:UIAlertActionStyleCancel
+                                                   handler:nil]];
 
-        [window.rootViewController presentViewController:alert animated:YES completion:nil];
+            [root presentViewController:input animated:YES completion:nil];
+        }]];
+
+        // Cancel
+        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+
+        [root presentViewController:alert animated:YES completion:nil];
     });
 }
 
-// ── Floating button ──
-static void injectButton() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{
-
-        UIWindow *window = UIApplication.sharedApplication.keyWindow;
-        if (!window) return;
-
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.frame = CGRectMake(20, 120, 130, 40);
-        btn.backgroundColor = [UIColor colorWithRed:0.1 green:0.6 blue:0.9 alpha:1.0];
-        btn.layer.cornerRadius = 10;
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-        [btn setTitle:@"Show UDID" forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-
-        // Use a block via objc associated objects trick via target/action
-        [btn addTarget:[UIApplication sharedApplication]
-                action:@selector(udidButtonTapped)
-      forControlEvents:UIControlEventTouchUpInside];
-
-        btn.tag = 9876;
-        [window addSubview:btn];
-    });
-}
-
-// ── Extend UIApplication to handle button tap ──
 %hook UIApplication
 
-- (void)udidButtonTapped {
-    showUDID();
-}
-
-%end
-
-// ── Hook APIClient ──
-%hook APIClient
-
-// Capture UDID when set
-- (void)setUDID:(NSString *)uid {
-    if (uid && uid.length > 0) {
-        _savedUDID = [uid copy];
-        NSLog(@"[UDIDExtract] setUDID captured: %@", _savedUDID);
-    }
+- (void)applicationDidBecomeActive:(UIApplication *)application {
     %orig;
-}
 
-// Capture UDID from getter too
-- (NSString *)getUDID {
-    NSString *result = %orig;
-    if (result && result.length > 0) {
-        _savedUDID = [result copy];
-        NSLog(@"[UDIDExtract] getUDID captured: %@", _savedUDID);
-    }
-    return result;
-}
-
-// Hook paid to call getUDID at the right moment so it gets captured
-- (void)paid:(void (^)(void))execute {
-    NSString *udid = [self getUDID];
-    if (udid && udid.length > 0) {
-        _savedUDID = [udid copy];
-        NSLog(@"[UDIDExtract] paid: UDID captured: %@", _savedUDID);
-    }
-    if (execute) execute(); // bypass
-}
-
-%end
-
-// ── Inject button on app start ──
-%hook UIApplicationDelegate
-
-- (BOOL)application:(UIApplication *)application
-    didFinishLaunchingWithOptions:(NSDictionary *)options {
-    BOOL result = %orig;
-    injectButton();
-    return result;
+    // Show once (you can add condition if needed)
+    showMenu();
 }
 
 %end
