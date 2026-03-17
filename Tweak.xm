@@ -375,7 +375,7 @@ static void installCryptoHooks(void) {
 // When the response is from our target host + path, we parse aes_data
 // and arm the crypto hooks before the app's own handler runs.
 
-static void (*orig_dataTaskCompletion)(id, SEL, NSData *, NSURLResponse *, NSError *);
+
 
 static void processAPIResponse(NSData *data, NSURLResponse *response) {
     NSURL *url = [(NSHTTPURLResponse *)response URL];
