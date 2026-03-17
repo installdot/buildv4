@@ -3,6 +3,7 @@
 #import <CommonCrypto/CommonCrypto.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonHMAC.h>
+#import <dlfcn.h>
 #import <substrate.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
