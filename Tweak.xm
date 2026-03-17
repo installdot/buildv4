@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 
-static NSString *const kTargetHost = @"app.tnspike.com:2087";
+static NSString *const kTargetHost = @"app.tnspike.com";
+static NSString *const kTargetPort = @"2087";
 static NSString *const kTargetPath = @"/verify_udid";
 
 static NSString *const kFakeResponse = @"{"
@@ -15,61 +16,45 @@ static NSString *const kFakeResponse = @"{"
     "\"update_notes\":[\"Fixed skill search filter not working\",\"Added Key Info card in DATA MOD tab\",\"Improved menu height and layout\",\"Added Contact button in Data Mod tab\"]"
 "}";
 
+static BOOL isTargetURL(NSURL *url) {
+    if (!url || !url.host) return NO;
+    BOOL hostMatch = [url.host isEqualToString:kTargetHost];
+    BOOL portMatch = url.port && [url.port.stringValue isEqualToString:kTargetPort];
+    BOOL pathMatch = [url.path containsString:kTargetPath];
+    return hostMatch && portMatch && pathMatch;
+}
+
+static void deliverFakeResponse(NSURL *url, void (^completionHandler)(NSData *, NSURLResponse *, NSError *)) {
+    NSHTTPURLResponse *fakeResponse = [[NSHTTPURLResponse alloc]
+        initWithURL:url
+         statusCode:200
+        HTTPVersion:@"HTTP/1.1"
+       headerFields:@{@"Content-Type": @"application/json"}];
+    NSData *fakeData = [kFakeResponse dataUsingEncoding:NSUTF8StringEncoding];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        completionHandler(fakeData, fakeResponse, nil);
+    });
+}
+
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-
-    NSURL *url = request.URL;
-
-    if (completionHandler &&
-        [url.host containsString:kTargetHost] &&
-        [url.path containsString:kTargetPath]) {
-
-        NSLog(@"[UDIDSpoofer] Intercepted: %@", url.absoluteString);
-
-        NSHTTPURLResponse *fakeResponse = [[NSHTTPURLResponse alloc]
-            initWithURL:url
-             statusCode:200
-            HTTPVersion:@"HTTP/1.1"
-           headerFields:@{@"Content-Type": @"application/json"}];
-
-        NSData *fakeData = [kFakeResponse dataUsingEncoding:NSUTF8StringEncoding];
-
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            completionHandler(fakeData, fakeResponse, nil);
-        });
-
+    if (completionHandler && isTargetURL(request.URL)) {
+        NSLog(@"[UDIDSpoofer] Intercepted request: %@", request.URL.absoluteString);
+        deliverFakeResponse(request.URL, completionHandler);
         return %orig(request, nil);
     }
-
     return %orig(request, completionHandler);
 }
 
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
                         completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-
-    if (completionHandler &&
-        [url.host containsString:kTargetHost] &&
-        [url.path containsString:kTargetPath]) {
-
+    if (completionHandler && isTargetURL(url)) {
         NSLog(@"[UDIDSpoofer] Intercepted URL: %@", url.absoluteString);
-
-        NSHTTPURLResponse *fakeResponse = [[NSHTTPURLResponse alloc]
-            initWithURL:url
-             statusCode:200
-            HTTPVersion:@"HTTP/1.1"
-           headerFields:@{@"Content-Type": @"application/json"}];
-
-        NSData *fakeData = [kFakeResponse dataUsingEncoding:NSUTF8StringEncoding];
-
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            completionHandler(fakeData, fakeResponse, nil);
-        });
-
+        deliverFakeResponse(url, completionHandler);
         return %orig(url, nil);
     }
-
     return %orig(url, completionHandler);
 }
 
