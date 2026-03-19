@@ -252,7 +252,7 @@ static const CGFloat kPad        = 10;
     [self addSubview:bar];
 
     UILabel *title  = [UILabel new];
-    title.text      = @"Mochi Interceptor";
+    title.text      = @"Mochi Hooker";
     title.textColor = COL_PURPLE;
     title.font      = [UIFont boldSystemFontOfSize:13];
     title.frame     = CGRectMake(10, 0, 210, kBarH);
@@ -274,7 +274,7 @@ static const CGFloat kPad        = 10;
     CGFloat y = kBarH + kPad;
 
     // ── Step 1 ──
-    y = [self sectionLabel:@"STEP 1 — GIFT ITEMS" y:y];
+    y = [self sectionLabel:@"Set Item" y:y];
 
     UILabel *hdr  = [UILabel new];
     hdr.text      = @"Item ID                    Amount";
@@ -305,7 +305,7 @@ static const CGFloat kPad        = 10;
     [self divider:y]; y += 8;
 
     // ── Step 2 ──
-    y = [self sectionLabel:@"STEP 2 — CREATE CODE" y:y];
+    y = [self sectionLabel:@"Hook Giftcode" y:y];
 
     _codeField = [[UITextField alloc] initWithFrame:CGRectMake(kPad, y, 155, kFieldH)];
     _codeField.borderStyle     = UITextBorderStyleRoundedRect;
