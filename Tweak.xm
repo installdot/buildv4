@@ -218,7 +218,6 @@ static const CGFloat kPad        = 10;
 
 @implementation MochiMenuView {
     UITextField  *_codeField;
-    UILabel      *_urlLabel;
     UIScrollView *_scroll;
     UIView       *_rowContainer;
     UILabel      *_statusLabel;
@@ -327,14 +326,6 @@ static const CGFloat kPad        = 10;
     copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
     y += kFieldH + 4;
 
-    _urlLabel               = [UILabel new];
-    _urlLabel.font          = [UIFont fontWithName:@"Courier" size:8];
-    _urlLabel.textColor     = [UIColor colorWithWhite:0.32 alpha:1];
-    _urlLabel.numberOfLines = 2;
-    _urlLabel.frame         = CGRectMake(kPad, y, kMenuW - kPad*2, 22);
-    [self addSubview:_urlLabel];
-    y += 24;
-
     [self divider:y]; y += 8;
 
     _runBtn = [self btn:@"Run"
@@ -440,7 +431,6 @@ static const CGFloat kPad        = 10;
     NSString *code  = [NSString stringWithFormat:@"mochi%@", randomAlpha(12)];
     _codeField.text = code;
     gMochiCode      = code;
-    _urlLabel.text  = targetURL();
     [self status:@"Code generated — press Run" col:COL_DIM];
 }
 
@@ -470,7 +460,6 @@ static const CGFloat kPad        = 10;
     if (!_codeField.text.length) { [self status:@"Generate a code first" col:COL_RED]; return; }
 
     gMochiCode     = _codeField.text;
-    _urlLabel.text = targetURL();
     gRunning       = YES;
     [_runBtn setTitle:@"Stop" forState:UIControlStateNormal];
     [_runBtn setTitleColor:COL_RED forState:UIControlStateNormal];
