@@ -70,14 +70,24 @@ static void installSwizzle() {
 }
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
-#define COL_BG      [UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:0.97]
-#define COL_BAR     [UIColor colorWithRed:0.11 green:0.07 blue:0.20 alpha:1]
-#define COL_PURPLE  [UIColor colorWithRed:0.55 green:0.35 blue:0.90 alpha:1]
-#define COL_GREEN   [UIColor colorWithRed:0.20 green:0.72 blue:0.44 alpha:1]
-#define COL_RED     [UIColor colorWithRed:0.90 green:0.25 blue:0.25 alpha:1]
-#define COL_FIELD   [UIColor colorWithWhite:0.18 alpha:1]
-#define COL_DIM     [UIColor colorWithWhite:0.40 alpha:1]
-#define COL_MONO    [UIColor colorWithRed:0.40 green:1.00 blue:0.62 alpha:1]
+#define COL_BG     [UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:0.97]
+#define COL_BAR    [UIColor colorWithRed:0.11 green:0.07 blue:0.20 alpha:1]
+#define COL_PURPLE [UIColor colorWithRed:0.55 green:0.35 blue:0.90 alpha:1]
+#define COL_GREEN  [UIColor colorWithRed:0.20 green:0.72 blue:0.44 alpha:1]
+#define COL_RED    [UIColor colorWithRed:0.90 green:0.25 blue:0.25 alpha:1]
+#define COL_FIELD  [UIColor colorWithWhite:0.18 alpha:1]
+#define COL_DIM    [UIColor colorWithWhite:0.40 alpha:1]
+#define COL_MONO   [UIColor colorWithRed:0.40 green:1.00 blue:0.62 alpha:1]
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+static const CGFloat kMenuW      = 290;
+static const CGFloat kBarH       = 34;
+static const CGFloat kRowH       = 28;
+static const CGFloat kRowSpacing = 32;
+static const CGFloat kFieldH     = 24;
+static const CGFloat kBtnH       = 28;
+static const CGFloat kScrollH    = 130;  // item scroll area height
+static const CGFloat kPad        = 10;
 
 // ─── Item Row ─────────────────────────────────────────────────────────────────
 @interface ItemRow : UIView
@@ -86,16 +96,17 @@ static void installSwizzle() {
 @end
 
 @implementation ItemRow
-- (instancetype)init {
-    self = [super initWithFrame:CGRectMake(0,0,288,30)];
 
-    _idField = [self makeField:@"Item ID" frame:CGRectMake(0,2,150,26) numeric:NO];
-    _amtField = [self makeField:@"Amount"  frame:CGRectMake(156,2,90,26) numeric:YES];
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(0, 0, 274, kRowH)];
+
+    _idField = [self field:@"Item ID" frame:CGRectMake(0, 0, 140, kFieldH) num:NO];
+    _amtField = [self field:@"Amount" frame:CGRectMake(146, 0, 82, kFieldH) num:YES];
 
     UIButton *del = [UIButton buttonWithType:UIButtonTypeSystem];
-    del.frame = CGRectMake(250,2,36,26);
+    del.frame = CGRectMake(232, 0, 38, kFieldH);
     [del setTitle:@"X" forState:UIControlStateNormal];
-    del.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    del.titleLabel.font = [UIFont boldSystemFontOfSize:12];
     [del setTitleColor:COL_RED forState:UIControlStateNormal];
     [del addTarget:self action:@selector(removeSelf)
   forControlEvents:UIControlEventTouchUpInside];
@@ -103,13 +114,14 @@ static void installSwizzle() {
     return self;
 }
 
-- (UITextField *)makeField:(NSString *)ph frame:(CGRect)f numeric:(BOOL)num {
+- (UITextField *)field:(NSString *)ph frame:(CGRect)f num:(BOOL)num {
     UITextField *t = [[UITextField alloc] initWithFrame:f];
     t.borderStyle = UITextBorderStyleRoundedRect;
-    t.font = [UIFont systemFontOfSize:12];
+    t.font = [UIFont systemFontOfSize:11];
     t.backgroundColor = COL_FIELD;
     t.textColor = UIColor.whiteColor;
     t.keyboardType = num ? UIKeyboardTypeNumberPad : UIKeyboardTypeDefault;
+    t.returnKeyType = UIReturnKeyDone;
     t.attributedPlaceholder =
         [[NSAttributedString alloc] initWithString:ph
              attributes:@{NSForegroundColorAttributeName:COL_DIM}];
@@ -118,23 +130,24 @@ static void installSwizzle() {
 }
 
 - (void)removeSelf {
-    UIScrollView *scroll = (UIScrollView *)self.superview.superview;
-    UIView *container    = self.superview;
+    UIView *container = self.superview;
+    UIScrollView *scroll = (UIScrollView *)container.superview;
     [self removeFromSuperview];
-    // restack
     CGFloat y = 2;
     for (UIView *v in container.subviews) {
-        v.frame = CGRectMake(0, y, 288, 30);
-        y += 34;
+        CGRect f = v.frame; f.origin.y = y; v.frame = f;
+        y += kRowSpacing;
     }
-    CGFloat h = MAX((CGFloat)container.subviews.count * 34 + 4, 34);
-    container.frame = CGRectMake(2,2,288,h);
-    scroll.contentSize = CGSizeMake(288, h+4);
+    CGFloat h = MAX(y, kRowH + 4);
+    container.frame = CGRectMake(2, 2, 274, h);
+    scroll.contentSize = CGSizeMake(274, h + 4);
 }
+
 @end
 
 // ─── Menu View ────────────────────────────────────────────────────────────────
-@interface MochiMenuView : UIView
+@interface MochiMenuView : UIView <UITextFieldDelegate>
+- (void)relayout;
 @end
 
 @implementation MochiMenuView {
@@ -144,33 +157,42 @@ static void installSwizzle() {
     UIView       *_rowContainer;
     UILabel      *_statusLabel;
     UIButton     *_runBtn;
+    // layout cache
+    CGFloat       _menuH;
 }
 
 - (instancetype)init {
-    self = [super initWithFrame:CGRectMake(20, 60, 316, 510)];
+    self = [super initWithFrame:CGRectZero];
     if (!self) return nil;
     gItems = [NSMutableArray array];
 
     self.backgroundColor = COL_BG;
-    self.layer.cornerRadius = 13;
+    self.layer.cornerRadius = 12;
     self.layer.borderColor  = COL_PURPLE.CGColor;
-    self.layer.borderWidth  = 1.5;
+    self.layer.borderWidth  = 1.4;
     self.layer.shadowColor  = UIColor.blackColor.CGColor;
-    self.layer.shadowOpacity = 0.7;
-    self.layer.shadowRadius  = 12;
+    self.layer.shadowOpacity = 0.65;
+    self.layer.shadowRadius  = 10;
+
+    // Tap outside to dismiss keyboard
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(dismissKeyboard)];
+    tap.cancelsTouchesInView = NO;
+    [self addGestureRecognizer:tap];
 
     // ── Title bar ──
-    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0,0,316,38)];
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kMenuW, kBarH)];
     bar.backgroundColor = COL_BAR;
-    bar.layer.cornerRadius = 13;
+    bar.layer.cornerRadius = 12;
     bar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    bar.tag = 99;
     [self addSubview:bar];
 
     UILabel *title = [UILabel new];
-    title.text = @"Mochi Hooker";
+    title.text = @"Mochi Interceptor";
     title.textColor = COL_PURPLE;
-    title.font = [UIFont boldSystemFontOfSize:14];
-    title.frame = CGRectMake(12,8,230,22);
+    title.font = [UIFont boldSystemFontOfSize:13];
+    title.frame = CGRectMake(10, 0, 200, kBarH);
     [bar addSubview:title];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
@@ -178,218 +200,235 @@ static void installSwizzle() {
     [bar addGestureRecognizer:pan];
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.frame = CGRectMake(282,8,24,22);
+    closeBtn.frame = CGRectMake(kMenuW - 34, 0, 30, kBarH);
     [closeBtn setTitle:@"X" forState:UIControlStateNormal];
-    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
     [closeBtn setTitleColor:COL_DIM forState:UIControlStateNormal];
     [closeBtn addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:closeBtn];
 
-    // ── Section 1: GIFT ITEMS (top) ──
-    [self sectionLabel:@"Choose Item" y:46];
+    CGFloat y = kBarH + kPad;
+
+    // ── Step 1 ──
+    y = [self sectionLabel:@"STEP 1 — GIFT ITEMS" y:y];
 
     UILabel *hdr = [UILabel new];
-    hdr.text = @"Item ID                              Amount";
-    hdr.font = [UIFont systemFontOfSize:10];
+    hdr.text = @"Item ID                    Amount";
+    hdr.font = [UIFont systemFontOfSize:9];
     hdr.textColor = COL_DIM;
-    hdr.frame = CGRectMake(12,61,292,13);
+    hdr.frame = CGRectMake(kPad, y, kMenuW - kPad*2, 12);
     [self addSubview:hdr];
+    y += 14;
 
-    _scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8,76,300,190)];
+    // Item scroll
+    _scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(7, y, kMenuW - 14, kScrollH)];
     _scroll.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1];
-    _scroll.layer.cornerRadius = 7;
+    _scroll.layer.cornerRadius = 6;
     _scroll.showsVerticalScrollIndicator = YES;
     [self addSubview:_scroll];
+    y += kScrollH + 6;
 
-    _rowContainer = [[UIView alloc] initWithFrame:CGRectMake(2,2,288,0)];
+    _rowContainer = [[UIView alloc] initWithFrame:CGRectMake(2, 2, 274, 0)];
     [_scroll addSubview:_rowContainer];
-    [self addRow]; // first row
+    [self addRow];
 
-    UIButton *addBtn = [self styledBtn:@"+ Add Item"
-                                 frame:CGRectMake(8,274,140,30)
-                                 color:COL_GREEN];
+    // Add item button
+    UIButton *addBtn = [self btn:@"+ Add Item" frame:CGRectMake(kPad, y, 120, kBtnH) col:COL_GREEN];
     [addBtn addTarget:self action:@selector(onAddItem) forControlEvents:UIControlEventTouchUpInside];
+    y += kBtnH + kPad;
 
     // ── Divider ──
-    [self divider:312];
+    [self divider:y]; y += 8;
 
-    // ── Section 2: CODE ──
-    [self sectionLabel:@"Hook Code" y:318];
+    // ── Step 2 ──
+    y = [self sectionLabel:@"STEP 2 — CREATE CODE" y:y];
 
-    _codeField = [[UITextField alloc] initWithFrame:CGRectMake(12,334,174,28)];
+    _codeField = [[UITextField alloc] initWithFrame:CGRectMake(kPad, y, 155, kFieldH)];
     _codeField.borderStyle = UITextBorderStyleRoundedRect;
-    _codeField.font = [UIFont fontWithName:@"Courier" size:12];
+    _codeField.font = [UIFont fontWithName:@"Courier" size:11];
     _codeField.backgroundColor = COL_FIELD;
     _codeField.textColor = COL_MONO;
+    _codeField.returnKeyType = UIReturnKeyDone;
+    _codeField.delegate = self;
     _codeField.attributedPlaceholder =
-        [[NSAttributedString alloc] initWithString:@"mochi{...}"
+        [[NSAttributedString alloc] initWithString:@"mochi..."
              attributes:@{NSForegroundColorAttributeName:COL_DIM}];
     [self addSubview:_codeField];
 
-    UIButton *genBtn = [self styledBtn:@"Generate"
-                                 frame:CGRectMake(192,334,56,28)
-                                 color:COL_PURPLE];
-    [genBtn addTarget:self action:@selector(onGenerate) forControlEvents:UIControlEventTouchUpInside];
-    genBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-
-    UIButton *copyBtn = [self styledBtn:@"Copy"
-                                  frame:CGRectMake(254,334,52,28)
-                                  color:COL_DIM];
-    [copyBtn addTarget:self action:@selector(onCopyCode) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *genBtn  = [self btn:@"Gen"  frame:CGRectMake(171, y,  52, kFieldH) col:COL_PURPLE];
+    UIButton *copyBtn = [self btn:@"Copy" frame:CGRectMake(228, y,  52, kFieldH) col:COL_DIM];
+    [genBtn  addTarget:self action:@selector(onGenerate)  forControlEvents:UIControlEventTouchUpInside];
+    [copyBtn addTarget:self action:@selector(onCopyCode)  forControlEvents:UIControlEventTouchUpInside];
+    genBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:11];
     copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    y += kFieldH + 4;
 
     _urlLabel = [UILabel new];
-    _urlLabel.font = [UIFont fontWithName:@"Courier" size:8.5];
-    _urlLabel.textColor = [UIColor colorWithWhite:0.35 alpha:1];
+    _urlLabel.font = [UIFont fontWithName:@"Courier" size:8];
+    _urlLabel.textColor = [UIColor colorWithWhite:0.32 alpha:1];
     _urlLabel.numberOfLines = 2;
-    _urlLabel.frame = CGRectMake(12,366,292,26);
+    _urlLabel.frame = CGRectMake(kPad, y, kMenuW - kPad*2, 22);
     [self addSubview:_urlLabel];
+    y += 24;
 
-    // ── Run / Stop ──
-    [self divider:398];
+    // ── Divider + Run ──
+    [self divider:y]; y += 8;
 
-    _runBtn = [self styledBtn:@"Run"
-                        frame:CGRectMake(8,406,300,34)
-                        color:COL_GREEN];
-    _runBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _runBtn = [self btn:@"Run" frame:CGRectMake(kPad, y, kMenuW - kPad*2, kBtnH + 2) col:COL_GREEN];
+    _runBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [_runBtn addTarget:self action:@selector(onRunStop) forControlEvents:UIControlEventTouchUpInside];
+    y += kBtnH + 2 + 6;
 
     // ── Status ──
     _statusLabel = [UILabel new];
-    _statusLabel.text = @"Status: Idle";
-    _statusLabel.font = [UIFont systemFontOfSize:11];
+    _statusLabel.text = @"Idle";
+    _statusLabel.font = [UIFont systemFontOfSize:10];
     _statusLabel.textColor = COL_DIM;
     _statusLabel.textAlignment = NSTextAlignmentCenter;
-    _statusLabel.frame = CGRectMake(0,448,316,20);
+    _statusLabel.frame = CGRectMake(0, y, kMenuW, 16);
     [self addSubview:_statusLabel];
+    y += 18;
 
+    _menuH = y;
+    self.frame = CGRectMake(20, 60, kMenuW, _menuH);
     return self;
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-- (UILabel *)sectionLabel:(NSString *)t y:(CGFloat)y {
-    UILabel *l = [UILabel new];
-    l.text = t;
-    l.font = [UIFont boldSystemFontOfSize:10];
-    l.textColor = COL_PURPLE;
-    l.frame = CGRectMake(12, y, 292, 14);
-    [self addSubview:l];
-    return l;
+// ─── UITextFieldDelegate ──────────────────────────────────────────────────────
+- (BOOL)textFieldShouldReturn:(UITextField *)tf {
+    [tf resignFirstResponder];
+    return YES;
 }
 
-- (UIButton *)styledBtn:(NSString *)title frame:(CGRect)f color:(UIColor *)c {
+- (void)dismissKeyboard {
+    [self endEditing:YES];
+}
+
+// ─── Layout helpers ───────────────────────────────────────────────────────────
+- (CGFloat)sectionLabel:(NSString *)t y:(CGFloat)y {
+    UILabel *l = [UILabel new];
+    l.text = t;
+    l.font = [UIFont boldSystemFontOfSize:9];
+    l.textColor = COL_PURPLE;
+    l.frame = CGRectMake(kPad, y, kMenuW - kPad*2, 12);
+    [self addSubview:l];
+    return y + 14;
+}
+
+- (UIButton *)btn:(NSString *)title frame:(CGRect)f col:(UIColor *)c {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.frame = f;
     [b setTitle:title forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
     [b setTitleColor:c forState:UIControlStateNormal];
     b.layer.borderColor  = c.CGColor;
-    b.layer.borderWidth  = 1.2;
-    b.layer.cornerRadius = 7;
+    b.layer.borderWidth  = 1.1;
+    b.layer.cornerRadius = 6;
     [self addSubview:b];
     return b;
 }
 
 - (void)divider:(CGFloat)y {
-    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(12,y,292,1)];
+    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(kPad, y, kMenuW - kPad*2, 1)];
     d.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
     [self addSubview:d];
 }
 
 - (void)addRow {
     ItemRow *row = [ItemRow new];
-    row.frame = CGRectMake(0, (CGFloat)_rowContainer.subviews.count * 34 + 2, 288, 30);
+    NSUInteger count = _rowContainer.subviews.count;
+    row.frame = CGRectMake(0, (CGFloat)count * kRowSpacing + 2, 274, kRowH);
+    // assign text field delegate for return key
+    row.idField.delegate  = self;
+    row.amtField.delegate = self;
     [_rowContainer addSubview:row];
     [self refreshScroll];
 }
 
 - (void)refreshScroll {
-    CGFloat h = MAX((CGFloat)_rowContainer.subviews.count * 34 + 4, 34);
-    _rowContainer.frame = CGRectMake(2,2,288,h);
-    _scroll.contentSize = CGSizeMake(288, h+4);
+    NSUInteger cnt = _rowContainer.subviews.count;
+    CGFloat h = MAX((CGFloat)cnt * kRowSpacing + 4, kRowH + 4);
+    _rowContainer.frame = CGRectMake(2, 2, 274, h);
+    _scroll.contentSize = CGSizeMake(274, h + 4);
 }
 
-// ── actions ───────────────────────────────────────────────────────────────────
+// landscape-aware reposition
+- (void)relayout {
+    CGRect screen = [UIScreen mainScreen].bounds;
+    CGFloat maxX = screen.size.width  - kMenuW - 10;
+    CGFloat maxY = screen.size.height - _menuH - 10;
+    CGRect f = self.frame;
+    f.origin.x = MIN(MAX(f.origin.x, 10), maxX);
+    f.origin.y = MIN(MAX(f.origin.y, 10), maxY);
+    self.frame = f;
+
+    // reposition FAB
+    if (gFabButton) {
+        gFabButton.frame = CGRectMake(screen.size.width - 78, 60, 68, 26);
+    }
+}
+
+// ─── Actions ──────────────────────────────────────────────────────────────────
 - (void)onAddItem { [self addRow]; }
 
 - (void)onGenerate {
-    // Collect items first
+    [self dismissKeyboard];
     [gItems removeAllObjects];
-    BOOL hasItems = NO;
+    BOOL ok = NO;
     for (ItemRow *row in _rowContainer.subviews) {
         if (![row isKindOfClass:[ItemRow class]]) continue;
-        NSString *iid = row.idField.text;
-        NSString *amt = row.amtField.text;
-        if (iid.length && amt.length) {
-            [gItems addObject:@{@"id":iid, @"amount":amt}];
-            hasItems = YES;
+        if (row.idField.text.length && row.amtField.text.length) {
+            [gItems addObject:@{@"id":row.idField.text, @"amount":row.amtField.text}];
+            ok = YES;
         }
     }
-    if (!hasItems) {
-        [self setStatus:@"Fill in at least one item first" color:COL_RED];
-        return;
-    }
-    NSString *code = [NSString stringWithFormat:@"mochi{%@}", randomAlpha(12)];
+    if (!ok) { [self status:@"Fill at least one item first" col:COL_RED]; return; }
+
+    // No {} – plain: mochiXXXXXXXXXXXX
+    NSString *code = [NSString stringWithFormat:@"mochi%@", randomAlpha(12)];
     _codeField.text = code;
     gMochiCode = code;
     _urlLabel.text = targetURL();
-    [self setStatus:@"Code hooked — press Run to activate" color:COL_DIM];
+    [self status:@"Code generated — press Run" col:COL_DIM];
 }
 
 - (void)onCopyCode {
-    NSString *code = _codeField.text;
-    if (!code.length) {
-        [self setStatus:@"Nothing to copy" color:COL_RED];
-        return;
-    }
-    [UIPasteboard generalPasteboard].string = code;
-    [self setStatus:@"Code copied to clipboard" color:COL_GREEN];
+    if (!_codeField.text.length) { [self status:@"Nothing to copy" col:COL_RED]; return; }
+    [UIPasteboard generalPasteboard].string = _codeField.text;
+    [self status:@"Copied to clipboard" col:COL_GREEN];
 }
 
 - (void)onRunStop {
+    [self dismissKeyboard];
     if (gRunning) {
         gRunning = NO;
         [_runBtn setTitle:@"Run" forState:UIControlStateNormal];
         [_runBtn setTitleColor:COL_GREEN forState:UIControlStateNormal];
         _runBtn.layer.borderColor = COL_GREEN.CGColor;
-        [self setStatus:@"Status: Stopped" color:COL_DIM];
+        [self status:@"Stopped" col:COL_DIM];
         return;
     }
-
-    // Validate items
     [gItems removeAllObjects];
     for (ItemRow *row in _rowContainer.subviews) {
         if (![row isKindOfClass:[ItemRow class]]) continue;
-        NSString *iid = row.idField.text;
-        NSString *amt = row.amtField.text;
-        if (iid.length && amt.length)
-            [gItems addObject:@{@"id":iid, @"amount":amt}];
+        if (row.idField.text.length && row.amtField.text.length)
+            [gItems addObject:@{@"id":row.idField.text, @"amount":row.amtField.text}];
     }
-    if (!gItems.count) {
-        [self setStatus:@"Add at least one item before running" color:COL_RED];
-        return;
-    }
+    if (!gItems.count) { [self status:@"Add items first" col:COL_RED]; return; }
+    if (!_codeField.text.length) { [self status:@"Generate a code first" col:COL_RED]; return; }
 
-    // Validate code
-    NSString *code = _codeField.text;
-    if (!code.length) {
-        [self setStatus:@"Generate or enter a code first" color:COL_RED];
-        return;
-    }
-    gMochiCode = code;
+    gMochiCode = _codeField.text;
     _urlLabel.text = targetURL();
-
     gRunning = YES;
     [_runBtn setTitle:@"Stop" forState:UIControlStateNormal];
     [_runBtn setTitleColor:COL_RED forState:UIControlStateNormal];
     _runBtn.layer.borderColor = COL_RED.CGColor;
-    [self setStatus:[NSString stringWithFormat:@"Active — hooking %lu item(s)",
-                     (unsigned long)gItems.count]
-              color:COL_MONO];
+    [self status:[NSString stringWithFormat:@"Active — %lu item(s)", (unsigned long)gItems.count]
+             col:COL_MONO];
 }
 
-- (void)setStatus:(NSString *)text color:(UIColor *)c {
-    _statusLabel.text  = text;
+- (void)status:(NSString *)t col:(UIColor *)c {
+    _statusLabel.text = t;
     _statusLabel.textColor = c;
 }
 
@@ -400,52 +439,69 @@ static void installSwizzle() {
 }
 
 - (void)close {
+    [self dismissKeyboard];
     self.hidden = YES;
     gFabButton.hidden = NO;
 }
 
 @end
 
-// ─── Overlay window ───────────────────────────────────────────────────────────
+// ─── Rotation-aware overlay ───────────────────────────────────────────────────
+@interface MochiOverlayVC : UIViewController @end
+@implementation MochiOverlayVC
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskAll;
+}
+- (void)viewWillTransitionToSize:(CGSize)size
+       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    [coordinator animateAlongsideTransition:^(id ctx) {
+        // nothing – relayout called after
+    } completion:^(id ctx) {
+        extern MochiMenuView *gMenuView;
+        if (gMenuView) [gMenuView relayout];
+    }];
+}
+@end
+
+// ─── Globals ──────────────────────────────────────────────────────────────────
 static UIWindow      *gOverlayWindow = nil;
-static MochiMenuView *gMenuView      = nil;
+MochiMenuView        *gMenuView      = nil;
 
 static void buildOverlay() {
     gOverlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
     gOverlayWindow.windowLevel = UIWindowLevelAlert + 200;
     gOverlayWindow.backgroundColor = UIColor.clearColor;
-    UIViewController *vc = [UIViewController new];
+    MochiOverlayVC *vc = [MochiOverlayVC new];
     vc.view.backgroundColor = UIColor.clearColor;
     gOverlayWindow.rootViewController = vc;
     [gOverlayWindow makeKeyAndVisible];
 
-    // ── Menu ──
     gMenuView = [MochiMenuView new];
     [vc.view addSubview:gMenuView];
 
-    // ── FAB toggle button (shown when menu is closed) ──
     CGFloat sw = [UIScreen mainScreen].bounds.size.width;
     gFabButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    gFabButton.frame = CGRectMake(sw - 78, 110, 68, 28);
+    gFabButton.frame = CGRectMake(sw - 78, 60, 68, 26);
     gFabButton.backgroundColor = [UIColor colorWithRed:0.11 green:0.07 blue:0.20 alpha:0.92];
-    gFabButton.layer.cornerRadius = 8;
+    gFabButton.layer.cornerRadius = 7;
     gFabButton.layer.borderColor  = COL_PURPLE.CGColor;
-    gFabButton.layer.borderWidth  = 1.2;
+    gFabButton.layer.borderWidth  = 1.1;
     [gFabButton setTitle:@"Mochi" forState:UIControlStateNormal];
     gFabButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
     [gFabButton setTitleColor:COL_PURPLE forState:UIControlStateNormal];
-    gFabButton.hidden = YES; // hidden while menu is visible
+    gFabButton.hidden = YES;
     [gFabButton addTarget:[UIApplication sharedApplication]
                    action:@selector(mochiShow)
          forControlEvents:UIControlEventTouchUpInside];
     [vc.view addSubview:gFabButton];
 }
 
-// ─── UIApplication category for FAB tap ──────────────────────────────────────
-@interface UIApplication (Mochi)
+@interface UIApplication (MochiShow)
 - (void)mochiShow;
 @end
-@implementation UIApplication (Mochi)
+@implementation UIApplication (MochiShow)
 - (void)mochiShow {
     gMenuView.hidden  = NO;
     gFabButton.hidden = YES;
