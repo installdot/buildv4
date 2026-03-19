@@ -18,6 +18,7 @@ static NSString *randomAlpha(NSUInteger len) {
 }
 
 static NSString *targetURL() {
+    if (!gMochiCode.length) return @"";
     return [NSString stringWithFormat:
         @"https://ashen-legacy-default-rtdb.asia-southeast1.firebasedatabase.app/Code//%@.json",
         gMochiCode];
@@ -35,38 +36,97 @@ static NSData *fakeResponse() {
     return [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
 }
 
-// ─── NSURLSession swizzle ─────────────────────────────────────────────────────
-typedef void (^CompletionBlock)(NSData *, NSURLResponse *, NSError *);
-static NSURLSessionDataTask *(*orig_dataTaskWithRequest)(id, SEL, NSURLRequest *, CompletionBlock);
+// ─── NSURLProtocol interceptor ────────────────────────────────────────────────
+// Registered globally — catches every NSURLSession/NSURLConnection request.
+static NSString *const kHandledKey = @"MochiHandled";
 
-static NSURLSessionDataTask *swiz_dataTaskWithRequest(id self, SEL _cmd,
-                                                       NSURLRequest *req,
-                                                       CompletionBlock ch) {
-    if (gRunning && gMochiCode.length &&
-        [req.URL.absoluteString isEqualToString:targetURL()]) {
-        dispatch_async(dispatch_get_global_queue(0, 0), ^{
-            NSHTTPURLResponse *resp =
-                [[NSHTTPURLResponse alloc] initWithURL:req.URL
-                                            statusCode:200
-                                           HTTPVersion:@"HTTP/1.1"
-                                          headerFields:@{@"Content-Type":@"application/json"}];
-            if (ch) ch(fakeResponse(), resp, nil);
-        });
-        NSURLSessionDataTask *dummy = orig_dataTaskWithRequest(self, _cmd, req, nil);
-        [dummy cancel];
-        return dummy;
-    }
-    return orig_dataTaskWithRequest(self, _cmd, req, ch);
+@interface MochiURLProtocol : NSURLProtocol @end
+@implementation MochiURLProtocol
+
+// Called for every outgoing request — return YES to intercept it
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    // Skip if we already processed this (avoid infinite loop)
+    if ([NSURLProtocol propertyForKey:kHandledKey inRequest:request]) return NO;
+
+    if (!gRunning || !gMochiCode.length) return NO;
+
+    NSString *url = request.URL.absoluteString;
+    return [url isEqualToString:targetURL()];
 }
 
-static void installSwizzle() {
-    Class cls = [NSURLSession class];
-    SEL   sel = @selector(dataTaskWithRequest:completionHandler:);
-    Method m  = class_getInstanceMethod(cls, sel);
-    orig_dataTaskWithRequest =
-        (NSURLSessionDataTask *(*)(id,SEL,NSURLRequest*,CompletionBlock))
-        method_getImplementation(m);
-    method_setImplementation(m, (IMP)swiz_dataTaskWithRequest);
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
++ (BOOL)requestIsCacheEquivalent:(NSURLRequest *)a toRequest:(NSURLRequest *)b {
+    return NO;
+}
+
+- (void)startLoading {
+    // Build fake HTTP response
+    NSData *body = fakeResponse();
+    NSHTTPURLResponse *resp =
+        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                    statusCode:200
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{
+                                      @"Content-Type":   @"application/json",
+                                      @"Content-Length": [@(body.length) stringValue]
+                                  }];
+
+    // Deliver spoofed response — never forwards to server
+    [self.client URLProtocol:self didReceiveResponse:resp
+          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:body];
+    [self.client URLProtocolDidFinishLoading:self];
+}
+
+- (void)stopLoading {
+    // Nothing to cancel — we never made a real request
+}
+
+@end
+
+// Also hook NSURLSession config so custom sessions pick up our protocol
+static void swizzleSessionConfig() {
+    // Patch +defaultSessionConfiguration
+    Class cls = [NSURLSessionConfiguration class];
+
+    SEL defSel = @selector(defaultSessionConfiguration);
+    Method defM = class_getClassMethod(cls, defSel);
+    IMP origDef = method_getImplementation(defM);
+    method_setImplementation(defM, imp_implementationWithBlock(^NSURLSessionConfiguration *{
+        NSURLSessionConfiguration *cfg =
+            ((NSURLSessionConfiguration *(*)(id,SEL))origDef)(cls, defSel);
+        NSMutableArray *protos =
+            [NSMutableArray arrayWithArray:cfg.protocolClasses ?: @[]];
+        if (![protos containsObject:[MochiURLProtocol class]])
+            [protos insertObject:[MochiURLProtocol class] atIndex:0];
+        cfg.protocolClasses = protos;
+        return cfg;
+    }));
+
+    // Patch +ephemeralSessionConfiguration
+    SEL ephSel = @selector(ephemeralSessionConfiguration);
+    Method ephM = class_getClassMethod(cls, ephSel);
+    IMP origEph = method_getImplementation(ephM);
+    method_setImplementation(ephM, imp_implementationWithBlock(^NSURLSessionConfiguration *{
+        NSURLSessionConfiguration *cfg =
+            ((NSURLSessionConfiguration *(*)(id,SEL))origEph)(cls, ephSel);
+        NSMutableArray *protos =
+            [NSMutableArray arrayWithArray:cfg.protocolClasses ?: @[]];
+        if (![protos containsObject:[MochiURLProtocol class]])
+            [protos insertObject:[MochiURLProtocol class] atIndex:0];
+        cfg.protocolClasses = protos;
+        return cfg;
+    }));
+}
+
+static void installInterceptor() {
+    // Register globally (covers shared session + any session using default/ephemeral config)
+    [NSURLProtocol registerClass:[MochiURLProtocol class]];
+    // Patch config constructors so per-app custom sessions also get the protocol
+    swizzleSessionConfig();
 }
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -88,21 +148,14 @@ static const CGFloat kBtnH       = 28;
 static const CGFloat kScrollH    = 130;
 static const CGFloat kPad        = 10;
 
-// ─── Pass-through overlay window ──────────────────────────────────────────────
-// CRITICAL FIX: return nil for any touch that doesn't land on a visible
-// overlay subview so the underlying app window gets the event normally.
+// ─── Pass-through window ──────────────────────────────────────────────────────
 @interface MochiPassthroughWindow : UIWindow @end
 @implementation MochiPassthroughWindow
-
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    // If hit is our own root view (the transparent background) return nil
-    // so the touch falls through to the app.
-    if (hit == self.rootViewController.view) return nil;
-    if (hit == self) return nil;
+    if (hit == self || hit == self.rootViewController.view) return nil;
     return hit;
 }
-
 @end
 
 // ─── Item Row ─────────────────────────────────────────────────────────────────
@@ -112,10 +165,8 @@ static const CGFloat kPad        = 10;
 @end
 
 @implementation ItemRow
-
 - (instancetype)init {
     self = [super initWithFrame:CGRectMake(0, 0, 274, kRowH)];
-
     _idField  = [self field:@"Item ID" frame:CGRectMake(0,   0, 140, kFieldH) num:NO];
     _amtField = [self field:@"Amount"  frame:CGRectMake(146, 0,  82, kFieldH) num:YES];
 
@@ -131,12 +182,12 @@ static const CGFloat kPad        = 10;
 }
 
 - (UITextField *)field:(NSString *)ph frame:(CGRect)f num:(BOOL)num {
-    UITextField *t = [[UITextField alloc] initWithFrame:f];
-    t.borderStyle  = UITextBorderStyleRoundedRect;
-    t.font         = [UIFont systemFontOfSize:11];
+    UITextField *t  = [[UITextField alloc] initWithFrame:f];
+    t.borderStyle   = UITextBorderStyleRoundedRect;
+    t.font          = [UIFont systemFontOfSize:11];
     t.backgroundColor = COL_FIELD;
-    t.textColor    = UIColor.whiteColor;
-    t.keyboardType = num ? UIKeyboardTypeNumberPad : UIKeyboardTypeDefault;
+    t.textColor     = UIColor.whiteColor;
+    t.keyboardType  = num ? UIKeyboardTypeNumberPad : UIKeyboardTypeDefault;
     t.returnKeyType = UIReturnKeyDone;
     t.attributedPlaceholder =
         [[NSAttributedString alloc] initWithString:ph
@@ -155,10 +206,9 @@ static const CGFloat kPad        = 10;
         y += kRowSpacing;
     }
     CGFloat h = MAX(y, kRowH + 4);
-    container.frame = CGRectMake(2, 2, 274, h);
+    container.frame    = CGRectMake(2, 2, 274, h);
     scroll.contentSize = CGSizeMake(274, h + 4);
 }
-
 @end
 
 // ─── Menu View ────────────────────────────────────────────────────────────────
@@ -181,7 +231,7 @@ static const CGFloat kPad        = 10;
     if (!self) return nil;
     gItems = [NSMutableArray array];
 
-    self.backgroundColor = COL_BG;
+    self.backgroundColor     = COL_BG;
     self.layer.cornerRadius  = 12;
     self.layer.borderColor   = COL_PURPLE.CGColor;
     self.layer.borderWidth   = 1.4;
@@ -189,20 +239,19 @@ static const CGFloat kPad        = 10;
     self.layer.shadowOpacity = 0.65;
     self.layer.shadowRadius  = 10;
 
-    // Tap anywhere on the menu card to dismiss keyboard
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(dismissKeyboard)];
     tap.cancelsTouchesInView = NO;
     [self addGestureRecognizer:tap];
 
-    // ── Title bar ──────────────────────────────────────────────────────────
+    // ── Title bar ──
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kMenuW, kBarH)];
     bar.backgroundColor = COL_BAR;
     bar.layer.cornerRadius = 12;
     bar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
     [self addSubview:bar];
 
-    UILabel *title = [UILabel new];
+    UILabel *title  = [UILabel new];
     title.text      = @"Mochi Interceptor";
     title.textColor = COL_PURPLE;
     title.font      = [UIFont boldSystemFontOfSize:13];
@@ -224,10 +273,10 @@ static const CGFloat kPad        = 10;
 
     CGFloat y = kBarH + kPad;
 
-    // ── Step 1 ─────────────────────────────────────────────────────────────
+    // ── Step 1 ──
     y = [self sectionLabel:@"STEP 1 — GIFT ITEMS" y:y];
 
-    UILabel *hdr = [UILabel new];
+    UILabel *hdr  = [UILabel new];
     hdr.text      = @"Item ID                    Amount";
     hdr.font      = [UIFont systemFontOfSize:9];
     hdr.textColor = COL_DIM;
@@ -255,32 +304,30 @@ static const CGFloat kPad        = 10;
 
     [self divider:y]; y += 8;
 
-    // ── Step 2 ─────────────────────────────────────────────────────────────
+    // ── Step 2 ──
     y = [self sectionLabel:@"STEP 2 — CREATE CODE" y:y];
 
     _codeField = [[UITextField alloc] initWithFrame:CGRectMake(kPad, y, 155, kFieldH)];
-    _codeField.borderStyle  = UITextBorderStyleRoundedRect;
-    _codeField.font         = [UIFont fontWithName:@"Courier" size:11];
+    _codeField.borderStyle     = UITextBorderStyleRoundedRect;
+    _codeField.font            = [UIFont fontWithName:@"Courier" size:11];
     _codeField.backgroundColor = COL_FIELD;
-    _codeField.textColor    = COL_MONO;
-    _codeField.returnKeyType = UIReturnKeyDone;
-    _codeField.delegate     = self;
+    _codeField.textColor       = COL_MONO;
+    _codeField.returnKeyType   = UIReturnKeyDone;
+    _codeField.delegate        = self;
     _codeField.attributedPlaceholder =
         [[NSAttributedString alloc] initWithString:@"mochi..."
              attributes:@{NSForegroundColorAttributeName:COL_DIM}];
     [self addSubview:_codeField];
 
-    UIButton *genBtn  = [self btn:@"Gen"  frame:CGRectMake(171, y,  52, kFieldH) col:COL_PURPLE];
-    UIButton *copyBtn = [self btn:@"Copy" frame:CGRectMake(228, y,  52, kFieldH) col:COL_DIM];
-    [genBtn  addTarget:self action:@selector(onGenerate)
-      forControlEvents:UIControlEventTouchUpInside];
-    [copyBtn addTarget:self action:@selector(onCopyCode)
-      forControlEvents:UIControlEventTouchUpInside];
+    UIButton *genBtn  = [self btn:@"Gen"  frame:CGRectMake(171, y, 52, kFieldH) col:COL_PURPLE];
+    UIButton *copyBtn = [self btn:@"Copy" frame:CGRectMake(228, y, 52, kFieldH) col:COL_DIM];
+    [genBtn  addTarget:self action:@selector(onGenerate)  forControlEvents:UIControlEventTouchUpInside];
+    [copyBtn addTarget:self action:@selector(onCopyCode)  forControlEvents:UIControlEventTouchUpInside];
     genBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:11];
     copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
     y += kFieldH + 4;
 
-    _urlLabel = [UILabel new];
+    _urlLabel               = [UILabel new];
     _urlLabel.font          = [UIFont fontWithName:@"Courier" size:8];
     _urlLabel.textColor     = [UIColor colorWithWhite:0.32 alpha:1];
     _urlLabel.numberOfLines = 2;
@@ -298,7 +345,7 @@ static const CGFloat kPad        = 10;
       forControlEvents:UIControlEventTouchUpInside];
     y += kBtnH + 2 + 6;
 
-    _statusLabel = [UILabel new];
+    _statusLabel               = [UILabel new];
     _statusLabel.text          = @"Idle";
     _statusLabel.font          = [UIFont systemFontOfSize:10];
     _statusLabel.textColor     = COL_DIM;
@@ -312,17 +359,13 @@ static const CGFloat kPad        = 10;
     return self;
 }
 
-// ─── UITextFieldDelegate ──────────────────────────────────────────────────────
 - (BOOL)textFieldShouldReturn:(UITextField *)tf {
-    [tf resignFirstResponder];
-    return YES;
+    [tf resignFirstResponder]; return YES;
 }
-
 - (void)dismissKeyboard { [self endEditing:YES]; }
 
-// ─── Layout helpers ───────────────────────────────────────────────────────────
 - (CGFloat)sectionLabel:(NSString *)t y:(CGFloat)y {
-    UILabel *l = [UILabel new];
+    UILabel *l  = [UILabel new];
     l.text      = t;
     l.font      = [UIFont boldSystemFontOfSize:9];
     l.textColor = COL_PURPLE;
@@ -335,8 +378,8 @@ static const CGFloat kPad        = 10;
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
     b.frame = f;
     [b setTitle:title forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    [b setTitleColor:c forState:UIControlStateNormal];
+    b.titleLabel.font    = [UIFont boldSystemFontOfSize:12];
+    [b setTitleColor:c   forState:UIControlStateNormal];
     b.layer.borderColor  = c.CGColor;
     b.layer.borderWidth  = 1.1;
     b.layer.cornerRadius = 6;
@@ -351,8 +394,10 @@ static const CGFloat kPad        = 10;
 }
 
 - (void)addRow {
-    ItemRow *row = [ItemRow new];
-    row.frame = CGRectMake(0, (CGFloat)_rowContainer.subviews.count * kRowSpacing + 2, 274, kRowH);
+    ItemRow *row  = [ItemRow new];
+    row.frame     = CGRectMake(0,
+                               (CGFloat)_rowContainer.subviews.count * kRowSpacing + 2,
+                               274, kRowH);
     row.idField.delegate  = self;
     row.amtField.delegate = self;
     [_rowContainer addSubview:row];
@@ -360,27 +405,23 @@ static const CGFloat kPad        = 10;
 }
 
 - (void)refreshScroll {
-    NSUInteger cnt = _rowContainer.subviews.count;
-    CGFloat h = MAX((CGFloat)cnt * kRowSpacing + 4, kRowH + 4);
-    _rowContainer.frame    = CGRectMake(2, 2, 274, h);
-    _scroll.contentSize    = CGSizeMake(274, h + 4);
+    CGFloat h = MAX((CGFloat)_rowContainer.subviews.count * kRowSpacing + 4, kRowH + 4);
+    _rowContainer.frame = CGRectMake(2, 2, 274, h);
+    _scroll.contentSize = CGSizeMake(274, h + 4);
 }
 
 - (void)relayout {
-    CGRect screen = [UIScreen mainScreen].bounds;
-    CGFloat maxX  = screen.size.width  - kMenuW - 10;
-    CGFloat maxY  = screen.size.height - _menuH  - 10;
-    CGRect f      = self.frame;
-    f.origin.x    = MIN(MAX(f.origin.x, 10), MAX(maxX, 10));
-    f.origin.y    = MIN(MAX(f.origin.y, 10), MAX(maxY, 10));
-    self.frame    = f;
-
-    if (gFabButton) {
+    CGRect  screen = [UIScreen mainScreen].bounds;
+    CGFloat maxX   = screen.size.width  - kMenuW - 10;
+    CGFloat maxY   = screen.size.height - _menuH  - 10;
+    CGRect  f      = self.frame;
+    f.origin.x     = MIN(MAX(f.origin.x, 10), MAX(maxX, 10));
+    f.origin.y     = MIN(MAX(f.origin.y, 10), MAX(maxY, 10));
+    self.frame     = f;
+    if (gFabButton)
         gFabButton.frame = CGRectMake(screen.size.width - 78, 60, 68, 26);
-    }
 }
 
-// ─── Actions ──────────────────────────────────────────────────────────────────
 - (void)onAddItem { [self addRow]; }
 
 - (void)onGenerate {
@@ -396,10 +437,10 @@ static const CGFloat kPad        = 10;
     }
     if (!ok) { [self status:@"Fill at least one item first" col:COL_RED]; return; }
 
-    NSString *code    = [NSString stringWithFormat:@"mochi%@", randomAlpha(12)];
-    _codeField.text   = code;
-    gMochiCode        = code;
-    _urlLabel.text    = targetURL();
+    NSString *code  = [NSString stringWithFormat:@"mochi%@", randomAlpha(12)];
+    _codeField.text = code;
+    gMochiCode      = code;
+    _urlLabel.text  = targetURL();
     [self status:@"Code generated — press Run" col:COL_DIM];
 }
 
@@ -425,8 +466,8 @@ static const CGFloat kPad        = 10;
         if (row.idField.text.length && row.amtField.text.length)
             [gItems addObject:@{@"id":row.idField.text, @"amount":row.amtField.text}];
     }
-    if (!gItems.count)          { [self status:@"Add items first"       col:COL_RED]; return; }
-    if (!_codeField.text.length){ [self status:@"Generate a code first" col:COL_RED]; return; }
+    if (!gItems.count)           { [self status:@"Add items first"       col:COL_RED]; return; }
+    if (!_codeField.text.length) { [self status:@"Generate a code first" col:COL_RED]; return; }
 
     gMochiCode     = _codeField.text;
     _urlLabel.text = targetURL();
@@ -444,7 +485,7 @@ static const CGFloat kPad        = 10;
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.superview];
+    CGPoint t   = [g translationInView:self.superview];
     self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
     [g setTranslation:CGPointZero inView:self.superview];
 }
@@ -454,10 +495,9 @@ static const CGFloat kPad        = 10;
     self.hidden       = YES;
     gFabButton.hidden = NO;
 }
-
 @end
 
-// ─── Rotation-aware root VC ───────────────────────────────────────────────────
+// ─── Rotation VC ──────────────────────────────────────────────────────────────
 @interface MochiOverlayVC : UIViewController @end
 @implementation MochiOverlayVC
 - (BOOL)shouldAutorotate { return YES; }
@@ -474,40 +514,35 @@ static const CGFloat kPad        = 10;
 }
 @end
 
-// ─── Globals ──────────────────────────────────────────────────────────────────
+// ─── Globals & overlay ────────────────────────────────────────────────────────
 static MochiPassthroughWindow *gOverlayWindow = nil;
 MochiMenuView                 *gMenuView      = nil;
 
 static void buildOverlay() {
     gOverlayWindow = [[MochiPassthroughWindow alloc]
         initWithFrame:[UIScreen mainScreen].bounds];
-    gOverlayWindow.windowLevel    = UIWindowLevelAlert + 200;
+    gOverlayWindow.windowLevel     = UIWindowLevelAlert + 200;
     gOverlayWindow.backgroundColor = UIColor.clearColor;
 
-    MochiOverlayVC *vc = [MochiOverlayVC new];
+    MochiOverlayVC *vc      = [MochiOverlayVC new];
     vc.view.backgroundColor = UIColor.clearColor;
-
-    // The root view must also pass through untouched areas
-    vc.view.userInteractionEnabled = YES;
     gOverlayWindow.rootViewController = vc;
     [gOverlayWindow makeKeyAndVisible];
 
-    // Restore original key window so the app keeps working normally
-    // The overlay window receives hits only on visible subviews (see hitTest above)
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+    // Restore app key window
+    for (UIWindow *w in [UIApplication sharedApplication].windows)
         if (w != gOverlayWindow) { [w makeKeyWindow]; break; }
-    }
 
     gMenuView = [MochiMenuView new];
     [vc.view addSubview:gMenuView];
 
-    CGFloat sw    = [UIScreen mainScreen].bounds.size.width;
-    gFabButton    = [UIButton buttonWithType:UIButtonTypeSystem];
+    CGFloat sw       = [UIScreen mainScreen].bounds.size.width;
+    gFabButton       = [UIButton buttonWithType:UIButtonTypeSystem];
     gFabButton.frame = CGRectMake(sw - 78, 60, 68, 26);
-    gFabButton.backgroundColor = [UIColor colorWithRed:0.11 green:0.07 blue:0.20 alpha:0.92];
-    gFabButton.layer.cornerRadius = 7;
-    gFabButton.layer.borderColor  = COL_PURPLE.CGColor;
-    gFabButton.layer.borderWidth  = 1.1;
+    gFabButton.backgroundColor      = [UIColor colorWithRed:0.11 green:0.07 blue:0.20 alpha:0.92];
+    gFabButton.layer.cornerRadius   = 7;
+    gFabButton.layer.borderColor    = COL_PURPLE.CGColor;
+    gFabButton.layer.borderWidth    = 1.1;
     [gFabButton setTitle:@"Mochi" forState:UIControlStateNormal];
     gFabButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
     [gFabButton setTitleColor:COL_PURPLE forState:UIControlStateNormal];
@@ -531,7 +566,7 @@ static void buildOverlay() {
 // ─── Constructor ──────────────────────────────────────────────────────────────
 __attribute__((constructor))
 static void mochiInit() {
-    installSwizzle();
+    installInterceptor();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         buildOverlay();
