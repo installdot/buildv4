@@ -1,14 +1,15 @@
-// Tweak.xm
+// Tweak.xm  –  TrollFools compatible plain dylib
 #import <UIKit/UIKit.h>
-#import <substrate.h>
+#import <objc/runtime.h>
 
-// ─── State ───────────────────────────────────────────────────────────────────
-static NSString *gMochiCode   = nil;   // current mochi code
-static NSMutableArray<NSDictionary*> *gItems = nil; // [{id, amount}]
-static BOOL      gRunning     = NO;
+// ─── State ────────────────────────────────────────────────────────────────────
+static NSString       *gMochiCode = nil;
+static NSMutableArray *gItems     = nil;
+static BOOL            gRunning   = NO;
+static UIButton       *gFabButton = nil;
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-static NSString *randomString(NSUInteger len) {
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+static NSString *randomAlpha(NSUInteger len) {
     NSString *chars = @"abcdefghijklmnopqrstuvwxyz0123456789";
     NSMutableString *s = [NSMutableString stringWithCapacity:len];
     for (NSUInteger i = 0; i < len; i++)
@@ -16,342 +17,447 @@ static NSString *randomString(NSUInteger len) {
     return s;
 }
 
-static NSString *buildTargetURL() {
-    return [NSString stringWithFormat:@"https://ashen-legacy-default-rtdb.asia-southeast1.firebasedatabase.app/Code//%@.json", gMochiCode];
+static NSString *targetURL() {
+    return [NSString stringWithFormat:
+        @"https://ashen-legacy-default-rtdb.asia-southeast1.firebasedatabase.app/Code//%@.json",
+        gMochiCode];
 }
 
-/** Build the fake JSON response from gItems */
-static NSData *buildFakeResponse() {
-    if (!gItems.count) {
-        // fallback
-        NSDictionary *d = @{@"CountCurrent":@1,
-                            @"CountMax":@10000,
-                            @"Gift":@"32-1000000"};
-        return [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+static NSData *fakeResponse() {
+    NSString *gift = @"0-0";
+    if (gItems.count) {
+        NSMutableArray *parts = [NSMutableArray array];
+        for (NSDictionary *item in gItems)
+            [parts addObject:[NSString stringWithFormat:@"%@-%@", item[@"id"], item[@"amount"]]];
+        gift = [parts componentsJoinedByString:@","];
     }
-    // Build gift string: "itemid-howmuch,itemid2-howmuch2,…"
-    NSMutableArray<NSString*> *parts = [NSMutableArray array];
-    for (NSDictionary *item in gItems)
-        [parts addObject:[NSString stringWithFormat:@"%@-%@", item[@"id"], item[@"amount"]]];
-    NSString *gift = [parts componentsJoinedByString:@","];
-    NSDictionary *d = @{@"CountCurrent":@1,
-                        @"CountMax":@10000,
-                        @"Gift":gift};
+    NSDictionary *d = @{@"CountCurrent":@1, @"CountMax":@10000, @"Gift":gift};
     return [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
 }
 
-// ─── NSURLSession hook ────────────────────────────────────────────────────────
-%hook NSURLSession
+// ─── NSURLSession swizzle ─────────────────────────────────────────────────────
+typedef void (^CompletionBlock)(NSData *, NSURLResponse *, NSError *);
+static NSURLSessionDataTask *(*orig_dataTaskWithRequest)(id, SEL, NSURLRequest *, CompletionBlock);
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))ch {
-    if (gRunning && gMochiCode.length) {
-        NSString *target = buildTargetURL();
-        if ([request.URL.absoluteString isEqualToString:target]) {
-            // Block real request – return fake response immediately
-            dispatch_async(dispatch_get_global_queue(0,0), ^{
-                NSHTTPURLResponse *fakeResp =
-                    [[NSHTTPURLResponse alloc] initWithURL:request.URL
-                                               statusCode:200
-                                              HTTPVersion:@"HTTP/1.1"
-                                             headerFields:@{@"Content-Type":@"application/json"}];
-                if (ch) ch(buildFakeResponse(), fakeResp, nil);
-            });
-            // Return a dummy (cancelled) task so callers hold a valid object
-            NSURLSessionDataTask *dummy = %orig(request, nil);
-            [dummy cancel];
-            return dummy;
-        }
+static NSURLSessionDataTask *swiz_dataTaskWithRequest(id self, SEL _cmd,
+                                                       NSURLRequest *req,
+                                                       CompletionBlock ch) {
+    if (gRunning && gMochiCode.length &&
+        [req.URL.absoluteString isEqualToString:targetURL()]) {
+        dispatch_async(dispatch_get_global_queue(0, 0), ^{
+            NSHTTPURLResponse *resp =
+                [[NSHTTPURLResponse alloc] initWithURL:req.URL
+                                            statusCode:200
+                                           HTTPVersion:@"HTTP/1.1"
+                                          headerFields:@{@"Content-Type":@"application/json"}];
+            if (ch) ch(fakeResponse(), resp, nil);
+        });
+        NSURLSessionDataTask *dummy = orig_dataTaskWithRequest(self, _cmd, req, nil);
+        [dummy cancel];
+        return dummy;
     }
-    return %orig;
+    return orig_dataTaskWithRequest(self, _cmd, req, ch);
 }
 
-%end
+static void installSwizzle() {
+    Class cls = [NSURLSession class];
+    SEL   sel = @selector(dataTaskWithRequest:completionHandler:);
+    Method m  = class_getInstanceMethod(cls, sel);
+    orig_dataTaskWithRequest =
+        (NSURLSessionDataTask *(*)(id,SEL,NSURLRequest*,CompletionBlock))
+        method_getImplementation(m);
+    method_setImplementation(m, (IMP)swiz_dataTaskWithRequest);
+}
 
-// ─── UI Window ───────────────────────────────────────────────────────────────
+// ─── Colors ───────────────────────────────────────────────────────────────────
+#define COL_BG      [UIColor colorWithRed:0.07 green:0.07 blue:0.11 alpha:0.97]
+#define COL_BAR     [UIColor colorWithRed:0.11 green:0.07 blue:0.20 alpha:1]
+#define COL_PURPLE  [UIColor colorWithRed:0.55 green:0.35 blue:0.90 alpha:1]
+#define COL_GREEN   [UIColor colorWithRed:0.20 green:0.72 blue:0.44 alpha:1]
+#define COL_RED     [UIColor colorWithRed:0.90 green:0.25 blue:0.25 alpha:1]
+#define COL_FIELD   [UIColor colorWithWhite:0.18 alpha:1]
+#define COL_DIM     [UIColor colorWithWhite:0.40 alpha:1]
+#define COL_MONO    [UIColor colorWithRed:0.40 green:1.00 blue:0.62 alpha:1]
+
+// ─── Item Row ─────────────────────────────────────────────────────────────────
+@interface ItemRow : UIView
+@property (nonatomic, strong) UITextField *idField;
+@property (nonatomic, strong) UITextField *amtField;
+@end
+
+@implementation ItemRow
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(0,0,288,30)];
+
+    _idField = [self makeField:@"Item ID" frame:CGRectMake(0,2,150,26) numeric:NO];
+    _amtField = [self makeField:@"Amount"  frame:CGRectMake(156,2,90,26) numeric:YES];
+
+    UIButton *del = [UIButton buttonWithType:UIButtonTypeSystem];
+    del.frame = CGRectMake(250,2,36,26);
+    [del setTitle:@"X" forState:UIControlStateNormal];
+    del.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [del setTitleColor:COL_RED forState:UIControlStateNormal];
+    [del addTarget:self action:@selector(removeSelf)
+  forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:del];
+    return self;
+}
+
+- (UITextField *)makeField:(NSString *)ph frame:(CGRect)f numeric:(BOOL)num {
+    UITextField *t = [[UITextField alloc] initWithFrame:f];
+    t.borderStyle = UITextBorderStyleRoundedRect;
+    t.font = [UIFont systemFontOfSize:12];
+    t.backgroundColor = COL_FIELD;
+    t.textColor = UIColor.whiteColor;
+    t.keyboardType = num ? UIKeyboardTypeNumberPad : UIKeyboardTypeDefault;
+    t.attributedPlaceholder =
+        [[NSAttributedString alloc] initWithString:ph
+             attributes:@{NSForegroundColorAttributeName:COL_DIM}];
+    [self addSubview:t];
+    return t;
+}
+
+- (void)removeSelf {
+    UIScrollView *scroll = (UIScrollView *)self.superview.superview;
+    UIView *container    = self.superview;
+    [self removeFromSuperview];
+    // restack
+    CGFloat y = 2;
+    for (UIView *v in container.subviews) {
+        v.frame = CGRectMake(0, y, 288, 30);
+        y += 34;
+    }
+    CGFloat h = MAX((CGFloat)container.subviews.count * 34 + 4, 34);
+    container.frame = CGRectMake(2,2,288,h);
+    scroll.contentSize = CGSizeMake(288, h+4);
+}
+@end
+
+// ─── Menu View ────────────────────────────────────────────────────────────────
 @interface MochiMenuView : UIView
 @end
 
 @implementation MochiMenuView {
-    UITextField   *_codeField;
-    UILabel       *_codeLabel;
-    UIScrollView  *_itemScroll;
-    UIStackView   *_itemStack;
-    UIButton      *_addBtn, *_runBtn, *_genBtn;
-    UILabel       *_statusLabel;
-    NSMutableArray<UIView*> *_itemRows;
+    UITextField  *_codeField;
+    UILabel      *_urlLabel;
+    UIScrollView *_scroll;
+    UIView       *_rowContainer;
+    UILabel      *_statusLabel;
+    UIButton     *_runBtn;
 }
 
 - (instancetype)init {
-    self = [super initWithFrame:CGRectMake(20, 80, 320, 460)];
+    self = [super initWithFrame:CGRectMake(20, 60, 316, 510)];
     if (!self) return nil;
-    gItems   = [NSMutableArray array];
-    _itemRows = [NSMutableArray array];
+    gItems = [NSMutableArray array];
 
-    self.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
-    self.layer.cornerRadius = 14;
-    self.layer.borderColor  = [UIColor systemPurpleColor].CGColor;
+    self.backgroundColor = COL_BG;
+    self.layer.cornerRadius = 13;
+    self.layer.borderColor  = COL_PURPLE.CGColor;
     self.layer.borderWidth  = 1.5;
+    self.layer.shadowColor  = UIColor.blackColor.CGColor;
+    self.layer.shadowOpacity = 0.7;
+    self.layer.shadowRadius  = 12;
 
-    // ── Title ──
+    // ── Title bar ──
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0,0,316,38)];
+    bar.backgroundColor = COL_BAR;
+    bar.layer.cornerRadius = 13;
+    bar.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    [self addSubview:bar];
+
     UILabel *title = [UILabel new];
-    title.text = @"🍡 Mochi Menu";
-    title.textColor = [UIColor systemPurpleColor];
-    title.font = [UIFont boldSystemFontOfSize:17];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.frame = CGRectMake(0, 10, 320, 28);
-    [self addSubview:title];
+    title.text = @"Mochi Hooker";
+    title.textColor = COL_PURPLE;
+    title.font = [UIFont boldSystemFontOfSize:14];
+    title.frame = CGRectMake(12,8,230,22);
+    [bar addSubview:title];
 
-    // ── Drag handle ──
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(handlePan:)];
-    [title addGestureRecognizer:pan];
-    title.userInteractionEnabled = YES;
+    [bar addGestureRecognizer:pan];
 
-    // ── Code row ──
-    UILabel *cl = [UILabel new];
-    cl.text = @"Code:";
-    cl.textColor = UIColor.lightGrayColor;
-    cl.font = [UIFont systemFontOfSize:13];
-    cl.frame = CGRectMake(12, 46, 46, 26);
-    [self addSubview:cl];
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.frame = CGRectMake(282,8,24,22);
+    [closeBtn setTitle:@"X" forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [closeBtn setTitleColor:COL_DIM forState:UIControlStateNormal];
+    [closeBtn addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:closeBtn];
 
-    _codeField = [[UITextField alloc] initWithFrame:CGRectMake(62, 46, 158, 26)];
+    // ── Section 1: GIFT ITEMS (top) ──
+    [self sectionLabel:@"Choose Item" y:46];
+
+    UILabel *hdr = [UILabel new];
+    hdr.text = @"Item ID                              Amount";
+    hdr.font = [UIFont systemFontOfSize:10];
+    hdr.textColor = COL_DIM;
+    hdr.frame = CGRectMake(12,61,292,13);
+    [self addSubview:hdr];
+
+    _scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8,76,300,190)];
+    _scroll.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1];
+    _scroll.layer.cornerRadius = 7;
+    _scroll.showsVerticalScrollIndicator = YES;
+    [self addSubview:_scroll];
+
+    _rowContainer = [[UIView alloc] initWithFrame:CGRectMake(2,2,288,0)];
+    [_scroll addSubview:_rowContainer];
+    [self addRow]; // first row
+
+    UIButton *addBtn = [self styledBtn:@"+ Add Item"
+                                 frame:CGRectMake(8,274,140,30)
+                                 color:COL_GREEN];
+    [addBtn addTarget:self action:@selector(onAddItem) forControlEvents:UIControlEventTouchUpInside];
+
+    // ── Divider ──
+    [self divider:312];
+
+    // ── Section 2: CODE ──
+    [self sectionLabel:@"Hook Code" y:318];
+
+    _codeField = [[UITextField alloc] initWithFrame:CGRectMake(12,334,174,28)];
     _codeField.borderStyle = UITextBorderStyleRoundedRect;
-    _codeField.placeholder = @"mochi{randomtext12}";
-    _codeField.font = [UIFont systemFontOfSize:12];
-    _codeField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1];
-    _codeField.textColor = UIColor.whiteColor;
+    _codeField.font = [UIFont fontWithName:@"Courier" size:12];
+    _codeField.backgroundColor = COL_FIELD;
+    _codeField.textColor = COL_MONO;
+    _codeField.attributedPlaceholder =
+        [[NSAttributedString alloc] initWithString:@"mochi{...}"
+             attributes:@{NSForegroundColorAttributeName:COL_DIM}];
     [self addSubview:_codeField];
 
-    _genBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _genBtn.frame = CGRectMake(226, 46, 82, 26);
-    [_genBtn setTitle:@"Generate" forState:UIControlStateNormal];
-    _genBtn.titleLabel.font = [UIFont systemFontOfSize:12];
-    [_genBtn setTitleColor:UIColor.systemPurpleColor forState:UIControlStateNormal];
-    _genBtn.layer.borderColor  = UIColor.systemPurpleColor.CGColor;
-    _genBtn.layer.borderWidth  = 1;
-    _genBtn.layer.cornerRadius = 6;
-    [_genBtn addTarget:self action:@selector(onGenerate) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:_genBtn];
+    UIButton *genBtn = [self styledBtn:@"Generate"
+                                 frame:CGRectMake(192,334,56,28)
+                                 color:COL_PURPLE];
+    [genBtn addTarget:self action:@selector(onGenerate) forControlEvents:UIControlEventTouchUpInside];
+    genBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
 
-    // ── Item list header ──
-    UILabel *ih = [UILabel new];
-    ih.text = @"Item ID           Amount";
-    ih.textColor = [UIColor colorWithWhite:0.6 alpha:1];
-    ih.font = [UIFont systemFontOfSize:11];
-    ih.frame = CGRectMake(12, 80, 296, 18);
-    [self addSubview:ih];
+    UIButton *copyBtn = [self styledBtn:@"Copy"
+                                  frame:CGRectMake(254,334,52,28)
+                                  color:COL_DIM];
+    [copyBtn addTarget:self action:@selector(onCopyCode) forControlEvents:UIControlEventTouchUpInside];
+    copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
 
-    // ── Item scroll ──
-    _itemScroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8, 100, 304, 230)];
-    _itemScroll.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
-    _itemScroll.layer.cornerRadius = 8;
-    [self addSubview:_itemScroll];
+    _urlLabel = [UILabel new];
+    _urlLabel.font = [UIFont fontWithName:@"Courier" size:8.5];
+    _urlLabel.textColor = [UIColor colorWithWhite:0.35 alpha:1];
+    _urlLabel.numberOfLines = 2;
+    _urlLabel.frame = CGRectMake(12,366,292,26);
+    [self addSubview:_urlLabel];
 
-    _itemStack = [UIStackView new];
-    _itemStack.axis = UILayoutConstraintAxisVertical;
-    _itemStack.spacing = 6;
-    _itemStack.frame = CGRectMake(0, 4, 304, 0);
-    [_itemScroll addSubview:_itemStack];
+    // ── Run / Stop ──
+    [self divider:398];
 
-    [self addItemRow]; // start with one row
-
-    // ── Add Item button ──
-    _addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _addBtn.frame = CGRectMake(8, 338, 140, 32);
-    [_addBtn setTitle:@"+ Add Item" forState:UIControlStateNormal];
-    [_addBtn setTitleColor:UIColor.systemGreenColor forState:UIControlStateNormal];
-    _addBtn.layer.borderColor  = UIColor.systemGreenColor.CGColor;
-    _addBtn.layer.borderWidth  = 1;
-    _addBtn.layer.cornerRadius = 8;
-    [_addBtn addTarget:self action:@selector(onAddItem) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:_addBtn];
-
-    // ── Run / Stop button ──
-    _runBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _runBtn.frame = CGRectMake(172, 338, 140, 32);
-    [_runBtn setTitle:@"▶  Run" forState:UIControlStateNormal];
-    [_runBtn setTitleColor:UIColor.systemGreenColor forState:UIControlStateNormal];
-    _runBtn.layer.borderColor  = UIColor.systemGreenColor.CGColor;
-    _runBtn.layer.borderWidth  = 1;
-    _runBtn.layer.cornerRadius = 8;
+    _runBtn = [self styledBtn:@"Run"
+                        frame:CGRectMake(8,406,300,34)
+                        color:COL_GREEN];
+    _runBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_runBtn addTarget:self action:@selector(onRunStop) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:_runBtn];
 
-    // ── Status label ──
+    // ── Status ──
     _statusLabel = [UILabel new];
     _statusLabel.text = @"Status: Idle";
-    _statusLabel.textColor = UIColor.lightGrayColor;
-    _statusLabel.font = [UIFont systemFontOfSize:12];
+    _statusLabel.font = [UIFont systemFontOfSize:11];
+    _statusLabel.textColor = COL_DIM;
     _statusLabel.textAlignment = NSTextAlignmentCenter;
-    _statusLabel.frame = CGRectMake(0, 380, 320, 22);
+    _statusLabel.frame = CGRectMake(0,448,316,20);
     [self addSubview:_statusLabel];
-
-    // ── URL preview ──
-    _codeLabel = [UILabel new];
-    _codeLabel.textColor = [UIColor colorWithWhite:0.5 alpha:1];
-    _codeLabel.font = [UIFont systemFontOfSize:9];
-    _codeLabel.textAlignment = NSTextAlignmentCenter;
-    _codeLabel.numberOfLines = 2;
-    _codeLabel.frame = CGRectMake(8, 406, 304, 40);
-    [self addSubview:_codeLabel];
-
-    // close button
-    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    close.frame = CGRectMake(290, 8, 24, 24);
-    [close setTitle:@"✕" forState:UIControlStateNormal];
-    [close setTitleColor:UIColor.grayColor forState:UIControlStateNormal];
-    [close addTarget:self action:@selector(onClose) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:close];
 
     return self;
 }
 
-// ── Add a new item row ──────────────────────────────────────────────────
-- (void)addItemRow {
-    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0,0,304,30)];
-
-    UITextField *idField = [[UITextField alloc] initWithFrame:CGRectMake(4,2,158,26)];
-    idField.placeholder = @"Item ID";
-    idField.borderStyle = UITextBorderStyleRoundedRect;
-    idField.font = [UIFont systemFontOfSize:12];
-    idField.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
-    idField.textColor = UIColor.whiteColor;
-    idField.tag = 1;
-    [row addSubview:idField];
-
-    UITextField *amtField = [[UITextField alloc] initWithFrame:CGRectMake(168,2,90,26)];
-    amtField.placeholder = @"Amount";
-    amtField.borderStyle = UITextBorderStyleRoundedRect;
-    amtField.font = [UIFont systemFontOfSize:12];
-    amtField.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
-    amtField.textColor = UIColor.whiteColor;
-    amtField.keyboardType = UIKeyboardTypeNumberPad;
-    amtField.tag = 2;
-    [row addSubview:amtField];
-
-    UIButton *del = [UIButton buttonWithType:UIButtonTypeSystem];
-    del.frame = CGRectMake(262,2,36,26);
-    [del setTitle:@"✕" forState:UIControlStateNormal];
-    [del setTitleColor:UIColor.systemRedColor forState:UIControlStateNormal];
-    [del addTarget:self action:@selector(onDeleteRow:) forControlEvents:UIControlEventTouchUpInside];
-    [row addSubview:del];
-
-    [_itemStack addArrangedSubview:row];
-    [_itemRows addObject:row];
-    [self relayout];
+// ── helpers ───────────────────────────────────────────────────────────────────
+- (UILabel *)sectionLabel:(NSString *)t y:(CGFloat)y {
+    UILabel *l = [UILabel new];
+    l.text = t;
+    l.font = [UIFont boldSystemFontOfSize:10];
+    l.textColor = COL_PURPLE;
+    l.frame = CGRectMake(12, y, 292, 14);
+    [self addSubview:l];
+    return l;
 }
 
-- (void)onDeleteRow:(UIButton *)btn {
-    UIView *row = btn.superview;
-    [_itemStack removeArrangedSubview:row];
-    [row removeFromSuperview];
-    [_itemRows removeObject:row];
-    [self relayout];
+- (UIButton *)styledBtn:(NSString *)title frame:(CGRect)f color:(UIColor *)c {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = f;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [b setTitleColor:c forState:UIControlStateNormal];
+    b.layer.borderColor  = c.CGColor;
+    b.layer.borderWidth  = 1.2;
+    b.layer.cornerRadius = 7;
+    [self addSubview:b];
+    return b;
 }
 
-- (void)relayout {
-    CGFloat h = (CGFloat)_itemRows.count * 36 + 8;
-    _itemStack.frame = CGRectMake(0, 4, 304, h);
-    _itemScroll.contentSize = CGSizeMake(304, h + 8);
+- (void)divider:(CGFloat)y {
+    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(12,y,292,1)];
+    d.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    [self addSubview:d];
 }
 
-// ── Generate code ───────────────────────────────────────────────────────
+- (void)addRow {
+    ItemRow *row = [ItemRow new];
+    row.frame = CGRectMake(0, (CGFloat)_rowContainer.subviews.count * 34 + 2, 288, 30);
+    [_rowContainer addSubview:row];
+    [self refreshScroll];
+}
+
+- (void)refreshScroll {
+    CGFloat h = MAX((CGFloat)_rowContainer.subviews.count * 34 + 4, 34);
+    _rowContainer.frame = CGRectMake(2,2,288,h);
+    _scroll.contentSize = CGSizeMake(288, h+4);
+}
+
+// ── actions ───────────────────────────────────────────────────────────────────
+- (void)onAddItem { [self addRow]; }
+
 - (void)onGenerate {
-    NSString *rnd  = randomString(12);
-    NSString *code = [NSString stringWithFormat:@"mochi{%@}", rnd];
+    // Collect items first
+    [gItems removeAllObjects];
+    BOOL hasItems = NO;
+    for (ItemRow *row in _rowContainer.subviews) {
+        if (![row isKindOfClass:[ItemRow class]]) continue;
+        NSString *iid = row.idField.text;
+        NSString *amt = row.amtField.text;
+        if (iid.length && amt.length) {
+            [gItems addObject:@{@"id":iid, @"amount":amt}];
+            hasItems = YES;
+        }
+    }
+    if (!hasItems) {
+        [self setStatus:@"Fill in at least one item first" color:COL_RED];
+        return;
+    }
+    NSString *code = [NSString stringWithFormat:@"mochi{%@}", randomAlpha(12)];
     _codeField.text = code;
     gMochiCode = code;
-    _codeLabel.text = buildTargetURL();
+    _urlLabel.text = targetURL();
+    [self setStatus:@"Code hooked — press Run to activate" color:COL_DIM];
 }
 
-// ── Run / Stop ──────────────────────────────────────────────────────────
+- (void)onCopyCode {
+    NSString *code = _codeField.text;
+    if (!code.length) {
+        [self setStatus:@"Nothing to copy" color:COL_RED];
+        return;
+    }
+    [UIPasteboard generalPasteboard].string = code;
+    [self setStatus:@"Code copied to clipboard" color:COL_GREEN];
+}
+
 - (void)onRunStop {
     if (gRunning) {
         gRunning = NO;
-        [_runBtn setTitle:@"▶  Run" forState:UIControlStateNormal];
-        [_runBtn setTitleColor:UIColor.systemGreenColor forState:UIControlStateNormal];
-        _runBtn.layer.borderColor = UIColor.systemGreenColor.CGColor;
-        _statusLabel.text = @"Status: Stopped";
+        [_runBtn setTitle:@"Run" forState:UIControlStateNormal];
+        [_runBtn setTitleColor:COL_GREEN forState:UIControlStateNormal];
+        _runBtn.layer.borderColor = COL_GREEN.CGColor;
+        [self setStatus:@"Status: Stopped" color:COL_DIM];
         return;
     }
 
-    // Collect code
+    // Validate items
+    [gItems removeAllObjects];
+    for (ItemRow *row in _rowContainer.subviews) {
+        if (![row isKindOfClass:[ItemRow class]]) continue;
+        NSString *iid = row.idField.text;
+        NSString *amt = row.amtField.text;
+        if (iid.length && amt.length)
+            [gItems addObject:@{@"id":iid, @"amount":amt}];
+    }
+    if (!gItems.count) {
+        [self setStatus:@"Add at least one item before running" color:COL_RED];
+        return;
+    }
+
+    // Validate code
     NSString *code = _codeField.text;
     if (!code.length) {
-        _statusLabel.text = @"⚠ Enter or generate a code first";
+        [self setStatus:@"Generate or enter a code first" color:COL_RED];
         return;
     }
     gMochiCode = code;
-
-    // Collect items
-    [gItems removeAllObjects];
-    for (UIView *row in _itemRows) {
-        UITextField *idF  = [row viewWithTag:1];
-        UITextField *amtF = [row viewWithTag:2];
-        NSString *itemId  = idF.text;
-        NSString *amount  = amtF.text;
-        if (itemId.length && amount.length)
-            [gItems addObject:@{@"id":itemId, @"amount":amount}];
-    }
+    _urlLabel.text = targetURL();
 
     gRunning = YES;
-    [_runBtn setTitle:@"⏹  Stop" forState:UIControlStateNormal];
-    [_runBtn setTitleColor:UIColor.systemRedColor forState:UIControlStateNormal];
-    _runBtn.layer.borderColor = UIColor.systemRedColor.CGColor;
-    _codeLabel.text = buildTargetURL();
-    _statusLabel.text = [NSString stringWithFormat:@"✅ Intercepting — %lu item(s)",
-                         (unsigned long)gItems.count];
+    [_runBtn setTitle:@"Stop" forState:UIControlStateNormal];
+    [_runBtn setTitleColor:COL_RED forState:UIControlStateNormal];
+    _runBtn.layer.borderColor = COL_RED.CGColor;
+    [self setStatus:[NSString stringWithFormat:@"Active — hooking %lu item(s)",
+                     (unsigned long)gItems.count]
+              color:COL_MONO];
 }
 
-- (void)onAddItem { [self addItemRow]; }
+- (void)setStatus:(NSString *)text color:(UIColor *)c {
+    _statusLabel.text  = text;
+    _statusLabel.textColor = c;
+}
 
-- (void)onClose   { [self removeFromSuperview]; }
-
-// ── Drag ───────────────────────────────────────────────────────────────
 - (void)handlePan:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.superview];
     self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
     [g setTranslation:CGPointZero inView:self.superview];
 }
 
+- (void)close {
+    self.hidden = YES;
+    gFabButton.hidden = NO;
+}
+
 @end
 
-// ─── Floating trigger button ───────────────────────────────────────────────
-static MochiMenuView *gMenu = nil;
+// ─── Overlay window ───────────────────────────────────────────────────────────
+static UIWindow      *gOverlayWindow = nil;
+static MochiMenuView *gMenuView      = nil;
 
-static void showMenu() {
-    UIWindow *win = [UIApplication sharedApplication].keyWindow;
-    if (gMenu && gMenu.superview) { [gMenu removeFromSuperview]; gMenu = nil; return; }
-    gMenu = [MochiMenuView new];
-    [win addSubview:gMenu];
+static void buildOverlay() {
+    gOverlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    gOverlayWindow.windowLevel = UIWindowLevelAlert + 200;
+    gOverlayWindow.backgroundColor = UIColor.clearColor;
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = UIColor.clearColor;
+    gOverlayWindow.rootViewController = vc;
+    [gOverlayWindow makeKeyAndVisible];
+
+    // ── Menu ──
+    gMenuView = [MochiMenuView new];
+    [vc.view addSubview:gMenuView];
+
+    // ── FAB toggle button (shown when menu is closed) ──
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    gFabButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    gFabButton.frame = CGRectMake(sw - 78, 110, 68, 28);
+    gFabButton.backgroundColor = [UIColor colorWithRed:0.11 green:0.07 blue:0.20 alpha:0.92];
+    gFabButton.layer.cornerRadius = 8;
+    gFabButton.layer.borderColor  = COL_PURPLE.CGColor;
+    gFabButton.layer.borderWidth  = 1.2;
+    [gFabButton setTitle:@"Mochi" forState:UIControlStateNormal];
+    gFabButton.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [gFabButton setTitleColor:COL_PURPLE forState:UIControlStateNormal];
+    gFabButton.hidden = YES; // hidden while menu is visible
+    [gFabButton addTarget:[UIApplication sharedApplication]
+                   action:@selector(mochiShow)
+         forControlEvents:UIControlEventTouchUpInside];
+    [vc.view addSubview:gFabButton];
 }
 
-%hook UIApplication
+// ─── UIApplication category for FAB tap ──────────────────────────────────────
+@interface UIApplication (Mochi)
+- (void)mochiShow;
+@end
+@implementation UIApplication (Mochi)
+- (void)mochiShow {
+    gMenuView.hidden  = NO;
+    gFabButton.hidden = YES;
+}
+@end
 
-- (void)applicationDidBecomeActive:(UIApplication *)app {
-    %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+// ─── Constructor ──────────────────────────────────────────────────────────────
+__attribute__((constructor))
+static void mochiInit() {
+    installSwizzle();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        UIWindow *win = app.keyWindow;
-        // Floating pill button
-        UIButton *fab = [UIButton buttonWithType:UIButtonTypeSystem];
-        fab.frame = CGRectMake(win.bounds.size.width - 66, 120, 58, 28);
-        fab.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
-        fab.layer.cornerRadius = 14;
-        fab.layer.borderColor  = UIColor.systemPurpleColor.CGColor;
-        fab.layer.borderWidth  = 1.2;
-        [fab setTitle:@"🍡" forState:UIControlStateNormal];
-        fab.titleLabel.font = [UIFont systemFontOfSize:18];
-        [fab addTarget:[UIApplication sharedApplication]
-                action:@selector(mochiToggle)
-      forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:fab];
+        buildOverlay();
     });
 }
-
-%new
-- (void)mochiToggle { showMenu(); }
-
-%end
