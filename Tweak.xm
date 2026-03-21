@@ -69,7 +69,7 @@ static void applyAccount(NSDictionary *acc) {
     // ── 1. Read template plist txt (never written to) ──────────────────────
     NSString *txtPath = [[NSHomeDirectory()
         stringByAppendingPathComponent:@"Library/Preferences"]
-        stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
+        stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.ios.vn.txt"];
 
     NSError  *readErr  = nil;
     NSString *xmlSrc   = [NSString stringWithContentsOfFile:txtPath
