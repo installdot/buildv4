@@ -1,8 +1,9 @@
-// DebugMenu.xm - Fixed Full Code
+// DebugMenu.xm - thêm dòng này vào đầu file
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-
+#import <objc/runtime.h>   // ← Fix lỗi objc_msgSend
+#import <objc/message.h>   // ← Fix lỗi objc_msgSend
 // ===================== Persistent Settings =====================
 
 static NSString * const kDebugPrefsPath =
