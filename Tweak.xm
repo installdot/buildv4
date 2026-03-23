@@ -1,27 +1,66 @@
 // Tweak.xm - Unitoreios Offline Cache Session Tester
-// Debug tool - chủ sở hữu sử dụng
+// Fix: dùng ObjC runtime, không forward-declare Unitoreios class
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
-@interface Unitoreios : NSObject
-@property (nonatomic, assign) NSInteger remainingSeconds;
-+ (NSString *)getRemainingTime;
-+ (NSString *)getCurrentKey;
-@end
+// ─── Runtime helpers (tránh linker tìm _OBJC_CLASS_$_Unitoreios) ──
+static Class UnitoreiosClass(void) {
+    return objc_getClass("Unitoreios");
+}
+
+static NSInteger getRemainingSecondsFromInstance(id inst) {
+    if (!inst) return 0;
+    Ivar ivar = class_getInstanceVariable(object_getClass(inst), "remainingSeconds");
+    if (!ivar) {
+        // Thử tên private _remainingSeconds
+        ivar = class_getInstanceVariable(object_getClass(inst), "_remainingSeconds");
+    }
+    if (!ivar) return 0;
+    // NSInteger là primitive, dùng ivar_getOffset
+    NSInteger *ptr = (NSInteger *)((uint8_t *)(__bridge void *)inst + ivar_getOffset(ivar));
+    return *ptr;
+}
+
+static void setRemainingSecondsOnInstance(id inst, NSInteger val) {
+    if (!inst) return;
+    Ivar ivar = class_getInstanceVariable(object_getClass(inst), "remainingSeconds");
+    if (!ivar) ivar = class_getInstanceVariable(object_getClass(inst), "_remainingSeconds");
+    if (!ivar) return;
+    NSInteger *ptr = (NSInteger *)((uint8_t *)(__bridge void *)inst + ivar_getOffset(ivar));
+    *ptr = val;
+}
+
+static NSString *callClassStringMethod(NSString *selName) {
+    Class cls = UnitoreiosClass();
+    if (!cls) return @"(class not found)";
+    SEL sel = NSSelectorFromString(selName);
+    if (![cls respondsToSelector:sel]) return @"(method not found)";
+    return ((NSString *(*)(id, SEL))objc_msgSend)(cls, sel);
+}
+
+// ─── Key để lưu singleton instance ───────────────────────────────
+static const void *kExtraInfoKey = &kExtraInfoKey;
+
+static id getExtraInfoInstance(void) {
+    return objc_getAssociatedObject(UnitoreiosClass(), kExtraInfoKey);
+}
+
+static void setExtraInfoInstance(id inst) {
+    objc_setAssociatedObject(UnitoreiosClass(), kExtraInfoKey,
+                             inst, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 
 // ─── Debug Menu ───────────────────────────────────────────────────
 @interface UnitoreiosDebugMenu : NSObject
 + (instancetype)sharedMenu;
-- (void)show;
-- (void)hide;
 - (void)toggle;
 @end
 
 @implementation UnitoreiosDebugMenu {
     UIWindow    *_menuWindow;
-    UIView      *_overlay;
     UIView      *_panel;
     UILabel     *_statusLabel;
     UITextField *_inputField;
@@ -35,205 +74,157 @@
     return s;
 }
 
-- (Unitoreios *)extraInfoInstance {
-    return objc_getAssociatedObject([Unitoreios class], "extraInfo_debug_ptr");
-}
-
-- (NSInteger)currentRemaining {
-    Unitoreios *inst = [self extraInfoInstance];
-    return inst ? inst.remainingSeconds : 0;
-}
-
-- (void)setRemaining:(NSInteger)seconds {
-    Unitoreios *inst = [self extraInfoInstance];
-    if (inst) inst.remainingSeconds = seconds;
-}
-
 - (void)refreshStatus {
-    NSString *key     = [Unitoreios getCurrentKey]    ?: @"(chưa có)";
-    NSString *timeStr = [Unitoreios getRemainingTime] ?: @"(chưa có)";
-    NSInteger rawSec  = [self currentRemaining];
+    id inst        = getExtraInfoInstance();
+    NSInteger raw  = getRemainingSecondsFromInstance(inst);
+    NSString *key  = callClassStringMethod(@"getCurrentKey");
+    NSString *time = callClassStringMethod(@"getRemainingTime");
+
     _statusLabel.text = [NSString stringWithFormat:
-        @"🔑 Key: %@\n⏱ Còn lại: %@\n📦 Raw seconds: %ld",
-        key, timeStr, (long)rawSec];
+        @"🔑 Key: %@\n⏱ Còn lại: %@\n📦 Raw seconds: %ld\n%@",
+        key ?: @"(none)",
+        time ?: @"(none)",
+        (long)raw,
+        inst ? @"✅ Instance found" : @"⚠️ Instance chưa được cache (cần mở app trước)"];
 }
 
 - (void)buildWindowIfNeeded {
     if (_menuWindow) return;
 
-    CGRect screen = [UIScreen mainScreen].bounds;
+    CGRect  screen = [UIScreen mainScreen].bounds;
+    CGFloat pw = 310, ph = 320;
 
-    // Overlay mờ phía sau
     _menuWindow = [[UIWindow alloc] initWithFrame:screen];
-    _menuWindow.windowLevel = UIWindowLevelAlert + 100;
-    _menuWindow.backgroundColor = [UIColor clearColor];
+    _menuWindow.windowLevel       = UIWindowLevelAlert + 100;
+    _menuWindow.backgroundColor   = [UIColor clearColor];
+    _menuWindow.userInteractionEnabled = YES;
 
-    _overlay = [[UIView alloc] initWithFrame:screen];
-    _overlay.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
-    UITapGestureRecognizer *tapDismiss = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(hide)];
-    [_overlay addGestureRecognizer:tapDismiss];
-    [_menuWindow addSubview:_overlay];
+    // Tap ngoài để đóng
+    UIControl *bg = [[UIControl alloc] initWithFrame:screen];
+    bg.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
+    [bg addTarget:self action:@selector(hide)
+ forControlEvents:UIControlEventTouchUpInside];
+    [_menuWindow addSubview:bg];
 
-    // Panel
-    CGFloat pw = 318, ph = 340;
     _panel = [[UIView alloc] initWithFrame:CGRectMake(
         (screen.size.width  - pw) / 2,
         (screen.size.height - ph) / 2,
         pw, ph)];
-    _panel.backgroundColor    = [UIColor colorWithWhite:0.09 alpha:0.97];
-    _panel.layer.cornerRadius = 22;
-    _panel.layer.borderWidth  = 1;
-    _panel.layer.borderColor  = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.5].CGColor;
-    _panel.layer.shadowColor  = UIColor.blackColor.CGColor;
-    _panel.layer.shadowOpacity = 0.4;
-    _panel.layer.shadowRadius  = 20;
-    _panel.layer.shadowOffset  = CGSizeMake(0, 8);
-    // Chặn tap xuyên qua panel xuống overlay
-    UITapGestureRecognizer *tapBlock = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(noop)];
-    [_panel addGestureRecognizer:tapBlock];
+    _panel.backgroundColor    = [UIColor colorWithWhite:0.10 alpha:0.97];
+    _panel.layer.cornerRadius  = 20;
+    _panel.layer.borderWidth   = 1;
+    _panel.layer.borderColor   = [UIColor colorWithRed:0.10 green:0.78
+                                                  blue:0.55 alpha:0.5].CGColor;
+    _panel.userInteractionEnabled = YES;
     [_menuWindow addSubview:_panel];
 
-    CGFloat y = 0;
-
-    // ── Header bar ──────────────────────────────────────────────
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, 48)];
-    header.backgroundColor = [UIColor colorWithRed:0.08 green:0.68 blue:0.46 alpha:0.18];
-    header.layer.cornerRadius = 22;
-    // chỉ bo góc trên
-    CAShapeLayer *headerMask = [CAShapeLayer layer];
-    UIBezierPath *hp = [UIBezierPath bezierPathWithRoundedRect:header.bounds
-        byRoundingCorners:UIRectCornerTopLeft|UIRectCornerTopRight
-              cornerRadii:CGSizeMake(22,22)];
-    headerMask.path = hp.CGPath;
-    header.layer.mask = headerMask;
-    [_panel addSubview:header];
-
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, pw - 50, 48)];
-    title.text          = @"🛠  Cache Session Debug";
+    // Title
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 14, pw, 26)];
+    title.text          = @"🛠 Cache Session Debug";
     title.textAlignment = NSTextAlignmentCenter;
     title.font          = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
     title.textColor     = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1];
-    title.frame = CGRectMake(25, 0, pw - 50, 48);
-    [header addSubview:title];
+    [_panel addSubview:title];
 
-    // ── Nút X đóng góc trên phải ────────────────────────────────
-    UIButton *xBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    xBtn.frame = CGRectMake(pw - 42, 8, 34, 34);
-    [xBtn setTitle:@"✕" forState:UIControlStateNormal];
-    xBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    [xBtn setTitleColor:[UIColor colorWithWhite:0.55 alpha:1] forState:UIControlStateNormal];
-    [xBtn setTitleColor:[UIColor colorWithWhite:0.85 alpha:1] forState:UIControlStateHighlighted];
-    xBtn.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1];
-    xBtn.layer.cornerRadius = 17;
-    [xBtn addTarget:self action:@selector(hide) forControlEvents:UIControlEventTouchUpInside];
-    [header addSubview:xBtn];
+    // Divider
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(14, 44, pw-28, 0.5)];
+    div.backgroundColor = [UIColor colorWithWhite:0.3 alpha:0.6];
+    [_panel addSubview:div];
 
-    y = 56;
-
-    // ── Status box ──────────────────────────────────────────────
-    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, y, pw - 28, 88)];
-    _statusLabel.numberOfLines  = 4;
-    _statusLabel.font           = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-    _statusLabel.textColor      = [UIColor colorWithWhite:0.85 alpha:1];
-    _statusLabel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.85];
-    _statusLabel.layer.cornerRadius = 10;
-    _statusLabel.clipsToBounds  = YES;
-    // padding dùng inset layer
-    _statusLabel.layer.borderWidth = 0.5;
-    _statusLabel.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1].CGColor;
+    // Status box
+    _statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 52, pw-28, 100)];
+    _statusLabel.numberOfLines    = 5;
+    _statusLabel.font             = [UIFont monospacedSystemFontOfSize:11
+                                                               weight:UIFontWeightRegular];
+    _statusLabel.textColor        = [UIColor colorWithWhite:0.85 alpha:1];
+    _statusLabel.backgroundColor  = [UIColor colorWithWhite:0.06 alpha:0.8];
+    _statusLabel.layer.cornerRadius = 8;
+    _statusLabel.clipsToBounds    = YES;
+    // padding bằng inset trick
+    _statusLabel.text = @"";
     [_panel addSubview:_statusLabel];
-    y += 96;
 
-    // ── Hint ────────────────────────────────────────────────────
-    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(14, y, pw - 28, 16)];
-    hint.text      = @"Nhập số giây muốn set  (86400 = 1 ngày)";
+    // Hint
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(14, 160, pw-28, 16)];
+    hint.text      = @"Nhập số giây muốn set (86400 = 1 ngày)";
     hint.font      = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
     hint.textColor = [UIColor colorWithWhite:0.50 alpha:1];
     [_panel addSubview:hint];
-    y += 22;
 
-    // ── Input ───────────────────────────────────────────────────
-    _inputField = [[UITextField alloc] initWithFrame:CGRectMake(14, y, pw - 28, 42)];
-    _inputField.placeholder         = @"Số giây  (vd: 86400)";
+    // Input
+    _inputField = [[UITextField alloc] initWithFrame:CGRectMake(14, 180, pw-28, 42)];
+    _inputField.placeholder         = @"vd: 86400";
     _inputField.keyboardType        = UIKeyboardTypeNumberPad;
     _inputField.textAlignment       = NSTextAlignmentCenter;
-    _inputField.backgroundColor     = UIColor.whiteColor;
-    _inputField.layer.cornerRadius  = 11;
+    _inputField.backgroundColor     = [UIColor colorWithWhite:1.0 alpha:0.96];
+    _inputField.layer.cornerRadius  = 10;
     _inputField.layer.masksToBounds = YES;
     _inputField.font                = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     _inputField.clearButtonMode     = UITextFieldViewModeWhileEditing;
-    _inputField.tintColor           = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1];
     [_panel addSubview:_inputField];
-    y += 50;
 
-    // ── Nút Save + Refresh ──────────────────────────────────────
-    CGFloat bw = (pw - 42) / 2;
-
+    // Row buttons
+    CGFloat bw = (pw - 42) / 2.0;
     UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    saveBtn.frame = CGRectMake(14, y, bw, 44);
-    saveBtn.backgroundColor   = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1];
-    saveBtn.layer.cornerRadius = 12;
-    [saveBtn setTitle:@"💾  Lưu" forState:UIControlStateNormal];
+    saveBtn.frame = CGRectMake(14, 232, bw, 44);
+    saveBtn.backgroundColor     = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:1];
+    saveBtn.layer.cornerRadius  = 12;
+    [saveBtn setTitle:@"💾 Lưu" forState:UIControlStateNormal];
     saveBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
-    [saveBtn addTarget:self action:@selector(onSave) forControlEvents:UIControlEventTouchUpInside];
+    [saveBtn addTarget:self action:@selector(onSave)
+      forControlEvents:UIControlEventTouchUpInside];
     [_panel addSubview:saveBtn];
 
     UIButton *refreshBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    refreshBtn.frame = CGRectMake(14 + bw + 14, y, bw, 44);
-    refreshBtn.backgroundColor   = [UIColor colorWithRed:0.22 green:0.42 blue:0.85 alpha:1];
-    refreshBtn.layer.cornerRadius = 12;
-    [refreshBtn setTitle:@"🔄  Refresh" forState:UIControlStateNormal];
+    refreshBtn.frame = CGRectMake(14 + bw + 14, 232, bw, 44);
+    refreshBtn.backgroundColor     = [UIColor colorWithRed:0.20 green:0.45 blue:0.85 alpha:1];
+    refreshBtn.layer.cornerRadius  = 12;
+    [refreshBtn setTitle:@"🔄 Refresh" forState:UIControlStateNormal];
     refreshBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
-    [refreshBtn addTarget:self action:@selector(onRefresh) forControlEvents:UIControlEventTouchUpInside];
+    [refreshBtn addTarget:self action:@selector(onRefresh)
+         forControlEvents:UIControlEventTouchUpInside];
     [_panel addSubview:refreshBtn];
-    y += 52;
 
-    // ── Nút Hide (ẩn menu, float button vẫn còn) ────────────────
-    UIButton *hideBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    hideBtn.frame = CGRectMake(14, y, pw - 28, 36);
-    hideBtn.backgroundColor   = [UIColor colorWithWhite:0.18 alpha:1];
-    hideBtn.layer.cornerRadius = 12;
-    [hideBtn setTitle:@"👁  Ẩn menu  (nút 🛠 vẫn còn)" forState:UIControlStateNormal];
-    [hideBtn setTitleColor:[UIColor colorWithWhite:0.60 alpha:1] forState:UIControlStateNormal];
-    hideBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    [hideBtn addTarget:self action:@selector(hide) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:hideBtn];
+    // Close
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    closeBtn.frame = CGRectMake(14, 284, pw-28, 28);
+    [closeBtn setTitle:@"✕ Đóng" forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    [closeBtn setTitleColor:[UIColor colorWithWhite:0.40 alpha:1]
+                  forState:UIControlStateNormal];
+    [closeBtn addTarget:self action:@selector(hide)
+       forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:closeBtn];
 }
-
-- (void)noop {}
 
 - (void)onSave {
     [_inputField resignFirstResponder];
-    NSString *text = [_inputField.text stringByTrimmingCharactersInSet:
-                      NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *text = [_inputField.text
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!text.length) return;
     NSInteger newSec = [text integerValue];
-    if (newSec <= 0) { [self toast:@"⚠️ Giá trị không hợp lệ"]; return; }
-    [self setRemaining:newSec];
+    if (newSec <= 0) { [self toast:@"⚠️ Giá trị phải > 0"]; return; }
+
+    id inst = getExtraInfoInstance();
+    if (!inst) { [self toast:@"⚠️ Chưa capture instance"]; return; }
+
+    setRemainingSecondsOnInstance(inst, newSec);
     [self refreshStatus];
-    [self toast:[NSString stringWithFormat:@"✅ Đã set %ld giây", (long)newSec]];
+    [self toast:[NSString stringWithFormat:@"✅ Set %ld giây", (long)newSec]];
 }
 
-- (void)onRefresh {
-    [self refreshStatus];
-    [self toast:@"🔄 Đã refresh"];
-}
+- (void)onRefresh { [self refreshStatus]; [self toast:@"🔄 Refreshed"]; }
 
 - (void)toast:(NSString *)msg {
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectZero];
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(20, 0, _panel.bounds.size.width - 40, 34)];
+    t.center          = CGPointMake(_panel.bounds.size.width/2, _panel.bounds.size.height - 20);
     t.text            = msg;
     t.textAlignment   = NSTextAlignmentCenter;
-    t.font            = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    t.font            = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     t.textColor       = UIColor.whiteColor;
-    t.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.95];
+    t.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.95];
     t.layer.cornerRadius = 10;
     t.clipsToBounds   = YES;
-    [t sizeToFit];
-    CGFloat tw = t.frame.size.width + 28;
-    t.frame = CGRectMake((_panel.bounds.size.width - tw) / 2,
-                         _panel.bounds.size.height - 48, tw, 32);
     t.alpha = 0;
     [_panel addSubview:t];
     [UIView animateWithDuration:0.2 animations:^{ t.alpha = 1; } completion:^(BOOL f){
@@ -251,15 +242,13 @@
     _visible = YES;
     _menuWindow.hidden = NO;
     [_menuWindow makeKeyAndVisible];
-    _panel.transform = CGAffineTransformMakeScale(0.88, 0.88);
+    _panel.transform = CGAffineTransformMakeScale(0.85, 0.85);
     _panel.alpha = 0;
-    _overlay.alpha = 0;
     [UIView animateWithDuration:0.28 delay:0
-         usingSpringWithDamping:0.72 initialSpringVelocity:0.5
+         usingSpringWithDamping:0.7 initialSpringVelocity:0.5
                         options:0 animations:^{
         self->_panel.transform = CGAffineTransformIdentity;
         self->_panel.alpha = 1;
-        self->_overlay.alpha = 1;
     } completion:nil];
 }
 
@@ -268,7 +257,6 @@
     [UIView animateWithDuration:0.2 animations:^{
         self->_panel.transform = CGAffineTransformMakeScale(0.88, 0.88);
         self->_panel.alpha = 0;
-        self->_overlay.alpha = 0;
     } completion:^(BOOL f){
         self->_menuWindow.hidden = YES;
         self->_visible = NO;
@@ -279,83 +267,82 @@
 
 @end
 
-// ─── Floating Button ──────────────────────────────────────────────
-@interface UnitoreiosFloatBtn : NSObject
-+ (void)install;
-@end
+// ─── Floating drag button ─────────────────────────────────────────
+static UIWindow *sFloatWin = nil;
 
-@implementation UnitoreiosFloatBtn
-
-+ (void)install {
+static void installFloatButton(void) {
     CGRect screen = [UIScreen mainScreen].bounds;
-    UIWindow *win  = [[UIWindow alloc] initWithFrame:
-        CGRectMake(screen.size.width - 62, screen.size.height * 0.38, 50, 50)];
-    win.windowLevel           = UIWindowLevelAlert + 50;
-    win.backgroundColor       = UIColor.clearColor;
-    win.hidden                = NO;
-    win.userInteractionEnabled = YES;
+    sFloatWin = [[UIWindow alloc] initWithFrame:CGRectMake(
+        screen.size.width - 62, screen.size.height * 0.38, 50, 50)];
+    sFloatWin.windowLevel          = UIWindowLevelAlert + 50;
+    sFloatWin.backgroundColor      = [UIColor clearColor];
+    sFloatWin.hidden               = NO;
+    sFloatWin.userInteractionEnabled = YES;
 
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
     btn.frame = CGRectMake(0, 0, 50, 50);
+    btn.tag   = 9981;
     [btn setTitle:@"🛠" forState:UIControlStateNormal];
-    btn.titleLabel.font      = [UIFont systemFontOfSize:22];
-    btn.backgroundColor      = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.92];
-    btn.layer.cornerRadius   = 25;
-    btn.layer.shadowColor    = UIColor.blackColor.CGColor;
-    btn.layer.shadowOpacity  = 0.35;
-    btn.layer.shadowRadius   = 8;
-    btn.layer.shadowOffset   = CGSizeMake(0, 4);
+    btn.backgroundColor    = [UIColor colorWithRed:0.10 green:0.78 blue:0.55 alpha:0.90];
+    btn.layer.cornerRadius = 25;
+    btn.layer.shadowColor  = UIColor.blackColor.CGColor;
+    btn.layer.shadowOpacity = 0.30;
+    btn.layer.shadowRadius  = 6;
+    btn.layer.shadowOffset  = CGSizeMake(0, 3);
+    btn.titleLabel.font    = [UIFont systemFontOfSize:20];
 
-    [btn addTarget:self action:@selector(onTap)
-          forControlEvents:UIControlEventTouchUpInside];
+    [btn addTarget:[UnitoreiosDebugMenu sharedMenu]
+            action:@selector(toggle)
+  forControlEvents:UIControlEventTouchUpInside];
 
+    // Drag
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-        initWithTarget:self action:@selector(onPan:)];
+        initWithTarget:btn action:@selector(handlePan:)];
     [btn addGestureRecognizer:pan];
-    [win addSubview:btn];
 
-    objc_setAssociatedObject([UnitoreiosFloatBtn class], "fw", win,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [win makeKeyAndVisible];
-    win.hidden = NO;
+    [sFloatWin addSubview:btn];
+    [sFloatWin makeKeyAndVisible];
+    sFloatWin.hidden = NO;
 }
 
-+ (void)onTap {
-    [[UnitoreiosDebugMenu sharedMenu] toggle];
+// Category trên UIButton để handle pan mà không cần class riêng
+@interface UIButton (UnitoreiosPan)
+- (void)handlePan:(UIPanGestureRecognizer *)pan;
+@end
+@implementation UIButton (UnitoreiosPan)
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    if (!sFloatWin) return;
+    CGPoint delta = [pan translationInView:sFloatWin];
+    CGRect  frame = sFloatWin.frame;
+    frame.origin.x += delta.x;
+    frame.origin.y += delta.y;
+    CGRect screen  = [UIScreen mainScreen].bounds;
+    frame.origin.x = MAX(0, MIN(frame.origin.x, screen.size.width  - frame.size.width));
+    frame.origin.y = MAX(20, MIN(frame.origin.y, screen.size.height - frame.size.height - 20));
+    sFloatWin.frame = frame;
+    [pan setTranslation:CGPointZero inView:sFloatWin];
 }
-
-+ (void)onPan:(UIPanGestureRecognizer *)pan {
-    UIWindow *win = objc_getAssociatedObject([UnitoreiosFloatBtn class], "fw");
-    if (!win) return;
-    CGPoint d = [pan translationInView:win];
-    CGRect  f = win.frame;
-    f.origin.x += d.x;
-    f.origin.y += d.y;
-    CGRect sc = [UIScreen mainScreen].bounds;
-    f.origin.x = MAX(0, MIN(f.origin.x, sc.size.width  - f.size.width));
-    f.origin.y = MAX(24, MIN(f.origin.y, sc.size.height - f.size.height - 24));
-    win.frame = f;
-    [pan setTranslation:CGPointZero inView:win];
-}
-
 @end
 
-// ─── Hook: bắt singleton extraInfo ───────────────────────────────
-%hook Unitoreios
+// ─── Hook: bắt singleton extraInfo khi -canUseCachedSession được gọi ──
+// Vì extraInfo là static local trong Unitoreios.mm, cách duy nhất không cần
+// re-export symbol là hook một instance method để lấy `self`.
+%hook NSObject
 
 - (BOOL)canUseCachedSession {
-    objc_setAssociatedObject([Unitoreios class], "extraInfo_debug_ptr",
-                             self, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Chỉ capture nếu đúng class Unitoreios
+    if (object_getClass(self) == objc_getClass("Unitoreios")) {
+        setExtraInfoInstance(self);
+    }
     return %orig;
 }
 
 %end
 
-// ─── Constructor - priority cao ───────────────────────────────────
-// __attribute__((constructor(101))) = load rất sớm sau dyld
-static void __attribute__((constructor(101))) UnitoreiosDebugInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+// ─── Constructor ──────────────────────────────────────────────────
+%ctor {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [UnitoreiosFloatBtn install];
+        installFloatButton();
     });
 }
