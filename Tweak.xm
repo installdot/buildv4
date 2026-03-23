@@ -4,12 +4,13 @@
 static NSMutableArray *logs;
 
 // ─────────────────────────────────────────
-// Logger helper
+// Logger
 // ─────────────────────────────────────────
 static void AddLog(NSString *log) {
     if (!logs) logs = [NSMutableArray new];
 
-    NSString *entry = [NSString stringWithFormat:@"\n====================\n%@\n====================\n", log];
+    NSString *entry = [NSString stringWithFormat:
+                       @"\n====================\n%@\n====================\n", log];
     [logs addObject:entry];
     NSLog(@"%@", entry);
 }
@@ -21,7 +22,7 @@ static NSString *DataToString(NSData *data) {
 }
 
 // ─────────────────────────────────────────
-// Copy logs to clipboard
+// Copy to clipboard
 // ─────────────────────────────────────────
 static void CopyLogsToClipboard() {
     NSString *all = [logs componentsJoinedByString:@"\n"];
@@ -31,21 +32,23 @@ static void CopyLogsToClipboard() {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"Export"
-                             message:@"Logs copied to clipboard"
-                      preferredStyle:UIAlertControllerStyleAlert];
+                                    alertControllerWithTitle:@"Export"
+                                    message:@"Logs copied to clipboard"
+                                    preferredStyle:UIAlertControllerStyleAlert];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"OK"
                                                   style:UIAlertActionStyleDefault
                                                 handler:nil]];
 
         UIWindow *keyWindow = [UIApplication sharedApplication].windows.firstObject;
-        [keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+        if (keyWindow.rootViewController) {
+            [keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+        }
     });
 }
 
 // ─────────────────────────────────────────
-// Floating button class
+// Floating button
 // ─────────────────────────────────────────
 @interface FloatingButton : UIButton
 @end
@@ -93,7 +96,7 @@ static void AddFloatingButton() {
 }
 
 // ─────────────────────────────────────────
-// NSURLSession Hook
+// Hook NSURLSession
 // ─────────────────────────────────────────
 %hook NSURLSession
 
@@ -101,12 +104,11 @@ static void AddFloatingButton() {
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 
     NSString *reqLog = [NSString stringWithFormat:
-        @"[REQUEST]\nURL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
-        request.URL.absoluteString,
-        request.HTTPMethod,
-        request.allHTTPHeaderFields,
-        DataToString(request.HTTPBody)
-    ];
+                        @"[REQUEST]\nURL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
+                        request.URL.absoluteString,
+                        request.HTTPMethod,
+                        request.allHTTPHeaderFields,
+                        DataToString(request.HTTPBody)];
 
     AddLog(reqLog);
 
@@ -115,12 +117,11 @@ static void AddFloatingButton() {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
 
         NSString *respLog = [NSString stringWithFormat:
-            @"[RESPONSE]\nURL: %@\nStatus: %ld\nHeaders: %@\nBody: %@",
-            request.URL.absoluteString,
-            (long)http.statusCode,
-            http.allHeaderFields,
-            DataToString(data)
-        ];
+                             @"[RESPONSE]\nURL: %@\nStatus: %ld\nHeaders: %@\nBody: %@",
+                             request.URL.absoluteString,
+                             (long)http.statusCode,
+                             http.allHeaderFields,
+                             DataToString(data)];
 
         AddLog(respLog);
 
@@ -133,22 +134,20 @@ static void AddFloatingButton() {
 %end
 
 // ─────────────────────────────────────────
-// Inject button on app launch
+// Add floating button on app launch
 // ─────────────────────────────────────────
 %hook UIApplication
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     BOOL result = %orig(application, launchOptions);
-
     AddFloatingButton();
-
     return result;
 }
 
 %end
 
 // ─────────────────────────────────────────
-// Fallback constructor
+// Constructor fallback
 // ─────────────────────────────────────────
 __attribute__((constructor(101))) static void init_hook(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
