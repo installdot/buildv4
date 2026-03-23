@@ -44,10 +44,10 @@ static NSString *const kTargetPath = @"/api.php";
         @"message": @"License validated successfully",
         @"data": @{
             @"subscription_type": @"daily",
-            @"expiry_date": @"2027-03-24 17:41:33",
-            @"remaining_days": @365,
-            @"remaining_hours": @0,
-            @"activated_at": @"2026-03-23 17:41:33",
+            @"expiry_date": @"2027-03-24 19:25:33",
+            @"remaining_days": @0,
+            @"remaining_hours": @23,
+            @"activated_at": @"2026-03-23 19:25:33",
             @"is_trial": @NO,
             @"is_pro": @1
         }
