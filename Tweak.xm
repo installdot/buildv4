@@ -69,14 +69,35 @@ static void CopyLogsToClipboard() {
 @end
 
 // ─────────────────────────────────────────
+// Overlay window (always on top)
+// ─────────────────────────────────────────
+@interface PassthroughViewController : UIViewController
+@end
+
+@implementation PassthroughViewController
+// Let touches outside the button fall through to the app beneath
+- (UIView *)viewForBaselineLayout { return self.view; }
+@end
+
+static UIWindow *overlayWindow = nil;
+
+// ─────────────────────────────────────────
 // Add floating button
 // ─────────────────────────────────────────
 static void AddFloatingButton() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = [UIApplication sharedApplication].windows.firstObject;
-        if (!window) return;
+        if (overlayWindow) return;
 
-        if ([window viewWithTag:9999]) return;
+        // Dedicated window so the app can never draw over the button
+        overlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        overlayWindow.windowLevel = UIWindowLevelAlert + 100;
+        overlayWindow.backgroundColor = [UIColor clearColor];
+        overlayWindow.userInteractionEnabled = YES;
+        overlayWindow.hidden = NO;
+
+        PassthroughViewController *vc = [PassthroughViewController new];
+        vc.view.backgroundColor = [UIColor clearColor];
+        overlayWindow.rootViewController = vc;
 
         FloatingButton *btn = [FloatingButton buttonWithType:UIButtonTypeSystem];
         btn.frame = CGRectMake(40, 200, 120, 50);
@@ -91,7 +112,7 @@ static void AddFloatingButton() {
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:btn action:@selector(handlePan:)];
         [btn addGestureRecognizer:pan];
 
-        [window addSubview:btn];
+        [vc.view addSubview:btn];
     });
 }
 
