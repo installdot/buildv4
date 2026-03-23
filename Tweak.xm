@@ -112,23 +112,27 @@ static void AddFloatingButton() {
 
     AddLog(reqLog);
 
-    return %orig(request, ^(NSData *data, NSURLResponse *response, NSError *error) {
+    // Block must be declared as a variable — Logos cannot parse a literal block inside %orig(...)
+    void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) =
+        ^(NSData *data, NSURLResponse *response, NSError *error) {
 
-        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+            NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
 
-        NSString *respLog = [NSString stringWithFormat:
-                             @"[RESPONSE]\nURL: %@\nStatus: %ld\nHeaders: %@\nBody: %@",
-                             request.URL.absoluteString,
-                             (long)http.statusCode,
-                             http.allHeaderFields,
-                             DataToString(data)];
+            NSString *respLog = [NSString stringWithFormat:
+                                 @"[RESPONSE]\nURL: %@\nStatus: %ld\nHeaders: %@\nBody: %@",
+                                 request.URL.absoluteString,
+                                 (long)http.statusCode,
+                                 http.allHeaderFields,
+                                 DataToString(data)];
 
-        AddLog(respLog);
+            AddLog(respLog);
 
-        if (completionHandler) {
-            completionHandler(data, response, error);
-        }
-    });
+            if (completionHandler) {
+                completionHandler(data, response, error);
+            }
+        };
+
+    return %orig(request, wrappedHandler);
 }
 
 %end
