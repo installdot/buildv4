@@ -1,12 +1,12 @@
-// Tweak.xm - FIXED VERSION
+// Tweak.xm - PROXY MODE (Sends real request + modifies response)
 #import <substrate.h>
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonCryptor.h>
 
 static BOOL g_HasProcessed = NO;
-static NSMutableData *g_ReceivedData = nil;
+static NSMutableData *g_ServerResponse = nil;
 
-// AES256 CBC Decryption
+// AES256 CBC Decryption/Encryption (same as before)
 NSData *aes256Decrypt(NSData *cipherData, NSString *keyString, NSString *ivString) {
     const void *keyBytes = [keyString UTF8String];
     const void *ivBytes = [ivString UTF8String];
@@ -15,27 +15,18 @@ NSData *aes256Decrypt(NSData *cipherData, NSString *keyString, NSString *ivStrin
     void *buffer = malloc(bufferSize);
     size_t decryptedSize = 0;
     
-    CCCryptorStatus cryptStatus = CCCrypt(kCCDecrypt,
-                                         kCCAlgorithmAES128,
-                                         kCCOptionPKCS7Padding,
-                                         keyBytes, kCCKeySizeAES256,
-                                         ivBytes,
+    CCCryptorStatus cryptStatus = CCCrypt(kCCDecrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding,
+                                         keyBytes, kCCKeySizeAES256, ivBytes,
                                          [cipherData bytes], bufferSize,
-                                         buffer, bufferSize,
-                                         &decryptedSize);
+                                         buffer, bufferSize, &decryptedSize);
     
     if (cryptStatus == kCCSuccess) {
-        NSData *result = [NSData dataWithBytesNoCopy:buffer length:decryptedSize];
-        NSLog(@"[Unitoreios Tweak] 🔓 Decrypt OK: %lu bytes", (unsigned long)decryptedSize);
-        return result;
+        return [NSData dataWithBytesNoCopy:buffer length:decryptedSize];
     }
-    
-    NSLog(@"[Unitoreios Tweak] ❌ Decrypt FAILED: %d", (int)cryptStatus);
     free(buffer);
     return nil;
 }
 
-// AES256 CBC Encryption
 NSData *aes256Encrypt(NSData *plainData, NSString *keyString, NSString *ivString) {
     const void *keyBytes = [keyString UTF8String];
     const void *ivBytes = [ivString UTF8String];
@@ -44,45 +35,35 @@ NSData *aes256Encrypt(NSData *plainData, NSString *keyString, NSString *ivString
     void *buffer = malloc(bufferSize);
     size_t encryptedSize = 0;
     
-    CCCryptorStatus cryptStatus = CCCrypt(kCCEncrypt,
-                                         kCCAlgorithmAES128,
-                                         kCCOptionPKCS7Padding,
-                                         keyBytes, kCCKeySizeAES256,
-                                         ivBytes,
+    CCCryptorStatus cryptStatus = CCCrypt(kCCEncrypt, kCCAlgorithmAES128, kCCOptionPKCS7Padding,
+                                         keyBytes, kCCKeySizeAES256, ivBytes,
                                          [plainData bytes], [plainData length],
-                                         buffer, bufferSize,
-                                         &encryptedSize);
+                                         buffer, bufferSize, &encryptedSize);
     
     if (cryptStatus == kCCSuccess) {
-        NSData *result = [NSData dataWithBytesNoCopy:buffer length:encryptedSize];
-        NSLog(@"[Unitoreios Tweak] 🔐 Encrypt OK: %lu bytes", (unsigned long)encryptedSize);
-        return result;
+        return [NSData dataWithBytesNoCopy:buffer length:encryptedSize];
     }
-    
-    NSLog(@"[Unitoreios Tweak] ❌ Encrypt FAILED: %d", (int)cryptStatus);
     free(buffer);
     return nil;
 }
 
-@interface InterceptProtocol : NSURLProtocol <NSURLConnectionDelegate>
-@property (nonatomic, strong) NSMutableData *responseData;
+@interface InterceptProtocol : NSURLProtocol <NSURLConnectionDelegate> {
+    NSURLConnection *_connection;
+    NSMutableData *_responseData;
+}
 @end
 
-@implementation InterceptProtocol {
-    NSURLConnection *_connection;
-}
+@implementation InterceptProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     if (g_HasProcessed) return NO;
     
     NSString *urlString = [[request URL] absoluteString];
-    NSLog(@"[Unitoreios Tweak] 🔍 URL: %@", urlString);
-    
     if ([urlString rangeOfString:@"apiunitoreios.site/Cheack.php"].location != NSNotFound &&
         [urlString rangeOfString:@"FREEFIRE-DAY-meCJeXGpKanR8ykG"].location != NSNotFound &&
         [urlString rangeOfString:@"D6C95F10-E5C1-40D8-BF40-72D9ADBAA538"].location != NSNotFound) {
-        NSLog(@"[Unitoreios Tweak] ✅ TARGET API MATCHED!");
-        g_ReceivedData = [NSMutableData data];
+        NSLog(@"[Unitoreios Tweak] ✅ TARGET API DETECTED: %@", urlString);
+        g_ServerResponse = [NSMutableData data];
         return YES;
     }
     return NO;
@@ -93,17 +74,24 @@ NSData *aes256Encrypt(NSData *plainData, NSString *keyString, NSString *ivString
 }
 
 - (void)startLoading {
-    self.responseData = [NSMutableData data];
-    NSMutableURLRequest *mutableRequest = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"InterceptProtocolHandled" inRequest:mutableRequest];
+    NSLog(@"[Unitoreios Tweak] ➡️ FORWARDING REQUEST TO SERVER...");
     
-    _connection = [[NSURLConnection alloc] initWithRequest:mutableRequest delegate:self startImmediately:YES];
+    // 🚀 FORWARD THE ORIGINAL REQUEST TO SERVER (NOT BLOCKED!)
+    NSMutableURLRequest *originalRequest = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"InterceptProtocolHandled" inRequest:originalRequest];
+    
+    _responseData = [NSMutableData data];
+    _connection = [[NSURLConnection alloc] initWithRequest:originalRequest delegate:self startImmediately:YES];
 }
 
 - (void)stopLoading {
-    [_connection cancel];
-    _connection = nil;
+    if (_connection) {
+        [_connection cancel];
+        _connection = nil;
+    }
 }
+
+#pragma mark - NSURLConnectionDelegate
 
 - (NSURLRequest *)connection:(NSURLConnection *)connection willSendRequest:(NSURLRequest *)request redirectResponse:(NSURLResponse *)response {
     NSMutableURLRequest *mutableRequest = [request mutableCopy];
@@ -112,52 +100,66 @@ NSData *aes256Encrypt(NSData *plainData, NSString *keyString, NSString *ivString
 }
 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
-    [[self client] URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [[self client] URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageAllowed];
 }
 
 - (void)connection:(NSURLConnection *)connection didReceiveData:(NSData *)data {
-    [self.responseData appendData:data];
-    [g_ReceivedData appendData:data];
+    [_responseData appendData:data];
+    [g_ServerResponse appendData:data];
 }
 
 - (void)connectionDidFinishLoading:(NSURLConnection *)connection {
-    NSLog(@"[Unitoreios Tweak] 📡 Response: %lu bytes", (unsigned long)[g_ReceivedData length]);
-    [self processRawResponse];
+    NSLog(@"[Unitoreios Tweak] ✅ SERVER RESPONSE RECEIVED: %lu bytes", (unsigned long)g_ServerResponse.length);
+    
+    // 🛠️ PROCESS & MODIFY RESPONSE
+    NSData *modifiedResponse = [self modifyServerResponse:g_ServerResponse];
+    
+    if (modifiedResponse) {
+        [[self client] URLProtocol:self didLoadData:modifiedResponse];
+        NSLog(@"[Unitoreios Tweak] ✅ MODIFIED RESPONSE SENT TO APP!");
+        g_HasProcessed = YES;
+    } else {
+        // Fallback: send original response
+        NSLog(@"[Unitoreios Tweak] ⚠️ Modification failed, sending original");
+        [[self client] URLProtocol:self didLoadData:g_ServerResponse];
+    }
+    
     [[self client] URLProtocolDidFinishLoading:self];
-    g_HasProcessed = YES;
 }
 
 - (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error {
-    NSLog(@"[Unitoreios Tweak] ❌ Error: %@", error);
+    NSLog(@"[Unitoreios Tweak] ❌ SERVER ERROR: %@", error);
     [[self client] URLProtocol:self didFailWithError:error];
 }
 
-- (void)processRawResponse {
+- (NSData *)modifyServerResponse:(NSData *)serverResponse {
     NSString *apiKey = @"unitoreios_api_key_2026_unitorei";
     NSString *ivKey = @"UnitoreiosIV2026";
     
-    NSData *encryptedData = g_ReceivedData;
+    // 🔓 DECRYPT SERVER RESPONSE
+    NSData *decryptedData = aes256Decrypt(serverResponse, apiKey, ivKey);
+    if (!decryptedData) {
+        NSLog(@"[Unitoreios Tweak] ❌ Decryption failed");
+        return nil;
+    }
     
-    // 🔓 DECRYPT RAW RESPONSE
-    NSData *decryptedData = aes256Decrypt(encryptedData, apiKey, ivKey);
-    if (!decryptedData) return;
+    NSLog(@"[Unitoreios Tweak] 📥 Decrypted: %lu bytes", (unsigned long)decryptedData.length);
     
-    // Parse as JSON (dynamic)
+    // Parse JSON
     NSError *error;
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:decryptedData options:0 error:&error];
+    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:decryptedData 
+                                                        options:kNilOptions 
+                                                          error:&error];
     
     NSMutableDictionary *modifiedJSON;
     if (json && !error) {
-        NSLog(@"[Unitoreios Tweak] 📋 JSON: %@", json);
+        NSLog(@"[Unitoreios Tweak] 📋 Original JSON: %@", json);
         modifiedJSON = [json mutableCopy];
         modifiedJSON[@"encypttimerkey"] = @"1000000 KEY By unitoreios";
-        NSLog(@"[Unitoreios Tweak] ✏️ Fixed timer: %@", modifiedJSON[@"encypttimerkey"]);
+        NSLog(@"[Unitoreios Tweak] ✏️ Modified: %@", modifiedJSON[@"encypttimerkey"]);
     } else {
-        // Fallback: treat as raw text and create expected JSON structure
-        NSLog(@"[Unitoreios Tweak] 📄 Raw text fallback");
-        NSString *decryptedString = [[NSString alloc] initWithData:decryptedData encoding:NSUTF8StringEncoding];
-        NSLog(@"[Unitoreios Tweak] Raw decrypted: %@", decryptedString);
-        
+        // Fallback for raw text responses
+        NSLog(@"[Unitoreios Tweak] 📄 Raw fallback");
         modifiedJSON = [NSMutableDictionary dictionaryWithDictionary:@{
             @"trangthaikey": @"successfully",
             @"key": @"FREEFIRE-DAY-meCJeXGpKanR8ykG",
@@ -167,25 +169,24 @@ NSData *aes256Encrypt(NSData *plainData, NSString *keyString, NSString *ivString
         }];
     }
     
-    // JSON -> Data
-    NSData *modifiedData = [NSJSONSerialization dataWithJSONObject:modifiedJSON options:0 error:&error];
-    if (!modifiedData) {
+    // JSON -> Data -> Encrypt
+    NSData *modifiedJSONData = [NSJSONSerialization dataWithJSONObject:modifiedJSON 
+                                                              options:0 
+                                                                error:&error];
+    if (!modifiedJSONData) {
         NSLog(@"[Unitoreios Tweak] ❌ JSON serialize failed");
-        return;
+        return nil;
     }
     
-    // 🔐 ENCRYPT MODIFIED DATA
-    NSData *fakeResponse = aes256Encrypt(modifiedData, apiKey, ivKey);
-    if (fakeResponse) {
-        [[self client] URLProtocol:self didLoadData:fakeResponse];
-        NSLog(@"[Unitoreios Tweak] ✅ FAKE RESPONSE SENT! (%lu->%lu bytes)", 
-              (unsigned long)encryptedData.length, (unsigned long)fakeResponse.length);
-    }
+    NSData *fakeEncrypted = aes256Encrypt(modifiedJSONData, apiKey, ivKey);
+    NSLog(@"[Unitoreios Tweak] 🔄 Fake encrypted: %lu bytes", (unsigned long)fakeEncrypted.length);
+    
+    return fakeEncrypted;
 }
 
 @end
 
 %ctor {
     [NSURLProtocol registerClass:[InterceptProtocol class]];
-    NSLog(@"[Unitoreios Tweak] 🚀 LOADED!");
+    NSLog(@"[Unitoreios Tweak] 🚀 PROXY MODE ACTIVE!");
 }
