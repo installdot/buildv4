@@ -720,26 +720,20 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath
 }
 
 - (void)refreshStats {
-    // Dùng id để tránh compiler error khi gọi class/instance methods
     Class UniClass = NSClassFromString(@"Unitoreios");
     id inst = [UniClass new];
 
-    NSString *key  = [UniClass getCurrentKey]    ?: @"nil";
-    NSString *time = [UniClass getRemainingTime] ?: @"nil";
+    NSString *key  = [UniClass performSelector:NSSelectorFromString(@"getCurrentKey")];
+    NSString *time = [UniClass performSelector:NSSelectorFromString(@"getRemainingTime")];
 
-    BOOL net    = IsForceOfflineEnabled()
-                ? NO
-                : [[inst valueForKey:@"isNetworkAvailable_result"]
-                    boolValue]; // fallback qua hook
-    // Gọi trực tiếp qua selector để tránh warning
-    SEL selNet    = NSSelectorFromString(@"isNetworkAvailable");
-    SEL selCached = NSSelectorFromString(@"canUseCachedSession");
-    SEL selStrict = NSSelectorFromString(@"hasStrictValidatedKeySession");
-
-    BOOL netOK   = IsForceOfflineEnabled() ? NO :
-        ((BOOL(*)(id,SEL))objc_msgSend)(inst, selNet);
-    BOOL cached  = ((BOOL(*)(id,SEL))objc_msgSend)(inst, selCached);
-    BOOL strict  = ((BOOL(*)(id,SEL))objc_msgSend)(inst, selStrict);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    // Bỏ biến 'net' thừa, dùng thẳng 'netOK'
+    BOOL netOK  = IsForceOfflineEnabled() ? NO :
+        (BOOL)[inst performSelector:NSSelectorFromString(@"isNetworkAvailable")];
+    BOOL cached = (BOOL)[inst performSelector:NSSelectorFromString(@"canUseCachedSession")];
+    BOOL strict = (BOOL)[inst performSelector:NSSelectorFromString(@"hasStrictValidatedKeySession")];
+#pragma clang diagnostic pop
 
     self.lbKey.text = key;
     self.lbKey.textColor =
@@ -758,7 +752,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath
     self.lbNetwork.textColor =
         netOK ? [UIColor systemGreenColor] : [UIColor systemRedColor];
 
-    self.lbCached.text =  cached ? @"✅ YES" : @"❌ NO";
+    self.lbCached.text = cached ? @"✅ YES" : @"❌ NO";
     self.lbCached.textColor =
         cached ? [UIColor systemGreenColor] : [UIColor systemRedColor];
 
@@ -778,7 +772,6 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath
     self.logView.text =
         [line stringByAppendingString:self.logView.text ?: @""];
 }
-
 // ===================== Settings Tab =====================
 
 - (void)buildSettingsTab {
