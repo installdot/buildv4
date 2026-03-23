@@ -1,7 +1,8 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
-static NSString *const kTargetURL = @"https://apiunitoreios.site/Cheack.php?key=FREEFIRE-DAY-meCJeXGpKanR8ykG&uuid=D6C95F10-E5C1-40D8-BF40-72D9ADBAA538&hash=unitoreios-bygDhw6QHLtrTeVIPqMY0WuZScs5X7UG61a006ffa0b610067a4422d53ed59b5c";
-static NSString *const kReplacementURL = @"https://chillysilly.frfrnocap.men/bypassvip.php";
+static NSString *const kTargetHost = @"api.cheatiosvip.vn";
+static NSString *const kTargetPath = @"/api.php";
 
 @interface HookURLProtocol : NSURLProtocol
 @end
@@ -9,13 +10,23 @@ static NSString *const kReplacementURL = @"https://chillysilly.frfrnocap.men/byp
 @implementation HookURLProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    NSString *urlString = request.URL.absoluteString;
-    if ([urlString isEqualToString:kTargetURL]) {
+    NSURL *url = request.URL;
+    if (!url) return NO;
+
+    BOOL match =
+        [url.host isEqualToString:kTargetHost] &&
+        [url.path isEqualToString:kTargetPath] &&
+        [request.HTTPMethod.uppercaseString isEqualToString:@"POST"];
+
+    if (match) {
         if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
             return NO;
         }
+
+        NSLog(@"[Hook] Intercepted request: %@", url.absoluteString);
         return YES;
     }
+
     return NO;
 }
 
@@ -24,62 +35,133 @@ static NSString *const kReplacementURL = @"https://chillysilly.frfrnocap.men/byp
 }
 
 - (void)startLoading {
-    NSURL *replacementURL = [NSURL URLWithString:kReplacementURL];
-    NSMutableURLRequest *newRequest = [NSMutableURLRequest requestWithURL:replacementURL];
-    newRequest.HTTPMethod = self.request.HTTPMethod;
-    newRequest.allHTTPHeaderFields = self.request.allHTTPHeaderFields;
 
-    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:newRequest];
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
-    NSURLSession *session = [NSURLSession sharedSession];
-    NSURLSessionDataTask *task = [session dataTaskWithRequest:newRequest
-        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            if (error) {
-                [self.client URLProtocol:self didFailWithError:error];
-                return;
-            }
+    NSDictionary *json = @{
+        @"success": @YES,
+        @"message": @"License validated successfully",
+        @"data": @{
+            @"subscription_type": @"daily",
+            @"expiry_date": @"2026-03-24 17:41:33",
+            @"remaining_days": @0,
+            @"remaining_hours": @22,
+            @"activated_at": @"2026-03-23 17:41:33",
+            @"is_trial": @NO,
+            @"is_pro": @1
+        }
+    };
 
-            NSHTTPURLResponse *origResponse = (NSHTTPURLResponse *)response;
-            NSHTTPURLResponse *spoofed = [[NSHTTPURLResponse alloc]
-                initWithURL:self.request.URL
-                statusCode:origResponse.statusCode
-               HTTPVersion:nil
-              headerFields:origResponse.allHeaderFields];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
 
-            [self.client URLProtocol:self didReceiveResponse:spoofed
-                  cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            [self.client URLProtocol:self didLoadData:data];
-            [self.client URLProtocolDidFinishLoading:self];
-        }];
-    [task resume];
+    NSHTTPURLResponse *response =
+        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                    statusCode:200
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{
+                                      @"Content-Type": @"application/json"
+                                  }];
+
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
 }
 
 - (void)stopLoading {}
 
 @end
 
-// ─── High-priority constructor (101 = earliest safe priority) ──────────────
+// ─────────────────────────────────────────
+// Central register function
+// ─────────────────────────────────────────
 
-__attribute__((constructor(101))) static void RegisterProtocolEarly(void) {
+static void RegisterProtocol(void) {
     [NSURLProtocol registerClass:[HookURLProtocol class]];
 }
 
-// ─── Hook NSURLSession as a safety net ────────────────────────────────────
+// ─────────────────────────────────────────
+// EARLY LOAD
+// ─────────────────────────────────────────
+
+__attribute__((constructor(101))) static void init_hook(void) {
+    RegisterProtocol();
+}
+
+// ─────────────────────────────────────────
+// FORCE into ALL sessions
+// ─────────────────────────────────────────
+
+%hook NSURLSessionConfiguration
+
+- (NSArray *)protocolClasses {
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
+    NSArray *orig = %orig;
+    if (orig) [arr addObjectsFromArray:orig];
+    return arr;
+}
+
+%end
+
+// ─────────────────────────────────────────
+// Hook ALL request creation paths
+// ─────────────────────────────────────────
 
 %hook NSURLSession
 
 + (NSURLSession *)sharedSession {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        [NSURLProtocol registerClass:[HookURLProtocol class]];
-    });
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
+                       completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+
+    RegisterProtocol();
     return %orig;
 }
 
 %end
 
-// ─── Logos fallback ctor ──────────────────────────────────────────────────
+// ─────────────────────────────────────────
+// NSURLConnection fallback (older apps)
+// ─────────────────────────────────────────
+
+%hook NSURLConnection
+
++ (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (instancetype)initWithRequest:(NSURLRequest *)request delegate:(id)delegate {
+    RegisterProtocol();
+    return %orig;
+}
+
+%end
+
+// ─────────────────────────────────────────
+// Logos fallback
+// ─────────────────────────────────────────
 
 %ctor {
-    [NSURLProtocol registerClass:[HookURLProtocol class]];
+    RegisterProtocol();
 }
