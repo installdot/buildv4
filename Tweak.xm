@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 @interface Unitoreios : NSObject
 - (void)activehack:(NSString *)title message:(NSString *)message font:(UIFont *)font;
