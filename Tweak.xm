@@ -16,7 +16,6 @@ static NSString *getDateString() {
 }
 
 static void showDebugBanner() {
-    // Dùng runtime để tránh lỗi linker
     Class unitoreiosClass = objc_getClass("Unitoreios");
     if (!unitoreiosClass) return;
 
@@ -24,12 +23,12 @@ static void showDebugBanner() {
     if (!instance) return;
 
     NSString *msg = [NSString stringWithFormat:@"Hôm nay là ngày: %@", getDateString()];
-
     SEL sel = NSSelectorFromString(@"activehack:message:font:");
     if ([instance respondsToSelector:sel]) {
         UIFont *font = [UIFont fontWithName:@"AvenirNext-Bold" size:13];
-        ((void (*)(id, SEL, NSString *, NSString *, UIFont *))
-            objc_msgSend)(instance, sel, @"Xumod.vn: Đẹp trai có gì sai?", msg, font);
+        typedef void (*MsgSendType)(id, SEL, NSString *, NSString *, UIFont *);
+        MsgSendType send = (MsgSendType)objc_msgSend;
+        send(instance, sel, @"Xumod.vn: Đẹp trai có gì sai?", msg, font);
     }
 }
 
@@ -43,11 +42,82 @@ static void showDebugBanner() {
     return YES;
 }
 
+// Chặn hoàn toàn offline notice, không gọi %orig
 - (void)showOfflineNoticeIfNeeded {
-    %orig;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        showDebugBanner();
-    });
+    // %orig bị bỏ → không hiện thông báo mất mạng
+}
+
+// Hook activehack để kéo dài thời gian hiện banner (5s → 12s)
+- (void)activehack:(NSString *)title message:(NSString *)message font:(UIFont *)font {
+    CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
+    CGFloat screenHeight = [UIScreen mainScreen].bounds.size.height;
+    CGFloat maxWidth = screenWidth * 0.75;
+
+    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, maxWidth, 0)];
+    titleLabel.text = title;
+    titleLabel.textAlignment = NSTextAlignmentLeft;
+    titleLabel.font = font;
+    titleLabel.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.2 alpha:1.0];
+    titleLabel.numberOfLines = 0;
+    [titleLabel sizeToFit];
+
+    UILabel *messageLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, maxWidth, 0)];
+    messageLabel.text = message;
+    messageLabel.textAlignment = NSTextAlignmentLeft;
+    messageLabel.font = [UIFont fontWithName:@"AvenirNext-Bold" size:10];
+    messageLabel.textColor = [UIColor whiteColor];
+    messageLabel.numberOfLines = 0;
+    [messageLabel sizeToFit];
+
+    CGFloat rectWidth = MAX(titleLabel.frame.size.width, messageLabel.frame.size.width) + 60;
+    CGFloat rectHeight = titleLabel.frame.size.height + messageLabel.frame.size.height + 16;
+    CGFloat rectX = screenWidth;
+    CGFloat rectY = screenHeight * 0.10;
+
+    UIWindow *mainWindow = [[[UIApplication sharedApplication] delegate] window];
+
+    UIView *rect2 = [[UIView alloc] initWithFrame:CGRectMake(rectX, rectY, 0, rectHeight)];
+    rect2.backgroundColor = [UIColor blackColor];
+    [mainWindow addSubview:rect2];
+
+    UIView *rect1 = [[UIView alloc] initWithFrame:CGRectMake(rectX, rectY, 0, rectHeight)];
+    rect1.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.2 alpha:1.0];
+    [mainWindow addSubview:rect1];
+
+    [UIView animateWithDuration:0.5 animations:^{
+        rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
+        rect2.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.15 delay:0.0 options:0 animations:^{
+            rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, screenWidth * 0.005, rectHeight);
+        } completion:^(BOOL finished) {
+            titleLabel.alpha = 1;
+            messageLabel.alpha = 1;
+            [mainWindow addSubview:titleLabel];
+            [mainWindow addSubview:messageLabel];
+            titleLabel.center = CGPointMake(rectX - rectWidth / 2 + 12, rectY + rectHeight / 2 - messageLabel.frame.size.height / 2 - 2);
+            messageLabel.center = CGPointMake(rectX - rectWidth / 2 + 12, rectY + rectHeight / 2 + titleLabel.frame.size.height / 2 + 2);
+
+            // ← 12s thay vì 5s
+            [UIView animateWithDuration:0.5 delay:12.0 options:0 animations:^{
+                rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
+                titleLabel.center = CGPointMake(rectX + rectWidth / 2 + 12, rectY + rectHeight / 2 - messageLabel.frame.size.height / 2 - 2);
+                messageLabel.center = CGPointMake(rectX + rectWidth / 2 + 12, rectY + rectHeight / 2 + titleLabel.frame.size.height / 2 + 2);
+            } completion:^(BOOL finished) {
+                [UIView animateWithDuration:0.15 delay:0.0 options:0 animations:^{
+                    rect1.frame = CGRectMake(rectX, rectY, 0, rectHeight);
+                    rect2.frame = CGRectMake(rectX, rectY, 0, rectHeight);
+                    titleLabel.alpha = 0;
+                    messageLabel.alpha = 0;
+                } completion:^(BOOL finished) {
+                    [rect1 removeFromSuperview];
+                    [rect2 removeFromSuperview];
+                    [titleLabel removeFromSuperview];
+                    [messageLabel removeFromSuperview];
+                }];
+            }];
+        }];
+    }];
 }
 
 %end
