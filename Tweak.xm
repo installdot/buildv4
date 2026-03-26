@@ -1,8 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
-static NSString *const kTargetHost = @"api.cheatiosvip.vn";
-static NSString *const kTargetPath = @"/api.php";
+static NSString *const kTargetHost = @"app.tnspike.com";
+static NSString *const kTargetPath = @"/verify_udid";
 
 @interface HookURLProtocol : NSURLProtocol
 @end
@@ -23,61 +23,8 @@ static NSString *const kTargetPath = @"/api.php";
         return NO;
     }
 
-    NSString *method = request.HTTPMethod.uppercaseString;
-
-    // ─────────────────────────────
-    // 1. GET notifications
-    // ─────────────────────────────
-    if ([method isEqualToString:@"GET"]) {
-        NSString *query = url.query ?: @"";
-        if ([query containsString:@"action=get_notifications"]) {
-            NSLog(@"[Hook] ✅ Notifications request detected");
-            return YES;
-        }
-    }
-
-    // ─────────────────────────────
-    // 2. POST validate
-    // ─────────────────────────────
-    if ([method isEqualToString:@"POST"]) {
-
-        NSData *bodyData = request.HTTPBody;
-
-        if (!bodyData && request.HTTPBodyStream) {
-            NSInputStream *stream = request.HTTPBodyStream;
-            NSMutableData *data = [NSMutableData data];
-
-            [stream open];
-            uint8_t buffer[1024];
-            NSInteger len;
-
-            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
-                [data appendBytes:buffer length:len];
-            }
-
-            [stream close];
-            bodyData = data;
-        }
-
-        if (!bodyData) return NO;
-
-        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
-        if (!body) return NO;
-
-        NSLog(@"[Hook] POST Body: %@", body);
-
-        BOOL match =
-            [body containsString:@"action=validate"] &&
-            [body containsString:@"key="] &&
-            [body containsString:@"hwid="];
-
-        if (match) {
-            NSLog(@"[Hook] ✅ Validate request detected");
-            return YES;
-        }
-    }
-
-    return NO;
+    NSLog(@"[Hook] ✅ verify_udid request detected");
+    return YES;
 }
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
@@ -89,62 +36,62 @@ static NSString *const kTargetPath = @"/api.php";
     NSMutableURLRequest *req = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
-    NSURL *url = self.request.URL;
-    NSString *method = self.request.HTTPMethod.uppercaseString;
-
     NSData *data = nil;
 
     // ─────────────────────────────
-    // 1. Notifications spoof
+    // BUILD FULL VIP RESPONSE
     // ─────────────────────────────
-    if ([method isEqualToString:@"GET"]) {
-        NSString *query = url.query ?: @"";
 
-        if ([query containsString:@"action=get_notifications"]) {
+    NSDate *now = [NSDate date];
+    NSDate *expires = [now dateByAddingTimeInterval:100.0 * 365.25 * 86400.0];
 
-            NSDictionary *json = @{
-                @"success": @YES,
-                @"count": @1,
-                @"notifications": @[
-                    @{
-                        @"id": @7,
-                        @"title": @"Óc Cảnh iOS",
-                        @"message": @"Crack by Hải",
-                        @"time": @"09/12/2025",
-                        @"priority": @2,
-                        @"created_at": @"2025-12-09 17:06:20"
-                    }
-                ]
-            };
+    NSDateComponents *diff =
+    [[NSCalendar currentCalendar] components:NSCalendarUnitDay
+                                    fromDate:now
+                                      toDate:expires
+                                     options:0];
 
-            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-        }
-    }
+    NSInteger days = diff.day;
+
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    fmt.locale = [NSLocale currentLocale];          // ✅ device locale
+    fmt.timeZone = [NSTimeZone localTimeZone];      // ✅ device timezone
+
+    NSDictionary *json = @{
+        @"message" : [NSString stringWithFormat:
+                      @"UDID is valid - %ld days remaining", (long)days],
+
+        @"status" : @"active",
+
+        @"activated_at" : [fmt stringFromDate:now],
+
+        @"expires_at" : [fmt stringFromDate:expires],
+
+        @"remaining" : [NSString stringWithFormat:@"%ld days", (long)days],
+
+        @"package_type" : @"VIP",
+
+        @"activation_key" : [NSString stringWithFormat:
+                             @"TNK-VIP-%ldD", (long)days],
+
+        @"client_version" : @"2.0.3",
+
+        @"update_notes" : @[
+            @"Fixed skill search filter not working",
+            @"Added Key Info card in DATA MOD tab",
+            @"Improved menu height and layout",
+            @"Added Contact button in Data Mod tab"
+        ]
+    };
+
+    data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+
+    NSLog(@"[Hook] 📦 Spoofed Response: %@",
+          [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]);
 
     // ─────────────────────────────
-    // 2. Validate spoof
-    // ─────────────────────────────
-    if (!data && [method isEqualToString:@"POST"]) {
-
-        NSDictionary *json = @{
-            @"success": @YES,
-            @"message": @"License validated successfully",
-            @"data": @{
-                @"subscription_type": @"daily",
-                @"expiry_date": @"2026-04-24 17:41:33",
-                @"remaining_days": @26,
-                @"remaining_hours": @22,
-                @"activated_at": @"2026-03-23 17:41:33",
-                @"is_trial": @NO,
-                @"is_pro": @1
-            }
-        };
-
-        data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-    }
-
-    // ─────────────────────────────
-    // Send response
+    // SEND RESPONSE
     // ─────────────────────────────
 
     NSHTTPURLResponse *response =
@@ -173,7 +120,7 @@ static void RegisterProtocol(void) {
     [NSURLProtocol registerClass:[HookURLProtocol class]];
 }
 
-// Early load
+// Early load (HIGH PRIORITY)
 __attribute__((constructor(101))) static void init_hook(void) {
     RegisterProtocol();
 }
