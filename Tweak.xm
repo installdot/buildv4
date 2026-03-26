@@ -108,7 +108,7 @@ static NSString *const kTargetPath = @"/api.php";
                 @"notifications": @[
                     @{
                         @"id": @7,
-                        @"title": @"Óc Cảnh iOS làm anti crack như cc đéo biết mã hoá payload",
+                        @"title": @"Óc Cảnh iOS",
                         @"message": @"Crack by Hải",
                         @"time": @"09/12/2025",
                         @"priority": @2,
@@ -131,12 +131,12 @@ static NSString *const kTargetPath = @"/api.php";
             @"message": @"License validated successfully",
             @"data": @{
                 @"subscription_type": @"daily",
-                @"expiry_date": @"2036-03-24 17:41:33",
-                @"remaining_days": @3650,
+                @"expiry_date": @"2026-04-24 17:41:33",
+                @"remaining_days": @26,
                 @"remaining_hours": @22,
                 @"activated_at": @"2026-03-23 17:41:33",
-                @"is_trial": @1,
-                @"is_pro": @NO
+                @"is_trial": @NO,
+                @"is_pro": @1
             }
         };
 
