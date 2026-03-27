@@ -2,32 +2,19 @@
 #import <UIKit/UIKit.h>
 
 // ─────────────────────────────
-// DYLIB HIDER (auto-hide self)
+// SAFE DYLIB HIDER (self-hiding from runtime & app)
 // ─────────────────────────────
-#include <dlfcn.h>
-#include <mach-o/dyld.h>
-#include <string.h>
-
-static const char *g_hiddenDylib = NULL;
-
-__attribute__((constructor(100))) static void setup_dylib_hider(void) {
-    Dl_info info;
-    if (dladdr((void *)setup_dylib_hider, &info)) {
-        g_hiddenDylib = strdup(info.dli_fname);
-        NSLog(@"[Hook] 🔒 Auto-detected dylib to hide: %s", g_hiddenDylib);
-    }
-}
-
 %hookf(const char *, _dyld_get_image_name, uint32_t image_index) {
     const char *name = %orig(image_index);
-    if (name && g_hiddenDylib && strcmp(name, g_hiddenDylib) == 0) {
-        return "/usr/lib/libSystem.B.dylib";   // fake system lib
+    if (name && strstr(name, "iSK") != NULL) {
+        NSLog(@"[Hook] 🔒 Hidden dylib: %s", name);
+        return "/usr/lib/libSystem.B.dylib";   // fake system library
     }
     return name;
 }
 
 // ─────────────────────────────
-// Flora Verify Spoof
+// Flora Verify Spoof (crash-safe)
 // ─────────────────────────────
 
 static NSString *const kVerifyHost = @"floraflower.life";
@@ -52,34 +39,8 @@ static NSString *const kVerifyPath = @"/verify";
         [url.path isEqualToString:kVerifyPath] &&
         [method isEqualToString:@"POST"]) {
 
-        NSData *bodyData = request.HTTPBody;
-
-        // Handle stream body
-        if (!bodyData && request.HTTPBodyStream) {
-            NSInputStream *stream = request.HTTPBodyStream;
-            NSMutableData *data = [NSMutableData data];
-
-            [stream open];
-            uint8_t buffer[1024];
-            NSInteger len;
-            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
-                [data appendBytes:buffer length:len];
-            }
-            [stream close];
-            bodyData = data;
-        }
-
-        if (!bodyData) return NO;
-
-        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
-        if (!body) return NO;
-
-        NSLog(@"[Hook] Flora body: %@", body);
-
-        if ([body containsString:@"hwid"] && [body containsString:@"key"]) {
-            NSLog(@"[Hook] ✅ Flora verify detected");
-            return YES;
-        }
+        NSLog(@"[Hook] ✅ Flora verify request detected");
+        return YES;
     }
 
     return NO;
@@ -97,7 +58,7 @@ static NSString *const kVerifyPath = @"/verify";
 
     NSData *bodyData = self.request.HTTPBody;
 
-    // Handle stream again
+    // Handle stream (only read here)
     if (!bodyData && self.request.HTTPBodyStream) {
         NSInputStream *stream = self.request.HTTPBodyStream;
         NSMutableData *d = [NSMutableData data];
@@ -114,7 +75,6 @@ static NSString *const kVerifyPath = @"/verify";
 
     NSString *keyValue = @"unknown";
 
-    // Try parse JSON body
     if (bodyData) {
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
         if ([json isKindOfClass:[NSDictionary class]]) {
@@ -122,7 +82,7 @@ static NSString *const kVerifyPath = @"/verify";
             if (k.length > 0) keyValue = k;
         }
 
-        // Fallback: form-urlencoded
+        // Fallback form-urlencoded
         if ([keyValue isEqualToString:@"unknown"]) {
             NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
             NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
@@ -136,7 +96,7 @@ static NSString *const kVerifyPath = @"/verify";
         }
     }
 
-    NSLog(@"[Hook] 🎯 Spoof key: %@", keyValue);
+    NSLog(@"[Hook] 🎯 Spoofing key → %@", keyValue);
 
     NSDictionary *json = @{
         @"success": @YES,
@@ -175,9 +135,10 @@ static void RegisterProtocol(void) {
 
 __attribute__((constructor(101))) static void init_hook(void) {
     RegisterProtocol();
+    NSLog(@"[Hook] 🌸 Flora Hook + Self-Hider loaded successfully");
 }
 
-// Inject into NSURLSession / NSURLConnection
+// Force injection into networking
 %hook NSURLSessionConfiguration
 - (NSArray *)protocolClasses {
     NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
@@ -188,28 +149,21 @@ __attribute__((constructor(101))) static void init_hook(void) {
 %end
 
 %hook NSURLSession
-+ (NSURLSession *)sharedSession {
-    RegisterProtocol();
-    return %orig;
-}
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    RegisterProtocol();
-    return %orig;
-}
++ (NSURLSession *)sharedSession { RegisterProtocol(); return %orig; }
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request { RegisterProtocol(); return %orig; }
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    RegisterProtocol();
-    return %orig;
+    RegisterProtocol(); return %orig;
 }
 %end
 
 %hook NSURLConnection
 + (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
-    RegisterProtocol();
-    return %orig;
+    RegisterProtocol(); return %orig;
 }
 %end
 
 %ctor {
     RegisterProtocol();
+    NSLog(@"[Hook] 🌸 Protocol registered");
 }
