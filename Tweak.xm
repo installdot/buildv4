@@ -1,157 +1,103 @@
+// tweak.xm
+// Self-hiding dylib tweak for Theos/Logos
+// Hides THIS dylib from _dyld_image_* APIs so apps and other dylibs cannot see it via standard enumeration.
+// Prevents easy detection and dumping by tools that rely on dyld image list (e.g. many jailbreak detectors, Frida, Cycript, class-dump, etc.).
+// Also adds basic anti-debug (PT_DENY_ATTACH) to make attaching a debugger/dumper harder.
+
 #import <Foundation/Foundation.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/dyld_images.h>
-#import <sys/mman.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <substrate.h>
+#include <sys/ptrace.h>
+#include <string.h>
 
-static NSString *const kVerifyPath = @"/verify";
-static BOOL gUnloaded = NO;
+// Global state - the original index of THIS dylib (found once in ctor)
+static int g_hiddenIndex = -1;
 
-static NSString *verifyHost(void) {
-    const uint8_t b[] = {
-        'f'^0xAA, 'l'^0xAA, 'o'^0xAA, 'r'^0xAA, 'a'^0xAA,
-        'f'^0xAA, 'l'^0xAA, 'o'^0xAA, 'w'^0xAA, 'e'^0xAA,
-        'r'^0xAA, '.'^0xAA, 'l'^0xAA, 'i'^0xAA, 'f'^0xAA,
-        'e'^0xAA, 0
-    };
-    char out[17];
-    for (int i = 0; i < 16; i++) out[i] = (char)(b[i] ^ 0xAA);
-    out[16] = 0;
-    return [NSString stringWithUTF8String:out];
-}
+// Original function pointers (set by MSHookFunction)
+static uint32_t (*orig_dyld_image_count)(void) = NULL;
+static const char* (*orig_dyld_get_image_name)(uint32_t) = NULL;
+static const struct mach_header* (*orig_dyld_get_image_header)(uint32_t) = NULL;
+static intptr_t (*orig_dyld_get_image_vmaddr_slide)(uint32_t) = NULL;
 
-static NSData *bodyFromRequest(NSURLRequest *req) {
-    if (req.HTTPBody) return req.HTTPBody;
-    NSInputStream *s = req.HTTPBodyStream;
-    if (!s) return nil;
-    NSMutableData *d = [NSMutableData data];
-    [s open];
-    uint8_t buf[1024];
-    NSInteger len;
-    while ((len = [s read:buf maxLength:sizeof(buf)]) > 0)
-        [d appendBytes:buf length:len];
-    [s close];
-    return d;
-}
-
-static BOOL isVerifyRequest(NSURLRequest *req) {
-    if (gUnloaded) return NO;
-    NSURL *url = req.URL;
-    return [url.host isEqualToString:verifyHost()] &&
-           [url.path isEqualToString:kVerifyPath] &&
-           [req.HTTPMethod.uppercaseString isEqualToString:@"POST"];
-}
-
-// ─────────────────────────────
-// Wipe image name from dyld_all_image_infos so
-// string scanners find nothing even if list entry lingers
-// ─────────────────────────────
-static void corruptImageName(const char *fname) {
-    struct task_dyld_info dyldInfo;
-    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_DYLD_INFO,
-                  (task_info_t)&dyldInfo, &count) != KERN_SUCCESS) return;
-
-    struct dyld_all_image_infos *infos =
-        (struct dyld_all_image_infos *)dyldInfo.all_image_info_addr;
-    if (!infos) return;
-
-    for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
-        const char *name = infos->infoArray[i].imageFilePath;
-        if (name && strcmp(name, fname) == 0) {
-            // Make the name page writable and zero it out
-            uintptr_t page = (uintptr_t)name & ~(uintptr_t)0xFFF;
-            if (mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE) == 0) {
-                memset((void *)name, 0, strlen(fname));
-                mprotect((void *)page, 0x1000, PROT_READ);
-            }
-            break;
-        }
-    }
-}
-
-static void removeSelfFromDyld(void) {
+// Helper: get full path of THIS dylib using dladdr on a function inside it
+static const char* getSelfDylibPath(void) {
     Dl_info info;
-    if (!dladdr((void *)removeSelfFromDyld, &info)) return;
-
-    // First corrupt the name so scanners can't match it
-    corruptImageName(info.dli_fname);
-
-    // Then remove from image list
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strcmp(name, info.dli_fname) == 0) {
-            typedef void (*RemoveFn)(uint32_t);
-            RemoveFn fn = (RemoveFn)dlsym(RTLD_DEFAULT, "_dyld_remove_image");
-            if (fn) fn(i);
-            break;
-        }
+    if (dladdr((void*)getSelfDylibPath, &info) == 0) {
+        return NULL;
     }
+    return info.dli_fname;
 }
 
-static void wipeMachHeader(void) {
-    Dl_info info;
-    if (!dladdr((void *)wipeMachHeader, &info)) return;
-    uintptr_t base = (uintptr_t)info.dli_fbase;
-    uintptr_t page = base & ~(uintptr_t)0xFFF;
-    struct mach_header_64 *mh = (struct mach_header_64 *)base;
-    mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE);
-    mh->ncmds = 0;
-    mh->sizeofcmds = 0;
-    mprotect((void *)page, 0x1000, PROT_READ | PROT_EXEC);
-}
-
-%hook NSURLSession
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    if (!gUnloaded && isVerifyRequest(request) && completionHandler) {
-        NSData *body = bodyFromRequest(request);
-        NSString *keyValue = @"unknown";
-
-        if (body) {
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:body options:0 error:nil];
-            NSString *k = [json isKindOfClass:[NSDictionary class]] ? json[@"key"] : nil;
-            if (k.length > 0) keyValue = k;
-        }
-
-        NSDictionary *fakeJSON = @{
-            @"success":      @YES,
-            @"code":         @0,
-            @"username":     keyValue,
-            @"subscription": @"free"
-        };
-
-        NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeJSON options:0 error:nil];
-        NSHTTPURLResponse *fakeResp =
-            [[NSHTTPURLResponse alloc] initWithURL:request.URL
-                                        statusCode:200
-                                       HTTPVersion:@"HTTP/1.1"
-                                      headerFields:@{@"Content-Type": @"application/json"}];
-
-        completionHandler(fakeData, fakeResp, nil);
-        gUnloaded = YES;
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            wipeMachHeader();
-        });
-
-        NSURLSession *dummy = [NSURLSession sessionWithConfiguration:
-            [NSURLSessionConfiguration ephemeralSessionConfiguration]];
-        NSURLSessionDataTask *task = [dummy dataTaskWithURL:request.URL];
-        [task cancel];
-        return task;
+// Helper: map a "visible" index (what the app sees) to the real original index (skipping our hidden one)
+static uint32_t mapVisibleToRealIndex(uint32_t visibleIdx) {
+    if (g_hiddenIndex < 0) {
+        return visibleIdx;
     }
-
-    return %orig;
+    if (visibleIdx < (uint32_t)g_hiddenIndex) {
+        return visibleIdx;
+    }
+    return visibleIdx + 1;  // shift everything after the hidden slot
 }
 
-%end
+// Hooked versions - these are what the rest of the system (app + other dylibs) will call
+static uint32_t my_dyld_image_count(void) {
+    uint32_t realCount = orig_dyld_image_count();
+    if (g_hiddenIndex >= 0 && (uint32_t)g_hiddenIndex < realCount) {
+        return realCount - 1;
+    }
+    return realCount;
+}
+
+static const char* my_dyld_get_image_name(uint32_t image_index) {
+    uint32_t realIdx = mapVisibleToRealIndex(image_index);
+    return orig_dyld_get_image_name(realIdx);
+}
+
+static const struct mach_header* my_dyld_get_image_header(uint32_t image_index) {
+    uint32_t realIdx = mapVisibleToRealIndex(image_index);
+    return orig_dyld_get_image_header(realIdx);
+}
+
+static intptr_t my_dyld_get_image_vmaddr_slide(uint32_t image_index) {
+    uint32_t realIdx = mapVisibleToRealIndex(image_index);
+    return orig_dyld_get_image_vmaddr_slide(realIdx);
+}
 
 %ctor {
-    %init;
-    // Remove immediately on load — before any other dylib can scan
-    removeSelfFromDyld();
+    // Basic anti-debug / anti-dump protection (makes debugger attachment fail in many cases)
+    ptrace(PT_DENY_ATTACH, 0, 0, 0);
+
+    // Find our own image index BEFORE we install the hooks
+    const char* selfPath = getSelfDylibPath();
+    if (selfPath != NULL) {
+        uint32_t realCount = _dyld_image_count();  // unhooked version
+        for (uint32_t i = 0; i < realCount; i++) {
+            const char* name = _dyld_get_image_name(i);  // unhooked
+            if (name && strcmp(name, selfPath) == 0) {
+                g_hiddenIndex = (int)i;
+                break;
+            }
+        }
+    }
+
+    // Install the hooks using Substrate (this is what makes the hiding global)
+    MSHookFunction((void*)_dyld_image_count,
+                   (void*)my_dyld_image_count,
+                   (void**)&orig_dyld_image_count);
+
+    MSHookFunction((void*)_dyld_get_image_name,
+                   (void*)my_dyld_get_image_name,
+                   (void**)&orig_dyld_get_image_name);
+
+    MSHookFunction((void*)_dyld_get_image_header,
+                   (void*)my_dyld_get_image_header,
+                   (void**)&orig_dyld_get_image_header);
+
+    MSHookFunction((void*)_dyld_get_image_vmaddr_slide,
+                   (void*)my_dyld_get_image_vmaddr_slide,
+                   (void**)&orig_dyld_get_image_vmaddr_slide);
+
+    NSLog(@"[SelfHideTweak] Successfully hidden! Hidden index = %d | Path = %s", g_hiddenIndex, selfPath ?: "unknown");
+    NSLog(@"[SelfHideTweak] This dylib will no longer appear in dyld image lists for the app or any other dylib.");
 }
