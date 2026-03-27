@@ -1,171 +1,202 @@
+#import <substrate.h>
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
+#import <mach-o/dyld.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
+#import <sys/mman.h>
+#import <dlfcn.h>
+#import <mach-o/loader.h>
+#import <mach-o/getsect.h>
 
-// ─────────────────────────────
-// SAFE DYLIB HIDER (self-hiding from runtime & app)
-// ─────────────────────────────
-#include <mach-o/dyld.h>
-#include <string.h>
+// Self-reference structures
+static const struct mach_header *self_header = NULL;
+static vm_address_t self_slide = 0;
+static char *self_path = NULL;
+static mach_port_t self_task = MACH_PORT_NULL;
 
-%hookf(const char *, _dyld_get_image_name, uint32_t image_index) {
-    const char *name = %orig(image_index);
-    if (name && strstr(name, "iSK") != NULL) {
-        return "/usr/lib/libSystem.B.dylib";   // fake system library (invisible)
+// DYLD INTERPOSITION (from previous - kept minimal)
+static uint32_t (*orig__dyld_image_count)(void);
+static const char* (*orig__dyld_get_image_name)(uint32_t image_index);
+
+uint32_t hook__dyld_image_count(void) {
+    uint32_t count = orig__dyld_image_count();
+    return MAX(1, count - 1); // Always hide at least 1 (ourselves)
+}
+
+const char* hook__dyld_get_image_name(uint32_t image_index) {
+    if (image_index >= orig__dyld_image_count()) return NULL;
+    
+    const char *name = orig__dyld_get_image_name(image_index);
+    if (strstr(name ?: "", "tweak") || strstr(name ?: "", "substrate")) {
+        return "/usr/lib/libSystem.B.dylib"; // Fake system lib
     }
     return name;
 }
 
-// ─────────────────────────────
-// Flora Verify Spoof (crash-safe)
-// ─────────────────────────────
+// ============================================================================
+// CORE: FIND AND ERASE SELF FROM MEMORY
+// ============================================================================
 
-static NSString *const kVerifyHost = @"floraflower.life";
-static NSString *const kVerifyPath = @"/verify";
-
-@interface HookURLProtocol : NSURLProtocol
-@end
-
-@implementation HookURLProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    NSURL *url = request.URL;
-    if (!url) return NO;
-
-    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
-        return NO;
-    }
-
-    NSString *method = request.HTTPMethod.uppercaseString ?: @"";
-
-    if ([url.host isEqualToString:kVerifyHost] &&
-        [url.path isEqualToString:kVerifyPath] &&
-        [method isEqualToString:@"POST"]) {
-
-        NSLog(@"[Hook] ✅ Flora verify request detected");
-        return YES;
-    }
-
-    return NO;
-}
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
-
-- (void)startLoading {
-    NSMutableURLRequest *req = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
-
-    NSURL *url = self.request.URL;
-
-    NSData *bodyData = self.request.HTTPBody;
-
-    // Handle stream (only read here)
-    if (!bodyData && self.request.HTTPBodyStream) {
-        NSInputStream *stream = self.request.HTTPBodyStream;
-        NSMutableData *d = [NSMutableData data];
-
-        [stream open];
-        uint8_t buffer[1024];
-        NSInteger len;
-        while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
-            [d appendBytes:buffer length:len];
-        }
-        [stream close];
-        bodyData = d;
-    }
-
-    NSString *keyValue = @"unknown";
-
-    if (bodyData) {
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
-        if ([json isKindOfClass:[NSDictionary class]]) {
-            NSString *k = json[@"key"];
-            if (k.length > 0) keyValue = k;
-        }
-
-        // Fallback form-urlencoded
-        if ([keyValue isEqualToString:@"unknown"]) {
-            NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
-            NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
-            for (NSString *pair in pairs) {
-                NSArray *kv = [pair componentsSeparatedByString:@"="];
-                if (kv.count == 2 && [kv[0] isEqualToString:@"key"]) {
-                    keyValue = kv[1];
-                    break;
-                }
+kern_return_t erase_self_from_memory() {
+    if (!self_header || !self_task) return KERN_FAILURE;
+    
+    // Get all segments of our dylib
+    struct segment_command_64 *seg_cmd = NULL;
+    struct section_64 *sect = NULL;
+    
+    // Walk load commands
+    const uint8_t *cmd = (uint8_t *)(self_header + 1);
+    for (uint32_t i = 0; i < self_header->ncmds; i++) {
+        if (((struct load_command*)cmd)->cmd == LC_SEGMENT_64) {
+            seg_cmd = (struct segment_command_64*)cmd;
+            if (strcmp(seg_cmd->segname, "__TEXT") == 0 || 
+                strcmp(seg_cmd->segname, "__DATA") == 0 ||
+                strcmp(seg_cmd->segname, "__LINKEDIT") == 0) {
+                
+                // Zero out the entire segment
+                vm_address_t start = seg_cmd->vmaddr + self_slide;
+                vm_size_t size = seg_cmd->vmsize;
+                
+                vm_protect(self_task, start, size, FALSE, VM_PROT_NO_CHANGE);
+                memset((void*)start, 0x00, size); // Wipe with zeros
+                vm_protect(self_task, start, size, FALSE, VM_PROT_READ | VM_PROT_EXEC);
             }
         }
+        cmd = (uint8_t*)cmd + ((struct load_command*)cmd)->cmdsize;
     }
-
-    NSLog(@"[Hook] 🎯 Spoofing key → %@", keyValue);
-
-    NSDictionary *json = @{
-        @"success": @YES,
-        @"code": @0,
-        @"username": keyValue,
-        @"subscription": @"free"
-    };
-
-    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-
-    NSHTTPURLResponse *response =
-        [[NSHTTPURLResponse alloc] initWithURL:url
-                                    statusCode:200
-                                   HTTPVersion:@"HTTP/1.1"
-                                  headerFields:@{
-                                      @"Content-Type": @"application/json",
-                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
-                                  }];
-
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:data];
-    [self.client URLProtocolDidFinishLoading:self];
+    
+    // Deallocate our own memory pages
+    vm_deallocate(self_task, (vm_address_t)self_header, 0x1000);
+    
+    return KERN_SUCCESS;
 }
 
-- (void)stopLoading {}
-
-@end
-
-// ─────────────────────────────
-// Register Protocol
-// ─────────────────────────────
-
-static void RegisterProtocol(void) {
-    [NSURLProtocol registerClass:[HookURLProtocol class]];
+// Unmap entire dylib from memory
+kern_return_t unmap_self_dylib() {
+    if (!self_task) self_task = mach_task_self();
+    
+    // Find our vm regions and deallocate
+    vm_address_t addr = 0;
+    vm_size_t size = 0;
+    mach_msg_type_number_t count;
+    
+    while (TRUE) {
+        count = VM_REGION_SUBMAP_COUNT;
+        natural_t depth = 0;
+        
+        kern_return_t kr = vm_region_64(self_task, &addr, &size, 
+                                       &depth, NULL, NULL, NULL);
+        if (kr != KERN_SUCCESS) break;
+        
+        // Check if this region contains our dylib
+        Dl_info info;
+        if (dladdr((void*)addr, &info) && info.dli_fbase == self_header) {
+            vm_deallocate(self_task, addr, size);
+            NSLog(@"[SELF-ERASE] Unmapped %p-%p", (void*)addr, (void*)(addr+size));
+        }
+        
+        addr += size;
+    }
+    return KERN_SUCCESS;
 }
 
-__attribute__((constructor(101))) static void init_hook(void) {
-    RegisterProtocol();
-    NSLog(@"[Hook] 🌸 Flora Hook + Self-Hider loaded successfully");
-    NSLog(@"[Hook] 🔒 Dylib hider active (iSK hidden from _dyld_get_image_name)");
+// ============================================================================
+// SELF DISCOVERY
+// ============================================================================
+
+void discover_self() {
+    uint32_t img_count = _dyld_image_count();
+    
+    for (uint32_t i = 0; i < img_count; i++) {
+        const char *img_name = _dyld_get_image_name(i);
+        if (strstr(img_name, "tweak") || strstr(img_name, "substrate")) {
+            self_header = _dyld_get_image_header(i);
+            self_path = strdup(img_name);
+            self_slide = _dyld_get_image_vmaddr_slide(i);
+            self_task = mach_task_self();
+            break;
+        }
+    }
 }
 
-// Force injection into networking
-%hook NSURLSessionConfiguration
-- (NSArray *)protocolClasses {
-    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
-    NSArray *orig = %orig;
-    if (orig) [arr addObjectsFromArray:orig];
-    return arr;
+// ============================================================================
+// DYLD INTERPOSITION + SELF ERASE
+// ============================================================================
+
+__attribute__((used)) static struct {
+    const char *name;
+    void *replacement;
+} dyld_table[] = {
+    { "_dyld_image_count", (void*)hook__dyld_image_count },
+    { "_dyld_get_image_name", (void*)hook__dyld_get_image_name },
+};
+
+void apply_dyld_interpose() {
+    extern void dyld_interpose(const void *table, size_t count);
+    dyld_interpose(dyld_table, sizeof(dyld_table)/sizeof(dyld_table[0]));
 }
+
+// ============================================================================
+// EXECUTABLE CODE WIPE (Advanced)
+// ============================================================================
+
+void wipe_executable_code() {
+    // Get __TEXT,__text section and zero it
+    unsigned long size = 0;
+    char *text_data = getsectiondata(self_header, "__TEXT", "__text", &size);
+    
+    if (text_data && size > 0) {
+        mprotect((void*)text_data, size, PROT_READ | PROT_WRITE | PROT_EXEC);
+        memset(text_data, 0x90, size); // NOP sled
+        mprotect((void*)text_data, size, PROT_READ | PROT_EXEC);
+    }
+}
+
+// ============================================================================
+// MAIN HOOKS + SELF-DESTRUCT SEQUENCE
+// ============================================================================
+
+%hook SpringBoard
+
+- (void)applicationDidFinishLaunching:(id)application {
+    %orig;
+    
+    // 1. Discover ourselves
+    discover_self();
+    
+    // 2. Apply DYLD hiding
+    apply_dyld_interpose();
+    
+    // 3. WIPE OURSELVES FROM MEMORY (delayed)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), 
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        NSLog(@"[SELF-ERASE] Initiating self-destruction...");
+        
+        wipe_executable_code();
+        erase_self_from_memory();
+        unmap_self_dylib();
+        
+        NSLog(@"[SELF-ERASE] Dylib completely erased from memory");
+    });
+}
+
 %end
 
-%hook NSURLSession
-+ (NSURLSession *)sharedSession { RegisterProtocol(); return %orig; }
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request { RegisterProtocol(); return %orig; }
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    RegisterProtocol(); return %orig;
-}
-%end
+// ============================================================================
+// EARLY CONSTRUCTOR - IMMEDIATE HIDING
+// ============================================================================
 
-%hook NSURLConnection
-+ (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
-    RegisterProtocol(); return %orig;
+static void early_hide() {
+    discover_self();
+    apply_dyld_interpose();
 }
-%end
 
 %ctor {
-    RegisterProtocol();
+    early_hide();
+    
+    // Final self-erase after 2 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2.0 * NSEC_PER_SEC), 
+                   dispatch_get_main_queue(), ^{
+        unmap_self_dylib();
+    });
 }
