@@ -1,10 +1,10 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <sys/mman.h>
 #import <mach-o/loader.h>
+#import <sys/mman.h>
 
-static NSString *const kVerifyPath = @"/verify
+static NSString *const kVerifyPath = @"/verify";
 static BOOL gUnloaded = NO;
 
 static NSString *verifyHost(void) {
@@ -26,7 +26,8 @@ static NSData *bodyFromRequest(NSURLRequest *req) {
     if (!s) return nil;
     NSMutableData *d = [NSMutableData data];
     [s open];
-    uint8_t buf[1024]; NSInteger len;
+    uint8_t buf[1024];
+    NSInteger len;
     while ((len = [s read:buf maxLength:sizeof(buf)]) > 0)
         [d appendBytes:buf length:len];
     [s close];
@@ -44,14 +45,13 @@ static BOOL isVerifyRequest(NSURLRequest *req) {
 static void removeSelfFromDyld(void) {
     Dl_info info;
     if (!dladdr((void *)removeSelfFromDyld, &info)) return;
-
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (name && strcmp(name, info.dli_fname) == 0) {
             typedef void (*RemoveFn)(uint32_t);
-            RemoveFn removeFn = (RemoveFn)dlsym(RTLD_DEFAULT, "_dyld_remove_image");
-            if (removeFn) removeFn(i);
+            RemoveFn fn = (RemoveFn)dlsym(RTLD_DEFAULT, "_dyld_remove_image");
+            if (fn) fn(i);
             break;
         }
     }
@@ -60,11 +60,9 @@ static void removeSelfFromDyld(void) {
 static void wipeMachHeader(void) {
     Dl_info info;
     if (!dladdr((void *)wipeMachHeader, &info)) return;
-
     uintptr_t base = (uintptr_t)info.dli_fbase;
-    struct mach_header_64 *mh = (struct mach_header_64 *)base;
-
     uintptr_t page = base & ~(uintptr_t)0xFFF;
+    struct mach_header_64 *mh = (struct mach_header_64 *)base;
     mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE);
     mh->ncmds = 0;
     mh->sizeofcmds = 0;
@@ -86,10 +84,10 @@ static void wipeMachHeader(void) {
         }
 
         NSDictionary *fakeJSON = @{
-            @"success": @YES,
-            @"code":    @0,
-            @"username": keyValue,
-            @"subscription":    @"paid"
+            @"success":      @YES,
+            @"code":         @0,
+            @"username":     keyValue,
+            @"subscription": @"free"
         };
 
         NSData *fakeData = [NSJSONSerialization dataWithJSONObject:fakeJSON options:0 error:nil];
