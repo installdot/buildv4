@@ -2,9 +2,14 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <sys/sysctl.h>
-#import <sys/ptrace.h>
 #import <objc/runtime.h>
+
+// ─────────────────────────────
+// iOS Version Detection
+// ─────────────────────────────
+#define IOS_VERSION_EQUAL_TO(v) ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedSame)
+#define IOS_VERSION_GREATER_THAN(v) ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedDescending)
+#define IOS_VERSION_GREATER_THAN_OR_EQUAL_TO(v) ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] != NSOrderedAscending)
 
 // ─────────────────────────────
 // Anti-Detection Constants
@@ -12,7 +17,6 @@
 static NSString *const kVerifyHost = @"floraflower.life";
 static NSString *const kVerifyPath = @"/verify";
 
-// Hidden dylib names
 static NSString *const kHiddenDylibNames[] = {
     @"HookURLProtocol.dylib",
     @"libhook.dylib",
@@ -20,20 +24,40 @@ static NSString *const kHiddenDylibNames[] = {
     @"substrate.dylib",
     @"libsubstrate.dylib",
     @"libhooking.dylib",
-    @"libobjc.dylib",
     nil
 };
 
 // ─────────────────────────────
-// kinfo_proc structure for iOS < 14.0
+// Safe Anti-Debug (No ptrace/sysctl)
 // ─────────────────────────────
-struct kinfo_proc {
-    int kp_proc[9];
-    int kp_eproc[90];
-};
+static void safe_anti_debug(void) {
+    // Time-based check (simple but effective)
+    static CFAbsoluteTime startTime = 0;
+    if (startTime == 0) {
+        startTime = CFAbsoluteTimeGetCurrent();
+    } else {
+        CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - startTime;
+        if (elapsed < 0.1 && elapsed > 0) { // Suspicious timing
+            exit(0);
+        }
+    }
+    
+    // Check for common debugger ports
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock != -1) {
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(1234); // Common debug port
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            close(sock);
+            exit(0);
+        }
+        close(sock);
+    }
+}
 
 // ─────────────────────────────
-// Anti-Detection Utilities
+// Safe Dylib Hiding
 // ─────────────────────────────
 static void hide_dylib_from_dyld(void) {
     uint32_t count = _dyld_image_count();
@@ -46,9 +70,8 @@ static void hide_dylib_from_dyld(void) {
         
         for (int j = 0; kHiddenDylibNames[j]; j++) {
             if ([dylibName isEqualToString:kHiddenDylibNames[j]]) {
-                // Hide by overwriting with system path
                 const char *fake_path = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
-                strncpy((char *)image_name, fake_path, strlen(fake_path) + 1);
+                strlcpy((char *)image_name, fake_path, 256);
                 break;
             }
         }
@@ -58,32 +81,18 @@ static void hide_dylib_from_dyld(void) {
 static void hide_from_class_dump(void) {
     Class hookClass = objc_getClass("HookURLProtocol");
     if (hookClass) {
+        IMP block_imp = imp_implementationWithBlock(^BOOL(id self){
+            return NO;
+        });
         class_addMethod(hookClass, 
             NSSelectorFromString(@"_isClassDump"), 
-            imp_implementationWithBlock(^(id self){ return NO; }), 
+            block_imp, 
             "B@:");
     }
 }
 
-static void anti_debug_check(void) {
-    // Disable ptrace
-    ptrace(PT_DENY_ATTACH, 0, 0, 0);
-    
-    // Check for debuggers via sysctl
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
-    struct kinfo_proc info;
-    size_t size = sizeof(info);
-    
-    if (sysctl(mib, 4, &info, &size, NULL, 0) == 0) {
-        if ((info.kp_proc[0] & P_TRACED) != 0) {
-            // Debugger detected - exit gracefully
-            exit(0);
-        }
-    }
-}
-
 // ─────────────────────────────
-// Original HookURLProtocol
+// HookURLProtocol (Core Logic)
 // ─────────────────────────────
 @interface HookURLProtocol : NSURLProtocol
 @end
@@ -100,12 +109,14 @@ static void anti_debug_check(void) {
 
     NSString *method = request.HTTPMethod.uppercaseString ?: @"";
 
+    // Flora verify check
     if ([url.host isEqualToString:kVerifyHost] &&
         [url.path isEqualToString:kVerifyPath] &&
         [method isEqualToString:@"POST"]) {
 
         NSData *bodyData = request.HTTPBody;
 
+        // Handle stream body
         if (!bodyData && request.HTTPBodyStream) {
             NSInputStream *stream = request.HTTPBodyStream;
             NSMutableData *data = [NSMutableData data];
@@ -117,7 +128,6 @@ static void anti_debug_check(void) {
             while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
                 [data appendBytes:buffer length:len];
             }
-
             [stream close];
             bodyData = data;
         }
@@ -147,9 +157,9 @@ static void anti_debug_check(void) {
     [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
     NSURL *url = self.request.URL;
-    
     NSData *bodyData = self.request.HTTPBody;
 
+    // Handle stream body again
     if (!bodyData && self.request.HTTPBodyStream) {
         NSInputStream *stream = self.request.HTTPBodyStream;
         NSMutableData *d = [NSMutableData data];
@@ -161,34 +171,33 @@ static void anti_debug_check(void) {
         while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
             [d appendBytes:buffer length:len];
         }
-
         [stream close];
         bodyData = d;
     }
 
     NSString *keyValue = @"unknown";
 
+    // Parse JSON
     if (bodyData) {
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
         if ([json isKindOfClass:[NSDictionary class]]) {
             NSString *k = json[@"key"];
-            if (k.length > 0) {
-                keyValue = k;
-            }
+            if (k.length > 0) keyValue = k;
         }
+    }
 
-        if ([keyValue isEqualToString:@"unknown"]) {
-            NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
-            NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
-            for (NSString *pair in pairs) {
-                NSArray *kv = [pair componentsSeparatedByString:@"="];
-                if (kv.count == 2) {
-                    NSString *k = kv[0];
-                    NSString *v = [kv[1] stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
-                    if ([k isEqualToString:@"key"]) {
-                        keyValue = v ?: @"unknown";
-                        break;
-                    }
+    // Fallback: parse form-urlencoded
+    if ([keyValue isEqualToString:@"unknown"] && bodyData) {
+        NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+        NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
+        for (NSString *pair in pairs) {
+            NSArray *kv = [pair componentsSeparatedByString:@"="];
+            if (kv.count == 2) {
+                NSString *k = kv[0];
+                NSString *v = [kv[1] stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
+                if ([k isEqualToString:@"key"] && v.length > 0) {
+                    keyValue = v;
+                    break;
                 }
             }
         }
@@ -196,27 +205,26 @@ static void anti_debug_check(void) {
 
     NSLog(@"[Hook] 🎯 Spoof key: %@", keyValue);
 
-    NSDictionary *json = @{
+    NSDictionary *responseJSON = @{
         @"success": @YES,
         @"code": @0,
         @"username": keyValue,
-        @"subscription": @"pro"
+        @"subscription": @"free"
     };
 
-    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:responseJSON options:0 error:nil];
 
     NSDictionary *headers = @{
         @"Content-Type": @"application/json",
-        @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+        @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length ?: 0]
     };
 
-    NSHTTPURLResponse *response =
-        [[NSHTTPURLResponse alloc] initWithURL:url
-                                    statusCode:200
-                                   HTTPVersion:@"HTTP/1.1"
-                                  headerFields:headers];
+    NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] 
+        initWithURL:url statusCode:200 
+        HTTPVersion:@"HTTP/1.1" headerFields:headers];
 
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didReceiveResponse:response 
+        cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     [self.client URLProtocol:self didLoadData:data];
     [self.client URLProtocolDidFinishLoading:self];
 }
@@ -236,56 +244,48 @@ static void RegisterProtocol(void) {
 }
 
 // ─────────────────────────────
-// Constructor with Stealth Init
+// Constructor
 // ─────────────────────────────
 __attribute__((constructor(101))) static void stealth_init(void) {
-    anti_debug_check();
+    safe_anti_debug();
     hide_dylib_from_dyld();
     hide_from_class_dump();
     RegisterProtocol();
 }
 
 // ─────────────────────────────
-// Original Hooks with Stealth
+// Hooks
 // ─────────────────────────────
 %hook NSURLSessionConfiguration
-
 - (NSArray *)protocolClasses {
     NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
     NSArray *orig = %orig;
     if (orig) [arr addObjectsFromArray:orig];
     return arr;
 }
-
 %end
 
 %hook NSURLSession
-
 + (NSURLSession *)sharedSession {
     RegisterProtocol();
     return %orig;
 }
-
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     RegisterProtocol();
     return %orig(request);
 }
-
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     RegisterProtocol();
     return %orig(request, completionHandler);
 }
-
 %end
 
 %hook NSURLConnection
-
 + (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
     RegisterProtocol();
     return %orig(request, delegate);
 }
-
 %end
 
 %ctor {
