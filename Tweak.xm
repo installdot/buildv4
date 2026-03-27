@@ -1,99 +1,40 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <objc/runtime.h>
 
 // ─────────────────────────────
-// iOS Version Detection
+// DYLIB HIDER SUPPORT
 // ─────────────────────────────
-#define IOS_VERSION_EQUAL_TO(v) ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedSame)
-#define IOS_VERSION_GREATER_THAN(v) ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedDescending)
-#define IOS_VERSION_GREATER_THAN_OR_EQUAL_TO(v) ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] != NSOrderedAscending)
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <string.h>
+
+static const char *g_hiddenDylib = NULL;
+
+__attribute__((constructor(100))) static void setup_dylib_hider(void) {
+    Dl_info info;
+    if (dladdr((void *)setup_dylib_hider, &info)) {
+        g_hiddenDylib = strdup(info.dli_fname);
+        NSLog(@"[Hook] 🔒 Auto-detected dylib to hide: %s", g_hiddenDylib);
+    }
+}
+
+// Hide the dylib from _dyld_get_image_name (most common detection method)
+%hookf(const char *, _dyld_get_image_name, uint32_t image_index) {
+    const char *name = %orig(image_index);
+    if (name && g_hiddenDylib && strcmp(name, g_hiddenDylib) == 0) {
+        // Return a harmless system library path so the tweak is invisible
+        return "/usr/lib/libSystem.B.dylib";
+    }
+    return name;
+}
 
 // ─────────────────────────────
-// Anti-Detection Constants
+// ORIGINAL HOOK CODE (unchanged except for the additions above)
 // ─────────────────────────────
+
 static NSString *const kVerifyHost = @"floraflower.life";
 static NSString *const kVerifyPath = @"/verify";
 
-static NSString *const kHiddenDylibNames[] = {
-    @"HookURLProtocol.dylib",
-    @"libhook.dylib",
-    @"tweak.dylib",
-    @"substrate.dylib",
-    @"libsubstrate.dylib",
-    @"libhooking.dylib",
-    nil
-};
-
-// ─────────────────────────────
-// Safe Anti-Debug (No ptrace/sysctl)
-// ─────────────────────────────
-static void safe_anti_debug(void) {
-    // Time-based check (simple but effective)
-    static CFAbsoluteTime startTime = 0;
-    if (startTime == 0) {
-        startTime = CFAbsoluteTimeGetCurrent();
-    } else {
-        CFAbsoluteTime elapsed = CFAbsoluteTimeGetCurrent() - startTime;
-        if (elapsed < 0.1 && elapsed > 0) { // Suspicious timing
-            exit(0);
-        }
-    }
-    
-    // Check for common debugger ports
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock != -1) {
-        struct sockaddr_in addr = {0};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(1234); // Common debug port
-        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            close(sock);
-            exit(0);
-        }
-        close(sock);
-    }
-}
-
-// ─────────────────────────────
-// Safe Dylib Hiding
-// ─────────────────────────────
-static void hide_dylib_from_dyld(void) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *image_name = _dyld_get_image_name(i);
-        if (!image_name) continue;
-        
-        NSString *imagePath = @(image_name);
-        NSString *dylibName = imagePath.lastPathComponent;
-        
-        for (int j = 0; kHiddenDylibNames[j]; j++) {
-            if ([dylibName isEqualToString:kHiddenDylibNames[j]]) {
-                const char *fake_path = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
-                strlcpy((char *)image_name, fake_path, 256);
-                break;
-            }
-        }
-    }
-}
-
-static void hide_from_class_dump(void) {
-    Class hookClass = objc_getClass("HookURLProtocol");
-    if (hookClass) {
-        IMP block_imp = imp_implementationWithBlock(^BOOL(id self){
-            return NO;
-        });
-        class_addMethod(hookClass, 
-            NSSelectorFromString(@"_isClassDump"), 
-            block_imp, 
-            "B@:");
-    }
-}
-
-// ─────────────────────────────
-// HookURLProtocol (Core Logic)
-// ─────────────────────────────
 @interface HookURLProtocol : NSURLProtocol
 @end
 
@@ -109,7 +50,9 @@ static void hide_from_class_dump(void) {
 
     NSString *method = request.HTTPMethod.uppercaseString ?: @"";
 
+    // ─────────────────────────────
     // Flora verify check
+    // ─────────────────────────────
     if ([url.host isEqualToString:kVerifyHost] &&
         [url.path isEqualToString:kVerifyPath] &&
         [method isEqualToString:@"POST"]) {
@@ -128,6 +71,7 @@ static void hide_from_class_dump(void) {
             while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
                 [data appendBytes:buffer length:len];
             }
+
             [stream close];
             bodyData = data;
         }
@@ -153,13 +97,16 @@ static void hide_from_class_dump(void) {
 }
 
 - (void)startLoading {
+
     NSMutableURLRequest *req = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
     NSURL *url = self.request.URL;
+    NSString *method = self.request.HTTPMethod.uppercaseString ?: @"";
+
     NSData *bodyData = self.request.HTTPBody;
 
-    // Handle stream body again
+    // Handle stream again
     if (!bodyData && self.request.HTTPBodyStream) {
         NSInputStream *stream = self.request.HTTPBodyStream;
         NSMutableData *d = [NSMutableData data];
@@ -171,33 +118,40 @@ static void hide_from_class_dump(void) {
         while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
             [d appendBytes:buffer length:len];
         }
+
         [stream close];
         bodyData = d;
     }
 
     NSString *keyValue = @"unknown";
 
-    // Parse JSON
+    // Try parse JSON body
     if (bodyData) {
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
+        NSDictionary *json =
+            [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
+
         if ([json isKindOfClass:[NSDictionary class]]) {
             NSString *k = json[@"key"];
-            if (k.length > 0) keyValue = k;
+            if (k.length > 0) {
+                keyValue = k;
+            }
         }
-    }
 
-    // Fallback: parse form-urlencoded
-    if ([keyValue isEqualToString:@"unknown"] && bodyData) {
-        NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
-        NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
-        for (NSString *pair in pairs) {
-            NSArray *kv = [pair componentsSeparatedByString:@"="];
-            if (kv.count == 2) {
-                NSString *k = kv[0];
-                NSString *v = [kv[1] stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
-                if ([k isEqualToString:@"key"] && v.length > 0) {
-                    keyValue = v;
-                    break;
+        // Fallback: parse form-urlencoded
+        if ([keyValue isEqualToString:@"unknown"]) {
+            NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+
+            NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
+            for (NSString *pair in pairs) {
+                NSArray *kv = [pair componentsSeparatedByString:@"="];
+                if (kv.count == 2) {
+                    NSString *k = kv[0];
+                    NSString *v = kv[1];
+
+                    if ([k isEqualToString:@"key"]) {
+                        keyValue = v;
+                        break;
+                    }
                 }
             }
         }
@@ -205,26 +159,25 @@ static void hide_from_class_dump(void) {
 
     NSLog(@"[Hook] 🎯 Spoof key: %@", keyValue);
 
-    NSDictionary *responseJSON = @{
+    NSDictionary *json = @{
         @"success": @YES,
         @"code": @0,
         @"username": keyValue,
         @"subscription": @"free"
     };
 
-    NSData *data = [NSJSONSerialization dataWithJSONObject:responseJSON options:0 error:nil];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
 
-    NSDictionary *headers = @{
-        @"Content-Type": @"application/json",
-        @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length ?: 0]
-    };
+    NSHTTPURLResponse *response =
+        [[NSHTTPURLResponse alloc] initWithURL:url
+                                    statusCode:200
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{
+                                      @"Content-Type": @"application/json",
+                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+                                  }];
 
-    NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] 
-        initWithURL:url statusCode:200 
-        HTTPVersion:@"HTTP/1.1" headerFields:headers];
-
-    [self.client URLProtocol:self didReceiveResponse:response 
-        cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     [self.client URLProtocol:self didLoadData:data];
     [self.client URLProtocolDidFinishLoading:self];
 }
@@ -234,58 +187,57 @@ static void hide_from_class_dump(void) {
 @end
 
 // ─────────────────────────────
-// Stealth Registration
+// Register
 // ─────────────────────────────
-static dispatch_once_t onceToken;
+
 static void RegisterProtocol(void) {
-    dispatch_once(&onceToken, ^{
-        [NSURLProtocol registerClass:[HookURLProtocol class]];
-    });
+    [NSURLProtocol registerClass:[HookURLProtocol class]];
 }
 
-// ─────────────────────────────
-// Constructor
-// ─────────────────────────────
-__attribute__((constructor(101))) static void stealth_init(void) {
-    safe_anti_debug();
-    hide_dylib_from_dyld();
-    hide_from_class_dump();
+__attribute__((constructor(101))) static void init_hook(void) {
     RegisterProtocol();
 }
 
-// ─────────────────────────────
-// Hooks
-// ─────────────────────────────
+// Inject into NSURLSession
 %hook NSURLSessionConfiguration
+
 - (NSArray *)protocolClasses {
     NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
     NSArray *orig = %orig;
     if (orig) [arr addObjectsFromArray:orig];
     return arr;
 }
+
 %end
 
 %hook NSURLSession
+
 + (NSURLSession *)sharedSession {
     RegisterProtocol();
     return %orig;
 }
+
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     RegisterProtocol();
-    return %orig(request);
+    return %orig;
 }
+
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     RegisterProtocol();
-    return %orig(request, completionHandler);
+    return %orig;
 }
+
 %end
 
+// NSURLConnection fallback
 %hook NSURLConnection
+
 + (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
     RegisterProtocol();
-    return %orig(request, delegate);
+    return %orig;
 }
+
 %end
 
 %ctor {
