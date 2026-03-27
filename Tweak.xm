@@ -2,7 +2,9 @@
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <mach-o/getsect.h>
+#import <sys/sysctl.h>
+#import <sys/ptrace.h>
+#import <objc/runtime.h>
 
 // ─────────────────────────────
 // Anti-Detection Constants
@@ -23,22 +25,30 @@ static NSString *const kHiddenDylibNames[] = {
 };
 
 // ─────────────────────────────
+// kinfo_proc structure for iOS < 14.0
+// ─────────────────────────────
+struct kinfo_proc {
+    int kp_proc[9];
+    int kp_eproc[90];
+};
+
+// ─────────────────────────────
 // Anti-Detection Utilities
 // ─────────────────────────────
 static void hide_dylib_from_dyld(void) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *image_name = _dyld_get_image_name(i);
+        if (!image_name) continue;
+        
         NSString *imagePath = @(image_name);
+        NSString *dylibName = imagePath.lastPathComponent;
         
         for (int j = 0; kHiddenDylibNames[j]; j++) {
-            if ([imagePath.lastPathComponent isEqualToString:kHiddenDylibNames[j]]) {
-                // Hide from dyld_image_count by marking as invalid
-                Dl_info info;
-                if (dladdr((void*)hide_dylib_from_dyld, &info)) {
-                    // Overwrite image name in memory
-                    strcpy((char*)image_name, "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation");
-                }
+            if ([dylibName isEqualToString:kHiddenDylibNames[j]]) {
+                // Hide by overwriting with system path
+                const char *fake_path = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+                strncpy((char *)image_name, fake_path, strlen(fake_path) + 1);
                 break;
             }
         }
@@ -46,10 +56,12 @@ static void hide_dylib_from_dyld(void) {
 }
 
 static void hide_from_class_dump(void) {
-    // Hide our classes from objective-c runtime
     Class hookClass = objc_getClass("HookURLProtocol");
     if (hookClass) {
-        class_addMethod(hookClass, NSSelectorFromString(@"_isClassDump"), imp_implementationWithBlock(^BOOL(id self){ return NO; }), "B@:");
+        class_addMethod(hookClass, 
+            NSSelectorFromString(@"_isClassDump"), 
+            imp_implementationWithBlock(^(id self){ return NO; }), 
+            "B@:");
     }
 }
 
@@ -57,19 +69,21 @@ static void anti_debug_check(void) {
     // Disable ptrace
     ptrace(PT_DENY_ATTACH, 0, 0, 0);
     
-    // Check for debuggers
+    // Check for debuggers via sysctl
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
     struct kinfo_proc info;
     size_t size = sizeof(info);
-    sysctl(mib, 4, &info, &size, NULL, 0);
     
-    if (info.kp_proc.p_flag & P_TRACED) {
-        exit(0);
+    if (sysctl(mib, 4, &info, &size, NULL, 0) == 0) {
+        if ((info.kp_proc[0] & P_TRACED) != 0) {
+            // Debugger detected - exit gracefully
+            exit(0);
+        }
     }
 }
 
 // ─────────────────────────────
-// Original HookURLProtocol (unchanged)
+// Original HookURLProtocol
 // ─────────────────────────────
 @interface HookURLProtocol : NSURLProtocol
 @end
@@ -133,8 +147,7 @@ static void anti_debug_check(void) {
     [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
     NSURL *url = self.request.URL;
-    NSString *method = self.request.HTTPMethod.uppercaseString ?: @"";
-
+    
     NSData *bodyData = self.request.HTTPBody;
 
     if (!bodyData && self.request.HTTPBodyStream) {
@@ -171,9 +184,9 @@ static void anti_debug_check(void) {
                 NSArray *kv = [pair componentsSeparatedByString:@"="];
                 if (kv.count == 2) {
                     NSString *k = kv[0];
-                    NSString *v = kv[1];
+                    NSString *v = [kv[1] stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
                     if ([k isEqualToString:@"key"]) {
-                        keyValue = v;
+                        keyValue = v ?: @"unknown";
                         break;
                     }
                 }
@@ -192,14 +205,16 @@ static void anti_debug_check(void) {
 
     NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
 
+    NSDictionary *headers = @{
+        @"Content-Type": @"application/json",
+        @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+    };
+
     NSHTTPURLResponse *response =
         [[NSHTTPURLResponse alloc] initWithURL:url
                                     statusCode:200
                                    HTTPVersion:@"HTTP/1.1"
-                                  headerFields:@{
-                                      @"Content-Type": @"application/json",
-                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
-                                  }];
+                                  headerFields:headers];
 
     [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     [self.client URLProtocol:self didLoadData:data];
@@ -215,8 +230,7 @@ static void anti_debug_check(void) {
 // ─────────────────────────────
 static dispatch_once_t onceToken;
 static void RegisterProtocol(void) {
-    static dispatch_once_t localOnce;
-    dispatch_once(&localOnce, ^{
+    dispatch_once(&onceToken, ^{
         [NSURLProtocol registerClass:[HookURLProtocol class]];
     });
 }
@@ -225,16 +239,9 @@ static void RegisterProtocol(void) {
 // Constructor with Stealth Init
 // ─────────────────────────────
 __attribute__((constructor(101))) static void stealth_init(void) {
-    // Anti-debug first
     anti_debug_check();
-    
-    // Hide dylib
     hide_dylib_from_dyld();
-    
-    // Hide from class dump
     hide_from_class_dump();
-    
-    // Register protocol
     RegisterProtocol();
 }
 
@@ -282,6 +289,5 @@ __attribute__((constructor(101))) static void stealth_init(void) {
 %end
 
 %ctor {
-    // Final stealth registration
     RegisterProtocol();
 }
