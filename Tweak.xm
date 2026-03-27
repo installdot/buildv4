@@ -99,7 +99,7 @@ static void removeDylibFromRuntime(void) {
     [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
     NSURL *url = self.request.URL;
-    NSString *method = self.request.HTTPMethod.uppercaseString ?: @"";
+    
 
     NSData *bodyData = self.request.HTTPBody;
 
