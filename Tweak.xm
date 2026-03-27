@@ -10,8 +10,7 @@
 %hookf(const char *, _dyld_get_image_name, uint32_t image_index) {
     const char *name = %orig(image_index);
     if (name && strstr(name, "iSK") != NULL) {
-        NSLog(@"[Hook] 🔒 Hidden dylib: %s", name);
-        return "/usr/lib/libSystem.B.dylib";   // fake system library
+        return "/usr/lib/libSystem.B.dylib";   // fake system library (invisible)
     }
     return name;
 }
@@ -139,6 +138,7 @@ static void RegisterProtocol(void) {
 __attribute__((constructor(101))) static void init_hook(void) {
     RegisterProtocol();
     NSLog(@"[Hook] 🌸 Flora Hook + Self-Hider loaded successfully");
+    NSLog(@"[Hook] 🔒 Dylib hider active (iSK hidden from _dyld_get_image_name)");
 }
 
 // Force injection into networking
@@ -168,5 +168,4 @@ __attribute__((constructor(101))) static void init_hook(void) {
 
 %ctor {
     RegisterProtocol();
-    NSLog(@"[Hook] 🌸 Protocol registered");
 }
