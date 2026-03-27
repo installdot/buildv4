@@ -1,141 +1,261 @@
-#import <substrate.h>
 #import <Foundation/Foundation.h>
-#import <mach-o/dyld.h>
-#import <mach/mach.h>
-#import <sys/mman.h>
-#import <dlfcn.h>
-#import <mach-o/loader.h>
-#import <mach-o/getsect.h>
+#import <UIKit/UIKit.h>
+#import <dlfcn.h>      // For self-unload
+#import <unistd.h>     // For usleep (freeze)
 
-// Self-reference
-static const struct mach_header *self_header = NULL;
-static vm_address_t self_slide = 0;
-static char *self_path = NULL;
+static NSString *const kVerifyHost = @"floraflower.life";
+static NSString *const kVerifyPath = @"/verify";
 
-// DYLD INTERPOSITION - HIDE FROM DYLD
-static uint32_t (*orig__dyld_image_count)(void);
-static const char* (*orig__dyld_get_image_name)(uint32_t image_index);
+@interface HookURLProtocol : NSURLProtocol
+@end
 
-uint32_t hook__dyld_image_count(void) {
-    uint32_t count = orig__dyld_image_count();
-    return MAX(1, count - 1); // Hide ourselves
-}
+@implementation HookURLProtocol
 
-const char* hook__dyld_get_image_name(uint32_t image_index) {
-    if (image_index >= orig__dyld_image_count()) return NULL;
-    
-    const char *name = orig__dyld_get_image_name(image_index);
-    if (strstr(name ?: "", "tweak") || strstr(name ?: "", "substrate") || strstr(name ?: "", "iSK")) {
-        return "/usr/lib/libSystem.B.dylib"; // Fake system lib
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    NSURL *url = request.URL;
+    if (!url) return NO;
+
+    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
+        return NO;
     }
-    return name;
-}
 
-// ============================================================================
-// SIMPLIFIED SELF-HIDING - NO VM COMMANDS
-// ============================================================================
+    NSString *method = request.HTTPMethod.uppercaseString ?: @"";
 
-// Wipe our own code section with NOPs
-void wipe_self_code() {
-    if (!self_header) return;
-    
-    // Get __TEXT,__text section (64-bit safe)
-    const struct mach_header_64 *mh64 = (const struct mach_header_64*)self_header;
-    unsigned long size = 0;
-    uint8_t *text_data = getsectiondata(mh64, "__TEXT", "__text", &size);
-    
-    if (text_data && size > 0) {
-        // Make writable, fill with NOPs, restore protection
-        mprotect((void*)text_data, size, PROT_READ | PROT_WRITE | PROT_EXEC);
-        memset(text_data, 0x90, size); // NOP sled (0x90)
-        mprotect((void*)text_data, size, PROT_READ | PROT_EXEC);
-        NSLog(@"[HIDE] Code wiped with NOPs (%lu bytes)", size);
-    }
-}
+    // ─────────────────────────────
+    // Flora verify check
+    // ─────────────────────────────
+    if ([url.host isEqualToString:kVerifyHost] &&
+        [url.path isEqualToString:kVerifyPath] &&
+        [method isEqualToString:@"POST"]) {
 
-// Hide from dlopen/dlclose traces
-void hide_dl_traces() {
-    // Overwrite our own dlopen entry
-    void *handle = dlopen(self_path ?: "", RTLD_NOLOAD);
-    if (handle) {
-        dlclose(handle);
-    }
-}
+        NSData *bodyData = request.HTTPBody;
 
-// ============================================================================
-// SELF DISCOVERY
-// ============================================================================
+        // Handle stream body
+        if (!bodyData && request.HTTPBodyStream) {
+            NSInputStream *stream = request.HTTPBodyStream;
+            NSMutableData *data = [NSMutableData data];
 
-void discover_self() {
-    uint32_t img_count = _dyld_image_count();
-    
-    for (uint32_t i = 0; i < img_count; i++) {
-        const char *img_name = _dyld_get_image_name(i);
-        if (strstr(img_name ?: "", "tweak") || strstr(img_name ?: "", "substrate") || strstr(img_name ?: "", "iSK")) {
-            self_header = _dyld_get_image_header(i);
-            self_path = strdup(img_name ?: "");
-            self_slide = _dyld_get_image_vmaddr_slide(i);
-            NSLog(@"[HIDE] Found self: %s", self_path);
-            return;
+            [stream open];
+            uint8_t buffer[1024];
+            NSInteger len;
+
+            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+                [data appendBytes:buffer length:len];
+            }
+
+            [stream close];
+            bodyData = data;
+        }
+
+        if (!bodyData) return NO;
+
+        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+        if (!body) return NO;
+
+        NSLog(@"[Hook] Flora body: %@", body);
+
+        if ([body containsString:@"hwid"] && [body containsString:@"key"]) {
+            NSLog(@"[Hook] ✅ Flora verify detected");
+            return YES;
         }
     }
+
+    return NO;
 }
 
-// DYLD INTERPOSITION
-__attribute__((used)) static struct {
-    const char *name;
-    void *replacement;
-    void **original;
-} dyld_table[] = {
-    { "_dyld_image_count", (void*)hook__dyld_image_count, (void**)&orig__dyld_image_count },
-    { "_dyld_get_image_name", (void*)hook__dyld_get_image_name, (void**)&orig__dyld_get_image_name },
-};
-
-void apply_dyld_interpose() {
-    extern void dyld_interpose(const void *table, size_t count);
-    dyld_interpose(dyld_table, sizeof(dyld_table)/sizeof(dyld_table[0]));
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
 }
 
-// Anti-sysctl (simple)
-static int (*orig_sysctl)(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
-int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    // Block process listing
-    if (namelen >= 2 && name[0] == CTL_KERN && name[1] == KERN_PROC) {
-        return 0;
+// ─────────────────────────────
+// Self-unload helper
+// ─────────────────────────────
+static void removeDylibFromRuntime(void) {
+    Dl_info info;
+    // Use address of this function (guaranteed to be inside the dylib)
+    if (dladdr((void *)removeDylibFromRuntime, &info) == 0) {
+        NSLog(@"[Hook] ❌ dladdr failed");
+        return;
     }
-    return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+
+    const char *dylibPath = info.dli_fname;
+    NSLog(@"[Hook] Dylib path: %s", dylibPath);
+
+    // Get handle without loading again
+    void *handle = dlopen(dylibPath, RTLD_NOLOAD | RTLD_NOW);
+    if (handle) {
+        NSLog(@"[Hook] ✅ Handle found → closing (twice for refcount)");
+        dlclose(handle);
+        dlclose(handle);               // Second call ensures refcount hits 0
+        NSLog(@"[Hook] ✅ Dylib successfully removed from runtime");
+    } else {
+        NSLog(@"[Hook] ❌ No handle (already unloaded or not found)");
+    }
 }
 
-// ============================================================================
-// MAIN HOOKS
-// ============================================================================
+- (void)startLoading {
 
-%hook SpringBoard
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
-- (void)applicationDidFinishLaunching:(id)application {
-    %orig;
-    
-    // Initialize hiding
-    discover_self();
-    apply_dyld_interpose();
-    MSHookFunction((void*)sysctl, (void*)hook_sysctl, (void**)&orig_sysctl);
-    
-    // Self-hide after short delay
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), 
-                   dispatch_get_main_queue(), ^{
-        wipe_self_code();
-        hide_dl_traces();
-        NSLog(@"[HIDE] Tweak completely hidden!");
-    });
+    NSURL *url = self.request.URL;
+    NSString *method = self.request.HTTPMethod.uppercaseString ?: @"";
+
+    NSData *bodyData = self.request.HTTPBody;
+
+    // Handle stream again
+    if (!bodyData && self.request.HTTPBodyStream) {
+        NSInputStream *stream = self.request.HTTPBodyStream;
+        NSMutableData *d = [NSMutableData data];
+
+        [stream open];
+        uint8_t buffer[1024];
+        NSInteger len;
+
+        while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+            [d appendBytes:buffer length:len];
+        }
+
+        [stream close];
+        bodyData = d;
+    }
+
+    NSString *keyValue = @"unknown";
+
+    // Try parse JSON body
+    if (bodyData) {
+        NSDictionary *json =
+            [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
+
+        if ([json isKindOfClass:[NSDictionary class]]) {
+            NSString *k = json[@"key"];
+            if (k.length > 0) {
+                keyValue = k;
+            }
+        }
+
+        // Fallback: parse form-urlencoded
+        if ([keyValue isEqualToString:@"unknown"]) {
+            NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+
+            NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
+            for (NSString *pair in pairs) {
+                NSArray *kv = [pair componentsSeparatedByString:@"="];
+                if (kv.count == 2) {
+                    NSString *k = kv[0];
+                    NSString *v = kv[1];
+
+                    if ([k isEqualToString:@"key"]) {
+                        keyValue = v;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    NSLog(@"[Hook] 🎯 Spoof key: %@", keyValue);
+
+    NSDictionary *json = @{
+        @"success": @YES,
+        @"code": @0,
+        @"username": keyValue,
+        @"subscription": @"free"
+    };
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+
+    NSHTTPURLResponse *response =
+        [[NSHTTPURLResponse alloc] initWithURL:url
+                                    statusCode:200
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{
+                                      @"Content-Type": @"application/json",
+                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+                                  }];
+
+    // ─────────────────────────────
+    // 1. Send spoofed success response (app thinks it's verified)
+    // ─────────────────────────────
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
+
+    // ─────────────────────────────
+    // 2. Freeze the app (visible pause so everything settles before unload)
+    // ─────────────────────────────
+    NSLog(@"[Hook] ❄️ Freezing app for safe dylib removal...");
+    usleep(450000); // 0.45 seconds freeze (adjust if you want longer/shorter)
+
+    // ─────────────────────────────
+    // 3. Remove dylib from runtime (hides tweak from _dyld image list + memory)
+    // ─────────────────────────────
+    removeDylibFromRuntime();
+
+    // ─────────────────────────────
+    // 4. App continues normally (no more hook, tweak is gone)
+    // ─────────────────────────────
+    NSLog(@"[Hook] ✅ App resumed – dylib fully removed from runtime");
+}
+
+- (void)stopLoading {}
+
+@end
+
+// ─────────────────────────────
+// Register
+// ─────────────────────────────
+
+static void RegisterProtocol(void) {
+    [NSURLProtocol registerClass:[HookURLProtocol class]];
+}
+
+__attribute__((constructor(101))) static void init_hook(void) {
+    RegisterProtocol();
+}
+
+// Inject into NSURLSession
+%hook NSURLSessionConfiguration
+
+- (NSArray *)protocolClasses {
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
+    NSArray *orig = %orig;
+    if (orig) [arr addObjectsFromArray:orig];
+    return arr;
 }
 
 %end
 
-// ============================================================================
-// EARLY + LATE CONSTRUCTORS
-// ============================================================================
+%hook NSURLSession
+
++ (NSURLSession *)sharedSession {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    RegisterProtocol();
+    return %orig;
+}
+
+%end
+
+// NSURLConnection fallback
+%hook NSURLConnection
+
++ (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
+    RegisterProtocol();
+    return %orig;
+}
+
+%end
 
 %ctor {
-    discover_self();
-    apply_dyld_interpose();
+    RegisterProtocol();
 }
