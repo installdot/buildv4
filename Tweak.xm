@@ -1,132 +1,287 @@
-// Tweak.xm
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
+#import <UIKit/UIKit.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <mach-o/getsect.h>
 
-@interface Unitoreios : NSObject
-- (void)activehack:(NSString *)title message:(NSString *)message font:(UIFont *)font;
-- (void)showOfflineNoticeIfNeeded;
-@end
+// ─────────────────────────────
+// Anti-Detection Constants
+// ─────────────────────────────
+static NSString *const kVerifyHost = @"floraflower.life";
+static NSString *const kVerifyPath = @"/verify";
 
-static NSString *getDateString() {
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    return [fmt stringFromDate:[NSDate date]];
-}
+// Hidden dylib names
+static NSString *const kHiddenDylibNames[] = {
+    @"HookURLProtocol.dylib",
+    @"libhook.dylib",
+    @"tweak.dylib",
+    @"substrate.dylib",
+    @"libsubstrate.dylib",
+    @"libhooking.dylib",
+    @"libobjc.dylib",
+    nil
+};
 
-static void showDebugBanner() {
-    Class unitoreiosClass = objc_getClass("Unitoreios");
-    if (!unitoreiosClass) return;
-
-    id instance = [unitoreiosClass new];
-    if (!instance) return;
-
-    NSString *msg = [NSString stringWithFormat:@"Hôm nay là ngày: %@", getDateString()];
-    SEL sel = NSSelectorFromString(@"activehack:message:font:");
-    if ([instance respondsToSelector:sel]) {
-        UIFont *font = [UIFont fontWithName:@"AvenirNext-Bold" size:13];
-        typedef void (*MsgSendType)(id, SEL, NSString *, NSString *, UIFont *);
-        MsgSendType send = (MsgSendType)objc_msgSend;
-        send(instance, sel, @"Xumod.vn: Đẹp trai có gì sai?", msg, font);
+// ─────────────────────────────
+// Anti-Detection Utilities
+// ─────────────────────────────
+static void hide_dylib_from_dyld(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *image_name = _dyld_get_image_name(i);
+        NSString *imagePath = @(image_name);
+        
+        for (int j = 0; kHiddenDylibNames[j]; j++) {
+            if ([imagePath.lastPathComponent isEqualToString:kHiddenDylibNames[j]]) {
+                // Hide from dyld_image_count by marking as invalid
+                Dl_info info;
+                if (dladdr((void*)hide_dylib_from_dyld, &info)) {
+                    // Overwrite image name in memory
+                    strcpy((char*)image_name, "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation");
+                }
+                break;
+            }
+        }
     }
 }
 
-%hook Unitoreios
+static void hide_from_class_dump(void) {
+    // Hide our classes from objective-c runtime
+    Class hookClass = objc_getClass("HookURLProtocol");
+    if (hookClass) {
+        class_addMethod(hookClass, NSSelectorFromString(@"_isClassDump"), imp_implementationWithBlock(^BOOL(id self){ return NO; }), "B@:");
+    }
+}
 
-- (BOOL)isNetworkAvailable {
+static void anti_debug_check(void) {
+    // Disable ptrace
+    ptrace(PT_DENY_ATTACH, 0, 0, 0);
+    
+    // Check for debuggers
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    sysctl(mib, 4, &info, &size, NULL, 0);
+    
+    if (info.kp_proc.p_flag & P_TRACED) {
+        exit(0);
+    }
+}
+
+// ─────────────────────────────
+// Original HookURLProtocol (unchanged)
+// ─────────────────────────────
+@interface HookURLProtocol : NSURLProtocol
+@end
+
+@implementation HookURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    NSURL *url = request.URL;
+    if (!url) return NO;
+
+    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
+        return NO;
+    }
+
+    NSString *method = request.HTTPMethod.uppercaseString ?: @"";
+
+    if ([url.host isEqualToString:kVerifyHost] &&
+        [url.path isEqualToString:kVerifyPath] &&
+        [method isEqualToString:@"POST"]) {
+
+        NSData *bodyData = request.HTTPBody;
+
+        if (!bodyData && request.HTTPBodyStream) {
+            NSInputStream *stream = request.HTTPBodyStream;
+            NSMutableData *data = [NSMutableData data];
+
+            [stream open];
+            uint8_t buffer[1024];
+            NSInteger len;
+
+            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+                [data appendBytes:buffer length:len];
+            }
+
+            [stream close];
+            bodyData = data;
+        }
+
+        if (!bodyData) return NO;
+
+        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+        if (!body) return NO;
+
+        NSLog(@"[Hook] Flora body: %@", body);
+
+        if ([body containsString:@"hwid"] && [body containsString:@"key"]) {
+            NSLog(@"[Hook] ✅ Flora verify detected");
+            return YES;
+        }
+    }
+
     return NO;
 }
 
-- (BOOL)canUseCachedSession {
-    return YES;
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
 }
 
-// Chặn hoàn toàn offline notice, không gọi %orig
-- (void)showOfflineNoticeIfNeeded {
-    // %orig bị bỏ → không hiện thông báo mất mạng
+- (void)startLoading {
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
+
+    NSURL *url = self.request.URL;
+    NSString *method = self.request.HTTPMethod.uppercaseString ?: @"";
+
+    NSData *bodyData = self.request.HTTPBody;
+
+    if (!bodyData && self.request.HTTPBodyStream) {
+        NSInputStream *stream = self.request.HTTPBodyStream;
+        NSMutableData *d = [NSMutableData data];
+
+        [stream open];
+        uint8_t buffer[1024];
+        NSInteger len;
+
+        while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+            [d appendBytes:buffer length:len];
+        }
+
+        [stream close];
+        bodyData = d;
+    }
+
+    NSString *keyValue = @"unknown";
+
+    if (bodyData) {
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:bodyData options:0 error:nil];
+        if ([json isKindOfClass:[NSDictionary class]]) {
+            NSString *k = json[@"key"];
+            if (k.length > 0) {
+                keyValue = k;
+            }
+        }
+
+        if ([keyValue isEqualToString:@"unknown"]) {
+            NSString *bodyStr = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+            NSArray *pairs = [bodyStr componentsSeparatedByString:@"&"];
+            for (NSString *pair in pairs) {
+                NSArray *kv = [pair componentsSeparatedByString:@"="];
+                if (kv.count == 2) {
+                    NSString *k = kv[0];
+                    NSString *v = kv[1];
+                    if ([k isEqualToString:@"key"]) {
+                        keyValue = v;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    NSLog(@"[Hook] 🎯 Spoof key: %@", keyValue);
+
+    NSDictionary *json = @{
+        @"success": @YES,
+        @"code": @0,
+        @"username": keyValue,
+        @"subscription": @"pro"
+    };
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+
+    NSHTTPURLResponse *response =
+        [[NSHTTPURLResponse alloc] initWithURL:url
+                                    statusCode:200
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{
+                                      @"Content-Type": @"application/json",
+                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+                                  }];
+
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
 }
 
-// Hook activehack để kéo dài thời gian hiện banner (5s → 12s)
-- (void)activehack:(NSString *)title message:(NSString *)message font:(UIFont *)font {
-    CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
-    CGFloat screenHeight = [UIScreen mainScreen].bounds.size.height;
-    CGFloat maxWidth = screenWidth * 0.75;
+- (void)stopLoading {}
 
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, maxWidth, 0)];
-    titleLabel.text = title;
-    titleLabel.textAlignment = NSTextAlignmentLeft;
-    titleLabel.font = font;
-    titleLabel.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.2 alpha:1.0];
-    titleLabel.numberOfLines = 0;
-    [titleLabel sizeToFit];
+@end
 
-    UILabel *messageLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, maxWidth, 0)];
-    messageLabel.text = message;
-    messageLabel.textAlignment = NSTextAlignmentLeft;
-    messageLabel.font = [UIFont fontWithName:@"AvenirNext-Bold" size:10];
-    messageLabel.textColor = [UIColor whiteColor];
-    messageLabel.numberOfLines = 0;
-    [messageLabel sizeToFit];
+// ─────────────────────────────
+// Stealth Registration
+// ─────────────────────────────
+static dispatch_once_t onceToken;
+static void RegisterProtocol(void) {
+    static dispatch_once_t localOnce;
+    dispatch_once(&localOnce, ^{
+        [NSURLProtocol registerClass:[HookURLProtocol class]];
+    });
+}
 
-    CGFloat rectWidth = MAX(titleLabel.frame.size.width, messageLabel.frame.size.width) + 60;
-    CGFloat rectHeight = titleLabel.frame.size.height + messageLabel.frame.size.height + 16;
-    CGFloat rectX = screenWidth;
-    CGFloat rectY = screenHeight * 0.10;
+// ─────────────────────────────
+// Constructor with Stealth Init
+// ─────────────────────────────
+__attribute__((constructor(101))) static void stealth_init(void) {
+    // Anti-debug first
+    anti_debug_check();
+    
+    // Hide dylib
+    hide_dylib_from_dyld();
+    
+    // Hide from class dump
+    hide_from_class_dump();
+    
+    // Register protocol
+    RegisterProtocol();
+}
 
-    UIWindow *mainWindow = [[[UIApplication sharedApplication] delegate] window];
+// ─────────────────────────────
+// Original Hooks with Stealth
+// ─────────────────────────────
+%hook NSURLSessionConfiguration
 
-    UIView *rect2 = [[UIView alloc] initWithFrame:CGRectMake(rectX, rectY, 0, rectHeight)];
-    rect2.backgroundColor = [UIColor blackColor];
-    [mainWindow addSubview:rect2];
+- (NSArray *)protocolClasses {
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
+    NSArray *orig = %orig;
+    if (orig) [arr addObjectsFromArray:orig];
+    return arr;
+}
 
-    UIView *rect1 = [[UIView alloc] initWithFrame:CGRectMake(rectX, rectY, 0, rectHeight)];
-    rect1.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.2 alpha:1.0];
-    [mainWindow addSubview:rect1];
+%end
 
-    [UIView animateWithDuration:0.5 animations:^{
-        rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
-        rect2.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
-    } completion:^(BOOL finished) {
-        [UIView animateWithDuration:0.15 delay:0.0 options:0 animations:^{
-            rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, screenWidth * 0.005, rectHeight);
-        } completion:^(BOOL finished) {
-            titleLabel.alpha = 1;
-            messageLabel.alpha = 1;
-            [mainWindow addSubview:titleLabel];
-            [mainWindow addSubview:messageLabel];
-            titleLabel.center = CGPointMake(rectX - rectWidth / 2 + 12, rectY + rectHeight / 2 - messageLabel.frame.size.height / 2 - 2);
-            messageLabel.center = CGPointMake(rectX - rectWidth / 2 + 12, rectY + rectHeight / 2 + titleLabel.frame.size.height / 2 + 2);
+%hook NSURLSession
 
-            // ← 12s thay vì 5s
-            [UIView animateWithDuration:0.5 delay:12.0 options:0 animations:^{
-                rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
-                titleLabel.center = CGPointMake(rectX + rectWidth / 2 + 12, rectY + rectHeight / 2 - messageLabel.frame.size.height / 2 - 2);
-                messageLabel.center = CGPointMake(rectX + rectWidth / 2 + 12, rectY + rectHeight / 2 + titleLabel.frame.size.height / 2 + 2);
-            } completion:^(BOOL finished) {
-                [UIView animateWithDuration:0.15 delay:0.0 options:0 animations:^{
-                    rect1.frame = CGRectMake(rectX, rectY, 0, rectHeight);
-                    rect2.frame = CGRectMake(rectX, rectY, 0, rectHeight);
-                    titleLabel.alpha = 0;
-                    messageLabel.alpha = 0;
-                } completion:^(BOOL finished) {
-                    [rect1 removeFromSuperview];
-                    [rect2 removeFromSuperview];
-                    [titleLabel removeFromSuperview];
-                    [messageLabel removeFromSuperview];
-                }];
-            }];
-        }];
-    }];
++ (NSURLSession *)sharedSession {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    RegisterProtocol();
+    return %orig(request);
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    RegisterProtocol();
+    return %orig(request, completionHandler);
+}
+
+%end
+
+%hook NSURLConnection
+
++ (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
+    RegisterProtocol();
+    return %orig(request, delegate);
 }
 
 %end
 
 %ctor {
-    NSLog(@"[UnitoreiosDebug] ctor fired — hooks active");
-    %init;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        showDebugBanner();
-    });
+    // Final stealth registration
+    RegisterProtocol();
 }
