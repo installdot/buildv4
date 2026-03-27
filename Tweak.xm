@@ -4,6 +4,9 @@
 // ─────────────────────────────
 // SAFE DYLIB HIDER (self-hiding from runtime & app)
 // ─────────────────────────────
+#include <mach-o/dyld.h>
+#include <string.h>
+
 %hookf(const char *, _dyld_get_image_name, uint32_t image_index) {
     const char *name = %orig(image_index);
     if (name && strstr(name, "iSK") != NULL) {
