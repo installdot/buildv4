@@ -2,6 +2,7 @@
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach-o/dyld_images.h>
 #import <sys/mman.h>
 
 static NSString *const kVerifyPath = @"/verify";
@@ -42,9 +43,42 @@ static BOOL isVerifyRequest(NSURLRequest *req) {
            [req.HTTPMethod.uppercaseString isEqualToString:@"POST"];
 }
 
+// ─────────────────────────────
+// Wipe image name from dyld_all_image_infos so
+// string scanners find nothing even if list entry lingers
+// ─────────────────────────────
+static void corruptImageName(const char *fname) {
+    struct task_dyld_info dyldInfo;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_DYLD_INFO,
+                  (task_info_t)&dyldInfo, &count) != KERN_SUCCESS) return;
+
+    struct dyld_all_image_infos *infos =
+        (struct dyld_all_image_infos *)dyldInfo.all_image_info_addr;
+    if (!infos) return;
+
+    for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
+        const char *name = infos->infoArray[i].imageFilePath;
+        if (name && strcmp(name, fname) == 0) {
+            // Make the name page writable and zero it out
+            uintptr_t page = (uintptr_t)name & ~(uintptr_t)0xFFF;
+            if (mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE) == 0) {
+                memset((void *)name, 0, strlen(fname));
+                mprotect((void *)page, 0x1000, PROT_READ);
+            }
+            break;
+        }
+    }
+}
+
 static void removeSelfFromDyld(void) {
     Dl_info info;
     if (!dladdr((void *)removeSelfFromDyld, &info)) return;
+
+    // First corrupt the name so scanners can't match it
+    corruptImageName(info.dli_fname);
+
+    // Then remove from image list
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
@@ -101,7 +135,6 @@ static void wipeMachHeader(void) {
         gUnloaded = YES;
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            removeSelfFromDyld();
             wipeMachHeader();
         });
 
@@ -119,4 +152,6 @@ static void wipeMachHeader(void) {
 
 %ctor {
     %init;
+    // Remove immediately on load — before any other dylib can scan
+    removeSelfFromDyld();
 }
