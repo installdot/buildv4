@@ -18,7 +18,7 @@
 
 
 ::  To activate, run the script with "/act" parameter or change 0 to 1 in below line
-set _activate=1
+set _activate=0
 
 ::  To Freeze the 30 days trial period, run the script with "/frz" parameter or change 0 to 1 in below line
 set _freeze=1
