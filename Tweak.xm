@@ -1,14 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <Network/Network.h>
-#import <sys/socket.h>
-#import <netinet/in.h>
-#import <arpa/inet.h>
-#import <dlfcn.h>
-#import <substrate.h>
 
 static NSMutableArray *logs;
-static BOOL hooksReady = NO; // guard — don't log until app is stable
 
 // ─────────────────────────────────────────
 // Logger
@@ -19,156 +12,206 @@ static void AddLog(NSString *tag, NSString *body) {
         NSString *ts = [NSDateFormatter localizedStringFromDate:[NSDate date]
                                                      dateStyle:NSDateFormatterNoStyle
                                                      timeStyle:NSDateFormatterMediumStyle];
-        NSString *entry = [NSString stringWithFormat:
-                           @"[%@] %@\n%@\n────────────────────────────",
-                           ts, tag, body];
-        [logs addObject:entry];
-        NSLog(@"[NetCapture] %@", entry);
+        [logs addObject:[NSString stringWithFormat:
+                         @"[%@] %@\n%@\n────────────────────────────",
+                         ts, tag, body]];
     } @catch (...) {}
 }
 
-static NSString *BytesToString(const void *buf, size_t len) {
-    if (!buf || len == 0) return @"<empty>";
-    NSData *data = [NSData dataWithBytes:buf length:MIN(len, 4096)];
-    NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    return str ?: [NSString stringWithFormat:@"<binary %zu bytes>", len];
+static NSString *DataToHuman(NSData *data) {
+    if (!data || data.length == 0) return @"<empty>";
+    NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return s ?: [NSString stringWithFormat:@"<binary %lu bytes>", (unsigned long)data.length];
 }
 
 // ─────────────────────────────────────────
-// Layer 1: NSURLSession
+// Layer 1: NSURLSession — data task
 // ─────────────────────────────────────────
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 
-    AddLog(@"NSURLSession REQUEST", [NSString stringWithFormat:
+    NSURLRequest *captured = request; // retain for block
+
+    AddLog(@"REQUEST", [NSString stringWithFormat:
         @"URL    : %@\nMethod : %@\nHeaders: %@\nBody   : %@",
-        request.URL.absoluteString,
-        request.HTTPMethod,
-        request.allHTTPHeaderFields,
-        request.HTTPBody
-            ? ([[NSString alloc] initWithData:request.HTTPBody
-                                     encoding:NSUTF8StringEncoding] ?: @"<binary>")
-            : @"<none>"
+        captured.URL.absoluteString,
+        captured.HTTPMethod,
+        captured.allHTTPHeaderFields,
+        captured.HTTPBody ? DataToHuman(captured.HTTPBody) : @"<none>"
     ]);
 
     void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
         ^(NSData *data, NSURLResponse *resp, NSError *err) {
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-            AddLog(@"NSURLSession RESPONSE", [NSString stringWithFormat:
-                @"URL    : %@\nStatus : %ld\nHeaders: %@\nBody   : %@",
-                request.URL.absoluteString,
-                (long)http.statusCode,
-                http.allHeaderFields,
-                data.length
-                    ? ([[NSString alloc] initWithData:data
-                                             encoding:NSUTF8StringEncoding] ?: @"<binary>")
-                    : @"<empty>"
-            ]);
+            @try {
+                NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+                AddLog(@"RESPONSE", [NSString stringWithFormat:
+                    @"URL    : %@\nStatus : %ld\nHeaders: %@\nBody   : %@",
+                    captured.URL.absoluteString,
+                    (long)http.statusCode,
+                    http.allHeaderFields,
+                    DataToHuman(data)
+                ]);
+            } @catch (...) {}
             if (completionHandler) completionHandler(data, resp, err);
         };
 
     return %orig(request, wrapped);
 }
 
+// ─────────────────────────────────────────
+// Layer 1b: NSURLSession — upload task
+// ─────────────────────────────────────────
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
                                          fromData:(NSData *)bodyData
                                 completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    AddLog(@"NSURLSession UPLOAD", [NSString stringWithFormat:
+    AddLog(@"UPLOAD", [NSString stringWithFormat:
         @"URL    : %@\nHeaders: %@\nBody   : %@",
         request.URL.absoluteString,
         request.allHTTPHeaderFields,
-        [[NSString alloc] initWithData:bodyData
-                              encoding:NSUTF8StringEncoding] ?: @"<binary>"
+        DataToHuman(bodyData)
     ]);
     return %orig(request, bodyData, completionHandler);
+}
+
+// ─────────────────────────────────────────
+// Layer 1c: NSURLSession — resume data task (no completion block variant)
+// ─────────────────────────────────────────
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    AddLog(@"REQUEST (no-block)", [NSString stringWithFormat:
+        @"URL    : %@\nMethod : %@\nHeaders: %@",
+        request.URL.absoluteString,
+        request.HTTPMethod,
+        request.allHTTPHeaderFields
+    ]);
+    return %orig(request);
 }
 
 %end
 
 // ─────────────────────────────────────────
-// Layer 2: NSURLConnection
+// Layer 2: NSURLConnection (legacy)
 // ─────────────────────────────────────────
 %hook NSURLConnection
 
 - (id)initWithRequest:(NSURLRequest *)request
              delegate:(id)delegate
      startImmediately:(BOOL)start {
-    AddLog(@"NSURLConnection REQUEST", [NSString stringWithFormat:
-        @"URL    : %@\nMethod : %@\nHeaders: %@",
+    AddLog(@"NSURLConnection", [NSString stringWithFormat:
+        @"URL    : %@\nMethod : %@\nHeaders: %@\nBody   : %@",
         request.URL.absoluteString,
         request.HTTPMethod,
-        request.allHTTPHeaderFields
+        request.allHTTPHeaderFields,
+        request.HTTPBody ? DataToHuman(request.HTTPBody) : @"<none>"
     ]);
     return %orig(request, delegate, start);
+}
+
++ (void)sendAsynchronousRequest:(NSURLRequest *)request
+                          queue:(NSOperationQueue *)queue
+              completionHandler:(void (^)(NSURLResponse *, NSData *, NSError *))handler {
+    AddLog(@"NSURLConnection async", [NSString stringWithFormat:
+        @"URL    : %@\nMethod : %@",
+        request.URL.absoluteString,
+        request.HTTPMethod
+    ]);
+    %orig(request, queue, handler);
 }
 
 %end
 
 // ─────────────────────────────────────────
-// Layer 3: BSD Socket hooks
-// Only hook send/recv — NOT read/write (too broad, causes crash)
+// Layer 3: NSURLProtocol — catches everything
+// including proxy-bypass sessions
 // ─────────────────────────────────────────
-static ssize_t (*orig_send)(int, const void *, size_t, int);
-static ssize_t (*orig_recv)(int, void *, size_t, int);
+@interface CaptureProtocol : NSURLProtocol <NSURLSessionDataDelegate>
+@property (nonatomic, strong) NSURLSession *innerSession;
+@property (nonatomic, strong) NSURLSessionDataTask *innerTask;
+@property (nonatomic, strong) NSMutableData *responseData;
+@end
 
-static BOOL IsNetworkSocket(int fd) {
-    // Quick sanity — fd must be valid
-    if (fd < 0 || fd > 4096) return NO;
+@implementation CaptureProtocol
 
-    struct sockaddr_storage addr;
-    socklen_t len = sizeof(addr);
-    if (getpeername(fd, (struct sockaddr *)&addr, &len) != 0) return NO;
-    return addr.ss_family == AF_INET || addr.ss_family == AF_INET6;
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    // Avoid infinite loop — only intercept untagged requests
+    if ([NSURLProtocol propertyForKey:@"CaptureProtocolHandled" inRequest:request]) {
+        return NO;
+    }
+    NSString *scheme = request.URL.scheme.lowercaseString;
+    return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
 }
 
-static NSString *PeerInfo(int fd) {
-    struct sockaddr_storage addr;
-    socklen_t len = sizeof(addr);
-    if (getpeername(fd, (struct sockaddr *)&addr, &len) != 0)
-        return @"unknown";
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
 
-    char ip[INET6_ADDRSTRLEN] = {0};
-    uint16_t port = 0;
+- (void)startLoading {
+    NSMutableURLRequest *tagged = self.request.mutableCopy;
+    [NSURLProtocol setProperty:@YES forKey:@"CaptureProtocolHandled" inRequest:tagged];
 
-    if (addr.ss_family == AF_INET) {
-        struct sockaddr_in *s = (struct sockaddr_in *)&addr;
-        inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
-        port = ntohs(s->sin_port);
+    AddLog(@"NSURLProtocol REQUEST", [NSString stringWithFormat:
+        @"URL    : %@\nMethod : %@\nHeaders: %@\nBody   : %@",
+        tagged.URL.absoluteString,
+        tagged.HTTPMethod,
+        tagged.allHTTPHeaderFields,
+        tagged.HTTPBody ? DataToHuman(tagged.HTTPBody) : @"<none>"
+    ]);
+
+    self.responseData = [NSMutableData new];
+
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    self.innerSession = [NSURLSession sessionWithConfiguration:cfg
+                                                      delegate:self
+                                                 delegateQueue:nil];
+    self.innerTask = [self.innerSession dataTaskWithRequest:tagged];
+    [self.innerTask resume];
+}
+
+- (void)stopLoading {
+    [self.innerTask cancel];
+    [self.innerSession invalidateAndCancel];
+}
+
+// delegate
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    [self.client URLProtocol:self didReceiveResponse:response
+          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveData:(NSData *)data {
+    [self.responseData appendData:data];
+    [self.client URLProtocol:self didLoadData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+didCompleteWithError:(NSError *)error {
+    if (error) {
+        [self.client URLProtocol:self didFailWithError:error];
     } else {
-        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
-        inet_ntop(AF_INET6, &s->sin6_addr, ip, sizeof(ip));
-        port = ntohs(s->sin6_port);
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)task.response;
+        AddLog(@"NSURLProtocol RESPONSE", [NSString stringWithFormat:
+            @"URL    : %@\nStatus : %ld\nHeaders: %@\nBody   : %@",
+            self.request.URL.absoluteString,
+            (long)http.statusCode,
+            http.allHeaderFields,
+            DataToHuman(self.responseData)
+        ]);
+        [self.client URLProtocolDidFinishLoading:self];
     }
-    return [NSString stringWithFormat:@"%s:%d", ip, port];
 }
 
-static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
-    ssize_t result = orig_send(fd, buf, len, flags);
-    // Guard: only log after app is stable + only network sockets
-    if (hooksReady && result > 0 && IsNetworkSocket(fd)) {
-        AddLog(@"BSD send()", [NSString stringWithFormat:
-            @"fd     : %d\nPeer   : %@\nBytes  : %zd\nData   : %@",
-            fd, PeerInfo(fd), result, BytesToString(buf, (size_t)result)
-        ]);
-    }
-    return result;
-}
-
-static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
-    ssize_t result = orig_recv(fd, buf, len, flags);
-    if (hooksReady && result > 0 && IsNetworkSocket(fd)) {
-        AddLog(@"BSD recv()", [NSString stringWithFormat:
-            @"fd     : %d\nPeer   : %@\nBytes  : %zd\nData   : %@",
-            fd, PeerInfo(fd), result, BytesToString(buf, (size_t)result)
-        ]);
-    }
-    return result;
-}
+@end
 
 // ─────────────────────────────────────────
-// Floating button UI
+// Floating button
 // ─────────────────────────────────────────
 @interface FloatingButton : UIButton
 @end
@@ -184,8 +227,8 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:[NSString stringWithFormat:
-                                      @"📡 %lu requests", (unsigned long)logs.count]
-                             message:@"Logs copied to clipboard"
+                                      @"📡 %lu captured", (unsigned long)logs.count]
+                             message:@"Copied to clipboard"
                       preferredStyle:UIAlertControllerStyleAlert];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Clear"
@@ -198,9 +241,7 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
                                                 handler:nil]];
 
         UIWindow *w = [UIApplication sharedApplication].windows.firstObject;
-        [w.rootViewController presentViewController:alert
-                                           animated:YES
-                                         completion:nil];
+        [w.rootViewController presentViewController:alert animated:YES completion:nil];
     });
 }
 
@@ -235,7 +276,7 @@ static void AddFloatingButton(void) {
 
         overlayWindow = [[PassthroughWindow alloc]
                          initWithFrame:[UIScreen mainScreen].bounds];
-        overlayWindow.windowLevel    = UIWindowLevelAlert + 100;
+        overlayWindow.windowLevel     = UIWindowLevelAlert + 100;
         overlayWindow.backgroundColor = UIColor.clearColor;
         overlayWindow.userInteractionEnabled = YES;
         overlayWindow.hidden = NO;
@@ -257,43 +298,34 @@ static void AddFloatingButton(void) {
       forControlEvents:UIControlEventTouchUpInside];
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-                                       initWithTarget:btn
-                                               action:@selector(handlePan:)];
+                                       initWithTarget:btn action:@selector(handlePan:)];
         [btn addGestureRecognizer:pan];
         [vc.view addSubview:btn];
     });
 }
 
 // ─────────────────────────────────────────
-// App launch hook — enable BSD logging only after app is stable
+// App launch hook
 // ─────────────────────────────────────────
 %hook UIApplication
 
 - (BOOL)application:(UIApplication *)app
 didFinishLaunchingWithOptions:(NSDictionary *)opts {
     BOOL r = %orig(app, opts);
+
+    // Register NSURLProtocol — catches all HTTP/HTTPS including proxy-bypass sessions
+    [NSURLProtocol registerClass:[CaptureProtocol class]];
+
     AddFloatingButton();
-
-    // Enable BSD socket logging only after app fully launched
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        hooksReady = YES;
-    });
-
     return r;
 }
 
 %end
 
 // ─────────────────────────────────────────
-// Constructor — only install send/recv hooks
-// Do NOT hook read/write — too broad, crashes on pipe/file fds
+// Constructor — minimal, no MSHookFunction
 // ─────────────────────────────────────────
 __attribute__((constructor(101))) static void init_hook(void) {
-
-    MSHookFunction((void *)send, (void *)hook_send, (void **)&orig_send);
-    MSHookFunction((void *)recv, (void *)hook_recv, (void **)&orig_recv);
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         AddFloatingButton();
