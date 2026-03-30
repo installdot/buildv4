@@ -8,22 +8,23 @@
 #import <substrate.h>
 
 static NSMutableArray *logs;
+static BOOL hooksReady = NO; // guard — don't log until app is stable
 
 // ─────────────────────────────────────────
 // Logger
 // ─────────────────────────────────────────
 static void AddLog(NSString *tag, NSString *body) {
-    if (!logs) logs = [NSMutableArray new];
-
-    NSString *ts = [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                                 dateStyle:NSDateFormatterNoStyle
-                                                 timeStyle:NSDateFormatterMediumStyle];
-    NSString *entry = [NSString stringWithFormat:
-                       @"[%@] %@\n%@\n%@",
-                       ts, tag, body,
-                       @"────────────────────────────"];
-    [logs addObject:entry];
-    NSLog(@"[NetCapture] %@", entry);
+    @try {
+        if (!logs) logs = [NSMutableArray new];
+        NSString *ts = [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                     dateStyle:NSDateFormatterNoStyle
+                                                     timeStyle:NSDateFormatterMediumStyle];
+        NSString *entry = [NSString stringWithFormat:
+                           @"[%@] %@\n%@\n────────────────────────────",
+                           ts, tag, body];
+        [logs addObject:entry];
+        NSLog(@"[NetCapture] %@", entry);
+    } @catch (...) {}
 }
 
 static NSString *BytesToString(const void *buf, size_t len) {
@@ -47,7 +48,8 @@ static NSString *BytesToString(const void *buf, size_t len) {
         request.HTTPMethod,
         request.allHTTPHeaderFields,
         request.HTTPBody
-            ? ([[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding] ?: @"<binary>")
+            ? ([[NSString alloc] initWithData:request.HTTPBody
+                                     encoding:NSUTF8StringEncoding] ?: @"<binary>")
             : @"<none>"
     ]);
 
@@ -59,7 +61,10 @@ static NSString *BytesToString(const void *buf, size_t len) {
                 request.URL.absoluteString,
                 (long)http.statusCode,
                 http.allHeaderFields,
-                [[NSString alloc] initWithData:data ?: [NSData data] encoding:NSUTF8StringEncoding] ?: @"<binary>"
+                data.length
+                    ? ([[NSString alloc] initWithData:data
+                                             encoding:NSUTF8StringEncoding] ?: @"<binary>")
+                    : @"<empty>"
             ]);
             if (completionHandler) completionHandler(data, resp, err);
         };
@@ -74,7 +79,8 @@ static NSString *BytesToString(const void *buf, size_t len) {
         @"URL    : %@\nHeaders: %@\nBody   : %@",
         request.URL.absoluteString,
         request.allHTTPHeaderFields,
-        [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding] ?: @"<binary>"
+        [[NSString alloc] initWithData:bodyData
+                              encoding:NSUTF8StringEncoding] ?: @"<binary>"
     ]);
     return %orig(request, bodyData, completionHandler);
 }
@@ -86,7 +92,9 @@ static NSString *BytesToString(const void *buf, size_t len) {
 // ─────────────────────────────────────────
 %hook NSURLConnection
 
-- (id)initWithRequest:(NSURLRequest *)request delegate:(id)delegate startImmediately:(BOOL)start {
+- (id)initWithRequest:(NSURLRequest *)request
+             delegate:(id)delegate
+     startImmediately:(BOOL)start {
     AddLog(@"NSURLConnection REQUEST", [NSString stringWithFormat:
         @"URL    : %@\nMethod : %@\nHeaders: %@",
         request.URL.absoluteString,
@@ -100,43 +108,46 @@ static NSString *BytesToString(const void *buf, size_t len) {
 
 // ─────────────────────────────────────────
 // Layer 3: BSD Socket hooks
+// Only hook send/recv — NOT read/write (too broad, causes crash)
 // ─────────────────────────────────────────
-static ssize_t (*orig_send)(int fd, const void *buf, size_t len, int flags);
-static ssize_t (*orig_recv)(int fd, void *buf, size_t len, int flags);
-static ssize_t (*orig_write)(int fd, const void *buf, size_t nbyte);
-static ssize_t (*orig_read)(int fd, void *buf, size_t nbyte);
+static ssize_t (*orig_send)(int, const void *, size_t, int);
+static ssize_t (*orig_recv)(int, void *, size_t, int);
 
 static BOOL IsNetworkSocket(int fd) {
+    // Quick sanity — fd must be valid
+    if (fd < 0 || fd > 4096) return NO;
+
     struct sockaddr_storage addr;
-    socklen_t addrLen = sizeof(addr);
-    if (getpeername(fd, (struct sockaddr *)&addr, &addrLen) != 0) return NO;
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) != 0) return NO;
     return addr.ss_family == AF_INET || addr.ss_family == AF_INET6;
 }
 
 static NSString *PeerInfo(int fd) {
     struct sockaddr_storage addr;
-    socklen_t addrLen = sizeof(addr);
-    if (getpeername(fd, (struct sockaddr *)&addr, &addrLen) != 0)
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr *)&addr, &len) != 0)
         return @"unknown";
 
-    char ipStr[INET6_ADDRSTRLEN] = {0};
+    char ip[INET6_ADDRSTRLEN] = {0};
     uint16_t port = 0;
 
     if (addr.ss_family == AF_INET) {
         struct sockaddr_in *s = (struct sockaddr_in *)&addr;
-        inet_ntop(AF_INET, &s->sin_addr, ipStr, sizeof(ipStr));
+        inet_ntop(AF_INET, &s->sin_addr, ip, sizeof(ip));
         port = ntohs(s->sin_port);
     } else {
         struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
-        inet_ntop(AF_INET6, &s->sin6_addr, ipStr, sizeof(ipStr));
+        inet_ntop(AF_INET6, &s->sin6_addr, ip, sizeof(ip));
         port = ntohs(s->sin6_port);
     }
-    return [NSString stringWithFormat:@"%s:%d", ipStr, port];
+    return [NSString stringWithFormat:@"%s:%d", ip, port];
 }
 
 static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
     ssize_t result = orig_send(fd, buf, len, flags);
-    if (result > 0 && IsNetworkSocket(fd)) {
+    // Guard: only log after app is stable + only network sockets
+    if (hooksReady && result > 0 && IsNetworkSocket(fd)) {
         AddLog(@"BSD send()", [NSString stringWithFormat:
             @"fd     : %d\nPeer   : %@\nBytes  : %zd\nData   : %@",
             fd, PeerInfo(fd), result, BytesToString(buf, (size_t)result)
@@ -147,7 +158,7 @@ static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
 
 static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     ssize_t result = orig_recv(fd, buf, len, flags);
-    if (result > 0 && IsNetworkSocket(fd)) {
+    if (hooksReady && result > 0 && IsNetworkSocket(fd)) {
         AddLog(@"BSD recv()", [NSString stringWithFormat:
             @"fd     : %d\nPeer   : %@\nBytes  : %zd\nData   : %@",
             fd, PeerInfo(fd), result, BytesToString(buf, (size_t)result)
@@ -155,57 +166,6 @@ static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
     }
     return result;
 }
-
-static ssize_t hook_write(int fd, const void *buf, size_t nbyte) {
-    ssize_t result = orig_write(fd, buf, nbyte);
-    if (result > 0 && IsNetworkSocket(fd)) {
-        AddLog(@"BSD write()", [NSString stringWithFormat:
-            @"fd     : %d\nPeer   : %@\nBytes  : %zd\nData   : %@",
-            fd, PeerInfo(fd), result, BytesToString(buf, (size_t)result)
-        ]);
-    }
-    return result;
-}
-
-static ssize_t hook_read(int fd, void *buf, size_t nbyte) {
-    ssize_t result = orig_read(fd, buf, nbyte);
-    if (result > 0 && IsNetworkSocket(fd)) {
-        AddLog(@"BSD read()", [NSString stringWithFormat:
-            @"fd     : %d\nPeer   : %@\nBytes  : %zd\nData   : %@",
-            fd, PeerInfo(fd), result, BytesToString(buf, (size_t)result)
-        ]);
-    }
-    return result;
-}
-
-// ─────────────────────────────────────────
-// Layer 4: Network.framework nw_connection
-// ─────────────────────────────────────────
-%hook OS_nw_connection
-
-- (void)sendContent:(id)content
-            context:(id)context
-         isComplete:(BOOL)isComplete
-         completion:(nw_connection_send_completion_t)completion {
-
-    if (content && [content conformsToProtocol:@protocol(OS_dispatch_data)]) {
-        dispatch_data_t dispData = (dispatch_data_t)content;
-        dispatch_data_apply(dispData, ^bool(dispatch_data_t region,
-                                             size_t offset,
-                                             const void *buffer,
-                                             size_t size) {
-            AddLog(@"nw_connection SEND", [NSString stringWithFormat:
-                @"Bytes  : %zu\nData   : %@",
-                size, BytesToString(buffer, size)
-            ]);
-            return true;
-        });
-    }
-
-    %orig(content, context, isComplete, completion);
-}
-
-%end
 
 // ─────────────────────────────────────────
 // Floating button UI
@@ -216,12 +176,15 @@ static ssize_t hook_read(int fd, void *buf, size_t nbyte) {
 @implementation FloatingButton
 
 - (void)handleTap {
-    NSString *all = [logs componentsJoinedByString:@"\n"];
+    NSString *all = logs.count
+        ? [logs componentsJoinedByString:@"\n"]
+        : @"No logs yet.";
     [UIPasteboard generalPasteboard].string = all;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:[NSString stringWithFormat:@"📡 %lu requests captured", (unsigned long)logs.count]
+            alertControllerWithTitle:[NSString stringWithFormat:
+                                      @"📡 %lu requests", (unsigned long)logs.count]
                              message:@"Logs copied to clipboard"
                       preferredStyle:UIAlertControllerStyleAlert];
 
@@ -230,13 +193,14 @@ static ssize_t hook_read(int fd, void *buf, size_t nbyte) {
                                                 handler:^(UIAlertAction *a) {
             [logs removeAllObjects];
         }]];
-
         [alert addAction:[UIAlertAction actionWithTitle:@"OK"
                                                   style:UIAlertActionStyleDefault
                                                 handler:nil]];
 
         UIWindow *w = [UIApplication sharedApplication].windows.firstObject;
-        [w.rootViewController presentViewController:alert animated:YES completion:nil];
+        [w.rootViewController presentViewController:alert
+                                           animated:YES
+                                         completion:nil];
     });
 }
 
@@ -248,24 +212,18 @@ static ssize_t hook_read(int fd, void *buf, size_t nbyte) {
 
 @end
 
-// ─────────────────────────────────────────
-// Passthrough window (touches pass through bg)
-// ─────────────────────────────────────────
 @interface PassthroughWindow : UIWindow
 @end
 
 @implementation PassthroughWindow
-
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     return (hit == self.rootViewController.view || hit == self) ? nil : hit;
 }
-
 @end
 
 @interface PassthroughVC : UIViewController
 @end
-
 @implementation PassthroughVC
 @end
 
@@ -275,8 +233,9 @@ static void AddFloatingButton(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (overlayWindow) return;
 
-        overlayWindow = [[PassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        overlayWindow.windowLevel = UIWindowLevelAlert + 100;
+        overlayWindow = [[PassthroughWindow alloc]
+                         initWithFrame:[UIScreen mainScreen].bounds];
+        overlayWindow.windowLevel    = UIWindowLevelAlert + 100;
         overlayWindow.backgroundColor = UIColor.clearColor;
         overlayWindow.userInteractionEnabled = YES;
         overlayWindow.hidden = NO;
@@ -306,7 +265,7 @@ static void AddFloatingButton(void) {
 }
 
 // ─────────────────────────────────────────
-// App launch hook
+// App launch hook — enable BSD logging only after app is stable
 // ─────────────────────────────────────────
 %hook UIApplication
 
@@ -314,20 +273,26 @@ static void AddFloatingButton(void) {
 didFinishLaunchingWithOptions:(NSDictionary *)opts {
     BOOL r = %orig(app, opts);
     AddFloatingButton();
+
+    // Enable BSD socket logging only after app fully launched
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        hooksReady = YES;
+    });
+
     return r;
 }
 
 %end
 
 // ─────────────────────────────────────────
-// Constructor — BSD hooks + button fallback
+// Constructor — only install send/recv hooks
+// Do NOT hook read/write — too broad, crashes on pipe/file fds
 // ─────────────────────────────────────────
 __attribute__((constructor(101))) static void init_hook(void) {
 
-    MSHookFunction((void *)send,  (void *)hook_send,  (void **)&orig_send);
-    MSHookFunction((void *)recv,  (void *)hook_recv,  (void **)&orig_recv);
-    MSHookFunction((void *)write, (void *)hook_write, (void **)&orig_write);
-    MSHookFunction((void *)read,  (void *)hook_read,  (void **)&orig_read);
+    MSHookFunction((void *)send, (void *)hook_send, (void **)&orig_send);
+    MSHookFunction((void *)recv, (void *)hook_recv, (void **)&orig_recv);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
