@@ -1,145 +1,279 @@
-// Tweak.xm
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
+#import <UIKit/UIKit.h>
 
-@interface Unitoreios : NSObject
-- (void)activehack:(NSString *)title message:(NSString *)message font:(UIFont *)font;
-- (void)showOfflineNoticeIfNeeded;
+static NSString *const kTargetHost = @"api.cheatiosvip.vn";
+static NSString *const kTargetPath = @"/api.php";
+
+@interface HookURLProtocol : NSURLProtocol
 @end
 
-static NSString *getDateString() {
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    return [fmt stringFromDate:[NSDate date]];
-}
+@implementation HookURLProtocol
 
-static void showDebugBanner() {
-    Class unitoreiosClass = objc_getClass("Unitoreios");
-    if (!unitoreiosClass) return;
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    NSURL *url = request.URL;
+    if (!url) return NO;
 
-    id instance = [unitoreiosClass new];
-    if (!instance) return;
+    BOOL isTarget =
+        [url.host isEqualToString:kTargetHost] &&
+        [url.path isEqualToString:kTargetPath];
 
-    NSString *msg = [NSString stringWithFormat:@"Hôm nay là ngày: %@", getDateString()];
-    SEL sel = NSSelectorFromString(@"activehack:message:font:");
-    if ([instance respondsToSelector:sel]) {
-        UIFont *font = [UIFont fontWithName:@"AvenirNext-Bold" size:13];
-        typedef void (*MsgSendType)(id, SEL, NSString *, NSString *, UIFont *);
-        MsgSendType send = (MsgSendType)objc_msgSend;
-        send(instance, sel, @"Trần Quang Hải - Đã crack key thành công...", msg, font);
+    if (!isTarget) return NO;
+
+    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
+        return NO;
     }
-}
 
-%hook Unitoreios
+    NSString *method = request.HTTPMethod.uppercaseString;
 
-- (BOOL)isNetworkAvailable {
+    // ─────────────────────────────
+    // 1. GET notifications
+    // ─────────────────────────────
+    if ([method isEqualToString:@"GET"]) {
+        NSString *query = url.query ?: @"";
+        if ([query containsString:@"action=get_notifications"]) {
+            NSLog(@"[Hook] ✅ Notifications request detected");
+            return YES;
+        }
+    }
+
+    // ─────────────────────────────
+    // 2. POST validate + connection_check
+    // ─────────────────────────────
+    if ([method isEqualToString:@"POST"]) {
+
+        NSData *bodyData = request.HTTPBody;
+
+        if (!bodyData && request.HTTPBodyStream) {
+            NSInputStream *stream = request.HTTPBodyStream;
+            NSMutableData *data = [NSMutableData data];
+
+            [stream open];
+            uint8_t buffer[1024];
+            NSInteger len;
+
+            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+                [data appendBytes:buffer length:len];
+            }
+
+            [stream close];
+            bodyData = data;
+        }
+
+        if (!bodyData) return NO;
+
+        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+        if (!body) return NO;
+
+        NSLog(@"[Hook] POST Body: %@", body);
+
+        BOOL isValidate =
+            [body containsString:@"action=validate"] &&
+            [body containsString:@"key="] &&
+            [body containsString:@"hwid="];
+
+        BOOL isConnectionCheck = [body containsString:@"action=connection_check"];
+
+        if (isValidate || isConnectionCheck) {
+            if (isValidate) {
+                NSLog(@"[Hook] ✅ Validate request detected");
+            } else {
+                NSLog(@"[Hook] ✅ Connection check request detected");
+            }
+            return YES;
+        }
+    }
+
     return NO;
 }
 
-- (BOOL)canUseCachedSession {
-    return YES;
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
 }
 
-// Chặn hoàn toàn offline notice, không gọi %orig
-- (void)showOfflineNoticeIfNeeded {
-    // %orig bị bỏ → không hiện thông báo mất mạng
+- (void)startLoading {
+
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
+
+    NSURL *url = self.request.URL;
+    NSString *method = self.request.HTTPMethod.uppercaseString;
+
+    NSData *data = nil;
+
+    // ─────────────────────────────
+    // 1. Notifications spoof
+    // ─────────────────────────────
+    if ([method isEqualToString:@"GET"]) {
+        NSString *query = url.query ?: @"";
+
+        if ([query containsString:@"action=get_notifications"]) {
+
+            NSDictionary *json = @{
+                @"success": @YES,
+                @"count": @1,
+                @"notifications": @[
+                    @{
+                        @"id": @7,
+                        @"title": @"Óc Cảnh iOS",
+                        @"message": @"Crack by Hải",
+                        @"time": @"09/12/2025",
+                        @"priority": @2,
+                        @"created_at": @"2025-12-09 17:06:20"
+                    }
+                ]
+            };
+
+            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+        }
+    }
+
+    // ─────────────────────────────
+    // 2. POST validate / connection_check spoof
+    // ─────────────────────────────
+    if (!data && [method isEqualToString:@"POST"]) {
+
+        NSData *bodyData = self.request.HTTPBody;
+
+        if (!bodyData && self.request.HTTPBodyStream) {
+            NSInputStream *stream = self.request.HTTPBodyStream;
+            NSMutableData *mutableData = [NSMutableData data];
+
+            [stream open];
+            uint8_t buffer[1024];
+            NSInteger len;
+
+            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+                [mutableData appendBytes:buffer length:len];
+            }
+
+            [stream close];
+            bodyData = mutableData;
+        }
+
+        if (bodyData) {
+            NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+            if (body) {
+
+                if ([body containsString:@"action=connection_check"]) {
+                    NSLog(@"[Hook] ✅ Connection check request detected");
+
+                    NSDictionary *json = @{
+                        @"success": @YES,
+                        @"killed": @NO,
+                        @"message": @"Connection OK",
+                        @"license_valid": @YES,
+                        @"expiry_date": @"2036-03-31 04:40:16",
+                        @"remaining_days": @0,
+                        @"remaining_hours": @4,
+                        @"server_time": @"2026-03-31 00:12:19"
+                    };
+
+                    data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+
+                } else if ([body containsString:@"action=validate"] &&
+                           [body containsString:@"key="] &&
+                           [body containsString:@"hwid="]) {
+
+                    NSLog(@"[Hook] ✅ Validate request detected");
+
+                    NSDictionary *json = @{
+                        @"success": @YES,
+                        @"message": @"License validated successfully",
+                        @"data": @{
+                            @"subscription_type": @"daily",
+                            @"expiry_date": @"2036-04-24 17:41:33",
+                            @"remaining_days": @26,
+                            @"remaining_hours": @22,
+                            @"activated_at": @"2026-03-23 17:41:33",
+                            @"is_trial": @NO,
+                            @"is_pro": @1
+                        }
+                    };
+
+                    data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────
+    // Send response
+    // ─────────────────────────────
+
+    NSHTTPURLResponse *response =
+        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                    statusCode:200
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{
+                                      @"Content-Type": @"application/json",
+                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+                                  }];
+
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
 }
 
-// Hook activehack để kéo dài thời gian hiện banner (5s → 12s)
-- (void)activehack:(NSString *)title message:(NSString *)message font:(UIFont *)font {
-    CGFloat screenWidth = [UIScreen mainScreen].bounds.size.width;
-    CGFloat screenHeight = [UIScreen mainScreen].bounds.size.height;
-    CGFloat maxWidth = screenWidth * 0.75;
+- (void)stopLoading {}
 
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, maxWidth, 0)];
-    titleLabel.text = title;
-    titleLabel.textAlignment = NSTextAlignmentLeft;
-    titleLabel.font = font;
-    titleLabel.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.2 alpha:1.0];
-    titleLabel.numberOfLines = 0;
-    [titleLabel sizeToFit];
+@end
 
-    UILabel *messageLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, maxWidth, 0)];
-    messageLabel.text = message;
-    messageLabel.textAlignment = NSTextAlignmentLeft;
-    messageLabel.font = [UIFont fontWithName:@"AvenirNext-Bold" size:10];
-    messageLabel.textColor = [UIColor whiteColor];
-    messageLabel.numberOfLines = 0;
-    [messageLabel sizeToFit];
+// ─────────────────────────────────────────
+// Register helper
+// ─────────────────────────────────────────
 
-    CGFloat rectWidth = MAX(titleLabel.frame.size.width, messageLabel.frame.size.width) + 60;
-    CGFloat rectHeight = titleLabel.frame.size.height + messageLabel.frame.size.height + 16;
-    CGFloat rectX = screenWidth;
-    CGFloat rectY = screenHeight * 0.10;
+static void RegisterProtocol(void) {
+    [NSURLProtocol registerClass:[HookURLProtocol class]];
+}
 
-    UIWindow *mainWindow = [[[UIApplication sharedApplication] delegate] window];
+// Early load
+__attribute__((constructor(101))) static void init_hook(void) {
+    RegisterProtocol();
+}
 
-    UIView *rect2 = [[UIView alloc] initWithFrame:CGRectMake(rectX, rectY, 0, rectHeight)];
-    rect2.backgroundColor = [UIColor blackColor];
-    [mainWindow addSubview:rect2];
+// Force into sessions
+%hook NSURLSessionConfiguration
 
-    UIView *rect1 = [[UIView alloc] initWithFrame:CGRectMake(rectX, rectY, 0, rectHeight)];
-    rect1.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.2 alpha:1.0];
-    [mainWindow addSubview:rect1];
-
-    [UIView animateWithDuration:0.5 animations:^{
-        rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
-        rect2.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
-    } completion:^(BOOL finished) {
-        [UIView animateWithDuration:0.15 delay:0.0 options:0 animations:^{
-            rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, screenWidth * 0.005, rectHeight);
-        } completion:^(BOOL finished) {
-            titleLabel.alpha = 1;
-            messageLabel.alpha = 1;
-            [mainWindow addSubview:titleLabel];
-            [mainWindow addSubview:messageLabel];
-            titleLabel.center = CGPointMake(rectX - rectWidth / 2 + 12, rectY + rectHeight / 2 - messageLabel.frame.size.height / 2 - 2);
-            messageLabel.center = CGPointMake(rectX - rectWidth / 2 + 12, rectY + rectHeight / 2 + titleLabel.frame.size.height / 2 + 2);
-
-            // ← 12s thay vì 5s
-            [UIView animateWithDuration:0.5 delay:12.0 options:0 animations:^{
-                rect1.frame = CGRectMake(rectX - rectWidth + 0.5, rectY, rectWidth, rectHeight);
-                titleLabel.center = CGPointMake(rectX + rectWidth / 2 + 12, rectY + rectHeight / 2 - messageLabel.frame.size.height / 2 - 2);
-                messageLabel.center = CGPointMake(rectX + rectWidth / 2 + 12, rectY + rectHeight / 2 + titleLabel.frame.size.height / 2 + 2);
-            } completion:^(BOOL finished) {
-                [UIView animateWithDuration:0.15 delay:0.0 options:0 animations:^{
-                    rect1.frame = CGRectMake(rectX, rectY, 0, rectHeight);
-                    rect2.frame = CGRectMake(rectX, rectY, 0, rectHeight);
-                    titleLabel.alpha = 0;
-                    messageLabel.alpha = 0;
-                } completion:^(BOOL finished) {
-                    [rect1 removeFromSuperview];
-                    [rect2 removeFromSuperview];
-                    [titleLabel removeFromSuperview];
-                    [messageLabel removeFromSuperview];
-                }];
-            }];
-        }];
-    }];
+- (NSArray *)protocolClasses {
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
+    NSArray *orig = %orig;
+    if (orig) [arr addObjectsFromArray:orig];
+    return arr;
 }
 
 %end
 
-// ─── Block outbound requests to apiunitoreios.site ───────────────────────────
-#import <Foundation/Foundation.h>
+// Cover all NSURLSession usage
+%hook NSURLSession
 
-%hook NSURLSessionTask
++ (NSURLSession *)sharedSession {
+    RegisterProtocol();
+    return %orig;
+}
 
-- (void)resume {
-    if ([[[self currentRequest].URL host] containsString:@"apiunitoreios.site"]) return;
-    %orig;
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    RegisterProtocol();
+    return %orig;
 }
 
 %end
-// ─────────────────────────────────────────────────────────────────────────────
+
+// NSURLConnection fallback
+%hook NSURLConnection
+
++ (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
+    RegisterProtocol();
+    return %orig;
+}
+
+%end
 
 %ctor {
-    NSLog(@"[UnitoreiosDebug] ctor fired — hooks active");
-    %init;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        showDebugBanner();
-    });
+    RegisterProtocol();
 }
