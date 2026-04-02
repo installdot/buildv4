@@ -1,279 +1,110 @@
+#import <substrate.h>
+#import <dobby.h>
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 
-static NSString *const kTargetHost = @"api.cheatiosvip.vn";
-static NSString *const kTargetPath = @"/api.php";
-
-@interface HookURLProtocol : NSURLProtocol
-@end
-
-@implementation HookURLProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    NSURL *url = request.URL;
-    if (!url) return NO;
-
-    BOOL isTarget =
-        [url.host isEqualToString:kTargetHost] &&
-        [url.path isEqualToString:kTargetPath];
-
-    if (!isTarget) return NO;
-
-    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
-        return NO;
-    }
-
-    NSString *method = request.HTTPMethod.uppercaseString;
-
-    // ─────────────────────────────
-    // 1. GET notifications
-    // ─────────────────────────────
-    if ([method isEqualToString:@"GET"]) {
-        NSString *query = url.query ?: @"";
-        if ([query containsString:@"action=get_notifications"]) {
-            NSLog(@"[Hook] ✅ Notifications request detected");
-            return YES;
-        }
-    }
-
-    // ─────────────────────────────
-    // 2. POST validate + connection_check
-    // ─────────────────────────────
-    if ([method isEqualToString:@"POST"]) {
-
-        NSData *bodyData = request.HTTPBody;
-
-        if (!bodyData && request.HTTPBodyStream) {
-            NSInputStream *stream = request.HTTPBodyStream;
-            NSMutableData *data = [NSMutableData data];
-
-            [stream open];
-            uint8_t buffer[1024];
-            NSInteger len;
-
-            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
-                [data appendBytes:buffer length:len];
-            }
-
-            [stream close];
-            bodyData = data;
-        }
-
-        if (!bodyData) return NO;
-
-        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
-        if (!body) return NO;
-
-        NSLog(@"[Hook] POST Body: %@", body);
-
-        BOOL isValidate =
-            [body containsString:@"action=validate"] &&
-            [body containsString:@"key="] &&
-            [body containsString:@"hwid="];
-
-        BOOL isConnectionCheck = [body containsString:@"action=connection_check"];
-
-        if (isValidate || isConnectionCheck) {
-            if (isValidate) {
-                NSLog(@"[Hook] ✅ Validate request detected");
-            } else {
-                NSLog(@"[Hook] ✅ Connection check request detected");
-            }
-            return YES;
-        }
-    }
-
-    return NO;
+static uintptr_t getBase() {
+    return (uintptr_t)_dyld_get_image_vmaddr_slide(0);
 }
 
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
+// ─── Typedefs ───────────────────────────────────────────
+
+typedef void* (*CreateCloudSaveSundry_t)(void* cloudData);
+typedef void  (*CheckIllegalMaterial_t)(void* self, void* cloudData);
+typedef double(*GetVariance_t)(void* data);
+typedef double(*GetVarianceRMM_t)(void* data);
+typedef long  (*GetMaterialTotal_t)(void* itemData);
+
+static CreateCloudSaveSundry_t orig_CreateCloudSaveSundry = NULL;
+
+// ─── Hook: CheckIllegalMaterial → no-op ─────────────────
+
+static void hook_CheckIllegalMaterial(void* self, void* cloudData) {
+    // do nothing — skip entirely
 }
 
-- (void)startLoading {
+// ─── Hook: Variance checks → return 0 ───────────────────
 
-    NSMutableURLRequest *req = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
+static double hook_GetVariance(void* data) { return 0.0; }
+static double hook_GetVarianceRMM(void* data) { return 0.0; }
+static long   hook_GetMaterialTotal(void* itemData) { return 0L; }
 
-    NSURL *url = self.request.URL;
-    NSString *method = self.request.HTTPMethod.uppercaseString;
+// ─── Hook: CreateCloudSaveSundry → clean fields after ───
 
-    NSData *data = nil;
+static void* hook_CreateCloudSaveSundry(void* cloudData) {
+    void* result = orig_CreateCloudSaveSundry(cloudData);
+    if (!result) return result;
 
-    // ─────────────────────────────
-    // 1. Notifications spoof
-    // ─────────────────────────────
-    if ([method isEqualToString:@"GET"]) {
-        NSString *query = url.query ?: @"";
+    uint8_t* obj = (uint8_t*)result;
 
-        if ([query containsString:@"action=get_notifications"]) {
+    // Set gem/fish/token fields to 99999999 in sundry report
+    // so server sees plausible numbers matching what we set
+    *(int*)(obj + 0x08) = 99999999; // Gem
+    *(int*)(obj + 0x14) = 99999999; // FishChip
 
-            NSDictionary *json = @{
-                @"success": @YES,
-                @"count": @1,
-                @"notifications": @[
-                    @{
-                        @"id": @7,
-                        @"title": @"Óc Cảnh iOS",
-                        @"message": @"Crack by Hải",
-                        @"time": @"09/12/2025",
-                        @"priority": @2,
-                        @"created_at": @"2025-12-09 17:06:20"
-                    }
-                ]
-            };
+    // Zero out all variance/suspicion fields
+    *(double*)(obj + 0x48) = 0.0;   // ItemVariance
+    *(double*)(obj + 0x58) = 0.0;   // SeedItemVariance
+    *(double*)(obj + 0x68) = 0.0;   // MaterialsItemVariance
+    *(double*)(obj + 0x78) = 0.0;   // TokenTicketsVariance
 
-            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-        }
-    }
+    // Null out UnKnownMaterial array (the main cheat flag)
+    *(uintptr_t*)(obj + 0x30) = 0;
 
-    // ─────────────────────────────
-    // 2. POST validate / connection_check spoof
-    // ─────────────────────────────
-    if (!data && [method isEqualToString:@"POST"]) {
-
-        NSData *bodyData = self.request.HTTPBody;
-
-        if (!bodyData && self.request.HTTPBodyStream) {
-            NSInputStream *stream = self.request.HTTPBodyStream;
-            NSMutableData *mutableData = [NSMutableData data];
-
-            [stream open];
-            uint8_t buffer[1024];
-            NSInteger len;
-
-            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
-                [mutableData appendBytes:buffer length:len];
-            }
-
-            [stream close];
-            bodyData = mutableData;
-        }
-
-        if (bodyData) {
-            NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
-            if (body) {
-
-                if ([body containsString:@"action=connection_check"]) {
-                    NSLog(@"[Hook] ✅ Connection check request detected");
-
-                    NSDictionary *json = @{
-                        @"success": @YES,
-                        @"killed": @NO,
-                        @"message": @"Connection OK",
-                        @"license_valid": @YES,
-                        @"expiry_date": @"2036-03-31 04:40:16",
-                        @"remaining_days": @0,
-                        @"remaining_hours": @4,
-                        @"server_time": @"2026-03-31 00:12:19"
-                    };
-
-                    data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-
-                } else if ([body containsString:@"action=validate"] &&
-                           [body containsString:@"key="] &&
-                           [body containsString:@"hwid="]) {
-
-                    NSLog(@"[Hook] ✅ Validate request detected");
-
-                    NSDictionary *json = @{
-                        @"success": @YES,
-                        @"message": @"License validated successfully",
-                        @"data": @{
-                            @"subscription_type": @"daily",
-                            @"expiry_date": @"2036-04-24 17:41:33",
-                            @"remaining_days": @26,
-                            @"remaining_hours": @22,
-                            @"activated_at": @"2026-03-23 17:41:33",
-                            @"is_trial": @NO,
-                            @"is_pro": @1
-                        }
-                    };
-
-                    data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                }
-            }
-        }
-    }
-
-    // ─────────────────────────────
-    // Send response
-    // ─────────────────────────────
-
-    NSHTTPURLResponse *response =
-        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
-                                    statusCode:200
-                                   HTTPVersion:@"HTTP/1.1"
-                                  headerFields:@{
-                                      @"Content-Type": @"application/json",
-                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
-                                  }];
-
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    [self.client URLProtocol:self didLoadData:data];
-    [self.client URLProtocolDidFinishLoading:self];
+    return result;
 }
 
-- (void)stopLoading {}
+// ─── Hook: AboGameData.CreateFromPlayerPref → patch values
 
-@end
+typedef void* (*AboCreateFromPref_t)(void);
+static AboCreateFromPref_t orig_AboCreate = NULL;
 
-// ─────────────────────────────────────────
-// Register helper
-// ─────────────────────────────────────────
+static void* hook_AboCreate(void) {
+    void* result = orig_AboCreate();
+    if (!result) return result;
 
-static void RegisterProtocol(void) {
-    [NSURLProtocol registerClass:[HookURLProtocol class]];
+    uint8_t* obj = (uint8_t*)result;
+
+    // AboGameData field offsets:
+    *(int*)(obj + 0x40) = 99999999; // gems
+    *(int*)(obj + 0x5C) = 99999999; // fishChip
+
+    // Note: tokenTickets live in ItemData, not directly here
+    // patch via CloudSaveGameData.itemData if needed
+
+    return result;
 }
 
-// Early load
-__attribute__((constructor(101))) static void init_hook(void) {
-    RegisterProtocol();
-}
+// ─── Constructor ─────────────────────────────────────────
 
-// Force into sessions
-%hook NSURLSessionConfiguration
+__attribute__((constructor))
+static void initialize() {
+    uintptr_t base = getBase();
 
-- (NSArray *)protocolClasses {
-    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
-    NSArray *orig = %orig;
-    if (orig) [arr addObjectsFromArray:orig];
-    return arr;
-}
+    // Kill CheckIllegalMaterial
+    DobbyHook(
+        (void*)(base + 0x6A09C8),
+        (void*)hook_CheckIllegalMaterial,
+        NULL
+    );
 
-%end
+    // Neutralize variance methods
+    DobbyHook((void*)(base + 0x6A1F20), (void*)hook_GetVariance,     NULL);
+    DobbyHook((void*)(base + 0x6A1078), (void*)hook_GetVarianceRMM,  NULL);
+    DobbyHook((void*)(base + 0x6A0F6C), (void*)hook_GetMaterialTotal, NULL);
 
-// Cover all NSURLSession usage
-%hook NSURLSession
+    // Hook CreateCloudSaveSundry (save original for chaining)
+    DobbyHook(
+        (void*)(base + 0x698EA4),
+        (void*)hook_CreateCloudSaveSundry,
+        (void**)&orig_CreateCloudSaveSundry
+    );
 
-+ (NSURLSession *)sharedSession {
-    RegisterProtocol();
-    return %orig;
-}
+    // Hook AboGameData.CreateFromPlayerPref
+    DobbyHook(
+        (void*)(base + 0x1D04A60),
+        (void*)hook_AboCreate,
+        (void**)&orig_AboCreate
+    );
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    RegisterProtocol();
-    return %orig;
-}
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    RegisterProtocol();
-    return %orig;
-}
-
-%end
-
-// NSURLConnection fallback
-%hook NSURLConnection
-
-+ (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
-    RegisterProtocol();
-    return %orig;
-}
-
-%end
-
-%ctor {
-    RegisterProtocol();
+    NSLog(@"[TWEAK] Hooks installed successfully");
 }
