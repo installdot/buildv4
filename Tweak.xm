@@ -1,6 +1,6 @@
 #import <substrate.h>
-#import <dobby.h>
 #import <Foundation/Foundation.h>
+#include <mach-o/dyld.h>
 
 static uintptr_t getBase() {
     return (uintptr_t)_dyld_get_image_vmaddr_slide(0);
@@ -81,26 +81,26 @@ static void initialize() {
     uintptr_t base = getBase();
 
     // Kill CheckIllegalMaterial
-    DobbyHook(
+    MSHookFunction(
         (void*)(base + 0x6A09C8),
         (void*)hook_CheckIllegalMaterial,
         NULL
     );
 
     // Neutralize variance methods
-    DobbyHook((void*)(base + 0x6A1F20), (void*)hook_GetVariance,     NULL);
-    DobbyHook((void*)(base + 0x6A1078), (void*)hook_GetVarianceRMM,  NULL);
-    DobbyHook((void*)(base + 0x6A0F6C), (void*)hook_GetMaterialTotal, NULL);
+    MSHookFunction((void*)(base + 0x6A1F20), (void*)hook_GetVariance,      NULL);
+    MSHookFunction((void*)(base + 0x6A1078), (void*)hook_GetVarianceRMM,   NULL);
+    MSHookFunction((void*)(base + 0x6A0F6C), (void*)hook_GetMaterialTotal, NULL);
 
     // Hook CreateCloudSaveSundry (save original for chaining)
-    DobbyHook(
+    MSHookFunction(
         (void*)(base + 0x698EA4),
         (void*)hook_CreateCloudSaveSundry,
         (void**)&orig_CreateCloudSaveSundry
     );
 
     // Hook AboGameData.CreateFromPlayerPref
-    DobbyHook(
+    MSHookFunction(
         (void*)(base + 0x1D04A60),
         (void*)hook_AboCreate,
         (void**)&orig_AboCreate
