@@ -18,28 +18,44 @@ static UIViewController *topVC() {
     return root;
 }
 
-// MARK: - Show current UDID + option to set custom
+// MARK: - Transparent passthrough root VC
+// Lets touches outside the button fall through to the app
+@interface _PassthroughVC : UIViewController
+@end
+@implementation _PassthroughVC
+- (void)loadView {
+    self.view = [[UIView alloc] init];
+    self.view.backgroundColor = [UIColor clearColor];
+    self.view.userInteractionEnabled = NO; // passthrough by default
+}
+@end
+
+// MARK: - Overlay window (lives above everything)
+@interface _UDIDOverlayWindow : UIWindow
+@end
+@implementation _UDIDOverlayWindow
+// Only intercept touches that land directly on subviews (the button)
+// Everything else falls through to the app window
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self || hit == self.rootViewController.view) return nil;
+    return hit;
+}
+@end
+
+// MARK: - UDID actions
 static void showUDIDMenu() {
     id client = getClient();
-    if (!client) {
-        UIAlertController *err = [UIAlertController
-            alertControllerWithTitle:@"Error"
-            message:@"APIClient not found in target app."
-            preferredStyle:UIAlertControllerStyleAlert];
-        [err addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
-        [topVC() presentViewController:err animated:YES completion:nil];
-        return;
-    }
-
-    NSString *udid = ((MsgSendStr)objc_msgSend)(client, NSSelectorFromString(@"getUDID"));
+    NSString *udid = client
+        ? ((MsgSendStr)objc_msgSend)(client, NSSelectorFromString(@"getUDID"))
+        : nil;
     if (!udid || udid.length == 0) udid = @"(not set)";
 
     UIAlertController *menu = [UIAlertController
         alertControllerWithTitle:@"UDID Manager"
-        message:[NSString stringWithFormat:@"Current UDID:\n%@", udid]
+        message:[NSString stringWithFormat:@"Current:\n%@", udid]
         preferredStyle:UIAlertControllerStyleAlert];
 
-    // Copy current
     [menu addAction:[UIAlertAction
         actionWithTitle:@"Copy Current"
         style:UIAlertActionStyleDefault
@@ -47,19 +63,18 @@ static void showUDIDMenu() {
             [UIPasteboard generalPasteboard].string = udid;
         }]];
 
-    // Set custom UDID
     [menu addAction:[UIAlertAction
         actionWithTitle:@"Set Custom UDID"
         style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *a) {
             UIAlertController *input = [UIAlertController
                 alertControllerWithTitle:@"Set Custom UDID"
-                message:@"Enter the UDID to write into APIClient"
+                message:@"Enter UDID to write into APIClient"
                 preferredStyle:UIAlertControllerStyleAlert];
 
             [input addTextFieldWithConfigurationHandler:^(UITextField *tf) {
                 tf.placeholder = @"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-                tf.text = udid; // pre-fill with current value
+                tf.text = udid;
                 tf.clearButtonMode = UITextFieldViewModeWhileEditing;
                 tf.autocorrectionType = UITextAutocorrectionTypeNo;
                 tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -70,25 +85,25 @@ static void showUDIDMenu() {
                 style:UIAlertActionStyleDefault
                 handler:^(UIAlertAction *a) {
                     NSString *custom = input.textFields.firstObject.text;
-                    if (custom.length == 0) return;
-
+                    if (!client || custom.length == 0) return;
                     ((MsgSendSetStr)objc_msgSend)(client, NSSelectorFromString(@"setUDID:"), custom);
 
-                    // Confirm
                     UIAlertController *ok = [UIAlertController
                         alertControllerWithTitle:@"Done"
-                        message:[NSString stringWithFormat:@"UDID set to:\n%@", custom]
+                        message:[NSString stringWithFormat:@"UDID set:\n%@", custom]
                         preferredStyle:UIAlertControllerStyleAlert];
-                    [ok addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                    [ok addAction:[UIAlertAction actionWithTitle:@"OK"
+                        style:UIAlertActionStyleCancel handler:nil]];
                     [topVC() presentViewController:ok animated:YES completion:nil];
                 }]];
 
-            [input addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [input addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                style:UIAlertActionStyleCancel handler:nil]];
             [topVC() presentViewController:input animated:YES completion:nil];
         }]];
 
-    // Dismiss
-    [menu addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Close"
+        style:UIAlertActionStyleCancel handler:nil]];
     [topVC() presentViewController:menu animated:YES completion:nil];
 }
 
@@ -99,16 +114,31 @@ static void showUDIDMenu() {
 - (void)tapped { showUDIDMenu(); }
 @end
 
-// MARK: - Inject floating button
-%hook UIWindow
+// MARK: - Inject overlay window once app is ready
+%hook UIApplication
 
-- (void)makeKeyAndVisible {
+- (void)applicationDidBecomeActive:(id)delegate {
     %orig;
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        _PassthroughVC *vc = [_PassthroughVC new];
+
+        _UDIDOverlayWindow *overlayWindow = [[_UDIDOverlayWindow alloc]
+            initWithFrame:[UIScreen mainScreen].bounds];
+        overlayWindow.rootViewController = vc;
+        overlayWindow.windowLevel = UIWindowLevelAlert + 100; // above everything
+        overlayWindow.backgroundColor = [UIColor clearColor];
+        overlayWindow.hidden = NO;
+        overlayWindow.userInteractionEnabled = YES;
+
+        // Keep window alive
+        objc_setAssociatedObject([UIApplication sharedApplication],
+            "udidOverlay", overlayWindow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
         _UDIDButtonTarget *target = [_UDIDButtonTarget new];
-        objc_setAssociatedObject(self, "udidTarget", target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(overlayWindow,
+            "udidTarget", target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.frame = CGRectMake(20, 80, 120, 44);
@@ -117,13 +147,14 @@ static void showUDIDMenu() {
         btn.backgroundColor = [UIColor systemBlueColor];
         btn.layer.cornerRadius = 8;
         btn.layer.masksToBounds = YES;
-        btn.layer.zPosition = 9999;
+        btn.userInteractionEnabled = YES;
 
         [btn addTarget:target
                 action:@selector(tapped)
       forControlEvents:UIControlEventTouchUpInside];
 
-        [self addSubview:btn];
+        [vc.view addSubview:btn];
+        vc.view.userInteractionEnabled = YES; // allow button to receive touches
     });
 }
 
