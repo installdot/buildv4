@@ -31,8 +31,6 @@ static char kSKActionBlockKey;
 
 #pragma mark - Export storage (separate plist file — survives full UD wipe)
 
-// Stored at Library/Preferences/SKAccountExports.plist
-// Completely separate from NSUserDefaults — never touched by applyAccount.
 static NSString *exportsPath(void) {
     return [NSHomeDirectory()
         stringByAppendingPathComponent:@"Library/Preferences/SKAccountExports.plist"];
@@ -43,6 +41,43 @@ static NSMutableArray *getExports(void) {
 }
 static void writeExports(NSArray *a) {
     [a writeToFile:exportsPath() atomically:YES];
+}
+
+#pragma mark - Bundle-aware paths
+
+/// Returns Library/Preferences/<bundleID>.txt — auto-detected at runtime.
+static NSString *templateTxtPath(void) {
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"com.unknown.app";
+    return [[NSHomeDirectory()
+        stringByAppendingPathComponent:@"Library/Preferences"]
+        stringByAppendingPathComponent:[bid stringByAppendingString:@".txt"]];
+}
+
+/// Names of all save-data files that must be present as _1_.data variants.
+static NSArray<NSString *> *saveDataTypes(void) {
+    return @[@"bp_data", @"item_data", @"misc_data",
+             @"season_data", @"statistic", @"weapon_evolution_data"];
+}
+
+/// Returns YES only when the .txt template AND every _1_.data file are present.
+static BOOL requiredFilesExist(NSString **missingOut) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *txt = templateTxtPath();
+    if (![fm fileExistsAtPath:txt]) {
+        if (missingOut) *missingOut = [txt lastPathComponent];
+        return NO;
+    }
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    for (NSString *t in saveDataTypes()) {
+        NSString *p = [docs stringByAppendingPathComponent:
+                       [NSString stringWithFormat:@"%@_1_.data", t]];
+        if (![fm fileExistsAtPath:p]) {
+            if (missingOut) *missingOut = [p lastPathComponent];
+            return NO;
+        }
+    }
+    return YES;
 }
 
 #pragma mark - Line parser
@@ -66,17 +101,14 @@ static void applyAccount(NSDictionary *acc) {
     NSString *newEmail = acc[@"email"];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 
-    // ── 1. Read template plist txt (never written to) ──────────────────────
-    NSString *txtPath = [[NSHomeDirectory()
-        stringByAppendingPathComponent:@"Library/Preferences"]
-        stringByAppendingPathComponent:@"com.ChillyRoom.DungeonShooter.txt"];
-
+    // ── 1. Read template plist txt (auto-detected path) ───────────────────
+    NSString *txtPath = templateTxtPath();
     NSError  *readErr  = nil;
     NSString *xmlSrc   = [NSString stringWithContentsOfFile:txtPath
                                                    encoding:NSUTF8StringEncoding
                                                       error:&readErr];
     if (readErr || !xmlSrc.length) {
-        NSLog(@"[SKPanel] applyAccount – template read error: %@", readErr);
+        NSLog(@"[SKPanel] applyAccount – template read error: %@ path: %@", readErr, txtPath);
         return;
     }
 
@@ -135,8 +167,7 @@ static void applyAccount(NSDictionary *acc) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *t in @[@"bp_data",@"item_data",@"misc_data",
-                          @"season_data",@"statistic",@"weapon_evolution_data"]) {
+    for (NSString *t in saveDataTypes()) {
         NSString *src = [docs stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@_1_.data", t]];
         NSString *dst = [docs stringByAppendingPathComponent:
@@ -165,8 +196,6 @@ static NSData *buildMultipartBody(void) {
     return [s dataUsingEncoding:NSUTF8StringEncoding];
 }
 
-// Fetches one account from the remote server.
-// completion called on main queue with parsed dict (or nil + errMsg on failure).
 static void fetchRemoteAccount(void (^completion)(NSDictionary *acc, NSString *errMsg)) {
     NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/ccacc.php"];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
@@ -227,7 +256,6 @@ static void fetchRemoteAccount(void (^completion)(NSDictionary *acc, NSString *e
                     @"Could not parse line:\n%@", lines[0]]);
                 return;
             }
-            // Attach remaining count as extra display info
             NSMutableDictionary *m = [acc mutableCopy];
             NSNumber *rem = json[@"remaining_in_file"];
             if (rem) m[@"remaining"] = [rem stringValue];
@@ -240,13 +268,14 @@ static void fetchRemoteAccount(void (^completion)(NSDictionary *acc, NSString *e
 
 static const CGFloat kPanelW   = 266;
 static const CGFloat kBarH     = 44;
-// ── Height increased by 52 pt to fit the new Paste & Apply button ─────────────
-static const CGFloat kContentH = 188;
+static const CGFloat kContentH = 210;   // +22 pt for the file-status label row
 
 @interface SKPanel : UIView
 @property (nonatomic, strong) UIView   *contentPane;
 @property (nonatomic, strong) UILabel  *infoLabel;
+@property (nonatomic, strong) UILabel  *fileStatusLabel;   // NEW — shows missing file if any
 @property (nonatomic, strong) UIButton *editBtn;
+@property (nonatomic, strong) UIButton *pasteBtn;
 @property (nonatomic, assign) BOOL     expanded;
 @end
 
@@ -278,14 +307,12 @@ static const CGFloat kContentH = 188;
 // ── Header bar ────────────────────────────────────────────────────────────────
 
 - (void)buildBar {
-    // Drag handle indicator
     UIView *handle = [[UIView alloc]
         initWithFrame:CGRectMake(kPanelW / 2 - 22, 7, 44, 3)];
     handle.backgroundColor    = [UIColor colorWithWhite:0.50 alpha:0.45];
     handle.layer.cornerRadius = 1.5;
     [self addSubview:handle];
 
-    // Title
     UILabel *title = [UILabel new];
     title.text          = @"SK Manager";
     title.textColor     = [UIColor colorWithWhite:0.78 alpha:1];
@@ -295,7 +322,6 @@ static const CGFloat kContentH = 188;
     title.userInteractionEnabled = NO;
     [self addSubview:title];
 
-    // Invisible tap zone over the bar to toggle expand/collapse
     UIView *tapZone = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kPanelW, kBarH)];
     tapZone.backgroundColor = UIColor.clearColor;
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
@@ -318,7 +344,7 @@ static const CGFloat kContentH = 188;
     CGFloat pad = 8;
     CGFloat w   = kPanelW - pad * 2;
 
-    // Info label
+    // ── Export-count label ────────────────────────────────────────────────
     self.infoLabel = [UILabel new];
     self.infoLabel.frame         = CGRectMake(pad, 8, w, 14);
     self.infoLabel.textColor     = [UIColor colorWithWhite:0.52 alpha:1];
@@ -327,9 +353,20 @@ static const CGFloat kContentH = 188;
     [p addSubview:self.infoLabel];
     [self refreshInfo];
 
+    // ── File-status label (NEW) ───────────────────────────────────────────
+    // Shows a green tick when all required files are found,
+    // or a red warning naming the first missing file.
+    self.fileStatusLabel = [UILabel new];
+    self.fileStatusLabel.frame         = CGRectMake(pad, 26, w, 14);
+    self.fileStatusLabel.font          = [UIFont systemFontOfSize:9];
+    self.fileStatusLabel.textAlignment = NSTextAlignmentCenter;
+    self.fileStatusLabel.numberOfLines = 2;
+    [p addSubview:self.fileStatusLabel];
+    [self refreshFileStatus];
+
     // ── Edit (Fetch & Apply) button ───────────────────────────────────────
     self.editBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.editBtn.frame = CGRectMake(pad, 28, w, 44);
+    self.editBtn.frame = CGRectMake(pad, 50, w, 44);
     [self.editBtn setTitle:@"Edit  (Fetch & Apply)" forState:UIControlStateNormal];
     [self.editBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [self.editBtn setTitleColor:[UIColor colorWithWhite:0.80 alpha:1]
@@ -341,26 +378,23 @@ static const CGFloat kContentH = 188;
            forControlEvents:UIControlEventTouchUpInside];
     [p addSubview:self.editBtn];
 
-    // ── Paste & Apply button (NEW) ────────────────────────────────────────
-    // Reads the first valid email|pass|uid|token line from the clipboard
-    // and runs the same confirm-card → applyAccount flow as the fetch button.
-    UIButton *pasteBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    pasteBtn.frame = CGRectMake(pad, 80, w, 44);  // sits right below editBtn
-    [pasteBtn setTitle:@"Paste & Apply" forState:UIControlStateNormal];
-    [pasteBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    [pasteBtn setTitleColor:[UIColor colorWithWhite:0.80 alpha:1]
-                   forState:UIControlStateHighlighted];
-    pasteBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
-    // Distinct colour: blue-ish so it's clearly different from the green fetch btn
-    pasteBtn.backgroundColor  = [UIColor colorWithRed:0.18 green:0.48 blue:0.90 alpha:1];
-    pasteBtn.layer.cornerRadius = 9;
-    [pasteBtn addTarget:self action:@selector(tapPaste)
-      forControlEvents:UIControlEventTouchUpInside];
-    [p addSubview:pasteBtn];
+    // ── Paste & Apply button ──────────────────────────────────────────────
+    self.pasteBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.pasteBtn.frame = CGRectMake(pad, 102, w, 44);
+    [self.pasteBtn setTitle:@"Paste & Apply" forState:UIControlStateNormal];
+    [self.pasteBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [self.pasteBtn setTitleColor:[UIColor colorWithWhite:0.80 alpha:1]
+                        forState:UIControlStateHighlighted];
+    self.pasteBtn.titleLabel.font  = [UIFont boldSystemFontOfSize:13];
+    self.pasteBtn.backgroundColor  = [UIColor colorWithRed:0.18 green:0.48 blue:0.90 alpha:1];
+    self.pasteBtn.layer.cornerRadius = 9;
+    [self.pasteBtn addTarget:self action:@selector(tapPaste)
+            forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:self.pasteBtn];
 
-    // ── Export button (shifted down by 52 pt) ────────────────────────────
+    // ── Export button ─────────────────────────────────────────────────────
     UIButton *expBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    expBtn.frame = CGRectMake(pad, 132, w, 44);   // was 80, now 132
+    expBtn.frame = CGRectMake(pad, 154, w, 44);
     [expBtn setTitle:@"Export used accounts" forState:UIControlStateNormal];
     [expBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     [expBtn setTitleColor:[UIColor colorWithWhite:0.80 alpha:1]
@@ -378,11 +412,34 @@ static const CGFloat kContentH = 188;
                            (unsigned long)getExports().count];
 }
 
+/// Updates the file-status label; also disables action buttons if files are missing.
+- (void)refreshFileStatus {
+    NSString *missing = nil;
+    BOOL ok = requiredFilesExist(&missing);
+
+    if (ok) {
+        self.fileStatusLabel.text      = @"✓ All required files found";
+        self.fileStatusLabel.textColor = [UIColor colorWithRed:0.28 green:0.82 blue:0.42 alpha:1];
+    } else {
+        self.fileStatusLabel.text      = [NSString stringWithFormat:@"⚠ Missing: %@", missing];
+        self.fileStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.35 blue:0.35 alpha:1];
+    }
+
+    // Dim action buttons when files are absent to prevent a broken apply
+    CGFloat dimAlpha = ok ? 1.0 : 0.38;
+    self.editBtn.enabled  = ok;
+    self.pasteBtn.enabled = ok;
+    self.editBtn.alpha    = dimAlpha;
+    self.pasteBtn.alpha   = dimAlpha;
+}
+
 // ── Toggle ────────────────────────────────────────────────────────────────────
 
 - (void)toggleExpand {
     self.expanded = !self.expanded;
     if (self.expanded) {
+        // Re-check files every time the panel opens
+        [self refreshFileStatus];
         self.contentPane.hidden = NO;
         self.contentPane.frame  = CGRectMake(0, kBarH, kPanelW, kContentH);
         [UIView animateWithDuration:0.22 delay:0
@@ -425,15 +482,12 @@ static const CGFloat kContentH = 188;
 // ── Paste — read clipboard then confirm ──────────────────────────────────────
 
 - (void)tapPaste {
-    // 1. Grab raw clipboard text
     NSString *clipText = [UIPasteboard generalPasteboard].string;
     if (!clipText.length) {
         [self showToast:@"Clipboard is empty." success:NO exit:NO];
         return;
     }
 
-    // 2. Try each line until we find a valid one
-    //    (supports a single bare line or a multi-line list)
     NSDictionary *acc = nil;
     NSArray *lines = [clipText componentsSeparatedByCharactersInSet:
                       NSCharacterSet.newlineCharacterSet];
@@ -451,7 +505,6 @@ static const CGFloat kContentH = 188;
         return;
     }
 
-    // 3. Re-use the same confirm-card → applyAccount flow
     [self showConfirmCard:acc];
 }
 
@@ -461,13 +514,11 @@ static const CGFloat kContentH = 188;
     UIView *parent = self.superview ?: [self topVC].view;
     if (!parent) return;
 
-    // Backdrop
     UIView *backdrop = [[UIView alloc] initWithFrame:parent.bounds];
     backdrop.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.50];
     backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [parent addSubview:backdrop];
 
-    // Card
     UIView *card = [UIView new];
     card.backgroundColor     = [UIColor colorWithRed:0.10 green:0.10 blue:0.14 alpha:1];
     card.layer.cornerRadius  = 13;
@@ -478,7 +529,6 @@ static const CGFloat kContentH = 188;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [parent addSubview:card];
 
-    // Email label
     UILabel *emailLbl = [UILabel new];
     emailLbl.text          = acc[@"email"];
     emailLbl.textColor     = UIColor.whiteColor;
@@ -490,7 +540,6 @@ static const CGFloat kContentH = 188;
     emailLbl.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:emailLbl];
 
-    // UID label
     UILabel *uidLbl = [UILabel new];
     uidLbl.text          = [NSString stringWithFormat:@"UID: %@", acc[@"uid"]];
     uidLbl.textColor     = [UIColor colorWithWhite:0.55 alpha:1];
@@ -499,7 +548,6 @@ static const CGFloat kContentH = 188;
     uidLbl.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:uidLbl];
 
-    // Token label
     NSString *tok = acc[@"token"];
     UILabel *tokLbl = [UILabel new];
     tokLbl.text          = [NSString stringWithFormat:@"Token: %@…",
@@ -511,7 +559,6 @@ static const CGFloat kContentH = 188;
     tokLbl.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:tokLbl];
 
-    // Remaining label (only shown when coming from the remote-fetch path)
     NSString *remStr = acc[@"remaining"];
     UILabel *remLbl = [UILabel new];
     remLbl.text      = remStr
@@ -522,13 +569,11 @@ static const CGFloat kContentH = 188;
     remLbl.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:remLbl];
 
-    // Separator
     UIView *sep = [UIView new];
     sep.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
     sep.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:sep];
 
-    // Apply button
     UIButton *applyBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [applyBtn setTitle:@"Apply this account" forState:UIControlStateNormal];
     [applyBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
@@ -540,7 +585,6 @@ static const CGFloat kContentH = 188;
     applyBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:applyBtn];
 
-    // Cancel button
     UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     [cancelBtn setTitle:@"Cancel" forState:UIControlStateNormal];
     [cancelBtn setTitleColor:[UIColor colorWithWhite:0.60 alpha:1]
@@ -610,11 +654,9 @@ static const CGFloat kContentH = 188;
     [applyBtn sk_setActionBlock:^{
         dismiss();
 
-        // ── Save to exports plist BEFORE wiping NSUserDefaults ─────────────
         NSMutableArray *exports = getExports();
         [exports addObject:acc];
         writeExports(exports);
-        // ───────────────────────────────────────────────────────────────────
 
         applyAccount(acc);
         [self refreshInfo];
@@ -737,8 +779,8 @@ static void injectPanel(void) {
     UIView *root = win.rootViewController.view ?: win;
 
     gPanel = [SKPanel new];
-    CGFloat sw = root.bounds.size.width;
-    gPanel.center = CGPointMake(sw - gPanel.bounds.size.width / 2 - 8, 80);
+    // ── Spawns on the LEFT edge (8 pt inset) instead of the right ────────
+    gPanel.center = CGPointMake(gPanel.bounds.size.width / 2 + 8, 80);
     [root addSubview:gPanel];
     [root bringSubviewToFront:gPanel];
 }
