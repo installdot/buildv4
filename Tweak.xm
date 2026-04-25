@@ -1,828 +1,939 @@
-// tweak.xm — Soul Knight Account Manager v7
-// iOS 14+ | Theos/Logos | ARC
+// DevApiHook.xm  —  v2
+// • Auto-logs every i.imgur.com URL seen at runtime
+// • Per-URL replacement map (saved, persists across launches)
+// • New imgur links appear automatically in the Manage Links screen
+// • Floating icon button → main menu → Imgur map / JSON editors / toggles
 
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-// ── UIButton block helper ─────────────────────────────────────────────────────
-@interface UIButton (SKActionBlock)
-- (void)sk_setActionBlock:(void(^)(void))block;
-@end
-@implementation UIButton (SKActionBlock)
-static char kSKActionBlockKey;
-- (void)sk_setActionBlock:(void(^)(void))block {
-    objc_setAssociatedObject(self, &kSKActionBlockKey,
-        [block copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
-    [self removeTarget:self action:@selector(sk_invokeActionBlock)
-      forControlEvents:UIControlEventTouchUpInside];
-    [self addTarget:self action:@selector(sk_invokeActionBlock)
-   forControlEvents:UIControlEventTouchUpInside];
-}
-- (void)sk_invokeActionBlock {
-    void (^b)(void) = objc_getAssociatedObject(self, &kSKActionBlockKey);
-    if (b) b();
-}
-@end
+// ═══════════════════════════════════════════════════════════════
+// MARK: - UserDefaults Keys
+// ═══════════════════════════════════════════════════════════════
 
-#pragma mark - Export storage
+static NSString *const kSuite             = @"com.dev.apihook.settings";
 
-static NSString *exportsPath(void) {
-    return [NSHomeDirectory()
-        stringByAppendingPathComponent:@"Library/Preferences/SKAccountExports.plist"];
-}
-static NSMutableArray *getExports(void) {
-    NSArray *a = [NSArray arrayWithContentsOfFile:exportsPath()];
-    return a ? [a mutableCopy] : [NSMutableArray new];
-}
-static void writeExports(NSArray *a) {
-    [a writeToFile:exportsPath() atomically:YES];
-}
+static NSString *const kHookCheckHud      = @"hook_check_hud";
+static NSString *const kHookValidate      = @"hook_validate";
+static NSString *const kHookNotifications = @"hook_notifications";
+static NSString *const kHookConnection    = @"hook_connection";
+static NSString *const kHookTabs          = @"hook_tabs";
+static NSString *const kHookImgur         = @"hook_imgur";   // master: apply replacements
 
-#pragma mark - Bundle-aware paths
+static NSString *const kJsonCheckHud      = @"json_check_hud";
+static NSString *const kJsonValidate      = @"json_validate";
+static NSString *const kJsonNotifications = @"json_notifications";
+static NSString *const kJsonConnection    = @"json_connection";
+static NSString *const kJsonTabs          = @"json_tabs";
 
-static NSString *templateTxtPath(void) {
-    NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"com.unknown.app";
-    return [[NSHomeDirectory()
-        stringByAppendingPathComponent:@"Library/Preferences"]
-        stringByAppendingPathComponent:[bid stringByAppendingString:@".txt"]];
-}
+// Imgur: dict { normalizedOriginalURL -> replacementURL or "" }
+static NSString *const kImgurMap          = @"imgur_url_map";
 
-static NSArray<NSString *> *saveDataTypes(void) {
-    return @[@"bp_data", @"item_data", @"misc_data",
-             @"season_data", @"statistic", @"weapon_evolution_data"];
-}
+static NSString *const kIconURL           = @"icon_url";
+static NSString *const kIconLocalPath     = @"icon_local_path";
+static NSString *const kIconUseLocal      = @"icon_use_local";
 
-static BOOL requiredFilesExist(NSString **missingOut) {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSString *txt = templateTxtPath();
-    if (![fm fileExistsAtPath:txt]) {
-        if (missingOut) *missingOut = [txt lastPathComponent];
-        return NO;
-    }
-    NSString *docs = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    for (NSString *t in saveDataTypes()) {
-        NSString *p = [docs stringByAppendingPathComponent:
-                       [NSString stringWithFormat:@"%@_1_.data", t]];
-        if (![fm fileExistsAtPath:p]) {
-            if (missingOut) *missingOut = [p lastPathComponent];
-            return NO;
-        }
-    }
-    return YES;
-}
+// ═══════════════════════════════════════════════════════════════
+// MARK: - ImgurLinkStore
+// Logs every i.imgur.com URL seen; stores per-URL replacements
+// ═══════════════════════════════════════════════════════════════
 
-#pragma mark - Line parser
-
-static NSDictionary *parseLine(NSString *line) {
-    NSArray *p = [line componentsSeparatedByString:@"|"];
-    if (p.count < 4) return nil;
-    return @{
-        @"email": [p[0] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],
-        @"pass" : [p[1] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],
-        @"uid"  : [p[2] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],
-        @"token": [p[3] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]
-    };
-}
-
-#pragma mark - Account Apply
-
-static void applyAccount(NSDictionary *acc) {
-    NSString *newUid   = acc[@"uid"];
-    NSString *newToken = acc[@"token"];
-    NSString *newEmail = acc[@"email"];
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-
-    NSString *txtPath = templateTxtPath();
-    NSError  *readErr  = nil;
-    NSString *xmlSrc   = [NSString stringWithContentsOfFile:txtPath
-                                                   encoding:NSUTF8StringEncoding
-                                                      error:&readErr];
-    if (readErr || !xmlSrc.length) return;
-
-    NSString *patched = [xmlSrc
-        stringByReplacingOccurrencesOfString:@"anhhaideptrai" withString:newToken];
-    patched = [patched
-        stringByReplacingOccurrencesOfString:@"98989898" withString:newUid];
-
-    NSError *parseErr = nil;
-    NSDictionary *newSnap = [NSPropertyListSerialization
-        propertyListWithData:[patched dataUsingEncoding:NSUTF8StringEncoding]
-                     options:NSPropertyListMutableContainersAndLeaves
-                      format:nil
-                       error:&parseErr];
-    if (parseErr || ![newSnap isKindOfClass:[NSDictionary class]]) return;
-
-    NSDictionary *current = [ud dictionaryRepresentation];
-    for (NSString *k in current) [ud removeObjectForKey:k];
-    for (NSString *k in newSnap) [ud setObject:newSnap[k] forKey:k];
-
-    NSString *raw = [ud stringForKey:@"SdkStateCache#1"];
-    if (raw) {
-        NSError *je = nil;
-        NSMutableDictionary *root = [[NSJSONSerialization
-            JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding]
-            options:NSJSONReadingMutableContainers error:&je] mutableCopy];
-        if (!je && root) {
-            NSMutableDictionary *user    = [root[@"User"]    mutableCopy] ?: [NSMutableDictionary new];
-            NSMutableDictionary *session = [root[@"Session"] mutableCopy] ?: [NSMutableDictionary new];
-            NSMutableDictionary *legacy  = [user[@"LegacyGateway"] mutableCopy] ?: [NSMutableDictionary new];
-            legacy[@"token"]       = newToken;
-            user[@"LegacyGateway"] = legacy;
-            user[@"Email"]         = newEmail;
-            user[@"PlayerId"]      = @([newUid longLongValue]);
-            session[@"Token"]      = newToken;
-            root[@"User"]          = user;
-            root[@"Session"]       = session;
-            NSData *out = [NSJSONSerialization dataWithJSONObject:root
-                options:NSJSONWritingPrettyPrinted error:&je];
-            if (!je && out)
-                [ud setObject:[[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding]
-                       forKey:@"SdkStateCache#1"];
-        }
-    }
-
-    [ud synchronize];
-
-    NSString *docs = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *t in saveDataTypes()) {
-        NSString *src = [docs stringByAppendingPathComponent:
-                         [NSString stringWithFormat:@"%@_1_.data", t]];
-        NSString *dst = [docs stringByAppendingPathComponent:
-                         [NSString stringWithFormat:@"%@_%@_.data", t, newUid]];
-        if ([fm fileExistsAtPath:src]) {
-            [fm removeItemAtPath:dst error:nil];
-            [fm copyItemAtPath:src toPath:dst error:nil];
-        }
-    }
-}
-
-#pragma mark - Remote fetch
-
-static NSData *buildMultipartBody(void) {
-    NSString *boundary = @"----WebKitFormBoundaryfGWYLKxAiP6gsfSo";
-    NSMutableString *s = [NSMutableString new];
-    void (^field)(NSString *, NSString *) = ^(NSString *name, NSString *val) {
-        [s appendFormat:@"--%@\r\n", boundary];
-        [s appendFormat:@"Content-Disposition: form-data; name=\"%@\"\r\n\r\n", name];
-        [s appendFormat:@"%@\r\n", val];
-    };
-    field(@"action",   @"check");
-    field(@"limit",    @"1");
-    field(@"parallel", @"10");
-    [s appendFormat:@"--%@--\r\n", boundary];
-    return [s dataUsingEncoding:NSUTF8StringEncoding];
-}
-
-static void fetchRemoteAccount(void (^completion)(NSDictionary *acc, NSString *errMsg)) {
-    NSURL *url = [NSURL URLWithString:@"https://chillysilly.frfrnocap.men/ccacc.php"];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-        timeoutInterval:20];
-    req.HTTPMethod = @"POST";
-
-    NSString *boundary = @"----WebKitFormBoundaryfGWYLKxAiP6gsfSo";
-    [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary]
-       forHTTPHeaderField:@"Content-Type"];
-    [req setValue:@"*/*"               forHTTPHeaderField:@"Accept"];
-    [req setValue:@"vi-VN,vi;q=0.9"   forHTTPHeaderField:@"Accept-Language"];
-    [req setValue:@"gzip, deflate, br" forHTTPHeaderField:@"Accept-Encoding"];
-    [req setValue:@"cors"              forHTTPHeaderField:@"Sec-Fetch-Mode"];
-    [req setValue:@"same-origin"       forHTTPHeaderField:@"Sec-Fetch-Site"];
-    [req setValue:@"empty"             forHTTPHeaderField:@"Sec-Fetch-Dest"];
-    [req setValue:@"https://chillysilly.frfrnocap.men" forHTTPHeaderField:@"Origin"];
-    [req setValue:@"https://chillysilly.frfrnocap.men/ccacc.php" forHTTPHeaderField:@"Referer"];
-    [req setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) "
-                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-       forHTTPHeaderField:@"User-Agent"];
-    [req setValue:@"PHPSESSID=883a6ee3b496cc69822e2144d57cc886; "
-                   "token=cf54cf6152d9ae63b1daccc7af669a1d"
-       forHTTPHeaderField:@"Cookie"];
-
-    req.HTTPBody = buildMultipartBody();
-
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:
-        [NSURLSessionConfiguration defaultSessionConfiguration]];
-    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (err || !data) { completion(nil, err.localizedDescription ?: @"Network error"); return; }
-            NSError *je = nil;
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
-            if (je || ![json isKindOfClass:[NSDictionary class]]) {
-                NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"Bad response";
-                completion(nil, raw); return;
-            }
-            NSArray *lines = json[@"lines"];
-            if (!lines.count) { completion(nil, @"No accounts returned\n(file may be empty)"); return; }
-            NSDictionary *acc = parseLine(lines[0]);
-            if (!acc) { completion(nil, [NSString stringWithFormat:@"Could not parse line:\n%@", lines[0]]); return; }
-            NSMutableDictionary *m = [acc mutableCopy];
-            NSNumber *rem = json[@"remaining_in_file"];
-            if (rem) m[@"remaining"] = [rem stringValue];
-            completion([m copy], nil);
-        });
-    }] resume];
-}
-
-#pragma mark - Screenshot helper
-
-static UIImage *captureScreen(void) {
-    UIWindow *keyWin = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows)
-        if (!w.isHidden && w.alpha > 0) { keyWin = w; break; }
-    if (!keyWin) return nil;
-    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
-    fmt.scale = UIScreen.mainScreen.scale;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
-        initWithSize:keyWin.bounds.size format:fmt];
-    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [keyWin drawViewHierarchyInRect:keyWin.bounds afterScreenUpdates:YES];
-    }];
-}
-
-#pragma mark - Discord webhook
-
-static NSString * const kDiscordWebhook =
-    @"https://discord.com/api/webhooks/1421522837520253059/"
-     "zDz92bS0oq00Giq0xIgIrpAEZQGIGEzwFNYL5dxNKdl1YnmlYnOJ9zGYekEZzyYrsMFL";
-
-static void sendToDiscord(NSArray *accounts, UIImage *screenshot,
-                          void (^completion)(BOOL success, NSString *msg)) {
-    NSURL *url = [NSURL URLWithString:kDiscordWebhook];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
-        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-        timeoutInterval:30];
-    req.HTTPMethod = @"POST";
-
-    NSString *boundary = [NSString stringWithFormat:@"Boundary-%@",
-        [[NSUUID UUID] UUIDString]];
-    [req setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary]
-       forHTTPHeaderField:@"Content-Type"];
-
-    // Build account text
-    NSMutableString *accountText = [NSMutableString stringWithString:@"**G2G Export**\n"];
-    for (NSDictionary *a in accounts)
-        [accountText appendFormat:@"`%@|%@`\n", a[@"email"], a[@"pass"]];
-
-    // Build payload JSON
-    NSDictionary *payload = @{ @"content": accountText };
-    NSData *payloadData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-
-    NSMutableData *body = [NSMutableData new];
-    NSString *crlf = @"\r\n";
-
-    // Part 1: JSON payload
-    [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[@"Content-Disposition: form-data; name=\"payload_json\"\r\n"
-        dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[@"Content-Type: application/json\r\n\r\n" dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:payloadData];
-    [body appendData:[crlf dataUsingEncoding:NSUTF8StringEncoding]];
-
-    // Part 2: Screenshot PNG
-    if (screenshot) {
-        NSData *pngData = UIImagePNGRepresentation(screenshot);
-        if (pngData) {
-            [body appendData:[[NSString stringWithFormat:@"--%@\r\n", boundary]
-                dataUsingEncoding:NSUTF8StringEncoding]];
-            [body appendData:[@"Content-Disposition: form-data; name=\"file\"; filename=\"screenshot.png\"\r\n"
-                dataUsingEncoding:NSUTF8StringEncoding]];
-            [body appendData:[@"Content-Type: image/png\r\n\r\n"
-                dataUsingEncoding:NSUTF8StringEncoding]];
-            [body appendData:pngData];
-            [body appendData:[crlf dataUsingEncoding:NSUTF8StringEncoding]];
-        }
-    }
-
-    [body appendData:[[NSString stringWithFormat:@"--%@--\r\n", boundary]
-        dataUsingEncoding:NSUTF8StringEncoding]];
-
-    req.HTTPBody = body;
-
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:
-        [NSURLSessionConfiguration defaultSessionConfiguration]];
-    [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-            BOOL ok = !err && (http.statusCode == 200 || http.statusCode == 204);
-            NSString *msg = ok ? @"Sent to Discord ✓"
-                : [NSString stringWithFormat:@"Discord error %ld", (long)http.statusCode];
-            completion(ok, msg);
-        });
-    }] resume];
-}
-
-#pragma mark - SKPanel (compact)
-
-// ── Reduced dimensions ────────────────────────────────────────────────────────
-static const CGFloat kPanelW   = 210;   // was 266
-static const CGFloat kBarH     = 36;    // was 44
-static const CGFloat kBtnH     = 36;    // button height
-static const CGFloat kBtnGap   = 6;     // gap between buttons
-static const CGFloat kPad      = 6;
-// Content height = top labels (22+12) + 4 buttons + gaps + bottom pad
-static const CGFloat kContentH = 22 + 12 + (kBtnH * 4) + (kBtnGap * 3) + 10;
-
-@interface SKPanel : UIView
-@property (nonatomic, strong) UIView   *contentPane;
-@property (nonatomic, strong) UILabel  *infoLabel;
-@property (nonatomic, strong) UILabel  *fileStatusLabel;
-@property (nonatomic, strong) UIButton *editBtn;
-@property (nonatomic, strong) UIButton *pasteBtn;
-@property (nonatomic, assign) BOOL     expanded;
+@interface ImgurLinkStore : NSObject
++ (instancetype)shared;
+- (void)logURL:(NSString *)rawURL;
+- (NSString *)replacementFor:(NSString *)rawURL;   // "" = no replacement
+- (void)setReplacement:(NSString *)rep forKey:(NSString *)normalizedURL;
+- (void)removeKey:(NSString *)normalizedURL;
+- (NSArray<NSString *> *)allKeys;                  // sorted normalized URLs
 @end
 
-@implementation SKPanel
+@implementation ImgurLinkStore {
+    NSMutableDictionary<NSString *, NSString *> *_map;
+    NSUserDefaults *_ud;
+}
+
++ (instancetype)shared {
+    static ImgurLinkStore *s; static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = [ImgurLinkStore new]; });
+    return s;
+}
 
 - (instancetype)init {
-    self = [super initWithFrame:CGRectMake(0, 0, kPanelW, kBarH)];
+    self = [super init];
+    _ud  = [[NSUserDefaults alloc] initWithSuiteName:kSuite];
+    NSDictionary *saved = [_ud dictionaryForKey:kImgurMap];
+    _map = saved ? [saved mutableCopy] : [NSMutableDictionary new];
+    return self;
+}
+
+// Strip query/fragment; keep scheme+host+path as the stable key
+- (NSString *)normalizeURL:(NSString *)raw {
+    NSURL *u = [NSURL URLWithString:raw];
+    if (!u) return raw;
+    return [NSString stringWithFormat:@"%@://%@%@",
+            u.scheme ?: @"https",
+            u.host   ?: @"i.imgur.com",
+            u.path   ?: @"/"];
+}
+
+- (void)logURL:(NSString *)rawURL {
+    if (!rawURL.length) return;
+    NSString *key = [self normalizeURL:rawURL];
+    @synchronized (self) {
+        if (_map[key] == nil) {
+            _map[key] = @"";
+            [self _save];
+        }
+    }
+}
+
+- (NSString *)replacementFor:(NSString *)rawURL {
+    NSString *key = [self normalizeURL:rawURL];
+    @synchronized (self) { return _map[key] ?: @""; }
+}
+
+- (void)setReplacement:(NSString *)rep forKey:(NSString *)key {
+    @synchronized (self) {
+        _map[key] = rep ?: @"";
+        [self _save];
+    }
+}
+
+- (void)removeKey:(NSString *)key {
+    @synchronized (self) { [_map removeObjectForKey:key]; [self _save]; }
+}
+
+- (NSArray<NSString *> *)allKeys {
+    @synchronized (self) {
+        return [_map.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    }
+}
+
+- (void)_save {
+    [_ud setObject:[_map copy] forKey:kImgurMap];
+    [_ud synchronize];
+}
+
+@end
+
+// ═══════════════════════════════════════════════════════════════
+// MARK: - DevSettings
+// ═══════════════════════════════════════════════════════════════
+
+@interface DevSettings : NSObject
+@property (nonatomic, strong) NSUserDefaults *ud;
++ (instancetype)shared;
+- (BOOL)isEnabled:(NSString *)key;
+- (void)setEnabled:(BOOL)v forKey:(NSString *)key;
+- (NSString *)jsonStringForKey:(NSString *)key;
+- (void)setJsonString:(NSString *)s forKey:(NSString *)key;
+- (NSDictionary *)jsonDictForKey:(NSString *)key;
+- (NSString *)stringForKey:(NSString *)key;
+- (void)setString:(NSString *)s forKey:(NSString *)key;
+@end
+
+@implementation DevSettings
+
++ (instancetype)shared {
+    static DevSettings *i; static dispatch_once_t t;
+    dispatch_once(&t, ^{ i = [DevSettings new]; });
+    return i;
+}
+
+- (instancetype)init {
+    self = [super init];
+    _ud = [[NSUserDefaults alloc] initWithSuiteName:kSuite];
+    [self _registerDefaults];
+    return self;
+}
+
+- (NSString *)_pretty:(NSDictionary *)d {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingPrettyPrinted error:nil];
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+- (void)_registerDefaults {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    NSDateFormatter *f = [NSDateFormatter new]; f.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+
+    NSDictionary *defs = @{
+        kHookCheckHud: @YES, kHookValidate: @YES,
+        kHookNotifications: @YES, kHookConnection: @YES,
+        kHookTabs: @YES, kHookImgur: @YES,
+        kIconURL: @"", kIconUseLocal: @NO,
+
+        kJsonCheckHud: [self _pretty:@{
+            @"success": @YES, @"hud_enabled": @YES,
+            @"message": @"HUD Control is active",
+            @"reason":  @"Admin is testing the remote control feature. This will be re-enabled shortly."
+        }],
+        kJsonValidate: [self _pretty:@{
+            @"success": @YES, @"message": @"License validated successfully",
+            @"data": @{
+                @"subscription_type": @"daily", @"expiry_date": @"2026-03-24 17:41:33",
+                @"remaining_days": @0, @"remaining_hours": @22,
+                @"activated_at": @"2026-03-23 17:41:33", @"is_trial": @NO, @"is_pro": @1
+            }
+        }],
+        kJsonNotifications: [self _pretty:@{
+            @"success": @YES, @"count": @1,
+            @"notifications": @[@{
+                @"id": @7, @"title": @"Dev", @"message": @"Tested by Hải",
+                @"time": @"09/12/2025", @"priority": @2,
+                @"created_at": @"2025-12-09 17:06:20"
+            }]
+        }],
+        kJsonConnection: [self _pretty:@{
+            @"status": @"success", @"message": @"Server is online",
+            @"timestamp": @((long long)now),
+            @"server_name": @"CheatiOSVip.VN", @"version": @"1.0.0"
+        }],
+        kJsonTabs: [self _pretty:@{
+            @"success": @YES,
+            @"server_time": @((long long)now), @"server_datetime": [f stringFromDate:[NSDate date]],
+            @"tabs": @{
+                @"aimbot": @1, @"esp": @1, @"msl": @1, @"weapons": @1,
+                @"profile": @1, @"other": @YES, @"kill_switch": @0,
+                @"shield": @0, @"video_set": @0, @"troll_enabled": @0
+            },
+            @"signin_button": @YES, @"key_field": @YES, @"start_button": @YES, @"music_enabled": @NO,
+            @"main_tabs": @{ @"home": @YES, @"notifications": @YES, @"account": @YES, @"settings": @YES }
+        }],
+    };
+    [_ud registerDefaults:defs];
+}
+
+- (BOOL)isEnabled:(NSString *)k              { return [_ud boolForKey:k]; }
+- (void)setEnabled:(BOOL)v forKey:(NSString *)k { [_ud setBool:v forKey:k]; [_ud synchronize]; }
+- (NSString *)jsonStringForKey:(NSString *)k { return [_ud stringForKey:k] ?: @"{}"; }
+- (void)setJsonString:(NSString *)s forKey:(NSString *)k { [_ud setObject:s forKey:k]; [_ud synchronize]; }
+- (NSDictionary *)jsonDictForKey:(NSString *)k {
+    NSData *d = [[_ud stringForKey:k] dataUsingEncoding:NSUTF8StringEncoding];
+    return d ? ([NSJSONSerialization JSONObjectWithData:d options:0 error:nil] ?: @{}) : @{};
+}
+- (NSString *)stringForKey:(NSString *)k { return [_ud stringForKey:k] ?: @""; }
+- (void)setString:(NSString *)s forKey:(NSString *)k { [_ud setObject:s forKey:k]; [_ud synchronize]; }
+
+@end
+
+// ═══════════════════════════════════════════════════════════════
+// MARK: - HookURLProtocol
+// ═══════════════════════════════════════════════════════════════
+
+@interface HookURLProtocol : NSURLProtocol
+@end
+@implementation HookURLProtocol
+
++ (NSString *)_bodyOf:(NSURLRequest *)r {
+    NSData *d = r.HTTPBody;
+    if (!d && r.HTTPBodyStream) {
+        NSInputStream *s = r.HTTPBodyStream; NSMutableData *m = [NSMutableData data];
+        [s open]; uint8_t b[1024]; NSInteger n;
+        while ((n = [s read:b maxLength:sizeof(b)]) > 0) [m appendBytes:b length:n];
+        [s close]; d = m;
+    }
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"";
+}
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)req {
+    NSURL *url = req.URL; if (!url) return NO;
+    if ([NSURLProtocol propertyForKey:@"DevHookDone" inRequest:req]) return NO;
+    NSString *host = url.host.lowercaseString;
+    NSString *path = url.path;
+    NSString *meth = req.HTTPMethod.uppercaseString;
+    DevSettings *s = DevSettings.shared;
+
+    // ── imgur: always log, intercept only if replacement exists ──
+    if ([host isEqualToString:@"i.imgur.com"]) {
+        [ImgurLinkStore.shared logURL:url.absoluteString];
+        if (![s isEnabled:kHookImgur]) return NO;
+        return [ImgurLinkStore.shared replacementFor:url.absoluteString].length > 0;
+    }
+
+    if (![host isEqualToString:@"api.cheatiosvip.vn"]) return NO;
+    if ([s isEnabled:kHookConnection] && [path isEqualToString:@"/check_connection.php"]) return YES;
+    if ([s isEnabled:kHookTabs]       && [path isEqualToString:@"/apitab.php"])           return YES;
+    if ([path isEqualToString:@"/api.php"]) {
+        if ([meth isEqualToString:@"GET"] && [s isEnabled:kHookNotifications] &&
+            [url.query containsString:@"action=get_notifications"])                        return YES;
+        if ([meth isEqualToString:@"POST"]) {
+            NSString *body = [self _bodyOf:req];
+            if ([s isEnabled:kHookCheckHud] && [body containsString:@"action=check_hud_control"]) return YES;
+            if ([s isEnabled:kHookValidate] && [body containsString:@"action=validate"] &&
+                [body containsString:@"key="] && [body containsString:@"hwid="])           return YES;
+        }
+    }
+    return NO;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
+
+- (void)startLoading {
+    NSMutableURLRequest *tagged = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"DevHookDone" inRequest:tagged];
+
+    NSURL *url   = self.request.URL;
+    NSString *host = url.host.lowercaseString;
+    NSString *path = url.path;
+    NSString *meth = self.request.HTTPMethod.uppercaseString;
+    DevSettings *s = DevSettings.shared;
+    NSData *data   = nil;
+
+    // ── Imgur redirect ──────────────────────────────────────
+    if ([host isEqualToString:@"i.imgur.com"]) {
+        NSString *rep = [ImgurLinkStore.shared replacementFor:url.absoluteString];
+        NSURL *repURL = [NSURL URLWithString:rep];
+        if (repURL) {
+            [[[NSURLSession sharedSession] dataTaskWithURL:repURL completionHandler:
+              ^(NSData *d, NSURLResponse *r, NSError *e) {
+                if (d && r) {
+                    [self.client URLProtocol:self didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+                    [self.client URLProtocol:self didLoadData:d];
+                    [self.client URLProtocolDidFinishLoading:self];
+                } else {
+                    [self.client URLProtocol:self didFailWithError:
+                     e ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorUnknown userInfo:nil]];
+                }
+            }] resume];
+            return;
+        }
+    }
+
+    // ── check_connection — live timestamp ───────────────────
+    else if ([path isEqualToString:@"/check_connection.php"]) {
+        NSMutableDictionary *d = [[s jsonDictForKey:kJsonConnection] mutableCopy];
+        d[@"timestamp"] = @((long long)[[NSDate date] timeIntervalSince1970]);
+        data = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+    }
+    // ── apitab — live timestamp ─────────────────────────────
+    else if ([path isEqualToString:@"/apitab.php"]) {
+        NSMutableDictionary *d = [[s jsonDictForKey:kJsonTabs] mutableCopy];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        NSDateFormatter *fmt = [NSDateFormatter new]; fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        d[@"server_time"]     = @((long long)now);
+        d[@"server_datetime"] = [fmt stringFromDate:[NSDate date]];
+        data = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
+    }
+    // ── GET notifications ────────────────────────────────────
+    else if ([meth isEqualToString:@"GET"] && [url.query containsString:@"action=get_notifications"]) {
+        data = [NSJSONSerialization dataWithJSONObject:[s jsonDictForKey:kJsonNotifications] options:0 error:nil];
+    }
+    // ── POST api.php ─────────────────────────────────────────
+    else if ([meth isEqualToString:@"POST"]) {
+        NSString *body = [HookURLProtocol _bodyOf:self.request];
+        NSDictionary *dict = [body containsString:@"action=check_hud_control"]
+            ? [s jsonDictForKey:kJsonCheckHud] : [s jsonDictForKey:kJsonValidate];
+        data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
+    }
+
+    if (!data) data = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
+
+    NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc]
+        initWithURL:self.request.URL statusCode:200 HTTPVersion:@"HTTP/1.1"
+        headerFields:@{
+            @"Content-Type":   @"application/json",
+            @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length],
+            @"X-Dev-Hook":     @"1"
+        }];
+    [self.client URLProtocol:self didReceiveResponse:resp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
+}
+
+- (void)stopLoading {}
+@end
+
+// ═══════════════════════════════════════════════════════════════
+// MARK: - JSONEditorVC
+// ═══════════════════════════════════════════════════════════════
+
+@interface JSONEditorVC : UIViewController <UITextViewDelegate>
+@property (nonatomic, copy) NSString *jsonKey, *titleStr;
+@property (nonatomic, strong) UITextView *tv;
+@property (nonatomic, strong) UILabel *status;
+@end
+@implementation JSONEditorVC
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = _titleStr;
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Save" style:UIBarButtonItemStyleDone target:self action:@selector(save)];
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(done)];
+
+    _tv = [[UITextView alloc] initWithFrame:self.view.bounds];
+    _tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _tv.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+    _tv.text = [DevSettings.shared jsonStringForKey:_jsonKey];
+    _tv.autocorrectionType = UITextAutocorrectionTypeNo;
+    _tv.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _tv.delegate = self;
+    [self.view addSubview:_tv];
+
+    _status = [UILabel new]; _status.translatesAutoresizingMaskIntoConstraints = NO;
+    _status.font = [UIFont systemFontOfSize:12]; _status.textAlignment = NSTextAlignmentCenter;
+    _status.textColor = UIColor.systemGreenColor; _status.text = @"✓ Valid JSON";
+    [self.view addSubview:_status];
+    [NSLayoutConstraint activateConstraints:@[
+        [_status.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8],
+        [_status.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor]
+    ]];
+}
+- (void)textViewDidChange:(UITextView *)tv {
+    NSData *d = [tv.text dataUsingEncoding:NSUTF8StringEncoding]; NSError *e;
+    [NSJSONSerialization JSONObjectWithData:d options:0 error:&e];
+    _status.textColor = e ? UIColor.systemRedColor : UIColor.systemGreenColor;
+    _status.text = e ? [NSString stringWithFormat:@"✗ %@", e.localizedDescription] : @"✓ Valid JSON";
+}
+- (void)save {
+    NSData *d = [_tv.text dataUsingEncoding:NSUTF8StringEncoding]; NSError *e;
+    [NSJSONSerialization JSONObjectWithData:d options:0 error:&e];
+    if (e) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Invalid JSON"
+                                    message:e.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil]; return;
+    }
+    [DevSettings.shared setJsonString:_tv.text forKey:_jsonKey]; [self done];
+}
+- (void)done { [self dismissViewControllerAnimated:YES completion:nil]; }
+@end
+
+// ═══════════════════════════════════════════════════════════════
+// MARK: - ImgurMapVC  (per-URL replacement list)
+// ═══════════════════════════════════════════════════════════════
+
+@interface ImgurMapVC : UITableViewController
+@property (nonatomic, strong) NSArray<NSString *> *keys;
+@end
+@implementation ImgurMapVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Imgur Links";
+    self.navigationItem.rightBarButtonItems = @[
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                                                      target:self action:@selector(reload)],
+        [[UIBarButtonItem alloc] initWithTitle:@"Clear All" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(clearAll)]
+    ];
+    [self.tableView registerClass:[UITableViewCell class] forCellReuseIdentifier:@"C"];
+    [self reload];
+}
+
+- (void)reload { _keys = [ImgurLinkStore.shared allKeys]; [self.tableView reloadData]; }
+
+- (void)clearAll {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Clear all imgur logs?"
+                                message:@"Replacements will also be removed."
+                                preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Clear All" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_){
+        for (NSString *k in self.keys) [ImgurLinkStore.shared removeKey:k];
+        [self reload];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return MAX(1, (NSInteger)_keys.count); }
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+    return [NSString stringWithFormat:@"%lu imgur URL%@ captured — tap to set replacement",
+            (unsigned long)_keys.count, _keys.count == 1 ? @"" : @"s"];
+}
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    return @"Swipe left to remove a URL from the log. Empty replacement = pass-through.";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"C"];
+    if (_keys.count == 0) {
+        cell.textLabel.text = @"No imgur links captured yet — run the app to populate";
+        cell.textLabel.textColor = UIColor.secondaryLabelColor;
+        cell.textLabel.numberOfLines = 2;
+        cell.userInteractionEnabled = NO;
+        return cell;
+    }
+    NSString *key = _keys[ip.row];
+    NSString *rep = [ImgurLinkStore.shared replacementFor:key];
+    BOOL hasRep   = rep.length > 0;
+
+    // filename as title, full URL as subtitle
+    cell.textLabel.text       = key.lastPathComponent;
+    cell.textLabel.font       = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightSemibold];
+    cell.detailTextLabel.numberOfLines = 2;
+    cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    if (hasRep) {
+        cell.detailTextLabel.text      = [NSString stringWithFormat:@"→ %@", rep];
+        cell.detailTextLabel.textColor = UIColor.systemGreenColor;
+        cell.imageView.image = [UIImage systemImageNamed:@"arrow.triangle.2.circlepath"];
+        cell.imageView.tintColor = UIColor.systemGreenColor;
+    } else {
+        cell.detailTextLabel.text      = key;
+        cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+        cell.imageView.image = [UIImage systemImageNamed:@"photo"];
+        cell.imageView.tintColor = UIColor.systemGrayColor;
+    }
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (_keys.count == 0) return;
+    NSString *key = _keys[ip.row];
+    NSString *cur = [ImgurLinkStore.shared replacementFor:key];
+
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Set Replacement URL"
+        message:key
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = cur;
+        tf.placeholder = @"https://i.imgur.com/other.jpeg";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.keyboardType = UIKeyboardTypeURL;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"Clear (pass-through)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_){
+        [ImgurLinkStore.shared setReplacement:@"" forKey:key]; [self reload];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_){
+        [ImgurLinkStore.shared setReplacement:a.textFields.firstObject.text ?: @"" forKey:key];
+        [self reload];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return _keys.count > 0; }
+- (void)tableView:(UITableView *)tv commitEditingStyle:(UITableViewCellEditingStyle)es forRowAtIndexPath:(NSIndexPath *)ip {
+    if (es == UITableViewCellEditingStyleDelete) { [ImgurLinkStore.shared removeKey:_keys[ip.row]]; [self reload]; }
+}
+
+@end
+
+// ═══════════════════════════════════════════════════════════════
+// MARK: - DevMenuVC  (main menu)
+// ═══════════════════════════════════════════════════════════════
+
+typedef NS_ENUM(NSInteger, Sec) {
+    SecIcon = 0, SecImgur,
+    SecCheckHud, SecValidate, SecNotifications, SecConnection, SecTabs,
+    SecCount
+};
+
+@interface DevMenuVC : UITableViewController
+    <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@end
+@implementation DevMenuVC
+
+static NSString *secTitle(Sec s) {
+    switch(s){
+        case SecIcon:          return @"Menu Icon";
+        case SecImgur:         return @"Imgur Hook";
+        case SecCheckHud:      return @"Check HUD Control";
+        case SecValidate:      return @"Validate Key";
+        case SecNotifications: return @"Get Notifications";
+        case SecConnection:    return @"Check Connection";
+        case SecTabs:          return @"Get Tabs";
+        default: return @"";
+    }
+}
+static NSString *secFooter(Sec s) {
+    switch(s){
+        case SecIcon:          return @"Image shown on the floating button. Set URL or pick from Photos.";
+        case SecImgur:         return @"All i.imgur.com requests are logged automatically. Enable replacements to redirect them. Tap 'Manage Links' to assign per-URL redirects.";
+        case SecCheckHud:      return @"POST /api.php  body: action=check_hud_control";
+        case SecValidate:      return @"POST /api.php  body: action=validate + key + hwid";
+        case SecNotifications: return @"GET  /api.php?action=get_notifications";
+        case SecConnection:    return @"GET  /check_connection.php  — timestamp auto-injected from device clock";
+        case SecTabs:          return @"GET  /apitab.php  — server_time & server_datetime auto-injected from device clock";
+        default: return @"";
+    }
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Dev API Hook";
+    self.tableView.backgroundColor = UIColor.systemGroupedBackgroundColor;
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
+}
+- (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return secTitle((Sec)s); }
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s { return secFooter((Sec)s); }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv                     { return SecCount; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    if (s == SecIcon)  return 3;   // URL | Photos | Preview
+    if (s == SecImgur) return 2;   // toggle | manage links
+    return 2;                      // toggle | edit JSON
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    DevSettings *s = DevSettings.shared;
+    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"C"];
+
+    // Icon section
+    if (ip.section == SecIcon) {
+        if (ip.row == 0) {
+            c.textLabel.text = @"Icon URL";
+            NSString *u = [s stringForKey:kIconURL];
+            c.detailTextLabel.text = u.length ? u.lastPathComponent : @"Not set";
+            c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else if (ip.row == 1) {
+            c.textLabel.text = @"Load from Photos";
+            c.imageView.image = [UIImage systemImageNamed:@"photo.on.rectangle"];
+            c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else {
+            c.textLabel.text = @"Preview Icon";
+            UIImage *img = [self _localIcon];
+            if (img) {
+                UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0,0,36,36)];
+                iv.image = img; iv.contentMode = UIViewContentModeScaleAspectFill;
+                iv.clipsToBounds = YES; iv.layer.cornerRadius = 8; c.accessoryView = iv;
+            } else { c.accessoryType = UITableViewCellAccessoryDisclosureIndicator; }
+        }
+        return c;
+    }
+
+    // Imgur section
+    if (ip.section == SecImgur) {
+        if (ip.row == 0) {
+            c.textLabel.text = @"Apply Replacements";
+            UISwitch *sw = [UISwitch new]; sw.on = [s isEnabled:kHookImgur];
+            [sw addTarget:self action:@selector(imgurToggle:) forControlEvents:UIControlEventValueChanged];
+            c.accessoryView = sw;
+        } else {
+            NSUInteger n = ImgurLinkStore.shared.allKeys.count;
+            c.textLabel.text = @"Manage Links";
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%lu captured", (unsigned long)n];
+            c.imageView.image = [UIImage systemImageNamed:@"link.badge.plus"];
+            c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        }
+        return c;
+    }
+
+    // API sections
+    NSString *hk = [self _hookKey:(Sec)ip.section];
+    if (ip.row == 0) {
+        c.textLabel.text = @"Enable Hook";
+        UISwitch *sw = [UISwitch new]; sw.on = [s isEnabled:hk];
+        sw.tag = ip.section * 10;
+        [sw addTarget:self action:@selector(apiToggle:) forControlEvents:UIControlEventValueChanged];
+        c.accessoryView = sw;
+    } else {
+        c.textLabel.text = @"Edit Response JSON";
+        c.imageView.image = [UIImage systemImageNamed:@"doc.text"];
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    }
+    return c;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+
+    if (ip.section == SecIcon) {
+        if (ip.row == 0) {
+            [self _promptURL:@"Icon URL" current:[DevSettings.shared stringForKey:kIconURL] done:^(NSString *v){
+                [DevSettings.shared setString:v forKey:kIconURL];
+                [DevSettings.shared setEnabled:NO forKey:kIconUseLocal];
+                [tv reloadSections:[NSIndexSet indexSetWithIndex:SecIcon] withRowAnimation:UITableViewRowAnimationNone];
+                [DevMenuManager.shared refreshButtonIcon];
+            }];
+        } else if (ip.row == 1) {
+            [self _pickPhoto];
+        } else {
+            [self _previewIcon];
+        }
+        return;
+    }
+
+    if (ip.section == SecImgur && ip.row == 1) {
+        [self.navigationController pushViewController:[ImgurMapVC new] animated:YES]; return;
+    }
+
+    if (ip.row == 1) {
+        NSString *jk = [self _jsonKey:(Sec)ip.section]; if (!jk) return;
+        JSONEditorVC *ed = [JSONEditorVC new]; ed.jsonKey = jk;
+        ed.titleStr = [NSString stringWithFormat:@"%@ Response", secTitle((Sec)ip.section)];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:ed];
+        [self presentViewController:nav animated:YES completion:nil];
+    }
+}
+
+- (void)imgurToggle:(UISwitch *)sw { [DevSettings.shared setEnabled:sw.on forKey:kHookImgur]; }
+- (void)apiToggle:(UISwitch *)sw {
+    NSString *k = [self _hookKey:(Sec)(sw.tag / 10)];
+    if (k) [DevSettings.shared setEnabled:sw.on forKey:k];
+}
+
+- (NSString *)_hookKey:(Sec)s {
+    switch(s){
+        case SecCheckHud: return kHookCheckHud; case SecValidate: return kHookValidate;
+        case SecNotifications: return kHookNotifications; case SecConnection: return kHookConnection;
+        case SecTabs: return kHookTabs; default: return nil;
+    }
+}
+- (NSString *)_jsonKey:(Sec)s {
+    switch(s){
+        case SecCheckHud: return kJsonCheckHud; case SecValidate: return kJsonValidate;
+        case SecNotifications: return kJsonNotifications; case SecConnection: return kJsonConnection;
+        case SecTabs: return kJsonTabs; default: return nil;
+    }
+}
+
+- (UIImage *)_localIcon {
+    DevSettings *s = DevSettings.shared;
+    if ([s isEnabled:kIconUseLocal]) { NSString *p = [s stringForKey:kIconLocalPath]; if (p.length) return [UIImage imageWithContentsOfFile:p]; }
+    return nil;
+}
+
+- (void)_pickPhoto {
+    UIImagePickerController *p = [UIImagePickerController new];
+    p.sourceType = UIImagePickerControllerSourceTypePhotoLibrary; p.delegate = self;
+    [self presentViewController:p animated:YES completion:nil];
+}
+- (void)imagePickerController:(UIImagePickerController *)p didFinishPickingMediaWithInfo:(NSDictionary *)info {
+    [p dismissViewControllerAnimated:YES completion:nil];
+    UIImage *img = info[UIImagePickerControllerOriginalImage]; if (!img) return;
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"dev_icon.jpg"];
+    [UIImageJPEGRepresentation(img, 0.9) writeToFile:path atomically:YES];
+    [DevSettings.shared setString:path forKey:kIconLocalPath];
+    [DevSettings.shared setEnabled:YES forKey:kIconUseLocal];
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:SecIcon] withRowAnimation:UITableViewRowAnimationNone];
+    [DevMenuManager.shared refreshButtonIcon];
+}
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)p { [p dismissViewControllerAnimated:YES completion:nil]; }
+
+- (void)_promptURL:(NSString *)title current:(NSString *)cur done:(void(^)(NSString *))done {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf){
+        tf.text = cur; tf.placeholder = @"https://...";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo; tf.keyboardType = UIKeyboardTypeURL;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_){
+        done(a.textFields.firstObject.text ?: @"");
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)_previewIcon {
+    UIImage *local = [self _localIcon];
+    if (local) { [self _showPreview:local]; return; }
+    NSString *url = [DevSettings.shared stringForKey:kIconURL]; if (!url.length) return;
+    [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:url]
+                                 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
+        if (!d) return; UIImage *img = [UIImage imageWithData:d]; if (!img) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ [self _showPreview:img]; });
+    }] resume];
+}
+- (void)_showPreview:(UIImage *)img {
+    UIViewController *vc = [UIViewController new]; vc.view.backgroundColor = UIColor.blackColor;
+    UIImageView *iv = [[UIImageView alloc] initWithFrame:vc.view.bounds];
+    iv.image = img; iv.contentMode = UIViewContentModeScaleAspectFit;
+    iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [vc.view addSubview:iv];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+@end
+
+// ═══════════════════════════════════════════════════════════════
+// MARK: - Floating Button
+// ═══════════════════════════════════════════════════════════════
+
+@interface DevFloatingBtn : UIButton
+- (void)refreshIcon;
+@end
+@implementation DevFloatingBtn
+
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f];
     if (!self) return nil;
-    self.clipsToBounds      = NO;
-    self.layer.cornerRadius = 10;
-    self.backgroundColor    = [UIColor colorWithRed:0.08 green:0.08 blue:0.10 alpha:0.96];
+    self.layer.cornerRadius  = f.size.width / 2;
     self.layer.shadowColor   = UIColor.blackColor.CGColor;
-    self.layer.shadowOpacity = 0.75;
-    self.layer.shadowRadius  = 8;
-    self.layer.shadowOffset  = CGSizeMake(0, 3);
-    self.layer.zPosition     = 9999;
-    [self buildBar];
-    [self buildContent];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-        initWithTarget:self action:@selector(onPan:)];
+    self.layer.shadowRadius  = 10; self.layer.shadowOpacity = 0.55;
+    self.layer.shadowOffset  = CGSizeMake(0, 4);
+    self.clipsToBounds       = NO;
+    self.layer.borderColor   = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
+    self.layer.borderWidth   = 1.5;
+    [self refreshIcon];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_pan:)];
     [self addGestureRecognizer:pan];
     return self;
 }
 
-- (void)buildBar {
-    UIView *handle = [[UIView alloc] initWithFrame:CGRectMake(kPanelW/2-16, 5, 32, 3)];
-    handle.backgroundColor    = [UIColor colorWithWhite:0.50 alpha:0.45];
-    handle.layer.cornerRadius = 1.5;
-    [self addSubview:handle];
-
-    UILabel *title = [UILabel new];
-    title.text          = @"SK Manager";
-    title.textColor     = [UIColor colorWithWhite:0.78 alpha:1];
-    title.font          = [UIFont boldSystemFontOfSize:11];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.frame         = CGRectMake(0, 12, kPanelW, 18);
-    title.userInteractionEnabled = NO;
-    [self addSubview:title];
-
-    UIView *tapZone = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kPanelW, kBarH)];
-    tapZone.backgroundColor = UIColor.clearColor;
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(toggleExpand)];
-    [tapZone addGestureRecognizer:tap];
-    [self addSubview:tapZone];
-}
-
-- (void)buildContent {
-    self.contentPane = [[UIView alloc]
-        initWithFrame:CGRectMake(0, kBarH, kPanelW, kContentH)];
-    self.contentPane.hidden        = YES;
-    self.contentPane.alpha         = 0;
-    self.contentPane.clipsToBounds = YES;
-    [self addSubview:self.contentPane];
-
-    UIView  *p = self.contentPane;
-    CGFloat w  = kPanelW - kPad * 2;
-    CGFloat y  = 6;
-
-    // ── Export-count label ────────────────────────────────────────────────
-    self.infoLabel = [UILabel new];
-    self.infoLabel.frame         = CGRectMake(kPad, y, w, 12);
-    self.infoLabel.textColor     = [UIColor colorWithWhite:0.52 alpha:1];
-    self.infoLabel.font          = [UIFont systemFontOfSize:9];
-    self.infoLabel.textAlignment = NSTextAlignmentCenter;
-    [p addSubview:self.infoLabel];
-    [self refreshInfo];
-    y += 14;
-
-    // ── File-status label ─────────────────────────────────────────────────
-    self.fileStatusLabel = [UILabel new];
-    self.fileStatusLabel.frame         = CGRectMake(kPad, y, w, 10);
-    self.fileStatusLabel.font          = [UIFont systemFontOfSize:8];
-    self.fileStatusLabel.textAlignment = NSTextAlignmentCenter;
-    self.fileStatusLabel.numberOfLines = 2;
-    [p addSubview:self.fileStatusLabel];
-    [self refreshFileStatus];
-    y += 14;
-
-    // Helper to create compact buttons
-    UIButton *(^makeBtn)(NSString *, UIColor *) = ^(NSString *title, UIColor *bg) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-        b.frame = CGRectMake(kPad, y, w, kBtnH);
-        [b setTitle:title forState:UIControlStateNormal];
-        [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        [b setTitleColor:[UIColor colorWithWhite:0.80 alpha:1] forState:UIControlStateHighlighted];
-        b.titleLabel.font       = [UIFont boldSystemFontOfSize:11];
-        b.backgroundColor       = bg;
-        b.layer.cornerRadius    = 7;
-        return b;
-    };
-
-    // ── Edit button ───────────────────────────────────────────────────────
-    self.editBtn = makeBtn(@"Edit (Fetch & Apply)",
-        [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1]);
-    [self.editBtn addTarget:self action:@selector(tapEdit)
-          forControlEvents:UIControlEventTouchUpInside];
-    [p addSubview:self.editBtn];
-    y += kBtnH + kBtnGap;
-
-    // ── Paste button ──────────────────────────────────────────────────────
-    self.pasteBtn = makeBtn(@"Paste & Apply",
-        [UIColor colorWithRed:0.18 green:0.48 blue:0.90 alpha:1]);
-    self.pasteBtn.frame = CGRectMake(kPad, y, w, kBtnH);
-    [self.pasteBtn addTarget:self action:@selector(tapPaste)
-           forControlEvents:UIControlEventTouchUpInside];
-    [p addSubview:self.pasteBtn];
-    y += kBtnH + kBtnGap;
-
-    // ── G2G Export button ─────────────────────────────────────────────────
-    UIButton *g2gBtn = makeBtn(@"G2G Export",
-        [UIColor colorWithRed:0.65 green:0.20 blue:0.90 alpha:1]);
-    g2gBtn.frame = CGRectMake(kPad, y, w, kBtnH);
-    [g2gBtn addTarget:self action:@selector(tapG2GExport)
-     forControlEvents:UIControlEventTouchUpInside];
-    [p addSubview:g2gBtn];
-    y += kBtnH + kBtnGap;
-
-    // ── Export button ─────────────────────────────────────────────────────
-    UIButton *expBtn = makeBtn(@"Export used accounts",
-        [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1]);
-    expBtn.frame = CGRectMake(kPad, y, w, kBtnH);
-    [expBtn addTarget:self action:@selector(tapExport)
-     forControlEvents:UIControlEventTouchUpInside];
-    [p addSubview:expBtn];
-}
-
-- (void)refreshInfo {
-    self.infoLabel.text = [NSString stringWithFormat:@"Export ready: %lu",
-                           (unsigned long)getExports().count];
-}
-
-- (void)refreshFileStatus {
-    NSString *missing = nil;
-    BOOL ok = requiredFilesExist(&missing);
-    if (ok) {
-        self.fileStatusLabel.text      = @"✓ All required files found";
-        self.fileStatusLabel.textColor = [UIColor colorWithRed:0.28 green:0.82 blue:0.42 alpha:1];
-    } else {
-        self.fileStatusLabel.text      = [NSString stringWithFormat:@"⚠ Missing: %@", missing];
-        self.fileStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.35 blue:0.35 alpha:1];
+- (void)refreshIcon {
+    DevSettings *s = DevSettings.shared;
+    UIImage *img = nil;
+    if ([s isEnabled:kIconUseLocal]) {
+        NSString *p = [s stringForKey:kIconLocalPath];
+        if (p.length) img = [UIImage imageWithContentsOfFile:p];
     }
-    CGFloat dimAlpha = ok ? 1.0 : 0.38;
-    self.editBtn.enabled  = ok;
-    self.pasteBtn.enabled = ok;
-    self.editBtn.alpha    = dimAlpha;
-    self.pasteBtn.alpha   = dimAlpha;
-}
-
-- (void)toggleExpand {
-    self.expanded = !self.expanded;
-    if (self.expanded) {
-        [self refreshFileStatus];
-        self.contentPane.hidden = NO;
-        self.contentPane.frame  = CGRectMake(0, kBarH, kPanelW, kContentH);
-        [UIView animateWithDuration:0.22 delay:0
-                            options:UIViewAnimationOptionCurveEaseOut
-                         animations:^{
-            CGRect f = self.frame; f.size.height = kBarH + kContentH; self.frame = f;
-            self.contentPane.alpha = 1;
-        } completion:nil];
-    } else {
-        [UIView animateWithDuration:0.18 delay:0
-                            options:UIViewAnimationOptionCurveEaseIn
-                         animations:^{
-            CGRect f = self.frame; f.size.height = kBarH; self.frame = f;
-            self.contentPane.alpha = 0;
-        } completion:^(BOOL _) { self.contentPane.hidden = YES; }];
-    }
-}
-
-- (void)tapEdit {
-    self.editBtn.enabled = NO;
-    [self.editBtn setTitle:@"Fetching…" forState:UIControlStateNormal];
-    self.editBtn.backgroundColor = [UIColor colorWithWhite:0.28 alpha:1];
-
-    fetchRemoteAccount(^(NSDictionary *acc, NSString *errMsg) {
-        self.editBtn.enabled = YES;
-        [self.editBtn setTitle:@"Edit (Fetch & Apply)" forState:UIControlStateNormal];
-        self.editBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1];
-        if (!acc) {
-            [self showToast:[NSString stringWithFormat:@"Fetch failed:\n%@", errMsg]
-                    success:NO exit:NO];
-            return;
+    if (!img) {
+        NSString *urlStr = [s stringForKey:kIconURL];
+        if (urlStr.length) {
+            [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:urlStr]
+                                         completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
+                if (!d) return; UIImage *remote = [UIImage imageWithData:d]; if (!remote) return;
+                dispatch_async(dispatch_get_main_queue(), ^{ [self _applyImage:remote]; });
+            }] resume];
+            [self _applyGlyph]; return;  // show glyph while loading
         }
-        [self showConfirmCard:acc];
-    });
-}
-
-- (void)tapPaste {
-    NSString *clipText = [UIPasteboard generalPasteboard].string;
-    if (!clipText.length) {
-        [self showToast:@"Clipboard is empty." success:NO exit:NO]; return;
+        [self _applyGlyph]; return;
     }
-    NSDictionary *acc = nil;
-    for (NSString *line in [clipText componentsSeparatedByCharactersInSet:
-                             NSCharacterSet.newlineCharacterSet]) {
-        NSString *t = [line stringByTrimmingCharactersInSet:
-                       NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (!t.length) continue;
-        acc = parseLine(t);
-        if (acc) break;
-    }
-    if (!acc) {
-        [self showToast:@"No valid account in clipboard.\nExpected: email|pass|uid|token"
-                success:NO exit:NO];
-        return;
-    }
-    [self showConfirmCard:acc];
+    [self _applyImage:img];
 }
 
-// ── G2G Export — capture screen + send exports to Discord ────────────────────
-
-- (void)tapG2GExport {
-    NSMutableArray *exports = getExports();
-    if (!exports.count) {
-        [self showToast:@"No exports yet.\nUse Edit/Paste first." success:NO exit:NO];
-        return;
-    }
-
-    // Capture screenshot on main thread first, then send
-    UIImage *shot = captureScreen();
-
-    [self showToast:@"Sending to Discord…" success:YES exit:NO];
-
-    sendToDiscord(exports, shot, ^(BOOL success, NSString *msg) {
-        if (success) {
-            writeExports(@[]);       // clear exports after successful send
-            [self refreshInfo];
-            [self showToast:[NSString stringWithFormat:
-                @"G2G Export done ✓\n%lu account(s) sent.\nExport list cleared.",
-                (unsigned long)exports.count] success:YES exit:NO];
-        } else {
-            [self showToast:[NSString stringWithFormat:@"Discord send failed:\n%@", msg]
-                    success:NO exit:NO];
-        }
-    });
+- (void)_applyImage:(UIImage *)src {
+    CGFloat sz = self.bounds.size.width;
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(sz, sz), NO, 0);
+    [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0,0,sz,sz)] addClip];
+    [src drawInRect:CGRectMake(0,0,sz,sz)];
+    UIImage *round = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    [self setImage:round forState:UIControlStateNormal];
+    self.imageView.contentMode = UIViewContentModeScaleAspectFill;
+    self.backgroundColor = UIColor.clearColor;
+    for (UIView *v in self.subviews) if ([v isKindOfClass:[UILabel class]]) [v removeFromSuperview];
 }
 
-// ── Confirm card ──────────────────────────────────────────────────────────────
-
-- (void)showConfirmCard:(NSDictionary *)acc {
-    UIView *parent = self.superview ?: [self topVC].view;
-    if (!parent) return;
-
-    UIView *backdrop = [[UIView alloc] initWithFrame:parent.bounds];
-    backdrop.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.50];
-    backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [parent addSubview:backdrop];
-
-    UIView *card = [UIView new];
-    card.backgroundColor     = [UIColor colorWithRed:0.10 green:0.10 blue:0.14 alpha:1];
-    card.layer.cornerRadius  = 13;
-    card.layer.shadowColor   = UIColor.blackColor.CGColor;
-    card.layer.shadowOpacity = 0.70;
-    card.layer.shadowRadius  = 10;
-    card.layer.shadowOffset  = CGSizeMake(0, 4);
-    card.translatesAutoresizingMaskIntoConstraints = NO;
-    [parent addSubview:card];
-
-    UILabel *emailLbl = [UILabel new];
-    emailLbl.text = acc[@"email"];
-    emailLbl.textColor = UIColor.whiteColor;
-    emailLbl.font = [UIFont boldSystemFontOfSize:12];
-    emailLbl.textAlignment = NSTextAlignmentCenter;
-    emailLbl.numberOfLines = 1;
-    emailLbl.adjustsFontSizeToFitWidth = YES;
-    emailLbl.minimumScaleFactor = 0.7;
-    emailLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:emailLbl];
-
-    UILabel *uidLbl = [UILabel new];
-    uidLbl.text = [NSString stringWithFormat:@"UID: %@", acc[@"uid"]];
-    uidLbl.textColor = [UIColor colorWithWhite:0.55 alpha:1];
-    uidLbl.font = [UIFont systemFontOfSize:10];
-    uidLbl.textAlignment = NSTextAlignmentCenter;
-    uidLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:uidLbl];
-
-    NSString *tok = acc[@"token"];
-    UILabel *tokLbl = [UILabel new];
-    tokLbl.text = [NSString stringWithFormat:@"Token: %@…",
-        [tok substringToIndex:MIN((NSUInteger)12, tok.length)]];
-    tokLbl.textColor = [UIColor colorWithWhite:0.48 alpha:1];
-    tokLbl.font = [UIFont fontWithName:@"Courier" size:9] ?: [UIFont systemFontOfSize:9];
-    tokLbl.textAlignment = NSTextAlignmentCenter;
-    tokLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:tokLbl];
-
-    NSString *remStr = acc[@"remaining"];
-    UILabel *remLbl = [UILabel new];
-    remLbl.text = remStr ? [NSString stringWithFormat:@"Remaining: %@", remStr] : @"";
-    remLbl.textColor = [UIColor colorWithRed:0.40 green:0.78 blue:1.00 alpha:1];
-    remLbl.font = [UIFont systemFontOfSize:9];
-    remLbl.textAlignment = NSTextAlignmentCenter;
-    remLbl.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:remLbl];
-
-    UIView *sep = [UIView new];
-    sep.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
-    sep.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:sep];
-
-    UIButton *applyBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    [applyBtn setTitle:@"Apply this account" forState:UIControlStateNormal];
-    [applyBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    applyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    applyBtn.backgroundColor = [UIColor colorWithRed:0.18 green:0.62 blue:0.38 alpha:1];
-    applyBtn.layer.cornerRadius = 8;
-    applyBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:applyBtn];
-
-    UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    [cancelBtn setTitle:@"Cancel" forState:UIControlStateNormal];
-    [cancelBtn setTitleColor:[UIColor colorWithWhite:0.60 alpha:1] forState:UIControlStateNormal];
-    cancelBtn.titleLabel.font = [UIFont systemFontOfSize:11];
-    cancelBtn.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1];
-    cancelBtn.layer.cornerRadius = 8;
-    cancelBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [card addSubview:cancelBtn];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [card.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
-        [card.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
-        [card.widthAnchor constraintEqualToConstant:248],
-
-        [emailLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
-        [emailLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [emailLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-
-        [uidLbl.topAnchor constraintEqualToAnchor:emailLbl.bottomAnchor constant:4],
-        [uidLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [uidLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-
-        [tokLbl.topAnchor constraintEqualToAnchor:uidLbl.bottomAnchor constant:3],
-        [tokLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [tokLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-
-        [remLbl.topAnchor constraintEqualToAnchor:tokLbl.bottomAnchor constant:3],
-        [remLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
-        [remLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
-
-        [sep.topAnchor constraintEqualToAnchor:remLbl.bottomAnchor constant:10],
-        [sep.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
-        [sep.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
-        [sep.heightAnchor constraintEqualToConstant:1],
-
-        [applyBtn.topAnchor constraintEqualToAnchor:sep.bottomAnchor constant:10],
-        [applyBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10],
-        [applyBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
-        [applyBtn.heightAnchor constraintEqualToConstant:40],
-
-        [cancelBtn.topAnchor constraintEqualToAnchor:applyBtn.bottomAnchor constant:6],
-        [cancelBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10],
-        [cancelBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
-        [cancelBtn.heightAnchor constraintEqualToConstant:32],
-
-        [card.bottomAnchor constraintEqualToAnchor:cancelBtn.bottomAnchor constant:12],
-    ]];
-
-    void (^dismiss)(void) = ^{
-        [UIView animateWithDuration:0.15 animations:^{
-            backdrop.alpha = 0; card.alpha = 0;
-        } completion:^(BOOL _) {
-            [backdrop removeFromSuperview]; [card removeFromSuperview];
-        }];
-    };
-
-    objc_setAssociatedObject(backdrop, "dismissBlock", [dismiss copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
-    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(backdropTapped:)];
-    bgTap.cancelsTouchesInView = NO;
-    [backdrop addGestureRecognizer:bgTap];
-
-    [applyBtn sk_setActionBlock:^{
-        dismiss();
-        NSMutableArray *exports = getExports();
-        [exports addObject:acc];
-        writeExports(exports);
-        applyAccount(acc);
-        [self refreshInfo];
-        NSString *msg = [NSString stringWithFormat:
-            @"Applied\n\nEmail : %@\nUID   : %@\nToken : %@…\n\nUD patched · files backed up\nClosing…",
-            acc[@"email"], acc[@"uid"],
-            [tok substringToIndex:MIN((NSUInteger)10, tok.length)]];
-        [self showToast:msg success:YES exit:YES];
-    }];
-
-    [cancelBtn sk_setActionBlock:^{ dismiss(); }];
-
-    card.alpha = 0; backdrop.alpha = 0;
-    [UIView animateWithDuration:0.18 animations:^{ backdrop.alpha = 1; card.alpha = 1; }];
-}
-
-- (void)backdropTapped:(UITapGestureRecognizer *)g {
-    void (^d)(void) = objc_getAssociatedObject(g.view, "dismissBlock");
-    if (d) d();
-}
-
-- (void)tapExport {
-    NSMutableArray *exports = getExports();
-    if (!exports.count) {
-        [self showToast:@"Nothing to export.\nUse Edit first." success:NO exit:NO]; return;
-    }
-    NSMutableString *out = [NSMutableString new];
-    for (NSDictionary *a in exports)
-        [out appendFormat:@"%@|%@\n", a[@"email"], a[@"pass"]];
-    [UIPasteboard generalPasteboard].string = out;
-    writeExports(@[]);
-    [self refreshInfo];
-    [self showToast:[NSString stringWithFormat:
-        @"Copied %lu account(s) to clipboard.\nExport list cleared.",
-        (unsigned long)exports.count] success:YES exit:NO];
-}
-
-- (void)showToast:(NSString *)msg success:(BOOL)ok exit:(BOOL)ex {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *parent = self.superview ?: [self topVC].view;
-        UILabel *t = [UILabel new];
-        t.text            = msg;
-        t.textColor       = UIColor.whiteColor;
-        t.font            = [UIFont systemFontOfSize:11];
-        t.backgroundColor = ok
-            ? [UIColor colorWithRed:0.08 green:0.20 blue:0.10 alpha:0.97]
-            : [UIColor colorWithRed:0.20 green:0.08 blue:0.08 alpha:0.97];
-        t.layer.cornerRadius = 9;
-        t.layer.borderColor  = ok
-            ? [UIColor colorWithRed:0.28 green:0.78 blue:0.38 alpha:0.5].CGColor
-            : [UIColor colorWithRed:0.78 green:0.28 blue:0.28 alpha:0.5].CGColor;
-        t.layer.borderWidth  = 1;
-        t.clipsToBounds = YES;
-        t.numberOfLines = 0;
-        t.textAlignment = NSTextAlignmentCenter;
-        t.translatesAutoresizingMaskIntoConstraints = NO;
-        [parent addSubview:t];
+- (void)_applyGlyph {
+    [self setImage:[UIImage systemImageNamed:@"ant.circle.fill"
+                           withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:30
+                                                                                             weight:UIImageSymbolWeightMedium]]
+          forState:UIControlStateNormal];
+    self.tintColor = [UIColor colorWithRed:0.25 green:1 blue:0.45 alpha:1];
+    self.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.07 alpha:0.92];
+    // tiny badge
+    if (![self viewWithTag:999]) {
+        UILabel *lb = [UILabel new]; lb.tag = 999;
+        lb.text = @"DEV"; lb.font = [UIFont boldSystemFontOfSize:7];
+        lb.textColor = [UIColor colorWithRed:0.25 green:1 blue:0.45 alpha:1];
+        lb.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:lb];
         [NSLayoutConstraint activateConstraints:@[
-            [t.centerXAnchor constraintEqualToAnchor:parent.centerXAnchor],
-            [t.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
-            [t.widthAnchor constraintLessThanOrEqualToAnchor:parent.widthAnchor constant:-40],
+            [lb.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+            [lb.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-6]
         ]];
-        NSTimeInterval delay = ex ? 2.8 : 1.8;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [UIView animateWithDuration:0.3 animations:^{ t.alpha = 0; }
-                             completion:^(BOOL _) { [t removeFromSuperview]; if (ex) exit(0); }];
-        });
-    });
+    }
 }
 
-- (void)onPan:(UIPanGestureRecognizer *)g {
-    CGPoint d  = [g translationInView:self.superview];
-    CGRect  sb = self.superview.bounds;
-    CGFloat nx = MAX(self.bounds.size.width/2,  MIN(sb.size.width  - self.bounds.size.width/2,  self.center.x + d.x));
-    CGFloat ny = MAX(self.bounds.size.height/2, MIN(sb.size.height - self.bounds.size.height/2, self.center.y + d.y));
-    self.center = CGPointMake(nx, ny);
-    [g setTranslation:CGPointZero inView:self.superview];
+- (void)_pan:(UIPanGestureRecognizer *)gr {
+    UIView *sv = self.superview; if (!sv) return;
+    CGPoint dt = [gr translationInView:sv];
+    CGFloat r  = self.bounds.size.width / 2;
+    UIEdgeInsets safe = sv.safeAreaInsets;
+    self.center = CGPointMake(
+        MAX(r+8, MIN(sv.bounds.size.width  - r - 8, self.center.x + dt.x)),
+        MAX(r+8+safe.top, MIN(sv.bounds.size.height - r - 8 - safe.bottom, self.center.y + dt.y))
+    );
+    [gr setTranslation:CGPointZero inView:sv];
+    if (gr.state == UIGestureRecognizerStateEnded) {
+        CGFloat snapX = self.center.x < sv.bounds.size.width/2 ? r+12 : sv.bounds.size.width-r-12;
+        [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.7
+              initialSpringVelocity:0 options:0
+                         animations:^{ self.center = CGPointMake(snapX, self.center.y); }
+                         completion:nil];
+    }
 }
-
-- (UIViewController *)topVC {
-    UIViewController *vc = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows.reverseObjectEnumerator)
-        if (!w.isHidden && w.alpha > 0 && w.rootViewController) { vc = w.rootViewController; break; }
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
-}
-
 @end
 
-#pragma mark - Injection
+// ═══════════════════════════════════════════════════════════════
+// MARK: - DevMenuManager
+// ═══════════════════════════════════════════════════════════════
 
-static SKPanel *gPanel = nil;
+@interface DevMenuManager : NSObject
+@property (nonatomic, weak) DevFloatingBtn *btn;
++ (instancetype)shared;
+- (void)install;
+- (void)refreshButtonIcon;
+- (void)openMenu;
+@end
+@implementation DevMenuManager
 
-static void injectPanel(void) {
-    UIWindow *win = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows)
-        if (!w.isHidden && w.alpha > 0) { win = w; break; }
-    if (!win) return;
-    UIView *root = win.rootViewController.view ?: win;
-    gPanel = [SKPanel new];
-    gPanel.center = CGPointMake(gPanel.bounds.size.width / 2 + 8, 80);
-    [root addSubview:gPanel];
-    [root bringSubviewToFront:gPanel];
++ (instancetype)shared { static DevMenuManager *m; static dispatch_once_t t; dispatch_once(&t,^{m=[DevMenuManager new];}); return m; }
+
+- (UIWindow *)_win {
+    if (@available(iOS 15, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) return w;
+        }
+    }
+    return UIApplication.sharedApplication.keyWindow;
 }
 
-%hook UIViewController
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ injectPanel(); });
+- (void)install {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = [self _win]; if (!win) return;
+        CGFloat sz = 60;
+        DevFloatingBtn *b = [[DevFloatingBtn alloc] initWithFrame:
+            CGRectMake(win.bounds.size.width - sz - 14, win.bounds.size.height - sz - 120, sz, sz)];
+        b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+        [b addTarget:self action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:b];
+        _btn = b;
     });
 }
+
+- (void)refreshButtonIcon { dispatch_async(dispatch_get_main_queue(), ^{ [_btn refreshIcon]; }); }
+
+- (void)openMenu {
+    UIWindow *win = [self _win]; if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    DevMenuVC *menu = [DevMenuVC new];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:menu];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    if (@available(iOS 15, *)) {
+        UISheetPresentationController *sh = nav.sheetPresentationController;
+        sh.detents = @[UISheetPresentationControllerDetent.mediumDetent,
+                       UISheetPresentationControllerDetent.largeDetent];
+        sh.prefersGrabberVisible = YES;
+    }
+    [top presentViewController:nav animated:YES completion:nil];
+}
+@end
+
+// ═══════════════════════════════════════════════════════════════
+// MARK: - Bootstrap
+// ═══════════════════════════════════════════════════════════════
+
+static void RegisterHook(void) {
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ [NSURLProtocol registerClass:[HookURLProtocol class]]; });
+}
+
+__attribute__((constructor(101))) static void init_dev_hook(void) {
+    RegisterHook();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8*NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [[DevMenuManager shared] install]; });
+}
+
+%hook NSURLSessionConfiguration
+- (NSArray *)protocolClasses {
+    NSMutableArray *a = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
+    NSArray *o = %orig; if (o) [a addObjectsFromArray:o]; return a;
+}
 %end
+
+%hook NSURLSession
++ (NSURLSession *)sharedSession                                       { RegisterHook(); return %orig; }
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r       { RegisterHook(); return %orig; }
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r
+                           completionHandler:(void(^)(NSData*,NSURLResponse*,NSError*))c
+                                                                      { RegisterHook(); return %orig; }
+%end
+%hook NSURLConnection
++ (instancetype)connectionWithRequest:(NSURLRequest *)r delegate:(id)d { RegisterHook(); return %orig; }
+%end
+
+%ctor { RegisterHook(); }
