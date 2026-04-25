@@ -1,8 +1,12 @@
-// DevApiHook.xm  —  v2
-// • Auto-logs every i.imgur.com URL seen at runtime
-// • Per-URL replacement map (saved, persists across launches)
-// • New imgur links appear automatically in the Manage Links screen
-// • Floating icon button → main menu → Imgur map / JSON editors / toggles
+// DevApiHook.xm  —  v3
+// Fixes:
+//  • Crash in _applyImage when bounds.size.width == 0 (zero-size CGContext)
+//  • Crash from refreshIcon called off main thread after NSURLSession callback
+//  • Install now uses UIApplicationDidBecomeActiveNotification (fires once)
+//    so the button appears reliably as soon as the first window is ready
+//  • openMenu walks UINavigationController/UITabBarController nesting correctly
+//  • _win is nil-safe; every call-site guards against nil
+//  • %hook NSURLSessionConfiguration guards against nil %orig
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -19,7 +23,7 @@ static NSString *const kHookValidate      = @"hook_validate";
 static NSString *const kHookNotifications = @"hook_notifications";
 static NSString *const kHookConnection    = @"hook_connection";
 static NSString *const kHookTabs          = @"hook_tabs";
-static NSString *const kHookImgur         = @"hook_imgur";   // master: apply replacements
+static NSString *const kHookImgur         = @"hook_imgur";
 
 static NSString *const kJsonCheckHud      = @"json_check_hud";
 static NSString *const kJsonValidate      = @"json_validate";
@@ -27,7 +31,6 @@ static NSString *const kJsonNotifications = @"json_notifications";
 static NSString *const kJsonConnection    = @"json_connection";
 static NSString *const kJsonTabs          = @"json_tabs";
 
-// Imgur: dict { normalizedOriginalURL -> replacementURL or "" }
 static NSString *const kImgurMap          = @"imgur_url_map";
 
 static NSString *const kIconURL           = @"icon_url";
@@ -36,16 +39,15 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - ImgurLinkStore
-// Logs every i.imgur.com URL seen; stores per-URL replacements
 // ═══════════════════════════════════════════════════════════════
 
 @interface ImgurLinkStore : NSObject
 + (instancetype)shared;
 - (void)logURL:(NSString *)rawURL;
-- (NSString *)replacementFor:(NSString *)rawURL;   // "" = no replacement
+- (NSString *)replacementFor:(NSString *)rawURL;
 - (void)setReplacement:(NSString *)rep forKey:(NSString *)normalizedURL;
 - (void)removeKey:(NSString *)normalizedURL;
-- (NSArray<NSString *> *)allKeys;                  // sorted normalized URLs
+- (NSArray<NSString *> *)allKeys;
 @end
 
 @implementation ImgurLinkStore {
@@ -67,8 +69,8 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     return self;
 }
 
-// Strip query/fragment; keep scheme+host+path as the stable key
 - (NSString *)normalizeURL:(NSString *)raw {
+    if (!raw.length) return raw ?: @"";
     NSURL *u = [NSURL URLWithString:raw];
     if (!u) return raw;
     return [NSString stringWithFormat:@"%@://%@%@",
@@ -89,11 +91,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 }
 
 - (NSString *)replacementFor:(NSString *)rawURL {
+    if (!rawURL.length) return @"";
     NSString *key = [self normalizeURL:rawURL];
     @synchronized (self) { return _map[key] ?: @""; }
 }
 
 - (void)setReplacement:(NSString *)rep forKey:(NSString *)key {
+    if (!key.length) return;
     @synchronized (self) {
         _map[key] = rep ?: @"";
         [self _save];
@@ -101,6 +105,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 }
 
 - (void)removeKey:(NSString *)key {
+    if (!key.length) return;
     @synchronized (self) { [_map removeObjectForKey:key]; [self _save]; }
 }
 
@@ -114,7 +119,6 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     [_ud setObject:[_map copy] forKey:kImgurMap];
     [_ud synchronize];
 }
-
 @end
 
 // ═══════════════════════════════════════════════════════════════
@@ -150,7 +154,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 
 - (NSString *)_pretty:(NSDictionary *)d {
     NSData *data = [NSJSONSerialization dataWithJSONObject:d options:NSJSONWritingPrettyPrinted error:nil];
-    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"{}";
 }
 
 - (void)_registerDefaults {
@@ -191,7 +195,8 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
         }],
         kJsonTabs: [self _pretty:@{
             @"success": @YES,
-            @"server_time": @((long long)now), @"server_datetime": [f stringFromDate:[NSDate date]],
+            @"server_time": @((long long)now),
+            @"server_datetime": [f stringFromDate:[NSDate date]],
             @"tabs": @{
                 @"aimbot": @1, @"esp": @1, @"msl": @1, @"weapons": @1,
                 @"profile": @1, @"other": @YES, @"kill_switch": @0,
@@ -204,17 +209,18 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     [_ud registerDefaults:defs];
 }
 
-- (BOOL)isEnabled:(NSString *)k              { return [_ud boolForKey:k]; }
-- (void)setEnabled:(BOOL)v forKey:(NSString *)k { [_ud setBool:v forKey:k]; [_ud synchronize]; }
-- (NSString *)jsonStringForKey:(NSString *)k { return [_ud stringForKey:k] ?: @"{}"; }
+- (BOOL)isEnabled:(NSString *)k                  { return [_ud boolForKey:k]; }
+- (void)setEnabled:(BOOL)v forKey:(NSString *)k  { [_ud setBool:v forKey:k]; [_ud synchronize]; }
+- (NSString *)jsonStringForKey:(NSString *)k     { return [_ud stringForKey:k] ?: @"{}"; }
 - (void)setJsonString:(NSString *)s forKey:(NSString *)k { [_ud setObject:s forKey:k]; [_ud synchronize]; }
 - (NSDictionary *)jsonDictForKey:(NSString *)k {
     NSData *d = [[_ud stringForKey:k] dataUsingEncoding:NSUTF8StringEncoding];
-    return d ? ([NSJSONSerialization JSONObjectWithData:d options:0 error:nil] ?: @{}) : @{};
+    if (!d) return @{};
+    NSDictionary *obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : @{};
 }
-- (NSString *)stringForKey:(NSString *)k { return [_ud stringForKey:k] ?: @""; }
-- (void)setString:(NSString *)s forKey:(NSString *)k { [_ud setObject:s forKey:k]; [_ud synchronize]; }
-
+- (NSString *)stringForKey:(NSString *)k         { return [_ud stringForKey:k] ?: @""; }
+- (void)setString:(NSString *)s forKey:(NSString *)k { [_ud setObject:(s ?: @"") forKey:k]; [_ud synchronize]; }
 @end
 
 // ═══════════════════════════════════════════════════════════════
@@ -233,7 +239,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
         while ((n = [s read:b maxLength:sizeof(b)]) > 0) [m appendBytes:b length:n];
         [s close]; d = m;
     }
-    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"";
+    return d ? ([[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"") : @"";
 }
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)req {
@@ -244,7 +250,6 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     NSString *meth = req.HTTPMethod.uppercaseString;
     DevSettings *s = DevSettings.shared;
 
-    // ── imgur: always log, intercept only if replacement exists ──
     if ([host isEqualToString:@"i.imgur.com"]) {
         [ImgurLinkStore.shared logURL:url.absoluteString];
         if (![s isEnabled:kHookImgur]) return NO;
@@ -270,23 +275,22 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)r { return r; }
 
 - (void)startLoading {
-    NSMutableURLRequest *tagged = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"DevHookDone" inRequest:tagged];
-
-    NSURL *url   = self.request.URL;
+    NSURL *url    = self.request.URL;
     NSString *host = url.host.lowercaseString;
     NSString *path = url.path;
     NSString *meth = self.request.HTTPMethod.uppercaseString;
     DevSettings *s = DevSettings.shared;
     NSData *data   = nil;
 
-    // ── Imgur redirect ──────────────────────────────────────
+    // ── Imgur redirect ─────────────────────────────────────────
     if ([host isEqualToString:@"i.imgur.com"]) {
-        NSString *rep = [ImgurLinkStore.shared replacementFor:url.absoluteString];
-        NSURL *repURL = [NSURL URLWithString:rep];
+        NSString *rep    = [ImgurLinkStore.shared replacementFor:url.absoluteString];
+        NSURL    *repURL = [NSURL URLWithString:rep];
         if (repURL) {
-            [[[NSURLSession sharedSession] dataTaskWithURL:repURL completionHandler:
-              ^(NSData *d, NSURLResponse *r, NSError *e) {
+            NSMutableURLRequest *fwd = [NSMutableURLRequest requestWithURL:repURL];
+            [NSURLProtocol setProperty:@YES forKey:@"DevHookDone" inRequest:fwd];
+            [[[NSURLSession sharedSession] dataTaskWithRequest:fwd
+                                             completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
                 if (d && r) {
                     [self.client URLProtocol:self didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageNotAllowed];
                     [self.client URLProtocol:self didLoadData:d];
@@ -299,14 +303,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
             return;
         }
     }
-
-    // ── check_connection — live timestamp ───────────────────
+    // ── check_connection — live timestamp ──────────────────────
     else if ([path isEqualToString:@"/check_connection.php"]) {
         NSMutableDictionary *d = [[s jsonDictForKey:kJsonConnection] mutableCopy];
         d[@"timestamp"] = @((long long)[[NSDate date] timeIntervalSince1970]);
         data = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
     }
-    // ── apitab — live timestamp ─────────────────────────────
+    // ── apitab — live timestamp ────────────────────────────────
     else if ([path isEqualToString:@"/apitab.php"]) {
         NSMutableDictionary *d = [[s jsonDictForKey:kJsonTabs] mutableCopy];
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
@@ -315,11 +318,12 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
         d[@"server_datetime"] = [fmt stringFromDate:[NSDate date]];
         data = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
     }
-    // ── GET notifications ────────────────────────────────────
-    else if ([meth isEqualToString:@"GET"] && [url.query containsString:@"action=get_notifications"]) {
+    // ── GET notifications ──────────────────────────────────────
+    else if ([meth isEqualToString:@"GET"] &&
+             [url.query containsString:@"action=get_notifications"]) {
         data = [NSJSONSerialization dataWithJSONObject:[s jsonDictForKey:kJsonNotifications] options:0 error:nil];
     }
-    // ── POST api.php ─────────────────────────────────────────
+    // ── POST api.php ───────────────────────────────────────────
     else if ([meth isEqualToString:@"POST"]) {
         NSString *body = [HookURLProtocol _bodyOf:self.request];
         NSDictionary *dict = [body containsString:@"action=check_hud_control"]
@@ -359,9 +363,12 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     self.title = _titleStr;
     self.view.backgroundColor = UIColor.systemBackgroundColor;
     self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"Save" style:UIBarButtonItemStyleDone target:self action:@selector(save)];
+        [[UIBarButtonItem alloc] initWithTitle:@"Save"
+                                         style:UIBarButtonItemStyleDone
+                                        target:self action:@selector(save)];
     self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel target:self action:@selector(done)];
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
+                                                      target:self action:@selector(done)];
 
     _tv = [[UITextView alloc] initWithFrame:self.view.bounds];
     _tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -392,17 +399,20 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     [NSJSONSerialization JSONObjectWithData:d options:0 error:&e];
     if (e) {
         UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Invalid JSON"
-                                    message:e.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+                                    message:e.localizedDescription
+                                    preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil]; return;
+        [self presentViewController:a animated:YES completion:nil];
+        return;
     }
-    [DevSettings.shared setJsonString:_tv.text forKey:_jsonKey]; [self done];
+    [DevSettings.shared setJsonString:_tv.text forKey:_jsonKey];
+    [self done];
 }
 - (void)done { [self dismissViewControllerAnimated:YES completion:nil]; }
 @end
 
 // ═══════════════════════════════════════════════════════════════
-// MARK: - ImgurMapVC  (per-URL replacement list)
+// MARK: - ImgurMapVC
 // ═══════════════════════════════════════════════════════════════
 
 @interface ImgurMapVC : UITableViewController
@@ -416,21 +426,32 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     self.navigationItem.rightBarButtonItems = @[
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                       target:self action:@selector(reload)],
-        [[UIBarButtonItem alloc] initWithTitle:@"Clear All" style:UIBarButtonItemStylePlain
+        [[UIBarButtonItem alloc] initWithTitle:@"Clear All"
+                                         style:UIBarButtonItemStylePlain
                                         target:self action:@selector(clearAll)]
     ];
     [self.tableView registerClass:[UITableViewCell class] forCellReuseIdentifier:@"C"];
     [self reload];
 }
 
-- (void)reload { _keys = [ImgurLinkStore.shared allKeys]; [self.tableView reloadData]; }
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self reload]; // refresh when navigating back
+}
+
+- (void)reload {
+    _keys = [ImgurLinkStore.shared allKeys];
+    [self.tableView reloadData];
+}
 
 - (void)clearAll {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Clear all imgur logs?"
-                                message:@"Replacements will also be removed."
-                                preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Clear all imgur logs?"
+        message:@"Replacements will also be removed."
+        preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Clear All" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_){
+    [a addAction:[UIAlertAction actionWithTitle:@"Clear All" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *_) {
         for (NSString *k in self.keys) [ImgurLinkStore.shared removeKey:k];
         [self reload];
     }]];
@@ -438,14 +459,15 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return MAX(1, (NSInteger)_keys.count); }
-
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return MAX(1, (NSInteger)_keys.count);
+}
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
     return [NSString stringWithFormat:@"%lu imgur URL%@ captured — tap to set replacement",
             (unsigned long)_keys.count, _keys.count == 1 ? @"" : @"s"];
 }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    return @"Swipe left to remove a URL from the log. Empty replacement = pass-through.";
+    return @"Swipe left to remove a URL. Empty replacement = pass-through.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -461,7 +483,6 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     NSString *rep = [ImgurLinkStore.shared replacementFor:key];
     BOOL hasRep   = rep.length > 0;
 
-    // filename as title, full URL as subtitle
     cell.textLabel.text       = key.lastPathComponent;
     cell.textLabel.font       = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightSemibold];
     cell.detailTextLabel.numberOfLines = 2;
@@ -469,13 +490,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     if (hasRep) {
         cell.detailTextLabel.text      = [NSString stringWithFormat:@"→ %@", rep];
         cell.detailTextLabel.textColor = UIColor.systemGreenColor;
-        cell.imageView.image = [UIImage systemImageNamed:@"arrow.triangle.2.circlepath"];
-        cell.imageView.tintColor = UIColor.systemGreenColor;
+        cell.imageView.image           = [UIImage systemImageNamed:@"arrow.triangle.2.circlepath"];
+        cell.imageView.tintColor       = UIColor.systemGreenColor;
     } else {
         cell.detailTextLabel.text      = key;
         cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-        cell.imageView.image = [UIImage systemImageNamed:@"photo"];
-        cell.imageView.tintColor = UIColor.systemGrayColor;
+        cell.imageView.image           = [UIImage systemImageNamed:@"photo"];
+        cell.imageView.tintColor       = UIColor.systemGrayColor;
     }
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     return cell;
@@ -499,38 +520,38 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
         tf.keyboardType = UIKeyboardTypeURL;
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
-    [a addAction:[UIAlertAction actionWithTitle:@"Clear (pass-through)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_){
-        [ImgurLinkStore.shared setReplacement:@"" forKey:key]; [self reload];
+    [a addAction:[UIAlertAction actionWithTitle:@"Clear (pass-through)"
+                                          style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *_) {
+        [ImgurLinkStore.shared setReplacement:@"" forKey:key];
+        [self reload];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_){
-        [ImgurLinkStore.shared setReplacement:a.textFields.firstObject.text ?: @"" forKey:key];
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *_) {
+        NSString *val = a.textFields.firstObject.text ?: @"";
+        [ImgurLinkStore.shared setReplacement:val forKey:key];
         [self reload];
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
 - (BOOL)tableView:(UITableView *)tv canEditRowAtIndexPath:(NSIndexPath *)ip { return _keys.count > 0; }
-- (void)tableView:(UITableView *)tv commitEditingStyle:(UITableViewCellEditingStyle)es forRowAtIndexPath:(NSIndexPath *)ip {
-    if (es == UITableViewCellEditingStyleDelete) { [ImgurLinkStore.shared removeKey:_keys[ip.row]]; [self reload]; }
+- (void)tableView:(UITableView *)tv commitEditingStyle:(UITableViewCellEditingStyle)es
+                                    forRowAtIndexPath:(NSIndexPath *)ip {
+    if (es == UITableViewCellEditingStyleDelete) {
+        [ImgurLinkStore.shared removeKey:_keys[ip.row]];
+        [self reload];
+    }
 }
-
 @end
 
 // ═══════════════════════════════════════════════════════════════
-// MARK: - DevMenuVC  (main menu)
+// MARK: - Forward declarations
 // ═══════════════════════════════════════════════════════════════
 
-typedef NS_ENUM(NSInteger, Sec) {
-    SecIcon = 0, SecImgur,
-    SecCheckHud, SecValidate, SecNotifications, SecConnection, SecTabs,
-    SecCount
-};
-
-// Forward declare the button so the Manager interface doesn't error out
 @class DevFloatingBtn;
 
-// Declare the Manager interface early so DevMenuVC can use it
 @interface DevMenuManager : NSObject
 @property (nonatomic, weak) DevFloatingBtn *btn;
 + (instancetype)shared;
@@ -539,6 +560,15 @@ typedef NS_ENUM(NSInteger, Sec) {
 - (void)openMenu;
 @end
 
+// ═══════════════════════════════════════════════════════════════
+// MARK: - DevMenuVC
+// ═══════════════════════════════════════════════════════════════
+
+typedef NS_ENUM(NSInteger, Sec) {
+    SecIcon = 0, SecImgur,
+    SecCheckHud, SecValidate, SecNotifications, SecConnection, SecTabs,
+    SecCount
+};
 
 @interface DevMenuVC : UITableViewController
     <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
@@ -546,7 +576,7 @@ typedef NS_ENUM(NSInteger, Sec) {
 @implementation DevMenuVC
 
 static NSString *secTitle(Sec s) {
-    switch(s){
+    switch(s) {
         case SecIcon:          return @"Menu Icon";
         case SecImgur:         return @"Imgur Hook";
         case SecCheckHud:      return @"Check HUD Control";
@@ -554,19 +584,19 @@ static NSString *secTitle(Sec s) {
         case SecNotifications: return @"Get Notifications";
         case SecConnection:    return @"Check Connection";
         case SecTabs:          return @"Get Tabs";
-        default: return @"";
+        default:               return @"";
     }
 }
 static NSString *secFooter(Sec s) {
-    switch(s){
+    switch(s) {
         case SecIcon:          return @"Image shown on the floating button. Set URL or pick from Photos.";
-        case SecImgur:         return @"All i.imgur.com requests are logged automatically. Enable replacements to redirect them. Tap 'Manage Links' to assign per-URL redirects.";
+        case SecImgur:         return @"All i.imgur.com requests are logged. Enable replacements to redirect them.";
         case SecCheckHud:      return @"POST /api.php  body: action=check_hud_control";
         case SecValidate:      return @"POST /api.php  body: action=validate + key + hwid";
         case SecNotifications: return @"GET  /api.php?action=get_notifications";
-        case SecConnection:    return @"GET  /check_connection.php  — timestamp auto-injected from device clock";
-        case SecTabs:          return @"GET  /apitab.php  — server_time & server_datetime auto-injected from device clock";
-        default: return @"";
+        case SecConnection:    return @"GET  /check_connection.php  — timestamp auto-injected";
+        case SecTabs:          return @"GET  /apitab.php  — server_time & datetime auto-injected";
+        default:               return @"";
     }
 }
 
@@ -575,7 +605,8 @@ static NSString *secFooter(Sec s) {
     self.title = @"Dev API Hook";
     self.tableView.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(close)];
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                      target:self action:@selector(close)];
 }
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 
@@ -583,9 +614,9 @@ static NSString *secFooter(Sec s) {
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s { return secFooter((Sec)s); }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv                     { return SecCount; }
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    if (s == SecIcon)  return 3;   // URL | Photos | Preview
-    if (s == SecImgur) return 2;   // toggle | manage links
-    return 2;                      // toggle | edit JSON
+    if (s == SecIcon)  return 3;
+    if (s == SecImgur) return 2;
+    return 2;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -610,7 +641,9 @@ static NSString *secFooter(Sec s) {
                 UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(0,0,36,36)];
                 iv.image = img; iv.contentMode = UIViewContentModeScaleAspectFill;
                 iv.clipsToBounds = YES; iv.layer.cornerRadius = 8; c.accessoryView = iv;
-            } else { c.accessoryType = UITableViewCellAccessoryDisclosureIndicator; }
+            } else {
+                c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            }
         }
         return c;
     }
@@ -636,7 +669,8 @@ static NSString *secFooter(Sec s) {
     NSString *hk = [self _hookKey:(Sec)ip.section];
     if (ip.row == 0) {
         c.textLabel.text = @"Enable Hook";
-        UISwitch *sw = [UISwitch new]; sw.on = [s isEnabled:hk];
+        UISwitch *sw = [UISwitch new];
+        sw.on  = hk ? [s isEnabled:hk] : NO;
         sw.tag = ip.section * 10;
         [sw addTarget:self action:@selector(apiToggle:) forControlEvents:UIControlEventValueChanged];
         c.accessoryView = sw;
@@ -653,10 +687,11 @@ static NSString *secFooter(Sec s) {
 
     if (ip.section == SecIcon) {
         if (ip.row == 0) {
-            [self _promptURL:@"Icon URL" current:[DevSettings.shared stringForKey:kIconURL] done:^(NSString *v){
+            [self _promptURL:@"Icon URL" current:[DevSettings.shared stringForKey:kIconURL] done:^(NSString *v) {
                 [DevSettings.shared setString:v forKey:kIconURL];
                 [DevSettings.shared setEnabled:NO forKey:kIconUseLocal];
-                [tv reloadSections:[NSIndexSet indexSetWithIndex:SecIcon] withRowAnimation:UITableViewRowAnimationNone];
+                [tv reloadSections:[NSIndexSet indexSetWithIndex:SecIcon]
+                  withRowAnimation:UITableViewRowAnimationNone];
                 [DevMenuManager.shared refreshButtonIcon];
             }];
         } else if (ip.row == 1) {
@@ -668,13 +703,16 @@ static NSString *secFooter(Sec s) {
     }
 
     if (ip.section == SecImgur && ip.row == 1) {
-        [self.navigationController pushViewController:[ImgurMapVC new] animated:YES]; return;
+        [self.navigationController pushViewController:[ImgurMapVC new] animated:YES];
+        return;
     }
 
     if (ip.row == 1) {
-        NSString *jk = [self _jsonKey:(Sec)ip.section]; if (!jk) return;
-        JSONEditorVC *ed = [JSONEditorVC new]; ed.jsonKey = jk;
-        ed.titleStr = [NSString stringWithFormat:@"%@ Response", secTitle((Sec)ip.section)];
+        NSString *jk = [self _jsonKey:(Sec)ip.section];
+        if (!jk) return;
+        JSONEditorVC *ed = [JSONEditorVC new];
+        ed.jsonKey   = jk;
+        ed.titleStr  = [NSString stringWithFormat:@"%@ Response", secTitle((Sec)ip.section)];
         UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:ed];
         [self presentViewController:nav animated:YES completion:nil];
     }
@@ -687,53 +725,73 @@ static NSString *secFooter(Sec s) {
 }
 
 - (NSString *)_hookKey:(Sec)s {
-    switch(s){
-        case SecCheckHud: return kHookCheckHud; case SecValidate: return kHookValidate;
-        case SecNotifications: return kHookNotifications; case SecConnection: return kHookConnection;
-        case SecTabs: return kHookTabs; default: return nil;
+    switch(s) {
+        case SecCheckHud:      return kHookCheckHud;
+        case SecValidate:      return kHookValidate;
+        case SecNotifications: return kHookNotifications;
+        case SecConnection:    return kHookConnection;
+        case SecTabs:          return kHookTabs;
+        default:               return nil;
     }
 }
 - (NSString *)_jsonKey:(Sec)s {
-    switch(s){
-        case SecCheckHud: return kJsonCheckHud; case SecValidate: return kJsonValidate;
-        case SecNotifications: return kJsonNotifications; case SecConnection: return kJsonConnection;
-        case SecTabs: return kJsonTabs; default: return nil;
+    switch(s) {
+        case SecCheckHud:      return kJsonCheckHud;
+        case SecValidate:      return kJsonValidate;
+        case SecNotifications: return kJsonNotifications;
+        case SecConnection:    return kJsonConnection;
+        case SecTabs:          return kJsonTabs;
+        default:               return nil;
     }
 }
 
 - (UIImage *)_localIcon {
     DevSettings *s = DevSettings.shared;
-    if ([s isEnabled:kIconUseLocal]) { NSString *p = [s stringForKey:kIconLocalPath]; if (p.length) return [UIImage imageWithContentsOfFile:p]; }
+    if ([s isEnabled:kIconUseLocal]) {
+        NSString *p = [s stringForKey:kIconLocalPath];
+        if (p.length) return [UIImage imageWithContentsOfFile:p];
+    }
     return nil;
 }
 
 - (void)_pickPhoto {
     UIImagePickerController *p = [UIImagePickerController new];
-    p.sourceType = UIImagePickerControllerSourceTypePhotoLibrary; p.delegate = self;
+    p.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    p.delegate   = self;
     [self presentViewController:p animated:YES completion:nil];
 }
-- (void)imagePickerController:(UIImagePickerController *)p didFinishPickingMediaWithInfo:(NSDictionary *)info {
+- (void)imagePickerController:(UIImagePickerController *)p
+      didFinishPickingMediaWithInfo:(NSDictionary *)info {
     [p dismissViewControllerAnimated:YES completion:nil];
-    UIImage *img = info[UIImagePickerControllerOriginalImage]; if (!img) return;
+    UIImage *img = info[UIImagePickerControllerOriginalImage];
+    if (!img) return;
     NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"dev_icon.jpg"];
-    [UIImageJPEGRepresentation(img, 0.9) writeToFile:path atomically:YES];
+    NSData *jpeg = UIImageJPEGRepresentation(img, 0.9);
+    if (!jpeg) return;
+    [jpeg writeToFile:path atomically:YES];
     [DevSettings.shared setString:path forKey:kIconLocalPath];
     [DevSettings.shared setEnabled:YES forKey:kIconUseLocal];
-    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:SecIcon] withRowAnimation:UITableViewRowAnimationNone];
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:SecIcon]
+                  withRowAnimation:UITableViewRowAnimationNone];
     [DevMenuManager.shared refreshButtonIcon];
 }
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)p { [p dismissViewControllerAnimated:YES completion:nil]; }
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)p {
+    [p dismissViewControllerAnimated:YES completion:nil];
+}
 
 - (void)_promptURL:(NSString *)title current:(NSString *)cur done:(void(^)(NSString *))done {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleAlert];
-    [a addTextFieldWithConfigurationHandler:^(UITextField *tf){
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.text = cur; tf.placeholder = @"https://...";
-        tf.autocorrectionType = UITextAutocorrectionTypeNo; tf.keyboardType = UIKeyboardTypeURL;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.keyboardType = UIKeyboardTypeURL;
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_){
-        done(a.textFields.firstObject.text ?: @"");
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *_) {
+        if (done) done(a.textFields.firstObject.text ?: @"");
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
@@ -741,27 +799,36 @@ static NSString *secFooter(Sec s) {
 - (void)_previewIcon {
     UIImage *local = [self _localIcon];
     if (local) { [self _showPreview:local]; return; }
-    NSString *url = [DevSettings.shared stringForKey:kIconURL]; if (!url.length) return;
-    [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:url]
-                                 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
-        if (!d) return; UIImage *img = [UIImage imageWithData:d]; if (!img) return;
+    NSString *urlStr = [DevSettings.shared stringForKey:kIconURL];
+    if (!urlStr.length) return;
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+    [[[NSURLSession sharedSession] dataTaskWithURL:url
+                                 completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (!d) return;
+        UIImage *img = [UIImage imageWithData:d];
+        if (!img) return;
         dispatch_async(dispatch_get_main_queue(), ^{ [self _showPreview:img]; });
     }] resume];
 }
 - (void)_showPreview:(UIImage *)img {
-    UIViewController *vc = [UIViewController new]; vc.view.backgroundColor = UIColor.blackColor;
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = UIColor.blackColor;
     UIImageView *iv = [[UIImageView alloc] initWithFrame:vc.view.bounds];
     iv.image = img; iv.contentMode = UIViewContentModeScaleAspectFit;
     iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [vc.view addSubview:iv];
     [self.navigationController pushViewController:vc animated:YES];
 }
-
 @end
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - Floating Button
+// FIX: _applyImage guards sz > 0; refreshIcon always dispatches
+//      UIKit work to main thread
 // ═══════════════════════════════════════════════════════════════
+
+static const CGFloat kBtnSize = 60.f;
 
 @interface DevFloatingBtn : UIButton
 - (void)refreshIcon;
@@ -769,73 +836,102 @@ static NSString *secFooter(Sec s) {
 @implementation DevFloatingBtn
 
 - (instancetype)initWithFrame:(CGRect)f {
+    // Ensure the frame has a real size so bounds.size.width != 0
+    if (CGRectIsEmpty(f)) f = CGRectMake(0, 0, kBtnSize, kBtnSize);
     self = [super initWithFrame:f];
     if (!self) return nil;
     self.layer.cornerRadius  = f.size.width / 2;
     self.layer.shadowColor   = UIColor.blackColor.CGColor;
-    self.layer.shadowRadius  = 10; self.layer.shadowOpacity = 0.55;
+    self.layer.shadowRadius  = 10;
+    self.layer.shadowOpacity = 0.55f;
     self.layer.shadowOffset  = CGSizeMake(0, 4);
     self.clipsToBounds       = NO;
     self.layer.borderColor   = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
-    self.layer.borderWidth   = 1.5;
+    self.layer.borderWidth   = 1.5f;
+    [self _applyGlyph];                  // show glyph immediately; icon loads async below
     [self refreshIcon];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_pan:)];
     [self addGestureRecognizer:pan];
     return self;
 }
 
+// Always called on main thread (callers ensure this)
 - (void)refreshIcon {
     DevSettings *s = DevSettings.shared;
-    UIImage *img = nil;
+
+    // 1. Try local file first (synchronous, safe)
     if ([s isEnabled:kIconUseLocal]) {
         NSString *p = [s stringForKey:kIconLocalPath];
-        if (p.length) img = [UIImage imageWithContentsOfFile:p];
-    }
-    if (!img) {
-        NSString *urlStr = [s stringForKey:kIconURL];
-        if (urlStr.length) {
-            [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:urlStr]
-                                         completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
-                if (!d) return; UIImage *remote = [UIImage imageWithData:d]; if (!remote) return;
-                dispatch_async(dispatch_get_main_queue(), ^{ [self _applyImage:remote]; });
-            }] resume];
-            [self _applyGlyph]; return;  // show glyph while loading
+        if (p.length) {
+            UIImage *img = [UIImage imageWithContentsOfFile:p];
+            if (img) { [self _applyImage:img]; return; }
         }
-        [self _applyGlyph]; return;
     }
-    [self _applyImage:img];
+
+    // 2. Try remote URL (async, result always dispatched to main)
+    NSString *urlStr = [s stringForKey:kIconURL];
+    if (urlStr.length) {
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (url) {
+            [self _applyGlyph]; // placeholder while loading
+            [[[NSURLSession sharedSession] dataTaskWithURL:url
+                                         completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+                if (!d) return;
+                UIImage *img = [UIImage imageWithData:d];
+                if (!img) return;
+                // FIX: always hop to main thread for UIKit work
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self _applyImage:img];
+                });
+            }] resume];
+            return;
+        }
+    }
+
+    // 3. Fallback glyph
+    [self _applyGlyph];
 }
 
+// FIX: guard sz > 0 to prevent zero-size CGContext crash
 - (void)_applyImage:(UIImage *)src {
+    if (!src) { [self _applyGlyph]; return; }
     CGFloat sz = self.bounds.size.width;
+    if (sz <= 0) sz = kBtnSize;          // ← was crashing here when bounds not yet set
+
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(sz, sz), NO, 0);
-    [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0,0,sz,sz)] addClip];
-    [src drawInRect:CGRectMake(0,0,sz,sz)];
+    [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, 0, sz, sz)] addClip];
+    [src drawInRect:CGRectMake(0, 0, sz, sz)];
     UIImage *round = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
+
+    if (!round) { [self _applyGlyph]; return; }
+
     [self setImage:round forState:UIControlStateNormal];
     self.imageView.contentMode = UIViewContentModeScaleAspectFill;
     self.backgroundColor = UIColor.clearColor;
-    for (UIView *v in self.subviews) if ([v isKindOfClass:[UILabel class]]) [v removeFromSuperview];
+    // Remove any leftover DEV badge
+    for (UIView *v in self.subviews)
+        if ([v isKindOfClass:[UILabel class]] && v.tag == 999) [v removeFromSuperview];
 }
 
 - (void)_applyGlyph {
-    [self setImage:[UIImage systemImageNamed:@"ant.circle.fill"
-                           withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:30
-                                                                                             weight:UIImageSymbolWeightMedium]]
-          forState:UIControlStateNormal];
-    self.tintColor = [UIColor colorWithRed:0.25 green:1 blue:0.45 alpha:1];
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:30 weight:UIImageSymbolWeightMedium];
+    UIImage *glyph = [UIImage systemImageNamed:@"ant.circle.fill" withConfiguration:cfg];
+    [self setImage:glyph forState:UIControlStateNormal];
+    self.tintColor       = [UIColor colorWithRed:0.25 green:1.0 blue:0.45 alpha:1];
     self.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.07 alpha:0.92];
-    // tiny badge
+
     if (![self viewWithTag:999]) {
         UILabel *lb = [UILabel new]; lb.tag = 999;
-        lb.text = @"DEV"; lb.font = [UIFont boldSystemFontOfSize:7];
-        lb.textColor = [UIColor colorWithRed:0.25 green:1 blue:0.45 alpha:1];
+        lb.text = @"DEV";
+        lb.font = [UIFont boldSystemFontOfSize:7];
+        lb.textColor = [UIColor colorWithRed:0.25 green:1.0 blue:0.45 alpha:1];
         lb.translatesAutoresizingMaskIntoConstraints = NO;
         [self addSubview:lb];
         [NSLayoutConstraint activateConstraints:@[
             [lb.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-            [lb.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-6]
+            [lb.bottomAnchor  constraintEqualToAnchor:self.bottomAnchor constant:-6]
         ]];
     }
 }
@@ -846,63 +942,141 @@ static NSString *secFooter(Sec s) {
     CGFloat r  = self.bounds.size.width / 2;
     UIEdgeInsets safe = sv.safeAreaInsets;
     self.center = CGPointMake(
-        MAX(r+8, MIN(sv.bounds.size.width  - r - 8, self.center.x + dt.x)),
-        MAX(r+8+safe.top, MIN(sv.bounds.size.height - r - 8 - safe.bottom, self.center.y + dt.y))
+        MAX(r + 8,            MIN(sv.bounds.size.width  - r - 8,                    self.center.x + dt.x)),
+        MAX(r + 8 + safe.top, MIN(sv.bounds.size.height - r - 8 - safe.bottom,      self.center.y + dt.y))
     );
     [gr setTranslation:CGPointZero inView:sv];
     if (gr.state == UIGestureRecognizerStateEnded) {
-        CGFloat snapX = self.center.x < sv.bounds.size.width/2 ? r+12 : sv.bounds.size.width-r-12;
-        [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.7
-              initialSpringVelocity:0 options:0
-                         animations:^{ self.center = CGPointMake(snapX, self.center.y); }
-                         completion:nil];
+        CGFloat snapX = (self.center.x < sv.bounds.size.width / 2) ? r + 12 : sv.bounds.size.width - r - 12;
+        [UIView animateWithDuration:0.28 delay:0
+               usingSpringWithDamping:0.7 initialSpringVelocity:0 options:0
+                           animations:^{ self.center = CGPointMake(snapX, self.center.y); }
+                           completion:nil];
     }
 }
 @end
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - DevMenuManager
+// FIX: install waits for UIApplicationDidBecomeActiveNotification
+//      so the window is guaranteed to exist.
+//      openMenu uses a recursive helper to find the real topmost VC.
 // ═══════════════════════════════════════════════════════════════
 
-@implementation DevMenuManager
-
-+ (instancetype)shared { static DevMenuManager *m; static dispatch_once_t t; dispatch_once(&t,^{m=[DevMenuManager new];}); return m; }
-
-- (UIWindow *)_win {
-    if (@available(iOS 15, *)) {
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) return w;
-        }
-    }
-    return UIApplication.sharedApplication.keyWindow;
+@implementation DevMenuManager {
+    BOOL _installed;
+    id   _becomeActiveObserver;
 }
 
++ (instancetype)shared {
+    static DevMenuManager *m; static dispatch_once_t t;
+    dispatch_once(&t, ^{ m = [DevMenuManager new]; });
+    return m;
+}
+
+// ── Find key window ────────────────────────────────────────────
+- (UIWindow *)_win {
+    UIWindow *found = nil;
+    if (@available(iOS 15, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (w.isKeyWindow) { found = w; break; }
+            }
+            if (found) break;
+        }
+    }
+    if (!found) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        found = UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
+    }
+    return found;
+}
+
+// ── Walk to the real topmost presented VC ─────────────────────
+- (UIViewController *)_topmostVC:(UIViewController *)root {
+    if (!root) return nil;
+    // Recurse into presented VC first
+    if (root.presentedViewController)
+        return [self _topmostVC:root.presentedViewController];
+    // Handle containers
+    if ([root isKindOfClass:[UINavigationController class]])
+        return [self _topmostVC:((UINavigationController *)root).visibleViewController] ?: root;
+    if ([root isKindOfClass:[UITabBarController class]]) {
+        UITabBarController *tab = (UITabBarController *)root;
+        UIViewController *sel = tab.selectedViewController;
+        return sel ? [self _topmostVC:sel] : root;
+    }
+    return root;
+}
+
+// ── Install button ─────────────────────────────────────────────
+// FIX: listen for UIApplicationDidBecomeActiveNotification so we
+//      install exactly once, as soon as the window is ready.
 - (void)install {
+    if (_installed) return;
+
+    __weak typeof(self) weak = self;
+    _becomeActiveObserver =
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *n) {
+            __strong typeof(weak) strong = weak;
+            if (!strong || strong->_installed) return;
+
+            UIWindow *win = [strong _win];
+            if (!win) return;  // not ready yet — will fire again next active event
+
+            strong->_installed = YES;
+            // Remove the one-shot observer
+            [[NSNotificationCenter defaultCenter] removeObserver:strong->_becomeActiveObserver];
+            strong->_becomeActiveObserver = nil;
+
+            CGFloat sz = kBtnSize;
+            CGFloat x  = win.bounds.size.width  - sz - 14;
+            CGFloat y  = win.bounds.size.height  - sz - 120;
+            DevFloatingBtn *b = [[DevFloatingBtn alloc]
+                initWithFrame:CGRectMake(x, y, sz, sz)];
+            b.autoresizingMask =
+                UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+            [b addTarget:strong action:@selector(openMenu)
+                forControlEvents:UIControlEventTouchUpInside];
+            [win addSubview:b];
+            strong.btn = b;
+        }];
+}
+
+// ── Refresh button icon (safe from any thread) ────────────────
+- (void)refreshButtonIcon {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = [self _win]; if (!win) return;
-        CGFloat sz = 60;
-        DevFloatingBtn *b = [[DevFloatingBtn alloc] initWithFrame:
-            CGRectMake(win.bounds.size.width - sz - 14, win.bounds.size.height - sz - 120, sz, sz)];
-        b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-        [b addTarget:self action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:b];
-        _btn = b;
+        [self.btn refreshIcon];
     });
 }
 
-- (void)refreshButtonIcon { dispatch_async(dispatch_get_main_queue(), ^{ [_btn refreshIcon]; }); }
-
+// ── Open menu ─────────────────────────────────────────────────
 - (void)openMenu {
     UIWindow *win = [self _win]; if (!win) return;
-    UIViewController *top = win.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
+    UIViewController *top = [self _topmostVC:win.rootViewController];
+    if (!top) return;
+
+    // Don't double-present if menu is already up
+    if ([top isKindOfClass:[UINavigationController class]] &&
+        [((UINavigationController *)top).viewControllers.firstObject isKindOfClass:[DevMenuVC class]])
+        return;
+
     DevMenuVC *menu = [DevMenuVC new];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:menu];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     if (@available(iOS 15, *)) {
         UISheetPresentationController *sh = nav.sheetPresentationController;
-        sh.detents = @[UISheetPresentationControllerDetent.mediumDetent,
-                       UISheetPresentationControllerDetent.largeDetent];
+        sh.detents = @[
+            UISheetPresentationControllerDetent.mediumDetent,
+            UISheetPresentationControllerDetent.largeDetent
+        ];
         sh.prefersGrabberVisible = YES;
     }
     [top presentViewController:nav animated:YES completion:nil];
@@ -920,26 +1094,44 @@ static void RegisterHook(void) {
 
 __attribute__((constructor(101))) static void init_dev_hook(void) {
     RegisterHook();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8*NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [[DevMenuManager shared] install]; });
+    // Button installation is now driven by UIApplicationDidBecomeActiveNotification
+    // inside DevMenuManager.install(), so it fires as soon as the window is ready.
+    [[DevMenuManager shared] install];
 }
 
+// ── NSURLSessionConfiguration: prepend our protocol ───────────
 %hook NSURLSessionConfiguration
 - (NSArray *)protocolClasses {
+    NSArray *orig = %orig;
+    // FIX: guard against nil orig; also avoid inserting duplicates
     NSMutableArray *a = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
-    NSArray *o = %orig; if (o) [a addObjectsFromArray:o]; return a;
+    if (orig) {
+        for (id cls in orig) {
+            if (cls != [HookURLProtocol class]) [a addObject:cls];
+        }
+    }
+    return [a copy];
 }
 %end
 
+// ── NSURLSession / NSURLConnection: keep protocol registered ──
 %hook NSURLSession
-+ (NSURLSession *)sharedSession                                       { RegisterHook(); return %orig; }
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r       { RegisterHook(); return %orig; }
++ (NSURLSession *)sharedSession {
+    RegisterHook(); return %orig;
+}
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r {
+    RegisterHook(); return %orig;
+}
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r
-                           completionHandler:(void(^)(NSData*,NSURLResponse*,NSError*))c
-                                                                      { RegisterHook(); return %orig; }
+                           completionHandler:(void(^)(NSData*, NSURLResponse*, NSError*))c {
+    RegisterHook(); return %orig;
+}
 %end
+
 %hook NSURLConnection
-+ (instancetype)connectionWithRequest:(NSURLRequest *)r delegate:(id)d { RegisterHook(); return %orig; }
++ (instancetype)connectionWithRequest:(NSURLRequest *)r delegate:(id)d {
+    RegisterHook(); return %orig;
+}
 %end
 
 %ctor { RegisterHook(); }
