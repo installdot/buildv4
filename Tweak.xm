@@ -329,9 +329,10 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 - (void)stopLoading {}
 @end
 
-// ─── Forward declaration ──────────────────────────────────────
-// Full @interface moved here so DevOverlayPanel can reference it.
-// The @implementation remains in the DevMenuManager section below.
+// ─── Forward declarations ─────────────────────────────────────
+// Both classes are defined later in the file; DevOverlayPanel
+// needs DevMenuManager, and DevMenuManager references DevFloatingBtn.
+@class DevFloatingBtn;
 @interface DevMenuManager : NSObject
 @property (nonatomic, weak) DevFloatingBtn *btn;
 + (instancetype)shared;
