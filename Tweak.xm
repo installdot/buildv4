@@ -745,7 +745,71 @@ static NSString *secFooter(Sec s) {
 }
 
 @end
+// ═══════════════════════════════════════════════════════════════
+// MARK: - DevMenuManager  (moved slightly earlier for clarity, but forward decl is enough)
+// ═══════════════════════════════════════════════════════════════
 
+@interface DevMenuManager : NSObject
+@property (nonatomic, weak) DevFloatingBtn *btn;
++ (instancetype)shared;
+- (void)install;
+- (void)refreshButtonIcon;
+- (void)openMenu;
+@end
+
+@implementation DevMenuManager
+
++ (instancetype)shared {
+    static DevMenuManager *m; static dispatch_once_t t;
+    dispatch_once(&t, ^{ m = [DevMenuManager new]; });
+    return m;
+}
+
+- (UIWindow *)_win {
+    if (@available(iOS 15, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) return w;
+        }
+    }
+    return UIApplication.sharedApplication.keyWindow;
+}
+
+- (void)install {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = [self _win]; if (!win) return;
+        CGFloat sz = 60;
+        DevFloatingBtn *b = [[DevFloatingBtn alloc] initWithFrame:
+            CGRectMake(win.bounds.size.width - sz - 14, win.bounds.size.height - sz - 120, sz, sz)];
+        b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+        [b addTarget:self action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:b];
+        _btn = b;
+    });
+}
+
+- (void)refreshButtonIcon {
+    dispatch_async(dispatch_get_main_queue(), ^{ 
+        [self.btn refreshIcon]; 
+    });
+}
+
+- (void)openMenu {
+    UIWindow *win = [self _win]; if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    DevMenuVC *menu = [DevMenuVC new];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:menu];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    if (@available(iOS 15, *)) {
+        UISheetPresentationController *sh = nav.sheetPresentationController;
+        sh.detents = @[UISheetPresentationControllerDetent.mediumDetent,
+                       UISheetPresentationControllerDetent.largeDetent];
+        sh.prefersGrabberVisible = YES;
+    }
+    [top presentViewController:nav animated:YES completion:nil];
+}
+
+@end
 // ═══════════════════════════════════════════════════════════════
 // MARK: - Floating Button
 // ═══════════════════════════════════════════════════════════════
@@ -845,74 +909,6 @@ static NSString *secFooter(Sec s) {
                          completion:nil];
     }
 }
-@end
-
-// ═══════════════════════════════════════════════════════════════
-// MARK: - DevMenuManager  (moved slightly earlier for clarity, but forward decl is enough)
-// ═══════════════════════════════════════════════════════════════
-
-@interface DevMenuManager : NSObject
-@property (nonatomic, weak) DevFloatingBtn *btn;
-+ (instancetype)shared;
-- (void)install;
-- (void)refreshButtonIcon;
-- (void)openMenu;
-@end
-
-@implementation DevMenuManager
-
-+ (instancetype)shared {
-    static DevMenuManager *m; static dispatch_once_t t;
-    dispatch_once(&t, ^{ m = [DevMenuManager new]; });
-    return m;
-}
-
-- (UIWindow *)_win {
-    if (@available(iOS 15, *)) {
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) return w;
-        }
-    }
-    return UIApplication.sharedApplication.keyWindow;
-}
-
-- (void)install {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *win = [self _win]; if (!win) return;
-        CGFloat sz = 60;
-        DevFloatingBtn *b = [[DevFloatingBtn alloc] initWithFrame:
-            CGRectMake(win.bounds.size.width - sz - 14, win.bounds.size.height - sz - 120, sz, sz)];
-        b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-        [b addTarget:self action:@selector(openMenu) forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:b];
-        _btn = b;
-    });
-}
-
-- (void)refreshButtonIcon {
-    dispatch_async(dispatch_get_main_queue(), ^{ 
-        [self.btn refreshIcon]; 
-    });
-}
-
-- (void)openMenu {
-    UIWindow *win = [self _win]; if (!win) return;
-    UIViewController *top = win.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
-    DevMenuVC *menu = [DevMenuVC new];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:menu];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    if (@available(iOS 15, *)) {
-        UISheetPresentationController *sh = nav.sheetPresentationController;
-        sh.detents = @[UISheetPresentationControllerDetent.mediumDetent,
-                       UISheetPresentationControllerDetent.largeDetent];
-        sh.prefersGrabberVisible = YES;
-    }
-    [top presentViewController:nav animated:YES completion:nil];
-}
-
-@end
-
 // ═══════════════════════════════════════════════════════════════
 // MARK: - Bootstrap
 // ═══════════════════════════════════════════════════════════════
