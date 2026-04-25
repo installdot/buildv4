@@ -330,11 +330,14 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 @end
 
 // ─── Forward declaration ──────────────────────────────────────
-// DevMenuManager is defined later in this file; DevOverlayPanel
-// calls it to refresh the floating button icon after changes.
+// Full @interface moved here so DevOverlayPanel can reference it.
+// The @implementation remains in the DevMenuManager section below.
 @interface DevMenuManager : NSObject
+@property (nonatomic, weak) DevFloatingBtn *btn;
 + (instancetype)shared;
+- (void)install;
 - (void)refreshButtonIcon;
+- (void)openMenu;
 @end
 
 // ═══════════════════════════════════════════════════════════════
@@ -1237,14 +1240,6 @@ static const CGFloat kBtnSize = 60.f;
 // ═══════════════════════════════════════════════════════════════
 // MARK: - DevMenuManager
 // ═══════════════════════════════════════════════════════════════
-
-@interface DevMenuManager : NSObject
-@property (nonatomic, weak) DevFloatingBtn *btn;
-+ (instancetype)shared;
-- (void)install;
-- (void)refreshButtonIcon;
-- (void)openMenu;
-@end
 
 @implementation DevMenuManager {
     BOOL _installed;
