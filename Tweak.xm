@@ -848,7 +848,7 @@ static NSString *secFooter(Sec s) {
 @end
 
 // ═══════════════════════════════════════════════════════════════
-// MARK: - DevMenuManager
+// MARK: - DevMenuManager  (moved slightly earlier for clarity, but forward decl is enough)
 // ═══════════════════════════════════════════════════════════════
 
 @interface DevMenuManager : NSObject
@@ -858,9 +858,14 @@ static NSString *secFooter(Sec s) {
 - (void)refreshButtonIcon;
 - (void)openMenu;
 @end
+
 @implementation DevMenuManager
 
-+ (instancetype)shared { static DevMenuManager *m; static dispatch_once_t t; dispatch_once(&t,^{m=[DevMenuManager new];}); return m; }
++ (instancetype)shared {
+    static DevMenuManager *m; static dispatch_once_t t;
+    dispatch_once(&t, ^{ m = [DevMenuManager new]; });
+    return m;
+}
 
 - (UIWindow *)_win {
     if (@available(iOS 15, *)) {
@@ -884,7 +889,11 @@ static NSString *secFooter(Sec s) {
     });
 }
 
-- (void)refreshButtonIcon { dispatch_async(dispatch_get_main_queue(), ^{ [_btn refreshIcon]; }); }
+- (void)refreshButtonIcon {
+    dispatch_async(dispatch_get_main_queue(), ^{ 
+        [self.btn refreshIcon]; 
+    });
+}
 
 - (void)openMenu {
     UIWindow *win = [self _win]; if (!win) return;
@@ -901,6 +910,7 @@ static NSString *secFooter(Sec s) {
     }
     [top presentViewController:nav animated:YES completion:nil];
 }
+
 @end
 
 // ═══════════════════════════════════════════════════════════════
