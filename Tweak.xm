@@ -817,6 +817,7 @@ static NSString *secFooter(Sec s) {
 @interface DevFloatingBtn : UIButton
 - (void)refreshIcon;
 @end
+
 @implementation DevFloatingBtn
 
 - (instancetype)initWithFrame:(CGRect)f {
@@ -847,12 +848,16 @@ static NSString *secFooter(Sec s) {
         if (urlStr.length) {
             [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:urlStr]
                                          completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){
-                if (!d) return; UIImage *remote = [UIImage imageWithData:d]; if (!remote) return;
+                if (!d) return; 
+                UIImage *remote = [UIImage imageWithData:d]; 
+                if (!remote) return;
                 dispatch_async(dispatch_get_main_queue(), ^{ [self _applyImage:remote]; });
             }] resume];
-            [self _applyGlyph]; return;  // show glyph while loading
+            [self _applyGlyph]; 
+            return;
         }
-        [self _applyGlyph]; return;
+        [self _applyGlyph]; 
+        return;
     }
     [self _applyImage:img];
 }
@@ -867,20 +872,22 @@ static NSString *secFooter(Sec s) {
     [self setImage:round forState:UIControlStateNormal];
     self.imageView.contentMode = UIViewContentModeScaleAspectFill;
     self.backgroundColor = UIColor.clearColor;
-    for (UIView *v in self.subviews) if ([v isKindOfClass:[UILabel class]]) [v removeFromSuperview];
+    for (UIView *v in self.subviews) 
+        if ([v isKindOfClass:[UILabel class]]) [v removeFromSuperview];
 }
 
 - (void)_applyGlyph {
     [self setImage:[UIImage systemImageNamed:@"ant.circle.fill"
-                           withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:30
-                                                                                             weight:UIImageSymbolWeightMedium]]
+                           withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:30 weight:UIImageSymbolWeightMedium]]
           forState:UIControlStateNormal];
     self.tintColor = [UIColor colorWithRed:0.25 green:1 blue:0.45 alpha:1];
     self.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.07 alpha:0.92];
-    // tiny badge
+
     if (![self viewWithTag:999]) {
-        UILabel *lb = [UILabel new]; lb.tag = 999;
-        lb.text = @"DEV"; lb.font = [UIFont boldSystemFontOfSize:7];
+        UILabel *lb = [UILabel new]; 
+        lb.tag = 999;
+        lb.text = @"DEV"; 
+        lb.font = [UIFont boldSystemFontOfSize:7];
         lb.textColor = [UIColor colorWithRed:0.25 green:1 blue:0.45 alpha:1];
         lb.translatesAutoresizingMaskIntoConstraints = NO;
         [self addSubview:lb];
@@ -892,7 +899,8 @@ static NSString *secFooter(Sec s) {
 }
 
 - (void)_pan:(UIPanGestureRecognizer *)gr {
-    UIView *sv = self.superview; if (!sv) return;
+    UIView *sv = self.superview; 
+    if (!sv) return;
     CGPoint dt = [gr translationInView:sv];
     CGFloat r  = self.bounds.size.width / 2;
     UIEdgeInsets safe = sv.safeAreaInsets;
@@ -901,6 +909,7 @@ static NSString *secFooter(Sec s) {
         MAX(r+8+safe.top, MIN(sv.bounds.size.height - r - 8 - safe.bottom, self.center.y + dt.y))
     );
     [gr setTranslation:CGPointZero inView:sv];
+
     if (gr.state == UIGestureRecognizerStateEnded) {
         CGFloat snapX = self.center.x < sv.bounds.size.width/2 ? r+12 : sv.bounds.size.width-r-12;
         [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.7
@@ -909,37 +918,61 @@ static NSString *secFooter(Sec s) {
                          completion:nil];
     }
 }
+
+@end   // ← Properly close DevFloatingBtn here
+
 // ═══════════════════════════════════════════════════════════════
-// MARK: - Bootstrap
+// MARK: - Bootstrap  (MUST be at top level, outside any @implementation)
 // ═══════════════════════════════════════════════════════════════
 
 static void RegisterHook(void) {
     static dispatch_once_t t;
-    dispatch_once(&t, ^{ [NSURLProtocol registerClass:[HookURLProtocol class]]; });
+    dispatch_once(&t, ^{ 
+        [NSURLProtocol registerClass:[HookURLProtocol class]]; 
+    });
 }
 
-__attribute__((constructor(101))) static void init_dev_hook(void) {
+__attribute__((constructor(101))) 
+static void init_dev_hook(void) {
     RegisterHook();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8*NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [[DevMenuManager shared] install]; });
+                   dispatch_get_main_queue(), ^{ 
+                       [[DevMenuManager shared] install]; 
+                   });
 }
 
 %hook NSURLSessionConfiguration
 - (NSArray *)protocolClasses {
     NSMutableArray *a = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
-    NSArray *o = %orig; if (o) [a addObjectsFromArray:o]; return a;
+    NSArray *o = %orig; 
+    if (o) [a addObjectsFromArray:o]; 
+    return a;
 }
 %end
 
 %hook NSURLSession
-+ (NSURLSession *)sharedSession                                       { RegisterHook(); return %orig; }
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r       { RegisterHook(); return %orig; }
++ (NSURLSession *)sharedSession { 
+    RegisterHook(); 
+    return %orig; 
+}
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r { 
+    RegisterHook(); 
+    return %orig; 
+}
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)r
-                           completionHandler:(void(^)(NSData*,NSURLResponse*,NSError*))c
-                                                                      { RegisterHook(); return %orig; }
-%end
-%hook NSURLConnection
-+ (instancetype)connectionWithRequest:(NSURLRequest *)r delegate:(id)d { RegisterHook(); return %orig; }
+                           completionHandler:(void(^)(NSData*,NSURLResponse*,NSError*))c {
+    RegisterHook(); 
+    return %orig; 
+}
 %end
 
-%ctor { RegisterHook(); }
+%hook NSURLConnection
++ (instancetype)connectionWithRequest:(NSURLRequest *)r delegate:(id)d { 
+    RegisterHook(); 
+    return %orig; 
+}
+%end
+
+%ctor { 
+    RegisterHook(); 
+}
