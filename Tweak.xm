@@ -1,12 +1,11 @@
-// DevApiHook.xm  —  v3
-// Fixes:
-//  • Crash in _applyImage when bounds.size.width == 0 (zero-size CGContext)
-//  • Crash from refreshIcon called off main thread after NSURLSession callback
-//  • Install now uses UIApplicationDidBecomeActiveNotification (fires once)
-//    so the button appears reliably as soon as the first window is ready
-//  • openMenu walks UINavigationController/UITabBarController nesting correctly
-//  • _win is nil-safe; every call-site guards against nil
-//  • %hook NSURLSessionConfiguration guards against nil %orig
+// DevApiHook.xm  —  v4
+// Changes from v3:
+//  • Imgur URLs are NO LONGER auto-logged when requests pass through.
+//  • ImgurMapVC now has an "Add" (+) button: user manually enters the
+//    original imgur URL and the replacement URL in one alert.
+//  • HookURLProtocol.canInitWithRequest no longer calls logURL — it only
+//    intercepts if a replacement was manually set.
+//  • ImgurLinkStore.logURL removed (kept addEntry:replacement: instead).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -39,11 +38,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - ImgurLinkStore
+// Manual entry only — no auto-logging.
 // ═══════════════════════════════════════════════════════════════
 
 @interface ImgurLinkStore : NSObject
 + (instancetype)shared;
-- (void)logURL:(NSString *)rawURL;
+/// Add or update an entry. Both originalURL and replacement are stored.
+- (void)addEntry:(NSString *)originalURL replacement:(NSString *)rep;
 - (NSString *)replacementFor:(NSString *)rawURL;
 - (void)setReplacement:(NSString *)rep forKey:(NSString *)normalizedURL;
 - (void)removeKey:(NSString *)normalizedURL;
@@ -79,14 +80,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
             u.path   ?: @"/"];
 }
 
-- (void)logURL:(NSString *)rawURL {
-    if (!rawURL.length) return;
-    NSString *key = [self normalizeURL:rawURL];
+/// Manual add: stores the replacement (may be empty = pass-through placeholder).
+- (void)addEntry:(NSString *)originalURL replacement:(NSString *)rep {
+    if (!originalURL.length) return;
+    NSString *key = [self normalizeURL:originalURL];
     @synchronized (self) {
-        if (_map[key] == nil) {
-            _map[key] = @"";
-            [self _save];
-        }
+        _map[key] = rep ?: @"";
+        [self _save];
     }
 }
 
@@ -225,6 +225,8 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - HookURLProtocol
+// NOTE: No auto-logging of imgur URLs. Only intercepts if a
+//       replacement was manually configured via ImgurMapVC.
 // ═══════════════════════════════════════════════════════════════
 
 @interface HookURLProtocol : NSURLProtocol
@@ -250,8 +252,8 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     NSString *meth = req.HTTPMethod.uppercaseString;
     DevSettings *s = DevSettings.shared;
 
+    // Imgur: only intercept if a replacement was MANUALLY set — no auto-log.
     if ([host isEqualToString:@"i.imgur.com"]) {
-        [ImgurLinkStore.shared logURL:url.absoluteString];
         if (![s isEnabled:kHookImgur]) return NO;
         return [ImgurLinkStore.shared replacementFor:url.absoluteString].length > 0;
     }
@@ -413,6 +415,9 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - ImgurMapVC
+// Manual entry: tap "+" to enter original URL + replacement URL.
+// Tap an existing row to edit its replacement.
+// Swipe left to delete.
 // ═══════════════════════════════════════════════════════════════
 
 @interface ImgurMapVC : UITableViewController
@@ -424,6 +429,8 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     [super viewDidLoad];
     self.title = @"Imgur Links";
     self.navigationItem.rightBarButtonItems = @[
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAdd
+                                                      target:self action:@selector(addLink)],
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                       target:self action:@selector(reload)],
         [[UIBarButtonItem alloc] initWithTitle:@"Clear All"
@@ -436,7 +443,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self reload]; // refresh when navigating back
+    [self reload];
 }
 
 - (void)reload {
@@ -444,10 +451,44 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     [self.tableView reloadData];
 }
 
+// ── Add a new entry manually ───────────────────────────────────
+- (void)addLink {
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Add Imgur Link"
+        message:@"Enter the original imgur URL and the replacement URL."
+        preferredStyle:UIAlertControllerStyleAlert];
+
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"Original: https://i.imgur.com/abc.jpg";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.keyboardType = UIKeyboardTypeURL;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"Replacement: https://i.imgur.com/xyz.jpg";
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.keyboardType = UIKeyboardTypeURL;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Add" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *_) {
+        NSString *orig = a.textFields[0].text ?: @"";
+        NSString *rep  = a.textFields[1].text ?: @"";
+        if (orig.length == 0) return;
+        [ImgurLinkStore.shared addEntry:orig replacement:rep];
+        [self reload];
+    }]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
 - (void)clearAll {
     UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"Clear all imgur logs?"
-        message:@"Replacements will also be removed."
+        alertControllerWithTitle:@"Clear all imgur entries?"
+        message:@"All manually added links and replacements will be removed."
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [a addAction:[UIAlertAction actionWithTitle:@"Clear All" style:UIAlertActionStyleDestructive
@@ -463,17 +504,17 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     return MAX(1, (NSInteger)_keys.count);
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
-    return [NSString stringWithFormat:@"%lu imgur URL%@ captured — tap to set replacement",
-            (unsigned long)_keys.count, _keys.count == 1 ? @"" : @"s"];
+    return [NSString stringWithFormat:@"%lu manual entr%@ — tap + to add",
+            (unsigned long)_keys.count, _keys.count == 1 ? @"y" : @"ies"];
 }
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    return @"Swipe left to remove a URL. Empty replacement = pass-through.";
+    return @"Tap a row to edit its replacement. Swipe left to remove. Empty replacement = pass-through.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"C"];
     if (_keys.count == 0) {
-        cell.textLabel.text = @"No imgur links captured yet — run the app to populate";
+        cell.textLabel.text = @"No entries yet — tap + to add an imgur link";
         cell.textLabel.textColor = UIColor.secondaryLabelColor;
         cell.textLabel.numberOfLines = 2;
         cell.userInteractionEnabled = NO;
@@ -502,6 +543,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     return cell;
 }
 
+// ── Tap row → edit replacement for existing entry ─────────────
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     if (_keys.count == 0) return;
@@ -509,7 +551,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     NSString *cur = [ImgurLinkStore.shared replacementFor:key];
 
     UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"Set Replacement URL"
+        alertControllerWithTitle:@"Edit Replacement URL"
         message:key
         preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
@@ -590,7 +632,7 @@ static NSString *secTitle(Sec s) {
 static NSString *secFooter(Sec s) {
     switch(s) {
         case SecIcon:          return @"Image shown on the floating button. Set URL or pick from Photos.";
-        case SecImgur:         return @"All i.imgur.com requests are logged. Enable replacements to redirect them.";
+        case SecImgur:         return @"Manually add imgur URLs to redirect via the Manage Links screen.";
         case SecCheckHud:      return @"POST /api.php  body: action=check_hud_control";
         case SecValidate:      return @"POST /api.php  body: action=validate + key + hwid";
         case SecNotifications: return @"GET  /api.php?action=get_notifications";
@@ -658,7 +700,8 @@ static NSString *secFooter(Sec s) {
         } else {
             NSUInteger n = ImgurLinkStore.shared.allKeys.count;
             c.textLabel.text = @"Manage Links";
-            c.detailTextLabel.text = [NSString stringWithFormat:@"%lu captured", (unsigned long)n];
+            c.detailTextLabel.text = [NSString stringWithFormat:@"%lu manual entr%@",
+                                      (unsigned long)n, n == 1 ? @"y" : @"ies"];
             c.imageView.image = [UIImage systemImageNamed:@"link.badge.plus"];
             c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         }
@@ -824,8 +867,6 @@ static NSString *secFooter(Sec s) {
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - Floating Button
-// FIX: _applyImage guards sz > 0; refreshIcon always dispatches
-//      UIKit work to main thread
 // ═══════════════════════════════════════════════════════════════
 
 static const CGFloat kBtnSize = 60.f;
@@ -836,7 +877,6 @@ static const CGFloat kBtnSize = 60.f;
 @implementation DevFloatingBtn
 
 - (instancetype)initWithFrame:(CGRect)f {
-    // Ensure the frame has a real size so bounds.size.width != 0
     if (CGRectIsEmpty(f)) f = CGRectMake(0, 0, kBtnSize, kBtnSize);
     self = [super initWithFrame:f];
     if (!self) return nil;
@@ -848,18 +888,15 @@ static const CGFloat kBtnSize = 60.f;
     self.clipsToBounds       = NO;
     self.layer.borderColor   = [UIColor colorWithWhite:1 alpha:0.2].CGColor;
     self.layer.borderWidth   = 1.5f;
-    [self _applyGlyph];                  // show glyph immediately; icon loads async below
+    [self _applyGlyph];
     [self refreshIcon];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(_pan:)];
     [self addGestureRecognizer:pan];
     return self;
 }
 
-// Always called on main thread (callers ensure this)
 - (void)refreshIcon {
     DevSettings *s = DevSettings.shared;
-
-    // 1. Try local file first (synchronous, safe)
     if ([s isEnabled:kIconUseLocal]) {
         NSString *p = [s stringForKey:kIconLocalPath];
         if (p.length) {
@@ -867,36 +904,28 @@ static const CGFloat kBtnSize = 60.f;
             if (img) { [self _applyImage:img]; return; }
         }
     }
-
-    // 2. Try remote URL (async, result always dispatched to main)
     NSString *urlStr = [s stringForKey:kIconURL];
     if (urlStr.length) {
         NSURL *url = [NSURL URLWithString:urlStr];
         if (url) {
-            [self _applyGlyph]; // placeholder while loading
+            [self _applyGlyph];
             [[[NSURLSession sharedSession] dataTaskWithURL:url
                                          completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
                 if (!d) return;
                 UIImage *img = [UIImage imageWithData:d];
                 if (!img) return;
-                // FIX: always hop to main thread for UIKit work
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self _applyImage:img];
-                });
+                dispatch_async(dispatch_get_main_queue(), ^{ [self _applyImage:img]; });
             }] resume];
             return;
         }
     }
-
-    // 3. Fallback glyph
     [self _applyGlyph];
 }
 
-// FIX: guard sz > 0 to prevent zero-size CGContext crash
 - (void)_applyImage:(UIImage *)src {
     if (!src) { [self _applyGlyph]; return; }
     CGFloat sz = self.bounds.size.width;
-    if (sz <= 0) sz = kBtnSize;          // ← was crashing here when bounds not yet set
+    if (sz <= 0) sz = kBtnSize;
 
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(sz, sz), NO, 0);
     [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, 0, sz, sz)] addClip];
@@ -909,7 +938,6 @@ static const CGFloat kBtnSize = 60.f;
     [self setImage:round forState:UIControlStateNormal];
     self.imageView.contentMode = UIViewContentModeScaleAspectFill;
     self.backgroundColor = UIColor.clearColor;
-    // Remove any leftover DEV badge
     for (UIView *v in self.subviews)
         if ([v isKindOfClass:[UILabel class]] && v.tag == 999) [v removeFromSuperview];
 }
@@ -942,8 +970,8 @@ static const CGFloat kBtnSize = 60.f;
     CGFloat r  = self.bounds.size.width / 2;
     UIEdgeInsets safe = sv.safeAreaInsets;
     self.center = CGPointMake(
-        MAX(r + 8,            MIN(sv.bounds.size.width  - r - 8,                    self.center.x + dt.x)),
-        MAX(r + 8 + safe.top, MIN(sv.bounds.size.height - r - 8 - safe.bottom,      self.center.y + dt.y))
+        MAX(r + 8,            MIN(sv.bounds.size.width  - r - 8,               self.center.x + dt.x)),
+        MAX(r + 8 + safe.top, MIN(sv.bounds.size.height - r - 8 - safe.bottom, self.center.y + dt.y))
     );
     [gr setTranslation:CGPointZero inView:sv];
     if (gr.state == UIGestureRecognizerStateEnded) {
@@ -958,9 +986,6 @@ static const CGFloat kBtnSize = 60.f;
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - DevMenuManager
-// FIX: install waits for UIApplicationDidBecomeActiveNotification
-//      so the window is guaranteed to exist.
-//      openMenu uses a recursive helper to find the real topmost VC.
 // ═══════════════════════════════════════════════════════════════
 
 @implementation DevMenuManager {
@@ -974,7 +999,6 @@ static const CGFloat kBtnSize = 60.f;
     return m;
 }
 
-// ── Find key window ────────────────────────────────────────────
 - (UIWindow *)_win {
     UIWindow *found = nil;
     if (@available(iOS 15, *)) {
@@ -995,13 +1019,10 @@ static const CGFloat kBtnSize = 60.f;
     return found;
 }
 
-// ── Walk to the real topmost presented VC ─────────────────────
 - (UIViewController *)_topmostVC:(UIViewController *)root {
     if (!root) return nil;
-    // Recurse into presented VC first
     if (root.presentedViewController)
         return [self _topmostVC:root.presentedViewController];
-    // Handle containers
     if ([root isKindOfClass:[UINavigationController class]])
         return [self _topmostVC:((UINavigationController *)root).visibleViewController] ?: root;
     if ([root isKindOfClass:[UITabBarController class]]) {
@@ -1012,9 +1033,6 @@ static const CGFloat kBtnSize = 60.f;
     return root;
 }
 
-// ── Install button ─────────────────────────────────────────────
-// FIX: listen for UIApplicationDidBecomeActiveNotification so we
-//      install exactly once, as soon as the window is ready.
 - (void)install {
     if (_installed) return;
 
@@ -1029,18 +1047,16 @@ static const CGFloat kBtnSize = 60.f;
             if (!strong || strong->_installed) return;
 
             UIWindow *win = [strong _win];
-            if (!win) return;  // not ready yet — will fire again next active event
+            if (!win) return;
 
             strong->_installed = YES;
-            // Remove the one-shot observer
             [[NSNotificationCenter defaultCenter] removeObserver:strong->_becomeActiveObserver];
             strong->_becomeActiveObserver = nil;
 
             CGFloat sz = kBtnSize;
             CGFloat x  = win.bounds.size.width  - sz - 14;
             CGFloat y  = win.bounds.size.height  - sz - 120;
-            DevFloatingBtn *b = [[DevFloatingBtn alloc]
-                initWithFrame:CGRectMake(x, y, sz, sz)];
+            DevFloatingBtn *b = [[DevFloatingBtn alloc] initWithFrame:CGRectMake(x, y, sz, sz)];
             b.autoresizingMask =
                 UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
             [b addTarget:strong action:@selector(openMenu)
@@ -1050,20 +1066,15 @@ static const CGFloat kBtnSize = 60.f;
         }];
 }
 
-// ── Refresh button icon (safe from any thread) ────────────────
 - (void)refreshButtonIcon {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.btn refreshIcon];
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ [self.btn refreshIcon]; });
 }
 
-// ── Open menu ─────────────────────────────────────────────────
 - (void)openMenu {
     UIWindow *win = [self _win]; if (!win) return;
     UIViewController *top = [self _topmostVC:win.rootViewController];
     if (!top) return;
 
-    // Don't double-present if menu is already up
     if ([top isKindOfClass:[UINavigationController class]] &&
         [((UINavigationController *)top).viewControllers.firstObject isKindOfClass:[DevMenuVC class]])
         return;
@@ -1094,16 +1105,12 @@ static void RegisterHook(void) {
 
 __attribute__((constructor(101))) static void init_dev_hook(void) {
     RegisterHook();
-    // Button installation is now driven by UIApplicationDidBecomeActiveNotification
-    // inside DevMenuManager.install(), so it fires as soon as the window is ready.
     [[DevMenuManager shared] install];
 }
 
-// ── NSURLSessionConfiguration: prepend our protocol ───────────
 %hook NSURLSessionConfiguration
 - (NSArray *)protocolClasses {
     NSArray *orig = %orig;
-    // FIX: guard against nil orig; also avoid inserting duplicates
     NSMutableArray *a = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
     if (orig) {
         for (id cls in orig) {
@@ -1114,7 +1121,6 @@ __attribute__((constructor(101))) static void init_dev_hook(void) {
 }
 %end
 
-// ── NSURLSession / NSURLConnection: keep protocol registered ──
 %hook NSURLSession
 + (NSURLSession *)sharedSession {
     RegisterHook(); return %orig;
