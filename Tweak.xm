@@ -864,13 +864,6 @@ static NSString *secFooter(Sec s) {
 // MARK: - DevMenuManager
 // ═══════════════════════════════════════════════════════════════
 
-@interface DevMenuManager : NSObject
-@property (nonatomic, weak) DevFloatingBtn *btn;
-+ (instancetype)shared;
-- (void)install;
-- (void)refreshButtonIcon;
-- (void)openMenu;
-@end
 @implementation DevMenuManager
 
 + (instancetype)shared { static DevMenuManager *m; static dispatch_once_t t; dispatch_once(&t,^{m=[DevMenuManager new];}); return m; }
