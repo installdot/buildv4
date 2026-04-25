@@ -864,7 +864,7 @@ static NSString *secFooter(Sec s) {
 // MARK: - DevMenuManager
 // ═══════════════════════════════════════════════════════════════
 
-
+@interface DevMenuManager : NSObject
 @property (nonatomic, weak) DevFloatingBtn *btn;
 + (instancetype)shared;
 - (void)install;
