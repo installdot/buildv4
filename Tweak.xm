@@ -329,6 +329,14 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 - (void)stopLoading {}
 @end
 
+// ─── Forward declaration ──────────────────────────────────────
+// DevMenuManager is defined later in this file; DevOverlayPanel
+// calls it to refresh the floating button icon after changes.
+@interface DevMenuManager : NSObject
++ (instancetype)shared;
+- (void)refreshButtonIcon;
+@end
+
 // ═══════════════════════════════════════════════════════════════
 // MARK: - DevOverlayPanel
 //
