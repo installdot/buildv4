@@ -346,7 +346,7 @@ static void nukeEverything(void) {
             NukeButton *btn = [[NukeButton alloc] init];
             btn.tag = 0xDEAD;
             [keyWin addSubview:btn];
-            keyWin.bringSubviewToFront(btn); // keep on top
+            [keyWin bringSubviewToFront:btn]; // keep on top
         });
     });
 }
