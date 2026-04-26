@@ -1,66 +1,40 @@
 // tweak.xm
-// Nuclear Data Cleaner - Clears ALL persistent storage for an app
-// Targets: NSUserDefaults, Keychain, Files (Documents/Library/Caches/tmp),
-//          SQLite/CoreData DBs, WKWebView storage, NSHTTPCookieStorage,
-//          NSURLCache, SharedUserDefaults, and more.
+// Nuclear Data Cleaner — floating ☢ button always on top via its own UIWindow
+// Clears: NSUserDefaults, Keychain, Files, SQLite/CoreData,
+//         HTTP Cache, Cookies, WebKit storage, iCloud KV Store
 //
-// Build: theos/makefiles or any Logos-compatible toolchain
-// Tested: iOS 14 – 17
+// Build: theos / Logos  |  iOS 14+
 
 #import <UIKit/UIKit.h>
 #import <Security/Security.h>
 #import <WebKit/WebKit.h>
 
 // ─────────────────────────────────────────────
-// MARK: - Helper: recursive delete directory
+// MARK: - Helpers
 // ─────────────────────────────────────────────
 static void nukeDirectory(NSString *path) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *err = nil;
     NSArray<NSString *> *items = [fm contentsOfDirectoryAtPath:path error:&err];
-    if (err) return;
-    for (NSString *item in items) {
-        NSString *full = [path stringByAppendingPathComponent:item];
-        [fm removeItemAtPath:full error:nil];
-    }
+    if (err || !items) return;
+    for (NSString *item in items)
+        [fm removeItemAtPath:[path stringByAppendingPathComponent:item] error:nil];
 }
 
 // ─────────────────────────────────────────────
-// MARK: - 1. NSUserDefaults (standard + suites)
+// MARK: - 1. NSUserDefaults
 // ─────────────────────────────────────────────
 static void clearUserDefaults(void) {
-    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-    if (!bundleID) return;
-
-    // Standard defaults
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     NSUserDefaults *std = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dict = [std dictionaryRepresentation];
-    for (NSString *key in dict.allKeys) {
-        [std removeObjectForKey:key];
-    }
+    for (NSString *k in [[std dictionaryRepresentation] allKeys]) [std removeObjectForKey:k];
     [std synchronize];
-
-    // Delete the plist on disk (survives reinstall on some iOS versions)
-    NSString *plistPath = [NSString stringWithFormat:
-        @"/var/mobile/Containers/Data/Application/%@/Library/Preferences/%@.plist",
-        [[[NSBundle mainBundle] bundlePath] lastPathComponent], bundleID];
-    [[NSFileManager defaultManager] removeItemAtPath:plistPath error:nil];
-
-    // Common shared suite names
-    NSArray *suites = @[
-        [NSString stringWithFormat:@"group.%@", bundleID],
-        [NSString stringWithFormat:@"%@.shared", bundleID],
-        [NSString stringWithFormat:@"%@.suite", bundleID],
-    ];
-    for (NSString *suite in suites) {
+    for (NSString *suite in @[[NSString stringWithFormat:@"group.%@", bid],
+                               [NSString stringWithFormat:@"%@.shared", bid]]) {
         NSUserDefaults *sd = [[NSUserDefaults alloc] initWithSuiteName:suite];
-        NSDictionary *sd_dict = [sd dictionaryRepresentation];
-        for (NSString *key in sd_dict.allKeys) {
-            [sd removeObjectForKey:key];
-        }
+        for (NSString *k in [[sd dictionaryRepresentation] allKeys]) [sd removeObjectForKey:k];
         [sd synchronize];
     }
-
     NSLog(@"[NukeCleaner] ✅ NSUserDefaults cleared");
 }
 
@@ -68,145 +42,83 @@ static void clearUserDefaults(void) {
 // MARK: - 2. Keychain
 // ─────────────────────────────────────────────
 static void clearKeychain(void) {
-    // All four main Keychain item classes
-    NSArray *secItemClasses = @[
-        (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecClassInternetPassword,
-        (__bridge id)kSecClassCertificate,
-        (__bridge id)kSecClassKey,
-        (__bridge id)kSecClassIdentity,
-    ];
-
-    for (id cls in secItemClasses) {
-        NSDictionary *spec = @{ (__bridge id)kSecClass: cls };
-        SecItemDelete((__bridge CFDictionaryRef)spec);
-    }
-
+    for (id cls in @[(__bridge id)kSecClassGenericPassword,
+                     (__bridge id)kSecClassInternetPassword,
+                     (__bridge id)kSecClassCertificate,
+                     (__bridge id)kSecClassKey,
+                     (__bridge id)kSecClassIdentity])
+        SecItemDelete((__bridge CFDictionaryRef)@{ (__bridge id)kSecClass: cls });
     NSLog(@"[NukeCleaner] ✅ Keychain cleared");
 }
 
 // ─────────────────────────────────────────────
-// MARK: - 3. File System Containers
+// MARK: - 3. File Containers
 // ─────────────────────────────────────────────
 static void clearFileContainers(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-
-    // Standard sandbox directories
-    NSArray *dirs = @[
-        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,   NSUserDomainMask, YES).firstObject,
-        NSSearchPathForDirectoriesInDomains(NSCachesDirectory,     NSUserDomainMask, YES).firstObject,
-        NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,    NSUserDomainMask, YES).firstObject,
-        NSTemporaryDirectory(),
-    ];
-
-    // Subdirectories inside Library we want to nuke explicitly
-    NSString *libPath = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
-    NSArray *libSubDirs = @[
-        @"Application Support",
-        @"Databases",
-        @"WebKit",
-        @"Cookies",
-        @"HTTPStorages",
-        @"SplashBoard",
-        @"Saved Application State",
-        @"BackgroundFetch",
-        @"CloudKit",
-    ];
-
-    for (NSString *sub in libSubDirs) {
-        NSString *full = [libPath stringByAppendingPathComponent:sub];
-        nukeDirectory(full);
-    }
-
-    // Top-level sandbox dirs
-    for (NSString *dir in dirs) {
-        if (!dir) continue;
-        nukeDirectory(dir);
-    }
-
-    // Shared group containers
-    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-    NSArray *groupIDs = @[
-        [NSString stringWithFormat:@"group.%@", bundleID],
-        [NSString stringWithFormat:@"group.%@.shared", bundleID],
-    ];
-    for (NSString *gid in groupIDs) {
-        NSURL *containerURL = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
-        if (containerURL) {
-            nukeDirectory(containerURL.path);
-        }
-    }
-
+    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,  NSUserDomainMask, YES).firstObject;
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    for (NSString *sub in @[@"Application Support",@"Databases",@"WebKit",
+                             @"Cookies",@"HTTPStorages",@"Caches",
+                             @"Saved Application State",@"CloudKit"])
+        nukeDirectory([lib stringByAppendingPathComponent:sub]);
+    nukeDirectory(doc);
+    nukeDirectory(NSTemporaryDirectory());
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    NSURL *grp = [fm containerURLForSecurityApplicationGroupIdentifier:
+                  [NSString stringWithFormat:@"group.%@", bid]];
+    if (grp) nukeDirectory(grp.path);
     NSLog(@"[NukeCleaner] ✅ File containers cleared");
 }
 
 // ─────────────────────────────────────────────
-// MARK: - 4. Core Data / SQLite databases
+// MARK: - 4. SQLite / CoreData
 // ─────────────────────────────────────────────
 static void clearDatabases(void) {
-    NSString *libPath = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *docPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSFileManager *fm   = [NSFileManager defaultManager];
-
-    NSArray *searchPaths = @[libPath, docPath, NSTemporaryDirectory()];
-    NSArray *extensions  = @[@"sqlite", @"sqlite3", @"db", @"db3",
-                              @"sqlite-wal", @"sqlite-shm"];
-
-    for (NSString *root in searchPaths) {
-        NSDirectoryEnumerator *enumerator = [fm enumeratorAtPath:root];
-        NSString *file;
-        while ((file = [enumerator nextObject])) {
-            if ([extensions containsObject:file.pathExtension.lowercaseString]) {
-                NSString *full = [root stringByAppendingPathComponent:file];
-                [fm removeItemAtPath:full error:nil];
-            }
-        }
-    }
-
-    NSLog(@"[NukeCleaner] ✅ SQLite / CoreData databases cleared");
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *roots = @[
+        NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,  NSUserDomainMask, YES).firstObject,
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject,
+        NSTemporaryDirectory(),
+    ];
+    NSArray *exts = @[@"sqlite",@"sqlite3",@"db",@"db3",@"sqlite-wal",@"sqlite-shm"];
+    for (NSString *root in roots)
+        for (NSString *file in [fm enumeratorAtPath:root])
+            if ([exts containsObject:file.pathExtension.lowercaseString])
+                [fm removeItemAtPath:[root stringByAppendingPathComponent:file] error:nil];
+    NSLog(@"[NukeCleaner] ✅ Databases cleared");
 }
 
 // ─────────────────────────────────────────────
 // MARK: - 5. HTTP Cache & Cookies
 // ─────────────────────────────────────────────
 static void clearNetworkStorage(void) {
-    // NSURLCache
-    NSURLCache *cache = [NSURLCache sharedURLCache];
-    [cache removeAllCachedResponses];
-
-    // HTTP Cookies
-    NSHTTPCookieStorage *cookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-    for (NSHTTPCookie *cookie in cookieStorage.cookies) {
-        [cookieStorage deleteCookie:cookie];
-    }
-
+    [[NSURLCache sharedURLCache] removeAllCachedResponses];
+    NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+    for (NSHTTPCookie *c in cs.cookies) [cs deleteCookie:c];
     NSLog(@"[NukeCleaner] ✅ HTTP Cache & Cookies cleared");
 }
 
 // ─────────────────────────────────────────────
-// MARK: - 6. WKWebView / WebKit Storage
+// MARK: - 6. WebKit
 // ─────────────────────────────────────────────
 static void clearWebKitStorage(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        WKWebsiteDataStore *store = [WKWebsiteDataStore defaultDataStore];
-        NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
-        [store removeDataOfTypes:allTypes
-                   modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
-               completionHandler:^{ NSLog(@"[NukeCleaner] ✅ WebKit storage cleared"); }];
+        [[WKWebsiteDataStore defaultDataStore]
+            removeDataOfTypes:[WKWebsiteDataStore allWebsiteDataTypes]
+                modifiedSince:[NSDate dateWithTimeIntervalSince1970:0]
+            completionHandler:^{ NSLog(@"[NukeCleaner] ✅ WebKit cleared"); }];
     });
 }
 
 // ─────────────────────────────────────────────
-// MARK: - 7. NSUbiquitousKeyValueStore (iCloud KV)
+// MARK: - 7. iCloud KV
 // ─────────────────────────────────────────────
 static void clearICloudKV(void) {
-    NSUbiquitousKeyValueStore *store = [NSUbiquitousKeyValueStore defaultStore];
-    NSDictionary *dict = [store dictionaryRepresentation];
-    for (NSString *key in dict.allKeys) {
-        [store removeObjectForKey:key];
-    }
-    [store synchronize];
-    NSLog(@"[NukeCleaner] ✅ iCloud KV Store cleared");
+    NSUbiquitousKeyValueStore *kv = [NSUbiquitousKeyValueStore defaultStore];
+    for (NSString *k in [[kv dictionaryRepresentation] allKeys]) [kv removeObjectForKey:k];
+    [kv synchronize];
+    NSLog(@"[NukeCleaner] ✅ iCloud KV cleared");
 }
 
 // ─────────────────────────────────────────────
@@ -215,138 +127,186 @@ static void clearICloudKV(void) {
 static void nukeEverything(void) {
     clearUserDefaults();
     clearKeychain();
-    clearDatabases();      // before file containers (subset)
-    clearFileContainers(); // broad pass
+    clearDatabases();
+    clearFileContainers();
     clearNetworkStorage();
     clearWebKitStorage();
     clearICloudKV();
-
     NSLog(@"[NukeCleaner] 💥 ALL DATA NUKED");
-
-    // Give WebKit async call a moment, then restart
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        // Force-terminate so the app restarts fresh (jailbroken context)
-        exit(0);
-    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ exit(0); });
 }
 
 // ─────────────────────────────────────────────
-// MARK: - Floating Button UI
+// MARK: - Passthrough window (lets touches reach app below)
 // ─────────────────────────────────────────────
-
-@interface NukeButton : UIButton
-@property (nonatomic, strong) UIPanGestureRecognizer *panGesture;
+@interface NukePassthroughWindow : UIWindow
+@end
+@implementation NukePassthroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    // Only intercept touches that land on our own subviews
+    return (hit == self) ? nil : hit;
+}
 @end
 
+// ─────────────────────────────────────────────
+// MARK: - Minimal root VC
+// ─────────────────────────────────────────────
+@interface NukeRootVC : UIViewController
+@end
+@implementation NukeRootVC
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskAll;
+}
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor clearColor];
+}
+@end
+
+// ─────────────────────────────────────────────
+// MARK: - Draggable nuke button
+// ─────────────────────────────────────────────
+@interface NukeButton : UIButton
+@end
 @implementation NukeButton
 
-- (instancetype)init {
-    self = [super initWithFrame:CGRectMake(20, 120, 56, 56)];
-    if (self) {
-        // Style
-        self.backgroundColor = [UIColor colorWithRed:0.9 green:0.15 blue:0.15 alpha:0.92];
-        self.layer.cornerRadius = 28;
-        self.layer.shadowColor  = [UIColor blackColor].CGColor;
-        self.layer.shadowOffset = CGSizeMake(0, 3);
-        self.layer.shadowRadius = 6;
-        self.layer.shadowOpacity = 0.45;
-        self.clipsToBounds = NO;
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
 
-        // Icon (☢ nuke symbol via label)
-        UILabel *icon = [[UILabel alloc] initWithFrame:self.bounds];
-        icon.text = @"☢";
-        icon.font = [UIFont systemFontOfSize:24];
-        icon.textAlignment = NSTextAlignmentCenter;
-        icon.userInteractionEnabled = NO;
-        [self addSubview:icon];
+    self.backgroundColor     = [UIColor colorWithRed:0.88 green:0.10 blue:0.10 alpha:0.93];
+    self.layer.cornerRadius  = frame.size.width / 2.0;
+    self.layer.shadowColor   = [UIColor blackColor].CGColor;
+    self.layer.shadowOffset  = CGSizeMake(0, 4);
+    self.layer.shadowRadius  = 8;
+    self.layer.shadowOpacity = 0.5;
+    self.clipsToBounds       = NO;
 
-        // Tap
-        [self addTarget:self action:@selector(buttonTapped) forControlEvents:UIControlEventTouchUpInside];
+    UILabel *lbl = [[UILabel alloc] initWithFrame:self.bounds];
+    lbl.text            = @"☢";
+    lbl.font            = [UIFont systemFontOfSize:26];
+    lbl.textAlignment   = NSTextAlignmentCenter;
+    lbl.userInteractionEnabled = NO;
+    [self addSubview:lbl];
 
-        // Drag
-        self.panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [self addGestureRecognizer:self.panGesture];
+    [self addTarget:self action:@selector(onTap)
+   forControlEvents:UIControlEventTouchUpInside];
 
-        // Pulse animation
-        [self startPulse];
-    }
+    UIPanGestureRecognizer *pan =
+        [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
+    [self addGestureRecognizer:pan];
+
+    // Pulse animation
+    CABasicAnimation *a  = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+    a.fromValue          = @(1.0);
+    a.toValue            = @(1.08);
+    a.duration           = 1.3;
+    a.autoreverses       = YES;
+    a.repeatCount        = HUGE_VALF;
+    a.timingFunction     = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    [self.layer addAnimation:a forKey:@"pulse"];
+
     return self;
 }
 
-- (void)startPulse {
-    CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-    pulse.fromValue = @1.0;
-    pulse.toValue   = @1.08;
-    pulse.duration  = 1.2;
-    pulse.autoreverses = YES;
-    pulse.repeatCount  = HUGE_VALF;
-    pulse.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-    [self.layer addAnimation:pulse forKey:@"pulse"];
-}
-
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
+- (void)onPan:(UIPanGestureRecognizer *)pan {
     UIView *sv = self.superview;
     if (!sv) return;
-    CGPoint translation = [pan translationInView:sv];
-    CGPoint newCenter = CGPointMake(self.center.x + translation.x,
-                                    self.center.y + translation.y);
-    // Clamp inside screen
-    CGFloat r = 28.0f;
-    newCenter.x = MAX(r, MIN(sv.bounds.size.width  - r, newCenter.x));
-    newCenter.y = MAX(r + 44, MIN(sv.bounds.size.height - r - 34, newCenter.y));
-    self.center = newCenter;
+    CGPoint t = [pan translationInView:sv];
+    CGFloat r = self.bounds.size.width / 2.0;
+    self.center = CGPointMake(
+        MIN(MAX(self.center.x + t.x, r), sv.bounds.size.width  - r),
+        MIN(MAX(self.center.y + t.y, r + 50), sv.bounds.size.height - r - 40)
+    );
     [pan setTranslation:CGPointZero inView:sv];
 }
 
-- (void)buttonTapped {
+- (void)onTap {
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"☢ Nuclear Wipe"
-        message:@"This will PERMANENTLY delete:\n\n"
-                 "• NSUserDefaults & Shared Suites\n"
-                 "• Keychain Items\n"
-                 "• All Files (Documents / Library / Caches / tmp)\n"
-                 "• SQLite & CoreData Databases\n"
-                 "• HTTP Cache & Cookies\n"
-                 "• WebKit / WKWebView Storage\n"
-                 "• iCloud KV Store\n\n"
-                 "The app will close when done."
+        message:
+            @"Will permanently erase:\n\n"
+             "• NSUserDefaults & shared suites\n"
+             "• All Keychain items\n"
+             "• Documents / Library / Caches / tmp\n"
+             "• SQLite & CoreData databases\n"
+             "• HTTP Cache & Cookies\n"
+             "• WebKit / WKWebView storage\n"
+             "• iCloud KV Store\n\n"
+             "App will close when finished."
         preferredStyle:UIAlertControllerStyleAlert];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"NUKE IT 💥"
+    [alert addAction:[UIAlertAction actionWithTitle:@"💥 NUKE IT"
                                               style:UIAlertActionStyleDestructive
-                                            handler:^(UIAlertAction *_) {
-        nukeEverything();
-    }]];
+                                            handler:^(UIAlertAction *_) { nukeEverything(); }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
-    UIViewController *top = [UIApplication sharedApplication].keyWindow.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
-    [top presentViewController:alert animated:YES completion:nil];
+    [self.window.rootViewController presentViewController:alert animated:YES completion:nil];
 }
-
 @end
 
 // ─────────────────────────────────────────────
-// MARK: - Inject button into every window
+// MARK: - Install overlay window
 // ─────────────────────────────────────────────
+static NukePassthroughWindow *gOverlayWindow = nil;
 
-%hook UIWindow
+static void installOverlayWindow(void) {
+    if (gOverlayWindow) return;
 
-- (void)makeKeyAndVisible {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // Find active UIWindowScene
+        UIWindowScene *scene = nil;
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) {
+                scene = (UIWindowScene *)s;
+                if (s.activationState == UISceneActivationStateForegroundActive) break;
+            }
+        }
+
+        NukePassthroughWindow *win;
+        if (scene) {
+            win = [[NukePassthroughWindow alloc] initWithWindowScene:scene];
+        } else {
+            win = [[NukePassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        }
+
+        win.windowLevel            = UIWindowLevelAlert + 100;
+        win.backgroundColor        = [UIColor clearColor];
+        win.userInteractionEnabled = YES;
+        win.hidden                 = NO;
+
+        NukeRootVC *vc = [[NukeRootVC alloc] init];
+        win.rootViewController = vc;
+
+        // Position button bottom-left, above home indicator
+        CGRect s = [UIScreen mainScreen].bounds;
+        CGFloat sz = 58.0;
+        NukeButton *btn = [[NukeButton alloc] initWithFrame:
+            CGRectMake(16, s.size.height - sz - 80, sz, sz)];
+        [vc.view addSubview:btn];
+
+        gOverlayWindow = win;
+        NSLog(@"[NukeCleaner] 🪟 Overlay window installed, level=%f", win.windowLevel);
+    });
+}
+
+// ─────────────────────────────────────────────
+// MARK: - Hook: applicationDidBecomeActive
+// ─────────────────────────────────────────────
+%hook UIApplication
+
+- (void)applicationDidBecomeActive:(UIApplication *)application {
     %orig;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            UIWindow *keyWin = [UIApplication sharedApplication].keyWindow;
-            if (!keyWin) return;
-            NukeButton *btn = [[NukeButton alloc] init];
-            btn.tag = 0xDEAD;
-            [keyWin addSubview:btn];
-            [keyWin bringSubviewToFront:btn]; // keep on top
+            installOverlayWindow();
         });
     });
 }
@@ -356,8 +316,13 @@ static void nukeEverything(void) {
 // ─────────────────────────────────────────────
 // MARK: - Constructor
 // ─────────────────────────────────────────────
-
 %ctor {
-    NSLog(@"[NukeCleaner] 🔌 Loaded into %@",
-          [[NSBundle mainBundle] bundleIdentifier]);
+    NSLog(@"[NukeCleaner] 🔌 Loaded — %@",
+          [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown");
+
+    // Belt-and-suspenders: also try after 3 seconds
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        installOverlayWindow();
+    });
 }
