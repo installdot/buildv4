@@ -1,13 +1,10 @@
-// DevApiHook.xm  —  v5
-// Changes from v4:
-//  • Auto-logging of i.imgur.com URLs restored
-//  • Menu is now a custom floating overlay card (no sheet/modal)
-//    — tapping the DEV button toggles a panel that animates in-place
-//      near the button; tapping outside dismisses it. Navigation
-//      between sub-screens slides horizontally inside the card.
-//  • All API hooks default to OFF:
-//    kHookCheckHud, kHookValidate, kHookNotifications,
-//    kHookConnection, kHookTabs, kHookImgur → @NO
+// DevApiHook.xm  —  v6
+// Changes from v5:
+//  • Added heartbeat hook for GET /heartbeat_api.php
+//    — kHookHeartbeat / kJsonHeartbeat (default OFF)
+//    — server_time is always replaced with local device time at intercept time
+//    — random_token and checksum stay exactly as stored in the JSON editor
+//  • OSecHeartbeat added between OSecConnection and OSecTabs in the overlay
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -23,6 +20,7 @@ static NSString *const kHookCheckHud      = @"hook_check_hud";
 static NSString *const kHookValidate      = @"hook_validate";
 static NSString *const kHookNotifications = @"hook_notifications";
 static NSString *const kHookConnection    = @"hook_connection";
+static NSString *const kHookHeartbeat     = @"hook_heartbeat";
 static NSString *const kHookTabs          = @"hook_tabs";
 static NSString *const kHookImgur         = @"hook_imgur";
 
@@ -30,6 +28,7 @@ static NSString *const kJsonCheckHud      = @"json_check_hud";
 static NSString *const kJsonValidate      = @"json_validate";
 static NSString *const kJsonNotifications = @"json_notifications";
 static NSString *const kJsonConnection    = @"json_connection";
+static NSString *const kJsonHeartbeat     = @"json_heartbeat";
 static NSString *const kJsonTabs          = @"json_tabs";
 
 static NSString *const kImgurMap          = @"imgur_url_map";
@@ -148,6 +147,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
         kHookValidate:      @NO,
         kHookNotifications: @NO,
         kHookConnection:    @NO,
+        kHookHeartbeat:     @NO,
         kHookTabs:          @NO,
         kHookImgur:         @NO,
         // ─────────────────────────────────────────────────────
@@ -177,6 +177,15 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
             @"status": @"success", @"message": @"Server is online",
             @"timestamp": @((long long)now),
             @"server_name": @"CheatiOSVip.VN", @"version": @"1.0.0"
+        }],
+        // heartbeat: server_time is overwritten at intercept time with local clock.
+        // random_token and checksum are kept exactly as stored here / in the JSON editor.
+        kJsonHeartbeat: [self _pretty:@{
+            @"status":       @"alive",
+            @"server_time":  @((long long)now),
+            @"random_token": @"2d6669129c853e1c763a875a1ce1483d",
+            @"checksum":     @"1f6a4817ea4539e2b417692dfd88d0a9f774b43fcedcceb81d86bbf4847d209b",
+            @"message":      @"Server is running normally"
         }],
         kJsonTabs: [self _pretty:@{
             @"success": @YES,
@@ -239,12 +248,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
     DevSettings *s = DevSettings.shared;
 
     if ([host isEqualToString:@"i.imgur.com"]) {
-        [ImgurLinkStore.shared logURL:url.absoluteString];  // auto-log restored
+        [ImgurLinkStore.shared logURL:url.absoluteString];
         if (![s isEnabled:kHookImgur]) return NO;
         return [ImgurLinkStore.shared replacementFor:url.absoluteString].length > 0;
     }
 
     if (![host isEqualToString:@"api.cheatiosvip.vn"]) return NO;
+    if ([s isEnabled:kHookHeartbeat]  && [path isEqualToString:@"/heartbeat_api.php"])  return YES;
     if ([s isEnabled:kHookConnection] && [path isEqualToString:@"/check_connection.php"]) return YES;
     if ([s isEnabled:kHookTabs]       && [path isEqualToString:@"/apitab.php"])           return YES;
     if ([path isEqualToString:@"/api.php"]) {
@@ -291,6 +301,11 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
             }] resume];
             return;
         }
+    } else if ([path isEqualToString:@"/heartbeat_api.php"]) {
+        // server_time → local device clock; random_token & checksum untouched from stored JSON
+        NSMutableDictionary *d = [[s jsonDictForKey:kJsonHeartbeat] mutableCopy];
+        d[@"server_time"] = @((long long)[[NSDate date] timeIntervalSince1970]);
+        data = [NSJSONSerialization dataWithJSONObject:d options:0 error:nil];
     } else if ([path isEqualToString:@"/check_connection.php"]) {
         NSMutableDictionary *d = [[s jsonDictForKey:kJsonConnection] mutableCopy];
         d[@"timestamp"] = @((long long)[[NSDate date] timeIntervalSince1970]);
@@ -330,8 +345,6 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 @end
 
 // ─── Forward declarations ─────────────────────────────────────
-// Both classes are defined later in the file; DevOverlayPanel
-// needs DevMenuManager, and DevMenuManager references DevFloatingBtn.
 @class DevFloatingBtn;
 @interface DevMenuManager : NSObject
 @property (nonatomic, weak) DevFloatingBtn *btn;
@@ -343,28 +356,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
 
 // ═══════════════════════════════════════════════════════════════
 // MARK: - DevOverlayPanel
-//
-// A custom floating card rendered directly on the key window.
-// Tapping the DEV button toggles it. Tapping outside dismisses.
-// Internal navigation uses a lightweight push/pop stack that
-// slides content horizontally inside the card — no UINavController.
-//
-// Card layout:
-//  ┌─────────────────────────────┐
-//  │ ● Dev API Hook          [✕] │  ← dark header (always visible)
-//  ├─────────────────────────────┤
-//  │ [‹ Back]    Sub-title       │  ← sub-nav (hidden on root)
-//  ├─────────────────────────────┤
-//  │                             │
-//  │        content area         │  ← clips & slides per screen
-//  │                             │
-//  └─────────────────────────────┘
 // ═══════════════════════════════════════════════════════════════
 
-// ─── Section model ────────────────────────────────────────────
 typedef NS_ENUM(NSInteger, OverlaySec) {
     OSecIcon = 0, OSecImgur,
-    OSecCheckHud, OSecValidate, OSecNotifications, OSecConnection, OSecTabs,
+    OSecCheckHud, OSecValidate, OSecNotifications, OSecConnection,
+    OSecHeartbeat,
+    OSecTabs,
     OSecCount
 };
 
@@ -376,6 +374,7 @@ static NSString *OSecTitle(OverlaySec s) {
         case OSecValidate:      return @"Validate Key";
         case OSecNotifications: return @"Notifications";
         case OSecConnection:    return @"Connection";
+        case OSecHeartbeat:     return @"Heartbeat";
         case OSecTabs:          return @"Tabs";
         default:                return @"";
     }
@@ -386,6 +385,7 @@ static NSString *OSecHookKey(OverlaySec s) {
         case OSecValidate:      return kHookValidate;
         case OSecNotifications: return kHookNotifications;
         case OSecConnection:    return kHookConnection;
+        case OSecHeartbeat:     return kHookHeartbeat;
         case OSecTabs:          return kHookTabs;
         default:                return nil;
     }
@@ -396,6 +396,7 @@ static NSString *OSecJsonKey(OverlaySec s) {
         case OSecValidate:      return kJsonValidate;
         case OSecNotifications: return kJsonNotifications;
         case OSecConnection:    return kJsonConnection;
+        case OSecHeartbeat:     return kJsonHeartbeat;
         case OSecTabs:          return kJsonTabs;
         default:                return nil;
     }
@@ -408,6 +409,7 @@ static NSString *OSecFooter(OverlaySec s) {
         case OSecValidate:      return @"POST /api.php  action=validate + key + hwid";
         case OSecNotifications: return @"GET  /api.php?action=get_notifications";
         case OSecConnection:    return @"GET  /check_connection.php";
+        case OSecHeartbeat:     return @"GET  /heartbeat_api.php  —  server_time is always local device time; token & checksum keep as stored.";
         case OSecTabs:          return @"GET  /apitab.php";
         default:                return @"";
     }
@@ -419,14 +421,12 @@ static const CGFloat kPanelRadius = 18.f;
 static const CGFloat kHeaderH     = 48.f;
 static const CGFloat kSubNavH     = 38.f;
 
-// ─── Tag constants for sub-tables ────────────────────────────
 static const NSInteger kTagImgurTable = 1001;
 
 @interface DevOverlayPanel : UIView
     <UITableViewDataSource, UITableViewDelegate,
      UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 
-// Overlay chrome
 @property (nonatomic, strong) UIView   *dimView;
 @property (nonatomic, strong) UIView   *card;
 @property (nonatomic, strong) UILabel  *headerTitle;
@@ -435,17 +435,13 @@ static const NSInteger kTagImgurTable = 1001;
 @property (nonatomic, strong) UILabel  *subNavTitle;
 @property (nonatomic, strong) UIView   *contentContainer;
 
-// Nav stack
 @property (nonatomic, strong) NSMutableArray<UIView *>   *navStack;
 @property (nonatomic, strong) NSMutableArray<NSString *> *titleStack;
 
-// Root table
 @property (nonatomic, strong) UITableView *rootTable;
 
-// Imgur sub-screen state
 @property (nonatomic, strong) NSArray<NSString *> *imgurKeys;
 
-// JSON editor state
 @property (nonatomic, copy)   NSString    *editingJsonKey;
 @property (nonatomic, strong) UITextView  *jsonTV;
 @property (nonatomic, strong) UILabel     *jsonStatus;
@@ -477,7 +473,6 @@ static const NSInteger kTagImgurTable = 1001;
 // ─────────────────────────────────────────────────────────────
 
 - (void)_buildChrome {
-    // Dim backdrop
     _dimView = [[UIView alloc] initWithFrame:CGRectZero];
     _dimView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
     _dimView.alpha = 0;
@@ -485,7 +480,6 @@ static const NSInteger kTagImgurTable = 1001;
         initWithTarget:self action:@selector(dismiss)];
     [_dimView addGestureRecognizer:tap];
 
-    // Card
     _card = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kPanelW, kPanelH)];
     _card.backgroundColor    = UIColor.systemGroupedBackgroundColor;
     _card.layer.cornerRadius = kPanelRadius;
@@ -565,7 +559,6 @@ static const NSInteger kTagImgurTable = 1001;
     _dimView.frame = win.bounds;
     [self addSubview:_dimView];
 
-    // Position card: anchored top-right below status bar
     UIEdgeInsets safe = win.safeAreaInsets;
     CGFloat cardX = win.bounds.size.width  - kPanelW - 16 - safe.right;
     CGFloat cardY = safe.top + 10;
@@ -577,7 +570,6 @@ static const NSInteger kTagImgurTable = 1001;
     _card.alpha     = 0;
     [self addSubview:_card];
 
-    // Reset to root
     [_navStack removeAllObjects];
     [_titleStack removeAllObjects];
     for (UIView *v in _contentContainer.subviews) [v removeFromSuperview];
@@ -632,7 +624,6 @@ static const NSInteger kTagImgurTable = 1001;
 - (void)_pushView:(UIView *)newView title:(NSString *)title {
     UIView *outgoing = _contentContainer.subviews.lastObject;
 
-    // Expand content container to add sub-nav space on first push
     if (_navStack.count == 0) {
         _contentContainer.frame = CGRectMake(0, kHeaderH + kSubNavH,
                                              kPanelW, kPanelH - kHeaderH - kSubNavH);
@@ -701,7 +692,6 @@ static const NSInteger kTagImgurTable = 1001;
         if (sec == OSecImgur) return 2;
         return 2;
     }
-    // Imgur sub-table
     return MAX(1, (NSInteger)_imgurKeys.count);
 }
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)sec {
@@ -798,7 +788,7 @@ static const NSInteger kTagImgurTable = 1001;
         return c;
     }
 
-    // API sections
+    // API sections (CheckHud, Validate, Notifications, Connection, Heartbeat, Tabs)
     NSString *hk = OSecHookKey(sec);
     if (ip.row == 0) {
         c.textLabel.text      = @"Enable Hook";
@@ -903,7 +893,6 @@ static const NSInteger kTagImgurTable = 1001;
     tv.backgroundColor = UIColor.clearColor;
     tv.tag             = kTagImgurTable;
 
-    // "Clear All" header button
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [clearBtn setTitle:@"Clear All" forState:UIControlStateNormal];
     clearBtn.tintColor  = UIColor.systemRedColor;
@@ -976,7 +965,6 @@ static const NSInteger kTagImgurTable = 1001;
 
     [self _pushView:wrap title:title];
 
-    // Layout after push (frame is now valid)
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect b = wrap.bounds;
         self->_jsonTV.frame     = CGRectMake(0, 0, b.size.width, b.size.height - 80);
@@ -1311,7 +1299,6 @@ static const CGFloat kBtnSize = 60.f;
         [panel dismiss];
     } else {
         [panel show];
-        // Keep floating button on top of the overlay
         if (win && _btn) [win bringSubviewToFront:(UIView *)_btn];
     }
 }
