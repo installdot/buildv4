@@ -16,20 +16,22 @@
 
 static NSString *const kSuite             = @"com.dev.apihook.settings";
 
-static NSString *const kHookCheckHud      = @"hook_check_hud";
-static NSString *const kHookValidate      = @"hook_validate";
-static NSString *const kHookNotifications = @"hook_notifications";
-static NSString *const kHookConnection    = @"hook_connection";
-static NSString *const kHookHeartbeat     = @"hook_heartbeat";
-static NSString *const kHookTabs          = @"hook_tabs";
-static NSString *const kHookImgur         = @"hook_imgur";
+static NSString *const kHookCheckHud        = @"hook_check_hud";
+static NSString *const kHookValidate        = @"hook_validate";
+static NSString *const kHookNotifications   = @"hook_notifications";
+static NSString *const kHookConnection      = @"hook_connection";
+static NSString *const kHookHeartbeat       = @"hook_heartbeat";
+static NSString *const kHookHwidApproval    = @"hook_hwid_approval";
+static NSString *const kHookTabs            = @"hook_tabs";
+static NSString *const kHookImgur           = @"hook_imgur";
 
-static NSString *const kJsonCheckHud      = @"json_check_hud";
-static NSString *const kJsonValidate      = @"json_validate";
-static NSString *const kJsonNotifications = @"json_notifications";
-static NSString *const kJsonConnection    = @"json_connection";
-static NSString *const kJsonHeartbeat     = @"json_heartbeat";
-static NSString *const kJsonTabs          = @"json_tabs";
+static NSString *const kJsonCheckHud        = @"json_check_hud";
+static NSString *const kJsonValidate        = @"json_validate";
+static NSString *const kJsonNotifications   = @"json_notifications";
+static NSString *const kJsonConnection      = @"json_connection";
+static NSString *const kJsonHeartbeat       = @"json_heartbeat";
+static NSString *const kJsonHwidApproval    = @"json_hwid_approval";
+static NSString *const kJsonTabs            = @"json_tabs";
 
 static NSString *const kImgurMap          = @"imgur_url_map";
 
@@ -148,6 +150,7 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
         kHookNotifications: @NO,
         kHookConnection:    @NO,
         kHookHeartbeat:     @NO,
+        kHookHwidApproval:  @NO,
         kHookTabs:          @NO,
         kHookImgur:         @NO,
         // ─────────────────────────────────────────────────────
@@ -186,6 +189,12 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
             @"random_token": @"2d6669129c853e1c763a875a1ce1483d",
             @"checksum":     @"1f6a4817ea4539e2b417692dfd88d0a9f774b43fcedcceb81d86bbf4847d209b",
             @"message":      @"Server is running normally"
+        }],
+        kJsonHwidApproval: [self _pretty:@{
+            @"success":                @YES,
+            @"hwid_approval_enabled":  @NO,
+            @"message":                @"HWID approval is disabled. Users can use keys directly without approval.",
+            @"require_hwid_approval":  @NO
         }],
         kJsonTabs: [self _pretty:@{
             @"success": @YES,
@@ -262,9 +271,10 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
             [url.query containsString:@"action=get_notifications"]) return YES;
         if ([meth isEqualToString:@"POST"]) {
             NSString *body = [self _bodyOf:req];
-            if ([s isEnabled:kHookCheckHud] && [body containsString:@"action=check_hud_control"]) return YES;
-            if ([s isEnabled:kHookValidate] && [body containsString:@"action=validate"] &&
-                [body containsString:@"key="] && [body containsString:@"hwid="])           return YES;
+            if ([s isEnabled:kHookCheckHud]      && [body containsString:@"action=check_hud_control"])    return YES;
+            if ([s isEnabled:kHookHwidApproval]  && [body containsString:@"action=check_hwid_approval"])  return YES;
+            if ([s isEnabled:kHookValidate]      && [body containsString:@"action=validate"] &&
+                [body containsString:@"key="] && [body containsString:@"hwid="])                           return YES;
         }
     }
     return NO;
@@ -323,8 +333,13 @@ static NSString *const kIconUseLocal      = @"icon_use_local";
                 [s jsonDictForKey:kJsonNotifications] options:0 error:nil];
     } else if ([meth isEqualToString:@"POST"]) {
         NSString *body = [HookURLProtocol _bodyOf:self.request];
-        NSDictionary *dict = [body containsString:@"action=check_hud_control"]
-            ? [s jsonDictForKey:kJsonCheckHud] : [s jsonDictForKey:kJsonValidate];
+        NSDictionary *dict;
+        if ([body containsString:@"action=check_hud_control"])
+            dict = [s jsonDictForKey:kJsonCheckHud];
+        else if ([body containsString:@"action=check_hwid_approval"])
+            dict = [s jsonDictForKey:kJsonHwidApproval];
+        else
+            dict = [s jsonDictForKey:kJsonValidate];
         data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
     }
 
@@ -362,6 +377,7 @@ typedef NS_ENUM(NSInteger, OverlaySec) {
     OSecIcon = 0, OSecImgur,
     OSecCheckHud, OSecValidate, OSecNotifications, OSecConnection,
     OSecHeartbeat,
+    OSecHwidApproval,
     OSecTabs,
     OSecCount
 };
@@ -375,6 +391,7 @@ static NSString *OSecTitle(OverlaySec s) {
         case OSecNotifications: return @"Notifications";
         case OSecConnection:    return @"Connection";
         case OSecHeartbeat:     return @"Heartbeat";
+        case OSecHwidApproval:  return @"HWID Approval";
         case OSecTabs:          return @"Tabs";
         default:                return @"";
     }
@@ -386,6 +403,7 @@ static NSString *OSecHookKey(OverlaySec s) {
         case OSecNotifications: return kHookNotifications;
         case OSecConnection:    return kHookConnection;
         case OSecHeartbeat:     return kHookHeartbeat;
+        case OSecHwidApproval:  return kHookHwidApproval;
         case OSecTabs:          return kHookTabs;
         default:                return nil;
     }
@@ -397,6 +415,7 @@ static NSString *OSecJsonKey(OverlaySec s) {
         case OSecNotifications: return kJsonNotifications;
         case OSecConnection:    return kJsonConnection;
         case OSecHeartbeat:     return kJsonHeartbeat;
+        case OSecHwidApproval:  return kJsonHwidApproval;
         case OSecTabs:          return kJsonTabs;
         default:                return nil;
     }
@@ -410,6 +429,7 @@ static NSString *OSecFooter(OverlaySec s) {
         case OSecNotifications: return @"GET  /api.php?action=get_notifications";
         case OSecConnection:    return @"GET  /check_connection.php";
         case OSecHeartbeat:     return @"GET  /heartbeat_api.php  —  server_time is always local device time; token & checksum keep as stored.";
+        case OSecHwidApproval:  return @"POST /api.php  action=check_hwid_approval";
         case OSecTabs:          return @"GET  /apitab.php";
         default:                return @"";
     }
