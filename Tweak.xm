@@ -7,6 +7,7 @@
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
+#import <NetworkExtension/NetworkExtension.h>
 #import <sys/utsname.h>
 #import <ifaddrs.h>
 #import <net/if.h>
