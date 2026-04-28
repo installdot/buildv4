@@ -1,17 +1,13 @@
 // tweak.xm — Soul Knight Save Manager v12
 // iOS 14+ | Theos/Logos | ARC
-// v12.2: Custom alert popups, VPN/proxy detection (NEVPNConnection + proxy), bug report, smaller panel
+// v12.1: Custom alert popups, bug report, smaller panel
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
-#import <NetworkExtension/NetworkExtension.h>
 #import <sys/utsname.h>
-#import <ifaddrs.h>
-#import <net/if.h>
-#import <arpa/inet.h>
 
 // ── Config ────────────────────────────────────────────────────────────────────
 #define API_BASE      @"https://chillysilly.frfrnocap.men/iske.php"
@@ -33,109 +29,8 @@ static const CGFloat kPW = 220;
 static const CGFloat kBH = 38;
 static const CGFloat kCH = 172;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - VPN / Proxy Detection  (NEVPNConnection + ifaddrs + proxy settings)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ① NEVPNConnection status check — catches Personal VPN profiles managed by
-//   NEVPNManager (IKEv2, IPSec, L2TP).  Status is synchronously readable via
-//   the shared manager's connection property without a prior loadFromPreferences
-//   call; we treat Connected / Connecting / Reasserting as "VPN active".
-static BOOL isNEVPNActive(void) {
-    NEVPNStatus status = [NEVPNManager sharedManager].connection.status;
-    return (status == NEVPNStatusConnected    ||
-            status == NEVPNStatusConnecting   ||
-            status == NEVPNStatusReasserting);
-}
-
-// ② Network-interface scan — catches WireGuard, OpenVPN, custom tunnel
-//   providers, and any VPN that registers a tun/ppp/ipsec/zt/wg interface.
-//   For utun* we only flag when the interface is UP and has a routable address
-//   (system utun interfaces for iCloud Relay / Continuity exist but carry no
-//   address when no real VPN is active).
-static BOOL isVPNInterfaceActive(void) {
-    struct ifaddrs *interfaces = NULL;
-    if (getifaddrs(&interfaces) != 0) return NO;
-    BOOL found = NO;
-    for (struct ifaddrs *cur = interfaces; cur; cur = cur->ifa_next) {
-        NSString *name = [NSString stringWithUTF8String:cur->ifa_name ?: ""];
-        BOOL isTunnel = ([name hasPrefix:@"tun"]   ||
-                         [name hasPrefix:@"ppp"]   ||
-                         [name hasPrefix:@"ipsec"] ||
-                         [name hasPrefix:@"tap"]   ||
-                         [name hasPrefix:@"zt"]    ||
-                         [name hasPrefix:@"wg"]);
-        BOOL isUtun   = [name hasPrefix:@"utun"];
-        if (isTunnel ||
-            (isUtun &&
-             (cur->ifa_flags & IFF_UP) &&
-             cur->ifa_addr != NULL &&
-             (cur->ifa_addr->sa_family == AF_INET ||
-              cur->ifa_addr->sa_family == AF_INET6))) {
-            found = YES; break;
-        }
-    }
-    freeifaddrs(interfaces);
-    return found;
-}
-
-// ③ Proxy-settings check — covers HTTP/HTTPS/SOCKS proxies set in
-//   Settings → Wi-Fi → Proxy.  Uses CFNetworkCopySystemProxySettings()
-//   (works on all supported iOS versions).  On iOS 17+ we additionally
-//   inspect NSURLSessionConfiguration.proxyConfigurations.
-static BOOL isProxyActive(void) {
-    // Legacy / universal path
-    NSDictionary *sys = (__bridge_transfer NSDictionary *)CFNetworkCopySystemProxySettings();
-    if ([sys[@"HTTPEnable"]  boolValue] && [sys[@"HTTPProxy"]  length] > 0) return YES;
-    if ([sys[@"HTTPSEnable"] boolValue] && [sys[@"HTTPSProxy"] length] > 0) return YES;
-    if ([sys[@"SOCKSEnable"] boolValue] && [sys[@"SOCKSProxy"] length] > 0) return YES;
-
-    // connectionProxyDictionary mirror (same data, kept for explicitness)
-    NSDictionary *cpd = [NSURLSessionConfiguration defaultSessionConfiguration]
-                            .connectionProxyDictionary;
-    if ([cpd[@"HTTPEnable"]  integerValue] > 0 && [cpd[@"HTTPProxy"]  length] > 0) return YES;
-    if ([cpd[@"HTTPSEnable"] integerValue] > 0 && [cpd[@"HTTPSProxy"] length] > 0) return YES;
-    if ([cpd[@"SOCKSEnable"] integerValue] > 0 && [cpd[@"SOCKSProxy"] length] > 0) return YES;
-
-    // iOS 17+ proxyConfigurations array
-    if (@available(iOS 17.0, *)) {
-        if ([NSURLSessionConfiguration defaultSessionConfiguration]
-                .proxyConfigurations.count > 0) return YES;
-    }
-    return NO;
-}
-
-// Aggregate: VPN or proxy is active when any of the three checks fires.
-static BOOL isVPNOrProxyActive(void) {
-    return isNEVPNActive() || isVPNInterfaceActive() || isProxyActive();
-}
-
-// ── Polling state ─────────────────────────────────────────────────────────────
-static BOOL gVPNAlerted = NO;
-
 // Forward declaration
 @class SKCustomAlert;
-static void showVPNBlockedAndExit(void);
-
-// Starts a background 1-second polling loop.  Fires showVPNBlockedAndExit()
-// once on the main thread as soon as a VPN or proxy is detected.
-static void startVPNPolling(void) {
-    gVPNAlerted = NO;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (YES) {
-            [NSThread sleepForTimeInterval:1.0];
-            if (isVPNOrProxyActive()) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (!gVPNAlerted) {
-                        gVPNAlerted = YES;
-                        showVPNBlockedAndExit();
-                    }
-                });
-                return;
-            }
-        }
-    });
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SF Symbol helper
@@ -466,7 +361,7 @@ static void skPost(NSURLSession *session,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Auth Network Request (VPN-guarded)
+// MARK: - Auth Network Request
 // ─────────────────────────────────────────────────────────────────────────────
 static void performKeyAuth(NSString *keyValue,
                            void (^completion)(BOOL ok, NSTimeInterval keyExpiry,
