@@ -695,7 +695,6 @@ typedef void (^SKAlertAction)(NSString *title);
         b.tintColor = [UIColor whiteColor];
         b.imageEdgeInsets = UIEdgeInsetsMake(0, 0, 0, 6);
 
-        SKAlertButton * __weak wab = ab;
         [b addTarget:self action:@selector(_btnTapped:) forControlEvents:UIControlEventTouchUpInside];
         b.tag = [_buttons indexOfObject:ab];
         [btnStack addArrangedSubview:b];
