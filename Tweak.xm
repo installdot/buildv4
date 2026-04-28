@@ -698,7 +698,6 @@ typedef void (^SKAlertAction)(NSString *title);
         SKAlertButton * __weak wab = ab;
         [b addTarget:self action:@selector(_btnTapped:) forControlEvents:UIControlEventTouchUpInside];
         b.tag = [_buttons indexOfObject:ab];
-        [b heightAnchor].active = NO;
         [btnStack addArrangedSubview:b];
         [b.heightAnchor constraintEqualToConstant:42].active = YES;
     }
