@@ -36,16 +36,31 @@ static const CGFloat kCH = 172;
 // MARK: - VPN / Proxy Detection
 // ─────────────────────────────────────────────────────────────────────────────
 static BOOL isVPNOrProxyActive(void) {
-    // Check for VPN/tun/ppp network interfaces
+    // Check for VPN/tunnel network interfaces.
+    // NOTE: iOS always has utun0/utun1/utun2 for system features (iCloud relay,
+    // Continuity, Bonjour, hotspot). We only treat an interface as a real VPN
+    // tunnel if it is UP *and* has an assigned IPv4/IPv6 address, which only
+    // happens when an actual VPN connection is active.
     struct ifaddrs *interfaces = NULL;
     if (getifaddrs(&interfaces) == 0) {
         struct ifaddrs *cursor = interfaces;
         while (cursor != NULL) {
             NSString *name = [NSString stringWithUTF8String:cursor->ifa_name ?: ""];
-            if ([name hasPrefix:@"utun"] || [name hasPrefix:@"tun"]  ||
-                [name hasPrefix:@"ppp"]  || [name hasPrefix:@"ipsec"]||
-                [name hasPrefix:@"tap"]  || [name hasPrefix:@"zt"]   ||
-                [name hasPrefix:@"wg"]) {
+            BOOL isTunnelIface = ([name hasPrefix:@"tun"]   ||
+                                  [name hasPrefix:@"ppp"]   ||
+                                  [name hasPrefix:@"ipsec"] ||
+                                  [name hasPrefix:@"tap"]   ||
+                                  [name hasPrefix:@"zt"]    ||
+                                  [name hasPrefix:@"wg"]);
+            // For utun: only flag when the interface is UP and has a real address
+            // (system utun interfaces exist but carry no routable address without VPN)
+            BOOL isUtun = [name hasPrefix:@"utun"];
+            if (isTunnelIface ||
+                (isUtun &&
+                 (cursor->ifa_flags & IFF_UP) &&
+                 cursor->ifa_addr != NULL &&
+                 (cursor->ifa_addr->sa_family == AF_INET ||
+                  cursor->ifa_addr->sa_family == AF_INET6))) {
                 freeifaddrs(interfaces);
                 return YES;
             }
@@ -53,11 +68,21 @@ static BOOL isVPNOrProxyActive(void) {
         }
         freeifaddrs(interfaces);
     }
-    // Check system proxy settings
+    // Check system proxy settings.
+    // Only flag when the proxy is enabled AND a proxy server/host is actually set.
+    // On some iOS versions the Enable key is non-zero for internal system entries
+    // even when the user has configured nothing in Settings → Wi-Fi → Proxy.
     NSDictionary *proxy = (__bridge_transfer NSDictionary *)CFNetworkCopySystemProxySettings();
-    if ([proxy[@"HTTPEnable"]  boolValue] ||
-        [proxy[@"HTTPSEnable"] boolValue] ||
-        [proxy[@"SOCKSEnable"] boolValue]) {
+    if ([proxy[@"HTTPEnable"] boolValue] &&
+        [proxy[@"HTTPProxy"] length] > 0) {
+        return YES;
+    }
+    if ([proxy[@"HTTPSEnable"] boolValue] &&
+        [proxy[@"HTTPSProxy"] length] > 0) {
+        return YES;
+    }
+    if ([proxy[@"SOCKSEnable"] boolValue] &&
+        [proxy[@"SOCKSProxy"] length] > 0) {
         return YES;
     }
     return NO;
