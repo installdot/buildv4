@@ -2494,11 +2494,6 @@ static const CGFloat kSWScale = 0.72f;
     __block NSArray<NSString*> *capturedFiles = allFiles;
     __weak SKPanel *weakSelf = self;
 
-    UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
-        initWithTarget:overlay action:nil];
-    [bgTap addTarget:overlay action:nil];
-    // Use a simple approach: add target via category shimming isn't available,
-    // so wire via KVO-free block wrapper stored on the overlay tag
     overlay.tag = 54321;
 
     // Dismiss on backdrop tap (outside card)
