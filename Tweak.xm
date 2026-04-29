@@ -1,6 +1,6 @@
 // tweak.xm — Soul Knight Save Manager v12
 // iOS 14+ | Theos/Logos | ARC
-// v12.1: Custom alert popups, VPN/proxy detection, bug report, smaller panel
+// v12.1: Custom alert popups, bug report, smaller panel
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -34,96 +34,6 @@ static const CGFloat kBH = 38;
 static const CGFloat kCH = 172;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - VPN / Proxy Detection
-// ─────────────────────────────────────────────────────────────────────────────
-static BOOL isVPNOrProxyActive(void) {
-    // Check for VPN/tunnel network interfaces.
-    // NOTE: iOS always has utun0/utun1/utun2 for system features (iCloud relay,
-    // Continuity, Bonjour, hotspot). We only treat an interface as a real VPN
-    // tunnel if it is UP *and* has an assigned IPv4/IPv6 address, which only
-    // happens when an actual VPN connection is active.
-    struct ifaddrs *interfaces = NULL;
-    if (getifaddrs(&interfaces) == 0) {
-        struct ifaddrs *cursor = interfaces;
-        while (cursor != NULL) {
-            NSString *name = [NSString stringWithUTF8String:cursor->ifa_name ?: ""];
-            BOOL isTunnelIface = ([name hasPrefix:@"tun"]   ||
-                                  [name hasPrefix:@"ppp"]   ||
-                                  [name hasPrefix:@"ipsec"] ||
-                                  [name hasPrefix:@"tap"]   ||
-                                  [name hasPrefix:@"zt"]    ||
-                                  [name hasPrefix:@"wg"]);
-            // For utun: only flag when the interface is UP and has a real address
-            // (system utun interfaces exist but carry no routable address without VPN)
-            BOOL isUtun = [name hasPrefix:@"utun"];
-            if (isTunnelIface ||
-                (isUtun &&
-                 (cursor->ifa_flags & IFF_UP) &&
-                 cursor->ifa_addr != NULL &&
-                 (cursor->ifa_addr->sa_family == AF_INET ||
-                  cursor->ifa_addr->sa_family == AF_INET6))) {
-                freeifaddrs(interfaces);
-                return YES;
-            }
-            cursor = cursor->ifa_next;
-        }
-        freeifaddrs(interfaces);
-    }
-    // Check system proxy settings.
-    // Only flag when the proxy is enabled AND a proxy server/host is actually set.
-    // On some iOS versions the Enable key is non-zero for internal system entries
-    // even when the user has configured nothing in Settings → Wi-Fi → Proxy.
-    NSDictionary *proxy = (__bridge_transfer NSDictionary *)CFNetworkCopySystemProxySettings();
-    if ([proxy[@"HTTPEnable"] boolValue] &&
-        [proxy[@"HTTPProxy"] length] > 0) {
-        return YES;
-    }
-    if ([proxy[@"HTTPSEnable"] boolValue] &&
-        [proxy[@"HTTPSProxy"] length] > 0) {
-        return YES;
-    }
-    if ([proxy[@"SOCKSEnable"] boolValue] &&
-        [proxy[@"SOCKSProxy"] length] > 0) {
-        return YES;
-    }
-    return NO;
-}
-
-static NSTimer *gVPNTimer = nil;
-static BOOL     gVPNAlerted = NO;
-
-static void stopVPNTimer(void) {
-    [gVPNTimer invalidate]; gVPNTimer = nil;
-}
-
-// Forward declaration
-@class SKCustomAlert;
-static void showVPNBlockedAndExit(void);
-
-static void startVPNPolling(void) {
-    stopVPNTimer();
-    gVPNAlerted = NO;
-    gVPNTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
-        target:[NSBlockOperation blockOperationWithBlock:^{}]
-        selector:@selector(main)
-        userInfo:nil repeats:YES];
-    // Use dispatch-based repeating instead
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (YES) {
-            [NSThread sleepForTimeInterval:1.0];
-            if (isVPNOrProxyActive()) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (!gVPNAlerted) {
-                        gVPNAlerted = YES;
-                        showVPNBlockedAndExit();
-                    }
-                });
-                return;
-            }
-        }
-    });
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SF Symbol helper
 // ─────────────────────────────────────────────────────────────────────────────
@@ -432,13 +342,6 @@ static MPRequest buildMP(NSDictionary<NSString*,NSString*> *fields,
 static void skPost(NSURLSession *session,
                    NSMutableURLRequest *req, NSData *body,
                    void (^cb)(NSDictionary *json, NSError *err)) {
-    // VPN check before every request
-    if (isVPNOrProxyActive()) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gVPNAlerted) { gVPNAlerted = YES; showVPNBlockedAndExit(); }
-        });
-        return;
-    }
     [[session uploadTaskWithRequest:req fromData:body
                   completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -460,17 +363,11 @@ static void skPost(NSURLSession *session,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Auth Network Request (VPN-guarded)
+// MARK: - Auth Network Request
 // ─────────────────────────────────────────────────────────────────────────────
 static void performKeyAuth(NSString *keyValue,
                            void (^completion)(BOOL ok, NSTimeInterval keyExpiry,
                                              NSTimeInterval deviceExpiry, NSString *errorMsg)) {
-    if (isVPNOrProxyActive()) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gVPNAlerted) { gVPNAlerted = YES; showVPNBlockedAndExit(); }
-        });
-        return;
-    }
     NSString *udid = loadCachedUDID();
     if (!udid.length) { completion(NO, 0, 0, @"Device not enrolled. UDID required."); return; }
 
@@ -794,20 +691,6 @@ typedef void (^SKAlertAction)(NSString *title);
        confirmIsDestructive:NO confirm:nil];
 }
 @end
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - VPN Blocked Notification (uses custom alert)
-// ─────────────────────────────────────────────────────────────────────────────
-static void showVPNBlockedAndExit(void) {
-    SKCustomAlert *a = [SKCustomAlert alertTitle:@"🚫 VPN / Proxy Detected"
-        message:@"A VPN or proxy is active on your device.\n\niSKE cannot run while a VPN or proxy is enabled.\n\nThe app will now close."
-        buttons:@[[SKAlertButton title:@"Close App" destructive:YES handler:^{
-            exit(0);
-        }]]];
-    [a show];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
-        dispatch_get_main_queue(), ^{ exit(0); });
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - SKBugReportOverlay
@@ -1658,7 +1541,7 @@ static const CGFloat kEW = 220;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Upload / Load (unchanged logic, VPN check via skPost)
+// MARK: - Upload / Load
 // ─────────────────────────────────────────────────────────────────────────────
 static void performUpload(NSArray<NSString *> *fileNames, SKProgressOverlay *ov,
                           void (^done)(NSString *link, NSString *err)) {
@@ -3062,16 +2945,9 @@ static void showMainPanel(UIView *root) {
     [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseOut
                      animations:^{ gPanel.alpha = 1; gPanel.transform = CGAffineTransformIdentity; }
                      completion:^(BOOL _){ showWelcomeIfNeeded(root); }];
-    // Start VPN polling after panel is shown
-    startVPNPolling();
 }
 
 static void injectPanel(void) {
-    // Initial VPN check before doing anything
-    if (isVPNOrProxyActive()) {
-        showVPNBlockedAndExit(); return;
-    }
-
     UIWindow *win = nil;
     for (UIWindow *w in UIApplication.sharedApplication.windows)
         if (!w.isHidden && w.alpha > 0) { win = w; break; }
