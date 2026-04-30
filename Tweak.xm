@@ -397,7 +397,7 @@ static UIImage *diagonalPatternImage(void) {
 
 - (void)setStatus:(NSString *)s { _statusLbl.text = s; }
 
-#define CLAMP(v,lo,hi) MAX((lo), MIN((hi), (v)))
+// NOTE: CLAMP is already defined above — duplicate removed.
 @end
 
 // ═══════════════════════════════════════════════════════════════
@@ -756,6 +756,7 @@ static NSDictionary *kTNLabels(void) {
 }
 
 // ──────────── EXP Tab ────────────
+
 - (UIView *)buildTabEXP:(CGFloat)w {
     UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0,0,w,200)];
 
@@ -1780,14 +1781,12 @@ static inline CGFloat CLAMP_F(CGFloat v, CGFloat lo, CGFloat hi) { return MAX(lo
 @interface TMDOverlayWindow : UIWindow
 @end
 @implementation TMDOverlayWindow
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    for (UIView *sub in self.subviews) {
-        if (!sub.hidden && sub.userInteractionEnabled &&
-            [sub pointInside:[self convertPoint:point toView:sub] withEvent:event]) {
-            return YES;
-        }
-    }
-    return NO;
+// hitTest is more reliable than pointInside alone on iOS 15+.
+// Return nil for the window/rootVC background so touches fall through to the game.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self || hit == self.rootViewController.view) return nil;
+    return hit;
 }
 @end
 
@@ -1834,12 +1833,16 @@ static void spawnMenuButton(void) {
     // rootViewController required for touch delivery on iOS 13+
     UIViewController *rootVC = [[UIViewController alloc] init];
     rootVC.view.backgroundColor = [UIColor clearColor];
-    rootVC.view.userInteractionEnabled = NO;
+    // Do NOT set userInteractionEnabled = NO here — the hitTest override on
+    // TMDOverlayWindow already passes through touches that don't land on the
+    // button. Setting it NO would block the button's own touches too.
     gOverlay.rootViewController = rootVC;
     gOverlay.hidden = NO;
 
     TMDMenuButton *btn = [[TMDMenuButton alloc] init];
-    [gOverlay addSubview:btn];
+    // Add to rootVC.view, not directly to the window — this ensures iOS 15+
+    // delivers touch events correctly through the view hierarchy.
+    [rootVC.view addSubview:btn];
 }
 
 // ─────────────────────────────────────────────
