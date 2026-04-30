@@ -143,6 +143,20 @@ static UIImage *diagonalPatternImage(void) {
 
 @end
 
+// UILabel category for letter spacing
+@interface UILabel (SLSpacing)
+@property (nonatomic) CGFloat letterSpacing;
+@end
+@implementation UILabel (SLSpacing)
+- (void)setLetterSpacing:(CGFloat)s {
+    if (!self.text) return;
+    NSMutableAttributedString *as = [[NSMutableAttributedString alloc] initWithString:self.text];
+    [as addAttribute:NSKernAttributeName value:@(s) range:NSMakeRange(0, as.length)];
+    self.attributedText = as;
+}
+- (CGFloat)letterSpacing { return 0; }
+@end
+
 // ═══════════════════════════════════════════════════════════════
 // MARK: — System Notification (Solo Leveling style)
 // ═══════════════════════════════════════════════════════════════
@@ -276,23 +290,11 @@ static UIImage *diagonalPatternImage(void) {
 
 @end
 
-// UILabel category for letter spacing
-@interface UILabel (SLSpacing)
-@property (nonatomic) CGFloat letterSpacing;
-@end
-@implementation UILabel (SLSpacing)
-- (void)setLetterSpacing:(CGFloat)s {
-    if (!self.text) return;
-    NSMutableAttributedString *as = [[NSMutableAttributedString alloc] initWithString:self.text];
-    [as addAttribute:NSKernAttributeName value:@(s) range:NSMakeRange(0, as.length)];
-    self.attributedText = as;
-}
-- (CGFloat)letterSpacing { return 0; }
-@end
-
 // ═══════════════════════════════════════════════════════════════
 // MARK: — Loading View
 // ═══════════════════════════════════════════════════════════════
+#define CLAMP(v,lo,hi) MAX((lo), MIN((hi), (v)))
+
 @interface TMDLoadingView : UIView
 @property (nonatomic, strong) UILabel *statusLbl;
 @property (nonatomic, strong) UIView  *bar;
