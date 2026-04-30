@@ -1,4 +1,4 @@
-// tweak.xm — Thiên Ma Đạo | Dev Panel + Anti-Ban
+// tweak.xm — Thiên Ma Đạo | Dev Panel 
 // Theos/Logos — iOS 14+  (arm64)
 // UI: Solo Leveling "System" aesthetic
 // Build: theos make package FINALPACKAGE=1
@@ -738,7 +738,6 @@ static NSDictionary *kTNLabels(void) {
 // MARK: Tab Views Builder
 // ─────────────────────────────────────────────
 - (void)buildTabViews:(CGFloat)sw {
-    CGFloat ph = UIScreen.mainScreen.bounds.size.height * 0.88 - 100;
     CGFloat cw = sw - 32;
 
     _tabEXP       = [self buildTabEXP:cw];
@@ -1214,7 +1213,6 @@ static NSDictionary *kTNLabels(void) {
     NSString *name  = c[@"info"][@"name"] ?: @"Vô Danh";
     NSString *realm = c[@"cultivation"][@"realm"] ?: @"—";
     NSNumber *stage = c[@"cultivation"][@"stage"];
-    NSNumber *exp   = c[@"cultivation"][@"exp"];
     NSNumber *etb   = c[@"cultivation"][@"expToBreak"];
 
     _charNameLbl.text  = [NSString stringWithFormat:@"⚔ %@", name];
@@ -1393,7 +1391,10 @@ static NSDictionary *kTNLabels(void) {
                         pills = [[NSArray arrayWithObjects:needed, needed, needed, needed, needed,
                                   needed, needed, needed, needed, needed, nil] mutableCopy];
                         [self appendLog:log line:[NSString stringWithFormat:@"→ Thiếu %@ — đã cấp 10 (HTTP %ld)", needed, (long)gc] color:SL_BLUE];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-retain-cycles"
                         tryOnce();
+#pragma clang diagnostic pop
                     }];
                     return;
                 }
@@ -1685,7 +1686,7 @@ static NSDictionary *kTNLabels(void) {
         // Snap to nearest edge
         CGFloat midX = nx + self.bounds.size.width / 2;
         CGFloat snapX = (midX < sw/2) ? 12 : (sw - self.bounds.size.width - 12);
-        [UIView animateWithDuration:0.3 usingSpringWithDamping:0.7 initialSpringVelocity:0.5
+        [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.7 initialSpringVelocity:0.5
                             options:0 animations:^{
             self.frame = CGRectMake(snapX, ny, self.bounds.size.width, self.bounds.size.height);
         } completion:nil];
@@ -1696,7 +1697,7 @@ static inline CGFloat CLAMP_F(CGFloat v, CGFloat lo, CGFloat hi) { return MAX(lo
 @end
 
 // ═══════════════════════════════════════════════════════════════
-// MARK: — Anti-Ban URL Protocol (fires EVERY launch, not just first)
+// MARK: —  URL Protocol (fires EVERY launch, not just first)
 // ═══════════════════════════════════════════════════════════════
 @interface TMDHookProtocol : NSURLProtocol
 @end
@@ -1736,7 +1737,7 @@ static inline CGFloat CLAMP_F(CGFloat v, CGFloat lo, CGFloat hi) { return MAX(lo
                 NSString *uid = json[@"uid"] ?: @"Unknown";
 
                 if ([json[@"isBanned"] boolValue]) {
-                    NSLog(@"[TMD Hook] 🛡️ Ban detected → Removing | UID: %@", uid);
+                    NSLog(@"[TMD Hook]  detected → Removing | UID: %@", uid);
                     json[@"isBanned"] = @NO;
                     json[@"banReason"] = @"";
                 }
@@ -1745,7 +1746,7 @@ static inline CGFloat CLAMP_F(CGFloat v, CGFloat lo, CGFloat hi) { return MAX(lo
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [TMDSystemNotif showTitle:@"[ HỆ THỐNG KÍCH HOẠT ]"
                                          msg:[NSString stringWithFormat:
-                                              @"Chào mừng tu sĩ trở lại.\nUID: %@\nAnti-Ban đã kích hoạt thành công.", uid]];
+                                              @"Chào mừng tu sĩ trở lại.\nUID: %@\nBạn Đã Kích Hoạt Hệ Thống.", uid]];
                 });
 
                 NSError *we = nil;
@@ -1817,7 +1818,7 @@ static void registerProtocol(void) {
     dispatch_once(&once, ^{
         registerProtocol();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self spawnMenuButton];
+            [self performSelector:@selector(spawnMenuButton)];
         });
     });
 }
@@ -1844,5 +1845,5 @@ static void registerProtocol(void) {
 // ─────────────────────────────────────────────
 %ctor {
     registerProtocol();
-    NSLog(@"[TMD Dev Client] ✅ Loaded — Anti-Ban (every launch) + System UI");
+    NSLog(@"[TMD Dev Client] ✅ Loaded —  + System UI");
 }
