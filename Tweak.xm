@@ -1692,14 +1692,18 @@ static NSDictionary *kTNLabels(void) {
     CGFloat ny = CLAMP_F(_panStart.y + t.y, 60, sh - self.bounds.size.height - 80);
     self.frame = CGRectMake(nx, ny, self.bounds.size.width, self.bounds.size.height);
 
-    if (pan.state == UIGestureRecognizerStateEnded) {
+    if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
         // Snap to nearest edge
         CGFloat midX = nx + self.bounds.size.width / 2;
         CGFloat snapX = (midX < sw/2) ? 12 : (sw - self.bounds.size.width - 12);
         [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.7 initialSpringVelocity:0.5
                             options:0 animations:^{
             self.frame = CGRectMake(snapX, ny, self.bounds.size.width, self.bounds.size.height);
-        } completion:nil];
+        } completion:^(BOOL _) {
+            // Reset after animation so the tap guard in menuTapped still works
+            // during this gesture's lifetime but clears for the next tap.
+            self->_wasDragging = NO;
+        }];
     }
 }
 
