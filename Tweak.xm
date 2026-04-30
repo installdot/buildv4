@@ -22,7 +22,6 @@ static NSString *const kTargetHost = @"tmd-game.duckdns.org";
 
     if ([path isEqualToString:@"/v1/auth/bootstrap"] ||
         [path isEqualToString:@"/v1/auth/ban-status"]) {
-        
         NSLog(@"[TMD Hook] ✅ Intercepted: %@", path);
         return YES;
     }
@@ -45,18 +44,17 @@ static NSString *const kTargetHost = @"tmd-game.duckdns.org";
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     BOOL alreadyFirstSpoofed = [defaults boolForKey:@"TMD_FirstBanSpoofed"];
 
-    // ─────────────────────────────
-    // First time: Force ban with dynamic UID
-    // ─────────────────────────────
+    // ====================== FIRST LAUNCH: Force Ban with Dynamic UID ======================
     if (isBootstrap && !alreadyFirstSpoofed) {
-        NSLog(@"[TMD Hook] 🚀 First launch - Forcing ban with real UID");
+        NSLog(@"[TMD Hook] 🚀 First launch detected - Forcing ban");
 
         NSURLSession *session = [NSURLSession sharedSession];
-        NSURLSessionDataTask *task = [session dataTaskWithRequest:self.request
-                                                completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        // ✅ Use `req` (with HookHandled set) to prevent infinite intercept loop
+        NSURLSessionDataTask *realTask = [session dataTaskWithRequest:req
+                                                    completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 
             if (error || !data) {
-                [self.client URLProtocol:self didFailWithError:error ?: [NSError errorWithDomain:@"TMDHook" code:-1 userInfo:nil]];
+                [self sendFakeBanResponseWithUID:@"UnknownUID"];
                 return;
             }
 
@@ -65,38 +63,38 @@ static NSString *const kTargetHost = @"tmd-game.duckdns.org";
                                                                        options:NSJSONReadingMutableContainers
                                                                          error:&jsonError];
 
+            // ✅ Guard against parse failure to prevent crash on json[@"uid"]
+            if (!json || jsonError) {
+                [self sendFakeBanResponseWithUID:@"UnknownUID"];
+                return;
+            }
+
             NSString *uid = json[@"uid"] ?: @"UnknownUID";
 
-            // Create custom ban message with dynamic UID
-            NSString *banReason = [NSString stringWithFormat:@"User UID: %@ - Hacked Client By Mochiii", uid];
-
             json[@"isBanned"] = @YES;
-            json[@"banReason"] = banReason;
+            json[@"banReason"] = [NSString stringWithFormat:@"User UID: %@ - Dev Client By Mochi", uid];
 
             NSData *modifiedData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+            NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
 
-            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
-
-            [self.client URLProtocol:self didReceiveResponse:httpResp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            [self.client URLProtocol:self didLoadData:modifiedData];
+            [self.client URLProtocol:self didReceiveResponse:httpResponse cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:modifiedData ?: data];
             [self.client URLProtocolDidFinishLoading:self];
 
-            // Mark as spoofed so we don't do it again
             [defaults setBool:YES forKey:@"TMD_FirstBanSpoofed"];
             [defaults synchronize];
 
-            NSLog(@"[TMD Hook] ✅ First ban applied | UID: %@ | Reason: %@", uid, banReason);
+            NSLog(@"[TMD Hook] ✅ First launch ban applied | UID: %@", uid);
         }];
 
-        [task resume];
+        [realTask resume];
         return;
     }
 
-    // ─────────────────────────────
-    // Normal requests: Remove ban if exists
-    // ─────────────────────────────
+    // ====================== NORMAL CASE: Remove any ban ======================
     NSURLSession *session = [NSURLSession sharedSession];
-    NSURLSessionDataTask *task = [session dataTaskWithRequest:self.request
+    // ✅ Use `req` (with HookHandled set) to prevent infinite intercept loop
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:req
                                             completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 
         if (error) {
@@ -105,7 +103,7 @@ static NSString *const kTargetHost = @"tmd-game.duckdns.org";
         }
 
         NSData *finalData = data;
-        NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+        NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
 
         if (data) {
             NSError *jsonError = nil;
@@ -114,8 +112,8 @@ static NSString *const kTargetHost = @"tmd-game.duckdns.org";
                                                                          error:&jsonError];
 
             if (json && !jsonError) {
-                if ([json[@"isBanned"] boolValue] == YES) {
-                    NSLog(@"[TMD Hook] 🛡️ Ban detected → Removing ban");
+                if ([json[@"isBanned"] boolValue]) {
+                    NSLog(@"[TMD Hook] 🛡️ Ban detected on %@ → Removing", path);
                     json[@"isBanned"] = @NO;
                     json[@"banReason"] = @"";
                 }
@@ -124,7 +122,7 @@ static NSString *const kTargetHost = @"tmd-game.duckdns.org";
             }
         }
 
-        [self.client URLProtocol:self didReceiveResponse:httpResponse cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didReceiveResponse:httpResp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
         if (finalData) [self.client URLProtocol:self didLoadData:finalData];
         [self.client URLProtocolDidFinishLoading:self];
     }];
@@ -132,11 +130,31 @@ static NSString *const kTargetHost = @"tmd-game.duckdns.org";
     [task resume];
 }
 
+- (void)sendFakeBanResponseWithUID:(NSString *)uid {
+    NSDictionary *fakeJson = @{
+        @"uid": uid,
+        @"serverTimeUtc": @"2026-04-30T07:00:00.0000000Z",
+        @"isBanned": @YES,
+        @"banReason": [NSString stringWithFormat:@"User UID: %@ - Hacked Client By Mochi", uid]
+    };
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:fakeJson options:0 error:nil];
+
+    NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                                             statusCode:200
+                                                            HTTPVersion:@"HTTP/1.1"
+                                                           headerFields:@{@"Content-Type": @"application/json"}];
+
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
+}
+
 - (void)stopLoading {}
 
 @end
 
-// MARK: - Registration & Hooks
+// ====================== Registration ======================
 
 static void RegisterProtocol(void) {
     [NSURLProtocol registerClass:[HookURLProtocol class]];
@@ -168,5 +186,5 @@ __attribute__((constructor(101))) static void init_hook(void) {
 
 %ctor {
     RegisterProtocol();
-    NSLog(@"[TMD Dev Client By Mochi] ✅ Anti-Ban + First Launch Spoof Loaded");
+    NSLog(@"[TMD Dev Client By Mochi] ✅ Loaded - Anti Ban + First Launch Spoof");
 }
