@@ -1830,6 +1830,7 @@ static void spawnMenuButton(void) {
     if (!scene) return;
 
     gOverlay = [[TMDOverlayWindow alloc] initWithWindowScene:scene];
+    gOverlay.frame = UIScreen.mainScreen.bounds;   // ← REQUIRED: zero frame = no hit-testing
     gOverlay.windowLevel = UIWindowLevelAlert + 100;
     gOverlay.backgroundColor = [UIColor clearColor];
     gOverlay.userInteractionEnabled = YES;
@@ -1837,6 +1838,8 @@ static void spawnMenuButton(void) {
     // rootViewController required for touch delivery on iOS 13+
     UIViewController *rootVC = [[UIViewController alloc] init];
     rootVC.view.backgroundColor = [UIColor clearColor];
+    rootVC.view.frame = gOverlay.bounds;
+    rootVC.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     // Do NOT set userInteractionEnabled = NO here — the hitTest override on
     // TMDOverlayWindow already passes through touches that don't land on the
     // button. Setting it NO would block the button's own touches too.
