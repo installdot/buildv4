@@ -448,7 +448,6 @@ static UIImage *diagonalPatternImage(void) {
     UIView *pad = [[UIView alloc] initWithFrame:CGRectMake(0,0,12,0)];
     self.leftView = pad;
     self.leftViewMode = UITextFieldViewModeAlways;
-    NSDictionary *ph = @{ NSForegroundColorAttributeName: SL_MUTED, NSFontAttributeName: SLFont(14, NO) };
     return self;
 }
 - (CGRect)textRect:(CGRect)bounds            { return CGRectInset(bounds, 12, 0); }
