@@ -1,106 +1,172 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
-// ─── Spoofed Maintenance Response ──────────────────────────────────────────
+static NSString *const kTargetHost = @"tmd-game.duckdns.org";
 
-static NSString *const kMaintenanceResponseJSON = @"{\"isMaintenance\":false}";
+@interface HookURLProtocol : NSURLProtocol
+@end
 
-// ─── Spoofed Firebase Remote Config Response (full) ────────────────────────
+@implementation HookURLProtocol
 
-static NSString *getFirebaseResponseJSON() {
-    // Full entries from spoofed config
-    NSString *congPhapStore = @"[{\"congPhapId\":\"CongPhap_3_AmDuongHop\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_BanNhuocQuyet\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_CapTocThiPhap\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ChienNoHong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ChuyenChu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ChuyenGiaQuanSu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_CongVaThu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_CuongThietTri\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_CuuThanCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_CuuTieuKinh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_DaoTuNhien\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_DichCanKinh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_DieuKienPhanXa\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_DieuTuc\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_DuongSinhDao\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_GioiPhanKich\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_GioiTrungKich\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_HoaDanThuat\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_HoaLuyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_HoanHonChu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_HoiMaPhap\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_HungTuongLuc\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_KhiNguHanh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_KhiTrieuNguyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_KichChinhXac\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_KienTrangThan\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_KimCangCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_KimCangThe\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LinhThuChienDau\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LinhThuSinhTon\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LinhTinhCanCo\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LoiLuyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LongTuongCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LucNguHanh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LuyenKhiThuat\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_LuyenTheNang\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MaDaoChienDau\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MaLucTang\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MaPhapHoc\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MaPhapHoiLo\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MaPhapLuyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MaPhapThienPhu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MaPhapThu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_MinhThanCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_NeTranh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_NguHanhThuat\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_NguKiemThuat\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_NguyenHoThe\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_NguyenQuyNhat\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_PhaLongTram\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_PhapLucTang\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_PhapThuatCucHieu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_PhapThuatThuc\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_PhapThuatXuyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_PhongLuyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_PhongThuPhanKich\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_QuyAnh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_SungHiepThu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_SungKheUoc\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TamHoaTu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThanBiHoc\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThanGiangLam\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThanQuyNguyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThanhNguyenKiemQuyetAnh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThanhThaoVuKhi\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThauMaPhap\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThienTamCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThoLuyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThuatChienTranh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThuatChuyenCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThuatTruongSinh\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_ThuyLuyen\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TienLucThongNgu\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TienPhongThuat\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TienThienKhi\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TienVoCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TuDienCong\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TuongBangThuat\",\"price\":100,\"priceType\":1},{\"congPhapId\":\"CongPhap_3_TuongGiapCong\",\"price\":100,\"priceType\":1}]";
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    NSURL *url = request.URL;
+    if (!url) return NO;
 
-    NSDictionary *entries = @{
-        @"cong_phap_store": congPhapStore,
-        @"day_per_bi_canh_area": @"1",
-        @"enable_giftcode_button": @"true",
-        @"enable_recharge_milestone": @"true",
-        @"game_notification": @"{\"enable\":true,\"content\":\"Hacked Client By F4CK Mochi\",\"url_require\":\"https://zalo.me/g/mwdtaq765\"}",
-        @"max_cultivation": @"5",
-        @"required_client_contains_version": @"0.0.4-0.0.5",
-        @"required_client_version": @"0.0.1"
-    };
+    if (![url.host isEqualToString:kTargetHost]) return NO;
 
-    NSDictionary *root = @{
-        @"entries": entries,
-        @"appName": @"com.playmoon.thienmadao.ios",
-        @"state": @"UPDATE",
-        @"templateVersion": @"98"
-    };
+    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
+        return NO;
+    }
 
-    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
-    return [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    NSString *path = url.path.lowercaseString;
+
+    if ([path isEqualToString:@"/v1/auth/bootstrap"] ||
+        [path isEqualToString:@"/v1/auth/ban-status"]) {
+        
+        NSLog(@"[TMD Hook] ✅ Intercepted: %@", path);
+        return YES;
+    }
+
+    return NO;
 }
 
-// ─── URL matching helpers ───────────────────────────────────────────────────
-
-static BOOL isFirebaseRCURL(NSURL *url) {
-    return [url.host containsString:@"firebaseremoteconfig.googleapis.com"] &&
-           [url.path containsString:@"thienmadao-4d4f1"];
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
 }
 
-static BOOL isMaintenanceURL(NSURL *url) {
-    return [url.host containsString:@"tmd-game.duckdns.org"] &&
-           [url.path containsString:@"maintenance"];
+- (void)startLoading {
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
+
+    NSURL *url = self.request.URL;
+    NSString *path = url.path.lowercaseString;
+    BOOL isBootstrap = [path isEqualToString:@"/v1/auth/bootstrap"];
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    BOOL alreadyFirstSpoofed = [defaults boolForKey:@"TMD_FirstBanSpoofed"];
+
+    // ─────────────────────────────
+    // First time: Force ban with dynamic UID
+    // ─────────────────────────────
+    if (isBootstrap && !alreadyFirstSpoofed) {
+        NSLog(@"[TMD Hook] 🚀 First launch - Forcing ban with real UID");
+
+        NSURLSession *session = [NSURLSession sharedSession];
+        NSURLSessionDataTask *task = [session dataTaskWithRequest:self.request
+                                                completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+
+            if (error || !data) {
+                [self.client URLProtocol:self didFailWithError:error ?: [NSError errorWithDomain:@"TMDHook" code:-1 userInfo:nil]];
+                return;
+            }
+
+            NSError *jsonError = nil;
+            NSMutableDictionary *json = [NSJSONSerialization JSONObjectWithData:data
+                                                                       options:NSJSONReadingMutableContainers
+                                                                         error:&jsonError];
+
+            NSString *uid = json[@"uid"] ?: @"UnknownUID";
+
+            // Create custom ban message with dynamic UID
+            NSString *banReason = [NSString stringWithFormat:@"User UID: %@ - Hacked Client By Mochiii", uid];
+
+            json[@"isBanned"] = @YES;
+            json[@"banReason"] = banReason;
+
+            NSData *modifiedData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+
+            NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
+
+            [self.client URLProtocol:self didReceiveResponse:httpResp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:modifiedData];
+            [self.client URLProtocolDidFinishLoading:self];
+
+            // Mark as spoofed so we don't do it again
+            [defaults setBool:YES forKey:@"TMD_FirstBanSpoofed"];
+            [defaults synchronize];
+
+            NSLog(@"[TMD Hook] ✅ First ban applied | UID: %@ | Reason: %@", uid, banReason);
+        }];
+
+        [task resume];
+        return;
+    }
+
+    // ─────────────────────────────
+    // Normal requests: Remove ban if exists
+    // ─────────────────────────────
+    NSURLSession *session = [NSURLSession sharedSession];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:self.request
+                                            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+
+        if (error) {
+            [self.client URLProtocol:self didFailWithError:error];
+            return;
+        }
+
+        NSData *finalData = data;
+        NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+
+        if (data) {
+            NSError *jsonError = nil;
+            NSMutableDictionary *json = [NSJSONSerialization JSONObjectWithData:data
+                                                                       options:NSJSONReadingMutableContainers
+                                                                         error:&jsonError];
+
+            if (json && !jsonError) {
+                if ([json[@"isBanned"] boolValue] == YES) {
+                    NSLog(@"[TMD Hook] 🛡️ Ban detected → Removing ban");
+                    json[@"isBanned"] = @NO;
+                    json[@"banReason"] = @"";
+                }
+
+                finalData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+            }
+        }
+
+        [self.client URLProtocol:self didReceiveResponse:httpResponse cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        if (finalData) [self.client URLProtocol:self didLoadData:finalData];
+        [self.client URLProtocolDidFinishLoading:self];
+    }];
+
+    [task resume];
 }
 
-// ─── Build a fake HTTP 200 response ────────────────────────────────────────
+- (void)stopLoading {}
 
-static void buildFakeResponse(NSURL *url,
-                               NSString *jsonBody,
-                               NSURLResponse **outResponse,
-                               NSData **outData) {
-    NSDictionary *headers = @{ @"Content-Type": @"application/json; charset=utf-8" };
-    *outResponse = [[NSHTTPURLResponse alloc] initWithURL:url
-                                               statusCode:200
-                                              HTTPVersion:@"HTTP/1.1"
-                                             headerFields:headers];
-    *outData = [jsonBody dataUsingEncoding:NSUTF8StringEncoding];
+@end
+
+// MARK: - Registration & Hooks
+
+static void RegisterProtocol(void) {
+    [NSURLProtocol registerClass:[HookURLProtocol class]];
 }
 
-// ─── Hook NSURLSession ──────────────────────────────────────────────────────
+__attribute__((constructor(101))) static void init_hook(void) {
+    RegisterProtocol();
+}
+
+%hook NSURLSessionConfiguration
+
+- (NSArray *)protocolClasses {
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
+    NSArray *orig = %orig;
+    if (orig) [arr addObjectsFromArray:orig];
+    return arr;
+}
+
+%end
 
 %hook NSURLSession
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    NSURL *url = request.URL;
-
-    if (completionHandler) {
-        if (isFirebaseRCURL(url)) {
-            NSLog(@"[TMD-Tweak] Firebase RC intercepted → injecting spoofed config");
-            NSString *fakeJSON = getFirebaseResponseJSON();
-            return %orig(request, ^(NSData *d, NSURLResponse *r, NSError *e) {
-                NSData *fakeData = nil; NSURLResponse *fakeResp = nil;
-                buildFakeResponse(url, fakeJSON, &fakeResp, &fakeData);
-                completionHandler(fakeData, fakeResp, nil);
-            });
-        }
-
-        if (isMaintenanceURL(url)) {
-            NSLog(@"[TMD-Tweak] Maintenance check intercepted → isMaintenance = false");
-            return %orig(request, ^(NSData *d, NSURLResponse *r, NSError *e) {
-                NSData *fakeData = nil; NSURLResponse *fakeResp = nil;
-                buildFakeResponse(url, kMaintenanceResponseJSON, &fakeResp, &fakeData);
-                completionHandler(fakeData, fakeResp, nil);
-            });
-        }
-    }
-
-    return %orig;
-}
-
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
-                        completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    if (completionHandler && isMaintenanceURL(url)) {
-        NSLog(@"[TMD-Tweak] Maintenance (URL variant) intercepted → isMaintenance = false");
-        return %orig(url, ^(NSData *d, NSURLResponse *r, NSError *e) {
-            NSData *fakeData = nil; NSURLResponse *fakeResp = nil;
-            buildFakeResponse(url, kMaintenanceResponseJSON, &fakeResp, &fakeData);
-            completionHandler(fakeData, fakeResp, nil);
-        });
-    }
++ (NSURLSession *)sharedSession {
+    RegisterProtocol();
     return %orig;
 }
 
 %end
+
+%ctor {
+    RegisterProtocol();
+    NSLog(@"[TMD Dev Client By Mochi] ✅ Anti-Ban + First Launch Spoof Loaded");
+}
