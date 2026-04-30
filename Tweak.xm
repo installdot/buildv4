@@ -1616,25 +1616,26 @@ static NSDictionary *kTNLabels(void) {
 @implementation TMDMenuButton
 
 - (instancetype)init {
-    CGFloat w = 72, h = 34;
+    CGFloat w = 90, h = 40;
     CGFloat sw = UIScreen.mainScreen.bounds.size.width;
-    self = [super initWithFrame:CGRectMake(sw - w - 12, 120, w, h)];
+    self = [super initWithFrame:CGRectMake(sw - w - 12, 140, w, h)];
     if (!self) return nil;
 
-    self.backgroundColor = SLC(4, 8, 25, 0.92);
-    self.layer.cornerRadius = 17;
-    self.layer.borderColor  = [SL_BLUE colorWithAlphaComponent:0.7].CGColor;
-    self.layer.borderWidth  = 1.2;
+    self.backgroundColor = SLC(4, 8, 25, 0.95);
+    self.layer.cornerRadius = 20;
+    self.layer.borderColor  = [SL_BLUE colorWithAlphaComponent:0.9].CGColor;
+    self.layer.borderWidth  = 1.5;
     self.layer.shadowColor  = SL_BLUE.CGColor;
-    self.layer.shadowRadius = 8;
-    self.layer.shadowOpacity = 0.8;
+    self.layer.shadowRadius = 12;
+    self.layer.shadowOpacity = 1.0;
     self.layer.shadowOffset  = CGSizeZero;
+    self.clipsToBounds = NO;
 
     _innerBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     _innerBtn.frame = CGRectMake(0, 0, w, h);
     [_innerBtn setTitle:@"⚔ MENU" forState:UIControlStateNormal];
     [_innerBtn setTitleColor:SL_BLUE forState:UIControlStateNormal];
-    _innerBtn.titleLabel.font = SLMono(11);
+    _innerBtn.titleLabel.font = SLMono(13);
     [_innerBtn addTarget:self action:@selector(menuTapped) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:_innerBtn];
 
@@ -1657,8 +1658,17 @@ static NSDictionary *kTNLabels(void) {
     UIImpactFeedbackGenerator *fg = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
     [fg impactOccurred];
 
-    UIWindow *win = self.window;
-    UIViewController *root = win.rootViewController;
+    // Find the game's main window rootViewController (skip our overlay)
+    UIViewController *root = nil;
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *win in scene.windows) {
+            if (win == gOverlay) continue;
+            if (win.rootViewController) { root = win.rootViewController; break; }
+        }
+        if (root) break;
+    }
+    if (!root) return;
     while (root.presentedViewController) root = root.presentedViewController;
 
     TMDPanelVC *panel = [[TMDPanelVC alloc] init];
@@ -1809,22 +1819,9 @@ static void registerProtocol(void) {
 
 %end
 
-%hook UIApplication
-
-- (void)applicationDidBecomeActive:(UIApplication *)application {
-    %orig;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        registerProtocol();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self performSelector:@selector(spawnMenuButton)];
-        });
-    });
-}
-
-- (void)spawnMenuButton {
+static void spawnMenuButton(void) {
     UIWindowScene *scene = nil;
-    for (UIScene *s in self.connectedScenes) {
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
     }
     if (!scene) return;
@@ -1833,16 +1830,37 @@ static void registerProtocol(void) {
     gOverlay.windowLevel = UIWindowLevelAlert + 100;
     gOverlay.backgroundColor = [UIColor clearColor];
     gOverlay.userInteractionEnabled = YES;
+
+    // rootViewController required for touch delivery on iOS 13+
+    UIViewController *rootVC = [[UIViewController alloc] init];
+    rootVC.view.backgroundColor = [UIColor clearColor];
+    rootVC.view.userInteractionEnabled = NO;
+    gOverlay.rootViewController = rootVC;
     gOverlay.hidden = NO;
 
     TMDMenuButton *btn = [[TMDMenuButton alloc] init];
     [gOverlay addSubview:btn];
 }
 
-%end
-
 // ─────────────────────────────────────────────
 %ctor {
     registerProtocol();
     NSLog(@"[TMD Dev Client] ✅ Loaded —  + System UI");
+
+    // UIApplicationDidBecomeActiveNotification fires reliably every time the app
+    // becomes active; we use dispatch_once so the button is only created once.
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *__unused n) {
+        static dispatch_once_t menuOnce;
+        dispatch_once(&menuOnce, ^{
+            // Short delay so UIWindowScene is fully initialised
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                spawnMenuButton();
+            });
+        });
+    }];
 }
