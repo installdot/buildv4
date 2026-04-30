@@ -1642,6 +1642,8 @@ static NSDictionary *kTNLabels(void) {
 
     // Drag gesture
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    pan.cancelsTouchesInView = NO;   // FIX: don't cancel _innerBtn's TouchUpInside
+    pan.delaysTouchesBegan   = NO;   // FIX: let button receive touches immediately
     [self addGestureRecognizer:pan];
 
     // Pulse animation
@@ -1655,7 +1657,7 @@ static NSDictionary *kTNLabels(void) {
 }
 
 - (void)menuTapped {
-    if (_wasDragging) return;
+    if (_wasDragging) { _wasDragging = NO; return; }   // FIX: also clear stuck flag
     UIImpactFeedbackGenerator *fg = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
     [fg impactOccurred];
 
@@ -1669,13 +1671,16 @@ static NSDictionary *kTNLabels(void) {
         }
         if (root) break;
     }
+    // FIX: fall back to overlay's own rootVC (handles Unity / non-standard windows)
+    if (!root) root = gOverlay.rootViewController;
     if (!root) return;
+
     while (root.presentedViewController) root = root.presentedViewController;
 
     TMDPanelVC *panel = [[TMDPanelVC alloc] init];
     panel.modalPresentationStyle = UIModalPresentationOverFullScreen;
     panel.modalTransitionStyle   = UIModalTransitionStyleCrossDissolve;
-    [root presentViewController:panel animated:NO completion:nil];
+    [root presentViewController:panel animated:YES completion:nil];
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
