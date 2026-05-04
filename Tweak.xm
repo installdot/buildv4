@@ -1,48 +1,74 @@
-// Tweak.xm
-// Intercepts:
-//   tmd-game.duckdns.org  – maintenance + bootstrap
-//   firebaseremoteconfig.googleapis.com – remote config patch
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 
-// ─────────────────────────────────────────────────────────────────────────────
-#pragma mark - Constants
-// ─────────────────────────────────────────────────────────────────────────────
+static NSString *const kTargetHost = @"api.cheatiosvip.vn";
+static NSString *const kTargetPath = @"/api.php";
 
-static NSString *const kTMDHost          = @"tmd-game.duckdns.org";
-static NSString *const kPathMaintenance  = @"/v1/servers/server001/maintenance";
-static NSString *const kPathBootstrap    = @"/v1/auth/bootstrap";
-
-static NSString *const kFirebaseHost     = @"firebaseremoteconfig.googleapis.com";
-static NSString *const kFirebasePath     = @"/v1/projects/thienmadao-4d4f1/namespaces/firebase:fetch";
-
-static BOOL sBootstrapFired = NO;
-
-// ─────────────────────────────────────────────────────────────────────────────
-#pragma mark - Shared registration
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void RegisterAllProtocols(void);   // forward decl
-
-// ─────────────────────────────────────────────────────────────────────────────
-#pragma mark - TMD Game Protocol
-// ─────────────────────────────────────────────────────────────────────────────
-
-@interface TMDHookProtocol : NSURLProtocol
+@interface HookURLProtocol : NSURLProtocol
 @end
 
-@implementation TMDHookProtocol
+@implementation HookURLProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     NSURL *url = request.URL;
     if (!url) return NO;
-    if (![url.host isEqualToString:kTMDHost]) return NO;
-    if ([NSURLProtocol propertyForKey:@"TMDHandled" inRequest:request]) return NO;
 
-    NSString *path = url.path;
-    return [path isEqualToString:kPathMaintenance] ||
-           [path isEqualToString:kPathBootstrap];
+    BOOL isTarget =
+        [url.host isEqualToString:kTargetHost] &&
+        [url.path isEqualToString:kTargetPath];
+
+    if (!isTarget) return NO;
+
+    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
+        return NO;
+    }
+
+    NSString *method = request.HTTPMethod.uppercaseString;
+
+    // ───────── GET notifications ─────────
+    if ([method isEqualToString:@"GET"]) {
+        NSString *query = url.query ?: @"";
+        if ([query containsString:@"action=get_notifications"]) {
+            NSLog(@"[Hook] ✅ Notifications request detected");
+            return YES;
+        }
+    }
+
+    // ───────── POST (all actions) ─────────
+    if ([method isEqualToString:@"POST"]) {
+        NSData *bodyData = request.HTTPBody;
+
+        if (!bodyData && request.HTTPBodyStream) {
+            NSInputStream *stream = request.HTTPBodyStream;
+            NSMutableData *data = [NSMutableData data];
+
+            [stream open];
+            uint8_t buffer[1024];
+            NSInteger len;
+
+            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+                [data appendBytes:buffer length:len];
+            }
+
+            [stream close];
+            bodyData = data;
+        }
+
+        if (!bodyData) return NO;
+
+        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+        if (!body) return NO;
+
+        NSLog(@"[Hook] POST Body: %@", body);
+
+        if ([body containsString:@"action=validate"] ||
+            [body containsString:@"action=check_kill_switch_v2"]) {
+            NSLog(@"[Hook] ✅ POST action detected");
+            return YES;
+        }
+    }
+
+    return NO;
 }
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
@@ -50,63 +76,119 @@ static void RegisterAllProtocols(void);   // forward decl
 }
 
 - (void)startLoading {
-    NSString *path = self.request.URL.path;
-    NSDictionary *json = nil;
 
-    if ([path isEqualToString:kPathMaintenance]) {
-        json = @{ @"isMaintenance": @NO };
-        NSLog(@"[TMDHook] → Maintenance override: false");
-    }
-    else if ([path isEqualToString:kPathBootstrap]) {
-        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        fmt.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss.SSSSSSS'Z'";
-        fmt.timeZone = [NSTimeZone timeZoneWithName:@"UTC"];
-        NSString *nowString = [fmt stringFromDate:[NSDate date]];
-        NSString *uid = @"NRdxit8cyKXIG9alQGBk970luxb2";
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
-        if (!sBootstrapFired) {
-            sBootstrapFired = YES;
-            json = @{
-                @"uid":           uid,
-                @"serverTimeUtc": nowString,
-                @"isBanned":      @YES,
-                @"banReason":     @"Anti-Ban 2.0 Bypass F4CK - Antiban chứ đ phải anti xoá dữ liệu acc"
+    NSURL *url = self.request.URL;
+    NSString *method = self.request.HTTPMethod.uppercaseString;
+
+    NSData *data = nil;
+
+    // ───────── GET spoof ─────────
+    if ([method isEqualToString:@"GET"]) {
+        NSString *query = url.query ?: @"";
+
+        if ([query containsString:@"action=get_notifications"]) {
+
+            NSDictionary *json = @{
+                @"success": @YES,
+                @"count": @1,
+                @"notifications": @[
+                    @{
+                        @"id": @7,
+                        @"title": @"Óc Cảnh iOS làm anti crack như cc đéo biết mã hoá payload",
+                        @"message": @"Crack by Hải",
+                        @"time": @"09/12/2025",
+                        @"priority": @2,
+                        @"created_at": @"2025-12-09 17:06:20"
+                    }
+                ]
             };
-            NSLog(@"[TMDHook] → Bootstrap (1st): banned");
-        } else {
-            json = @{
-                @"uid":           uid,
-                @"serverTimeUtc": nowString,
-                @"isBanned":      @NO,
-                @"banReason":     @""
-            };
-            NSLog(@"[TMDHook] → Bootstrap (repeat): clean");
+
+            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
         }
     }
 
-    if (!json) {
-        [self.client URLProtocol:self didFailWithError:
-            [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorUnknown userInfo:nil]];
-        return;
+    // ───────── POST spoof (ALL IN ONE) ─────────
+    if (!data && [method isEqualToString:@"POST"]) {
+
+        NSData *bodyData = self.request.HTTPBody;
+
+        if (!bodyData && self.request.HTTPBodyStream) {
+            NSInputStream *stream = self.request.HTTPBodyStream;
+            NSMutableData *dataStream = [NSMutableData data];
+
+            [stream open];
+            uint8_t buffer[1024];
+            NSInteger len;
+
+            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+                [dataStream appendBytes:buffer length:len];
+            }
+
+            [stream close];
+            bodyData = dataStream;
+        }
+
+        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+
+        // ───────── 1. Kill switch (PRIORITY) ─────────
+        if ([body containsString:@"action=check_kill_switch_v2"]) {
+
+            NSDictionary *json = @{
+                @"success": @NO,
+                @"killed": @NO,
+                @"message": @"Service active",
+                @"server_time": @"2026-05-04 12:36:28"
+            };
+
+            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+
+            NSLog(@"[Hook] 🔥 Kill switch spoofed");
+        }
+
+        // ───────── 2. Validate ─────────
+        else if ([body containsString:@"action=validate"] &&
+                 [body containsString:@"key="] &&
+                 [body containsString:@"hwid="]) {
+
+            NSDictionary *json = @{
+                @"success": @YES,
+                @"message": @"License validated successfully",
+                @"data": @{
+                    @"subscription_type": @"daily",
+                    @"expiry_date": @"2026-03-24 17:41:33",
+                    @"remaining_days": @0,
+                    @"remaining_hours": @22,
+                    @"activated_at": @"2026-03-23 17:41:33",
+                    @"is_trial": @NO,
+                    @"is_pro": @1
+                }
+            };
+
+            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+
+            NSLog(@"[Hook] ✅ Validate spoofed");
+        }
     }
 
-    [self sendJSON:json];
-}
+    // ───────── FAILSAFE (avoid crash) ─────────
+    if (!data) {
+        data = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
+    }
 
-- (void)sendJSON:(NSDictionary *)json {
-    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-    NSHTTPURLResponse *resp =
+    // ───────── RESPONSE ─────────
+    NSHTTPURLResponse *response =
         [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
                                     statusCode:200
                                    HTTPVersion:@"HTTP/1.1"
                                   headerFields:@{
-                                      @"Content-Type":   @"application/json",
-                                      @"Content-Length": [NSString stringWithFormat:@"%lu",
-                                                          (unsigned long)data.length]
+                                      @"Content-Type": @"application/json",
+                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
                                   }];
-    [self.client URLProtocol:self didReceiveResponse:resp
-          cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     [self.client URLProtocol:self didLoadData:data];
     [self.client URLProtocolDidFinishLoading:self];
 }
@@ -115,156 +197,20 @@ static void RegisterAllProtocols(void);   // forward decl
 
 @end
 
-// ─────────────────────────────────────────────────────────────────────────────
-#pragma mark - Firebase Remote Config Protocol  (pass-through + patch)
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────── REGISTER ─────────
 
-@interface FirebaseConfigHookProtocol : NSURLProtocol
-@property (nonatomic, strong) NSURLSessionDataTask *realTask;
-@end
-
-@implementation FirebaseConfigHookProtocol
-
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    NSURL *url = request.URL;
-    if (!url) return NO;
-    if (![url.host isEqualToString:kFirebaseHost]) return NO;
-    if (![url.path isEqualToString:kFirebasePath]) return NO;
-    if ([NSURLProtocol propertyForKey:@"FBHandled" inRequest:request]) return NO;
-    NSLog(@"[FBHook] ✅ Intercepting Firebase Remote Config");
-    return YES;
-}
-
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
-
-- (void)startLoading {
-    // Build a real copy of the request (marked so we don't re-intercept it)
-    NSMutableURLRequest *real = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"FBHandled" inRequest:real];
-
-    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    // Insert our protocol so NSURLSession doesn't strip it, but FBHandled prevents re-entry
-    NSMutableArray *protos = [NSMutableArray arrayWithObject:[FirebaseConfigHookProtocol class]];
-    if (cfg.protocolClasses) [protos addObjectsFromArray:cfg.protocolClasses];
-    cfg.protocolClasses = protos;
-
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-
-    __weak typeof(self) weakSelf = self;
-    self.realTask = [session dataTaskWithRequest:real
-                               completionHandler:^(NSData *data,
-                                                   NSURLResponse *response,
-                                                   NSError *error) {
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self) return;
-
-        if (error || !data) {
-            NSLog(@"[FBHook] Real request failed: %@", error);
-            [self.client URLProtocol:self didFailWithError:error ?: 
-                [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorUnknown userInfo:nil]];
-            return;
-        }
-
-        // ── Parse real response ──
-        NSMutableDictionary *root = nil;
-        NSError *parseErr = nil;
-        id parsed = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&parseErr];
-
-        if ([parsed isKindOfClass:[NSMutableDictionary class]]) {
-            root = (NSMutableDictionary *)parsed;
-        } else {
-            // Unexpected shape — pass through unmodified
-            NSLog(@"[FBHook] ⚠️ Unexpected response shape, passing through");
-            [self.client URLProtocol:self didReceiveResponse:response
-                  cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-            [self.client URLProtocol:self didLoadData:data];
-            [self.client URLProtocolDidFinishLoading:self];
-            return;
-        }
-
-        // ── Patch entries ──
-        // Firebase Remote Config wraps values inside "entries" dict
-        NSMutableDictionary *entries = root[@"entries"];
-        if (![entries isKindOfClass:[NSMutableDictionary class]]) {
-            entries = [NSMutableDictionary dictionary];
-            root[@"entries"] = entries;
-        }
-
-        // 1. Milestone — always enabled
-        entries[@"enable_recharge_milestone"] = @"true";
-
-        // 2. Game notification — override content + url, keep enable:true
-        NSDictionary *notifPatch = @{
-            @"enable":      @YES,
-            @"content":     @"Hacked Client By F4CK",
-            @"url_require": @"https://t.me/F4ckCheat"
-        };
-        NSData *notifData = [NSJSONSerialization dataWithJSONObject:notifPatch options:0 error:nil];
-        NSString *notifString = [[NSString alloc] initWithData:notifData encoding:NSUTF8StringEncoding];
-        entries[@"game_notification"] = notifString;
-
-        NSLog(@"[FBHook] ✅ Patched entries: %@", entries);
-
-        // ── Serialise patched response ──
-        NSData *patched = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
-        if (!patched) patched = data;   // fallback
-
-        NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
-        NSMutableDictionary *headers = [httpResp.allHeaderFields mutableCopy] ?: [NSMutableDictionary dictionary];
-        headers[@"Content-Type"]   = @"application/json";
-        headers[@"Content-Length"] = [NSString stringWithFormat:@"%lu", (unsigned long)patched.length];
-
-        NSHTTPURLResponse *newResp =
-            [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
-                                        statusCode:httpResp.statusCode
-                                       HTTPVersion:@"HTTP/1.1"
-                                      headerFields:headers];
-
-        [self.client URLProtocol:self didReceiveResponse:newResp
-              cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-        [self.client URLProtocol:self didLoadData:patched];
-        [self.client URLProtocolDidFinishLoading:self];
-    }];
-
-    [self.realTask resume];
-}
-
-- (void)stopLoading {
-    [self.realTask cancel];
-}
-
-@end
-
-// ─────────────────────────────────────────────────────────────────────────────
-#pragma mark - Registration
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void RegisterAllProtocols(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        [NSURLProtocol registerClass:[TMDHookProtocol class]];
-        [NSURLProtocol registerClass:[FirebaseConfigHookProtocol class]];
-        NSLog(@"[Hook] All protocols registered");
-    });
+static void RegisterProtocol(void) {
+    [NSURLProtocol registerClass:[HookURLProtocol class]];
 }
 
 __attribute__((constructor(101))) static void init_hook(void) {
-    RegisterAllProtocols();
+    RegisterProtocol();
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-#pragma mark - NSURLSessionConfiguration hook (covers custom sessions)
-// ─────────────────────────────────────────────────────────────────────────────
 
 %hook NSURLSessionConfiguration
 
 - (NSArray *)protocolClasses {
-    NSMutableArray *arr = [NSMutableArray arrayWithObjects:
-        [TMDHookProtocol class],
-        [FirebaseConfigHookProtocol class],
-        nil];
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
     NSArray *orig = %orig;
     if (orig) [arr addObjectsFromArray:orig];
     return arr;
@@ -275,18 +221,18 @@ __attribute__((constructor(101))) static void init_hook(void) {
 %hook NSURLSession
 
 + (NSURLSession *)sharedSession {
-    RegisterAllProtocols();
+    RegisterProtocol();
     return %orig;
 }
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    RegisterAllProtocols();
+    RegisterProtocol();
     return %orig;
 }
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))h {
-    RegisterAllProtocols();
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    RegisterProtocol();
     return %orig;
 }
 
@@ -295,12 +241,12 @@ __attribute__((constructor(101))) static void init_hook(void) {
 %hook NSURLConnection
 
 + (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
-    RegisterAllProtocols();
+    RegisterProtocol();
     return %orig;
 }
 
 %end
 
 %ctor {
-    RegisterAllProtocols();
+    RegisterProtocol();
 }
