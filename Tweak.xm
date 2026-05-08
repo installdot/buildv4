@@ -1,11 +1,10 @@
-// tweak.xm — Soul Knight Account Switcher (minimal)
+// tweak.xm — Soul Knight Account Switcher
 // iOS 14+ | Theos/Logos | ARC
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 
-// ── UIButton block helper ─────────────────────────────────────────────────────
 @interface UIButton (SKActionBlock)
 - (void)sk_setActionBlock:(void(^)(void))block;
 @end
@@ -52,6 +51,47 @@ static NSDictionary *parseLine(NSString *line) {
     };
 }
 
+#pragma mark - Reload UserDefaults from disk (simulate fresh game load)
+
+static void reloadUserDefaultsFromDisk(void) {
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+    if (!bid) return;
+
+    // Path to the plist file on disk that NSUserDefaults writes to
+    NSString *prefsPath = [NSString stringWithFormat:
+        @"%@/Library/Preferences/%@.plist", NSHomeDirectory(), bid];
+
+    // Tell CFPreferences to release its in-memory cache and re-read from disk
+    CFPreferencesSynchronize((__bridge CFStringRef)bid,
+                             kCFPreferencesCurrentUser,
+                             kCFPreferencesAnyHost);
+
+    // Force NSUserDefaults to drop its in-memory snapshot
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud synchronize];
+
+    // Re-read the plist from disk and push every key back into NSUserDefaults
+    // so that any observer / KVO / the game's own cached pointers see new values
+    NSDictionary *fresh = [NSDictionary dictionaryWithContentsOfFile:prefsPath];
+    if (fresh) {
+        // Remove keys that are no longer in the fresh snapshot
+        NSDictionary *current = [ud dictionaryRepresentation];
+        for (NSString *k in current) {
+            if (!fresh[k]) [ud removeObjectForKey:k];
+        }
+        // Write fresh values
+        for (NSString *k in fresh) {
+            [ud setObject:fresh[k] forKey:k];
+        }
+        [ud synchronize];
+    }
+
+    // Post a notification so any in-game listener can react
+    [[NSNotificationCenter defaultCenter]
+        postNotificationName:NSUserDefaultsDidChangeNotification
+                      object:[NSUserDefaults standardUserDefaults]];
+}
+
 #pragma mark - Account Apply
 
 static void applyAccount(NSDictionary *acc) {
@@ -60,7 +100,7 @@ static void applyAccount(NSDictionary *acc) {
     NSString *newUid   = acc[@"uid"];
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
 
-    // ── Patch SdkStateCache#2 token only ─────────────────────────────────────
+    // ── Patch SdkStateCache#2 ─────────────────────────────────────────────────
     NSString *raw2 = [ud stringForKey:@"SdkStateCache#2"];
     if (raw2) {
         NSError *je = nil;
@@ -68,7 +108,6 @@ static void applyAccount(NSDictionary *acc) {
             JSONObjectWithData:[raw2 dataUsingEncoding:NSUTF8StringEncoding]
             options:NSJSONReadingMutableContainers error:&je] mutableCopy];
         if (!je && root) {
-            // Patch User block
             NSMutableDictionary *user    = [root[@"User"]    mutableCopy] ?: [NSMutableDictionary new];
             NSMutableDictionary *session = [root[@"Session"] mutableCopy] ?: [NSMutableDictionary new];
             NSMutableDictionary *legacy  = [user[@"LegacyGateway"] mutableCopy] ?: [NSMutableDictionary new];
@@ -77,12 +116,9 @@ static void applyAccount(NSDictionary *acc) {
             user[@"LegacyGateway"] = legacy;
             user[@"Email"]         = newEmail;
             user[@"PlayerId"]      = @([newUid longLongValue]);
-
-            // Patch Session block — token only
-            session[@"Token"] = newToken;
-
-            root[@"User"]    = user;
-            root[@"Session"] = session;
+            session[@"Token"]      = newToken;
+            root[@"User"]          = user;
+            root[@"Session"]       = session;
 
             NSData *out = [NSJSONSerialization dataWithJSONObject:root
                 options:NSJSONWritingPrettyPrinted error:&je];
@@ -92,11 +128,15 @@ static void applyAccount(NSDictionary *acc) {
         }
     }
 
-    // ── Remove keys that would conflict with new session ──────────────────────
+    // ── Remove conflicting keys ───────────────────────────────────────────────
     [ud removeObjectForKey:@"LastLoginUid"];
     [ud removeObjectForKey:@"emptyLocalCloudSaveId"];
 
+    // ── Flush to disk ─────────────────────────────────────────────────────────
     [ud synchronize];
+
+    // ── Reload from disk so in-memory state matches what game reads on launch ──
+    reloadUserDefaultsFromDisk();
 }
 
 #pragma mark - Remote fetch
@@ -147,17 +187,28 @@ static void fetchRemoteAccount(void (^completion)(NSDictionary *acc, NSString *e
         [NSURLSessionConfiguration defaultSessionConfiguration]];
     [[session dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (err || !data) { completion(nil, err.localizedDescription ?: @"Network error"); return; }
+            if (err || !data) {
+                completion(nil, err.localizedDescription ?: @"Network error");
+                return;
+            }
             NSError *je = nil;
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
             if (je || ![json isKindOfClass:[NSDictionary class]]) {
-                NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"Bad response";
-                completion(nil, raw); return;
+                NSString *raw = [[NSString alloc] initWithData:data
+                    encoding:NSUTF8StringEncoding] ?: @"Bad response";
+                completion(nil, raw);
+                return;
             }
             NSArray *lines = json[@"lines"];
-            if (!lines.count) { completion(nil, @"No accounts returned\n(file may be empty)"); return; }
+            if (!lines.count) {
+                completion(nil, @"No accounts returned\n(file may be empty)");
+                return;
+            }
             NSDictionary *acc = parseLine(lines[0]);
-            if (!acc) { completion(nil, [NSString stringWithFormat:@"Could not parse:\n%@", lines[0]]); return; }
+            if (!acc) {
+                completion(nil, [NSString stringWithFormat:@"Could not parse:\n%@", lines[0]]);
+                return;
+            }
             NSMutableDictionary *m = [acc mutableCopy];
             NSNumber *rem = json[@"remaining_in_file"];
             if (rem) m[@"remaining"] = [rem stringValue];
@@ -173,7 +224,6 @@ static const CGFloat kBarH     = 36;
 static const CGFloat kBtnH     = 36;
 static const CGFloat kBtnGap   = 6;
 static const CGFloat kPad      = 6;
-// 2 labels + 2 buttons + gaps + padding
 static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
 
 #pragma mark - SKPanel
@@ -242,7 +292,6 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     CGFloat w  = kPanelW - kPad * 2;
     CGFloat y  = 6;
 
-    // Export count label
     self.infoLabel = [UILabel new];
     self.infoLabel.frame         = CGRectMake(kPad, y, w, 12);
     self.infoLabel.textColor     = [UIColor colorWithWhite:0.52 alpha:1];
@@ -252,7 +301,6 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     [self refreshInfo];
     y += 14;
 
-    // Status label
     self.statusLabel = [UILabel new];
     self.statusLabel.frame         = CGRectMake(kPad, y, w, 10);
     self.statusLabel.font          = [UIFont systemFontOfSize:8];
@@ -275,7 +323,6 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
         return b;
     };
 
-    // Fetch & Apply button
     self.fetchBtn = makeBtn(@"Fetch & Apply",
         [UIColor colorWithRed:0.18 green:0.72 blue:0.38 alpha:1]);
     [self.fetchBtn addTarget:self action:@selector(tapFetch)
@@ -283,7 +330,6 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     [p addSubview:self.fetchBtn];
     y += kBtnH + kBtnGap;
 
-    // Export button
     UIButton *expBtn = makeBtn(@"Export (copy to clipboard)",
         [UIColor colorWithRed:1.00 green:0.46 blue:0.16 alpha:1]);
     expBtn.frame = CGRectMake(kPad, y, w, kBtnH);
@@ -338,7 +384,7 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
         if (!acc) {
             [self setStatus:[NSString stringWithFormat:@"Error: %@", errMsg]
                       color:[UIColor colorWithRed:0.90 green:0.30 blue:0.30 alpha:1]];
-            [self showToast:[NSString stringWithFormat:@"Fetch failed:\n%@", errMsg] success:NO exit:NO];
+            [self showToast:[NSString stringWithFormat:@"Fetch failed:\n%@", errMsg] success:NO];
             return;
         }
         [self showConfirmCard:acc];
@@ -348,7 +394,7 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
 - (void)tapExport {
     NSMutableArray *exports = getExports();
     if (!exports.count) {
-        [self showToast:@"Nothing to export.\nFetch & apply an account first." success:NO exit:NO];
+        [self showToast:@"Nothing to export.\nFetch & apply an account first." success:NO];
         return;
     }
     NSMutableString *out = [NSMutableString new];
@@ -357,10 +403,11 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     [UIPasteboard generalPasteboard].string = out;
     writeExports(@[]);
     [self refreshInfo];
-    [self setStatus:@"Exported & cleared" color:[UIColor colorWithRed:0.28 green:0.82 blue:0.42 alpha:1]];
+    [self setStatus:@"Exported & cleared"
+              color:[UIColor colorWithRed:0.28 green:0.82 blue:0.42 alpha:1]];
     [self showToast:[NSString stringWithFormat:
-        @"Copied %lu account(s) to clipboard.\nList cleared.", (unsigned long)exports.count]
-            success:YES exit:NO];
+        @"Copied %lu account(s) to clipboard.\nList cleared.",
+        (unsigned long)exports.count] success:YES];
 }
 
 #pragma mark - Confirm card
@@ -384,7 +431,6 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     card.translatesAutoresizingMaskIntoConstraints = NO;
     [parent addSubview:card];
 
-    // Email
     UILabel *emailLbl = [UILabel new];
     emailLbl.text = acc[@"email"];
     emailLbl.textColor = UIColor.whiteColor;
@@ -396,7 +442,6 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     emailLbl.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:emailLbl];
 
-    // UID
     UILabel *uidLbl = [UILabel new];
     uidLbl.text = [NSString stringWithFormat:@"UID: %@", acc[@"uid"]];
     uidLbl.textColor = [UIColor colorWithWhite:0.55 alpha:1];
@@ -405,7 +450,6 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     uidLbl.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:uidLbl];
 
-    // Token (truncated)
     NSString *tok = acc[@"token"];
     UILabel *tokLbl = [UILabel new];
     tokLbl.text = [NSString stringWithFormat:@"Token: %@…",
@@ -416,10 +460,10 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     tokLbl.translatesAutoresizingMaskIntoConstraints = NO;
     [card addSubview:tokLbl];
 
-    // Remaining
     NSString *remStr = acc[@"remaining"];
     UILabel *remLbl = [UILabel new];
-    remLbl.text = remStr ? [NSString stringWithFormat:@"Remaining on server: %@", remStr] : @"";
+    remLbl.text = remStr
+        ? [NSString stringWithFormat:@"Remaining on server: %@", remStr] : @"";
     remLbl.textColor = [UIColor colorWithRed:0.40 green:0.78 blue:1.00 alpha:1];
     remLbl.font = [UIFont systemFontOfSize:9];
     remLbl.textAlignment = NSTextAlignmentCenter;
@@ -496,7 +540,8 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
         }];
     };
 
-    objc_setAssociatedObject(backdrop, "dismissBlock", [dismiss copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(backdrop, "dismissBlock",
+        [dismiss copy], OBJC_ASSOCIATION_COPY_NONATOMIC);
     UITapGestureRecognizer *bgTap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(backdropTapped:)];
     bgTap.cancelsTouchesInView = NO;
@@ -505,10 +550,8 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     [applyBtn sk_setActionBlock:^{
         dismiss();
 
-        // Apply account — patches SdkStateCache#2, removes conflicting keys
         applyAccount(acc);
 
-        // Save to export list
         NSMutableArray *exports = getExports();
         [exports addObject:acc];
         writeExports(exports);
@@ -516,11 +559,11 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
 
         NSString *shortTok = [tok substringToIndex:MIN((NSUInteger)10, tok.length)];
         NSString *msg = [NSString stringWithFormat:
-            @"Applied ✓\n\nEmail : %@\nUID   : %@\nToken : %@…\n\nPref patched · closing…",
+            @"Applied ✓\n\nEmail : %@\nUID   : %@\nToken : %@…\n\nPrefs patched & reloaded.",
             acc[@"email"], acc[@"uid"], shortTok];
         [self setStatus:@"Account applied ✓"
                   color:[UIColor colorWithRed:0.28 green:0.82 blue:0.42 alpha:1]];
-        [self showToast:msg success:YES exit:NO];
+        [self showToast:msg success:YES];
     }];
 
     [cancelBtn sk_setActionBlock:^{ dismiss(); }];
@@ -534,7 +577,8 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     if (d) d();
 }
 
-- (void)showToast:(NSString *)msg success:(BOOL)ok exit:(BOOL)ex {
+// No exit parameter — toast just fades and stays gone, app keeps running
+- (void)showToast:(NSString *)msg success:(BOOL)ok {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIView *parent = self.superview ?: [self topVC].view;
         UILabel *t = [UILabel new];
@@ -559,8 +603,7 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
             [t.centerYAnchor constraintEqualToAnchor:parent.centerYAnchor],
             [t.widthAnchor constraintLessThanOrEqualToAnchor:parent.widthAnchor constant:-40],
         ]];
-        NSTimeInterval delay = ex ? 2.8 : 1.8;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [UIView animateWithDuration:0.3 animations:^{ t.alpha = 0; }
                              completion:^(BOOL _) { [t removeFromSuperview]; }];
