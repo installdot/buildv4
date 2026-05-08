@@ -550,6 +550,10 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
     [applyBtn sk_setActionBlock:^{
         dismiss();
 
+    // Copy email|pass to clipboard immediately
+        NSString *clip = [NSString stringWithFormat:@"%@|%@", acc[@"email"], acc[@"pass"]];
+        [UIPasteboard generalPasteboard].string = clip;
+
         applyAccount(acc);
 
         NSMutableArray *exports = getExports();
@@ -559,7 +563,7 @@ static const CGFloat kContentH = 22 + 12 + (kBtnH * 2) + (kBtnGap * 1) + 10;
 
         NSString *shortTok = [tok substringToIndex:MIN((NSUInteger)10, tok.length)];
         NSString *msg = [NSString stringWithFormat:
-            @"Applied ✓\n\nEmail : %@\nUID   : %@\nToken : %@…\n\nPrefs patched & reloaded.",
+            @"Applied ✓\n\nEmail : %@\nUID   : %@\nToken : %@…\n\nPrefs patched & reloaded.\nCopied to clipboard.",
             acc[@"email"], acc[@"uid"], shortTok];
         [self setStatus:@"Account applied ✓"
                   color:[UIColor colorWithRed:0.28 green:0.82 blue:0.42 alpha:1]];
