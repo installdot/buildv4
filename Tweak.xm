@@ -1,182 +1,226 @@
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
-static NSMutableArray *logs;
+static NSString *const kTargetHost = @"api.cheatiosvip.vn";
+static NSString *const kTargetPath = @"/api.php";
 
-// ─────────────────────────────────────────
-// Logger
-// ─────────────────────────────────────────
-static void AddLog(NSString *log) {
-    if (!logs) logs = [NSMutableArray new];
+@interface HookURLProtocol : NSURLProtocol
+@end
 
-    NSString *entry = [NSString stringWithFormat:
-                       @"\n====================\n%@\n====================\n", log];
-    [logs addObject:entry];
-    NSLog(@"%@", entry);
-}
+@implementation HookURLProtocol
 
-static NSString *DataToString(NSData *data) {
-    if (!data) return @"<empty>";
-    NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    return str ?: [NSString stringWithFormat:@"<%lu bytes>", (unsigned long)data.length];
-}
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    NSURL *url = request.URL;
+    if (!url) return NO;
 
-// ─────────────────────────────────────────
-// Copy to clipboard
-// ─────────────────────────────────────────
-static void CopyLogsToClipboard() {
-    NSString *all = [logs componentsJoinedByString:@"\n"];
-    [UIPasteboard generalPasteboard].string = all;
+    BOOL isTarget =
+        [url.host isEqualToString:kTargetHost] &&
+        [url.path isEqualToString:kTargetPath];
 
-    NSLog(@"[EXPORT] Copied logs to clipboard");
+    if (!isTarget) return NO;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController
-                                    alertControllerWithTitle:@"Export"
-                                    message:@"Logs copied to clipboard"
-                                    preferredStyle:UIAlertControllerStyleAlert];
+    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
+        return NO;
+    }
 
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:nil]];
+    NSString *method = request.HTTPMethod.uppercaseString;
 
-        UIWindow *keyWindow = [UIApplication sharedApplication].windows.firstObject;
-        if (keyWindow.rootViewController) {
-            [keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+    // ─────────────────────────────
+    // 1. GET notifications
+    // ─────────────────────────────
+    if ([method isEqualToString:@"GET"]) {
+        NSString *query = url.query ?: @"";
+        if ([query containsString:@"action=get_notifications"]) {
+            NSLog(@"[Hook] ✅ Notifications request detected");
+            return YES;
         }
-    });
+    }
+
+    // ─────────────────────────────
+    // 2. POST validate
+    // ─────────────────────────────
+    if ([method isEqualToString:@"POST"]) {
+
+        NSData *bodyData = request.HTTPBody;
+
+        if (!bodyData && request.HTTPBodyStream) {
+            NSInputStream *stream = request.HTTPBodyStream;
+            NSMutableData *data = [NSMutableData data];
+
+            [stream open];
+            uint8_t buffer[1024];
+            NSInteger len;
+
+            while ((len = [stream read:buffer maxLength:sizeof(buffer)]) > 0) {
+                [data appendBytes:buffer length:len];
+            }
+
+            [stream close];
+            bodyData = data;
+        }
+
+        if (!bodyData) return NO;
+
+        NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+        if (!body) return NO;
+
+        NSLog(@"[Hook] POST Body: %@", body);
+
+        BOOL match =
+            [body containsString:@"action=validate"] &&
+            [body containsString:@"key="] &&
+            [body containsString:@"hwid="];
+
+        if (match) {
+            NSLog(@"[Hook] ✅ Validate request detected");
+            return YES;
+        }
+    }
+
+    return NO;
 }
 
-// ─────────────────────────────────────────
-// Floating button
-// ─────────────────────────────────────────
-@interface FloatingButton : UIButton
-@end
-
-@implementation FloatingButton
-
-- (void)handleTap {
-    CopyLogsToClipboard();
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + translation.x,
-                              self.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:self.superview];
-}
+- (void)startLoading {
 
-@end
+    NSMutableURLRequest *req = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"HookHandled" inRequest:req];
 
-// ─────────────────────────────────────────
-// Overlay window (always on top)
-// ─────────────────────────────────────────
-@interface PassthroughViewController : UIViewController
-@end
+    NSURL *url = self.request.URL;
+    NSString *method = self.request.HTTPMethod.uppercaseString;
 
-@implementation PassthroughViewController
-// Let touches outside the button fall through to the app beneath
-- (UIView *)viewForBaselineLayout { return self.view; }
-@end
+    NSData *data = nil;
 
-static UIWindow *overlayWindow = nil;
+    // ─────────────────────────────
+    // 1. Notifications spoof
+    // ─────────────────────────────
+    if ([method isEqualToString:@"GET"]) {
+        NSString *query = url.query ?: @"";
 
-// ─────────────────────────────────────────
-// Add floating button
-// ─────────────────────────────────────────
-static void AddFloatingButton() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (overlayWindow) return;
+        if ([query containsString:@"action=get_notifications"]) {
 
-        // Dedicated window so the app can never draw over the button
-        overlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        overlayWindow.windowLevel = UIWindowLevelAlert + 100;
-        overlayWindow.backgroundColor = [UIColor clearColor];
-        overlayWindow.userInteractionEnabled = YES;
-        overlayWindow.hidden = NO;
+            NSDictionary *json = @{
+                @"success": @YES,
+                @"count": @1,
+                @"notifications": @[
+                    @{
+                        @"id": @7,
+                        @"title": @"Óc Cảnh iOS làm anti crack như cc đéo biết mã hoá payload",
+                        @"message": @"Crack by Hải",
+                        @"time": @"09/12/2025",
+                        @"priority": @2,
+                        @"created_at": @"2025-12-09 17:06:20"
+                    }
+                ]
+            };
 
-        PassthroughViewController *vc = [PassthroughViewController new];
-        vc.view.backgroundColor = [UIColor clearColor];
-        overlayWindow.rootViewController = vc;
+            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+        }
+    }
 
-        FloatingButton *btn = [FloatingButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = CGRectMake(40, 200, 120, 50);
-        btn.tag = 9999;
-        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
-        [btn setTitle:@"Copy Logs" forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        btn.layer.cornerRadius = 10;
+    // ─────────────────────────────
+    // 2. Validate spoof
+    // ─────────────────────────────
+    if (!data && [method isEqualToString:@"POST"]) {
 
-        [btn addTarget:btn action:@selector(handleTap) forControlEvents:UIControlEventTouchUpInside];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:btn action:@selector(handlePan:)];
-        [btn addGestureRecognizer:pan];
-
-        [vc.view addSubview:btn];
-    });
-}
-
-// ─────────────────────────────────────────
-// Hook NSURLSession
-// ─────────────────────────────────────────
-%hook NSURLSession
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-
-    NSString *reqLog = [NSString stringWithFormat:
-                        @"[REQUEST]\nURL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
-                        request.URL.absoluteString,
-                        request.HTTPMethod,
-                        request.allHTTPHeaderFields,
-                        DataToString(request.HTTPBody)];
-
-    AddLog(reqLog);
-
-    // Block must be declared as a variable — Logos cannot parse a literal block inside %orig(...)
-    void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) =
-        ^(NSData *data, NSURLResponse *response, NSError *error) {
-
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-
-            NSString *respLog = [NSString stringWithFormat:
-                                 @"[RESPONSE]\nURL: %@\nStatus: %ld\nHeaders: %@\nBody: %@",
-                                 request.URL.absoluteString,
-                                 (long)http.statusCode,
-                                 http.allHeaderFields,
-                                 DataToString(data)];
-
-            AddLog(respLog);
-
-            if (completionHandler) {
-                completionHandler(data, response, error);
+        NSDictionary *json = @{
+            @"success": @YES,
+            @"message": @"License validated successfully",
+            @"data": @{
+                @"subscription_type": @"daily",
+                @"expiry_date": @"2026-03-24 17:41:33",
+                @"remaining_days": @0,
+                @"remaining_hours": @22,
+                @"activated_at": @"2026-03-23 17:41:33",
+                @"is_trial": @NO,
+                @"is_pro": @1
             }
         };
 
-    return %orig(request, wrappedHandler);
+        data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+    }
+
+    // ─────────────────────────────
+    // Send response
+    // ─────────────────────────────
+
+    NSHTTPURLResponse *response =
+        [[NSHTTPURLResponse alloc] initWithURL:self.request.URL
+                                    statusCode:200
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{
+                                      @"Content-Type": @"application/json",
+                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+                                  }];
+
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
 }
 
-%end
+- (void)stopLoading {}
+
+@end
 
 // ─────────────────────────────────────────
-// Add floating button on app launch
+// Register helper
 // ─────────────────────────────────────────
-%hook UIApplication
 
-- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    BOOL result = %orig(application, launchOptions);
-    AddFloatingButton();
-    return result;
+static void RegisterProtocol(void) {
+    [NSURLProtocol registerClass:[HookURLProtocol class]];
 }
 
-%end
-
-// ─────────────────────────────────────────
-// Constructor fallback
-// ─────────────────────────────────────────
+// Early load
 __attribute__((constructor(101))) static void init_hook(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-        AddFloatingButton();
-    });
+    RegisterProtocol();
+}
+
+// Force into sessions
+%hook NSURLSessionConfiguration
+
+- (NSArray *)protocolClasses {
+    NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
+    NSArray *orig = %orig;
+    if (orig) [arr addObjectsFromArray:orig];
+    return arr;
+}
+
+%end
+
+// Cover all NSURLSession usage
+%hook NSURLSession
+
++ (NSURLSession *)sharedSession {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    RegisterProtocol();
+    return %orig;
+}
+
+%end
+
+// NSURLConnection fallback
+%hook NSURLConnection
+
++ (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
+    RegisterProtocol();
+    return %orig;
+}
+
+%end
+
+%ctor {
+    RegisterProtocol();
 }
