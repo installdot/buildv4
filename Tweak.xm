@@ -158,6 +158,8 @@ __attribute__((constructor(101))) static void init_hook(void) {
     RegisterProtocol();
 }
 
+// ==================== Hooks ====================
+
 %hook NSURLSessionConfiguration
 - (NSArray *)protocolClasses {
     NSMutableArray *arr = [NSMutableArray arrayWithObject:[HookURLProtocol class]];
@@ -168,16 +170,27 @@ __attribute__((constructor(101))) static void init_hook(void) {
 %end
 
 %hook NSURLSession
-+ (NSURLSession *)sharedSession { RegisterProtocol(); return %orig; }
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request { RegisterProtocol(); return %orig; }
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    RegisterProtocol(); return %orig;
++ (NSURLSession *)sharedSession {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
+    RegisterProtocol();
+    return %orig;
+}
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    RegisterProtocol();
+    return %orig;
 }
 %end
 
 %hook NSURLConnection
 + (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
-    RegisterProtocol(); return %orig;
+    RegisterProtocol();
+    return %orig;
 }
 %end
 
