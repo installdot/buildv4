@@ -18,14 +18,12 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
     NSString *path = url.path;
     NSString *method = request.HTTPMethod.uppercaseString;
 
-    if ([method isEqualToString:@"GET"]) {
-        if ([path containsString:@"/api/status"] ||
-            [path containsString:@"/api/app/config"] ||
-            [path containsString:@"/api/chat/messages"]) {
-            
-            NSLog(@"[Hook] ✅ Intercepted: %@", path);
-            return YES;
-        }
+    if ([path containsString:@"/api/status"] ||
+        [path containsString:@"/api/app/config"] ||
+        [path containsString:@"/api/chat/messages"]) {
+        
+        NSLog(@"[Hook] ✅ Intercepted: %@ %@", method, path);
+        return YES;
     }
     return NO;
 }
@@ -43,7 +41,7 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
     NSData *data = nil;
 
     // ─────────────────────────────
-    // 1. /api/status
+    // 1. /api/status (GET)
     // ─────────────────────────────
     if ([path containsString:@"/api/status"]) {
         NSDictionary *json = @{
@@ -51,11 +49,11 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
             @"message": @"Authorized"
         };
         data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-        NSLog(@"[Hook] Status spoofed → Authorized");
+        NSLog(@"[Hook] Status spoofed");
     }
 
     // ─────────────────────────────
-    // 2. /api/app/config (keyless_mode = true)
+    // 2. /api/app/config (GET)
     // ─────────────────────────────
     else if ([path containsString:@"/api/app/config"]) {
         NSDictionary *json = @{
@@ -96,11 +94,11 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
             }
         };
         data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-        NSLog(@"[Hook] App config spoofed with keyless_mode = true");
+        NSLog(@"[Hook] App config spoofed (keyless_mode = true)");
     }
 
     // ─────────────────────────────
-    // 3. /api/chat/messages (NEW - only 2 messages)
+    // 3. /api/chat/messages (POST)
     // ─────────────────────────────
     else if ([path containsString:@"/api/chat/messages"]) {
         NSDictionary *json = @{
@@ -117,7 +115,7 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
                 @{
                     @"_id": @"6a4706fa94db463b8cf37ce5",
                     @"maskedKey": @"Admin",
-                    @"message": @"Đã bị crack bởi xD",
+                    @"message": @"Đã bị crack bởi xD!!!",
                     @"isSystem": @NO,
                     @"createdAt": @"2026-07-04T00:01:00.000Z",
                     @"__v": @0
@@ -138,7 +136,8 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
                                                              HTTPVersion:@"HTTP/1.1"
                                                             headerFields:@{
         @"Content-Type": @"application/json",
-        @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length]
+        @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length],
+        @"Access-Control-Allow-Credentials": @"true"
     }];
 
     [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
@@ -169,25 +168,16 @@ __attribute__((constructor(101))) static void init_hook(void) {
 %end
 
 %hook NSURLSession
-+ (NSURLSession *)sharedSession {
-    RegisterProtocol();
-    return %orig;
-}
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    RegisterProtocol();
-    return %orig;
-}
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-    RegisterProtocol();
-    return %orig;
++ (NSURLSession *)sharedSession { RegisterProtocol(); return %orig; }
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request { RegisterProtocol(); return %orig; }
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    RegisterProtocol(); return %orig;
 }
 %end
 
 %hook NSURLConnection
 + (instancetype)connectionWithRequest:(NSURLRequest *)request delegate:(id)delegate {
-    RegisterProtocol();
-    return %orig;
+    RegisterProtocol(); return %orig;
 }
 %end
 
