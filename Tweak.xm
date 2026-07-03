@@ -13,15 +13,18 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
     if (!url) return NO;
 
     if (![url.host isEqualToString:kTargetHost]) return NO;
-    if (![NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) {
-        NSString *path = url.path;
-        NSString *method = request.HTTPMethod.uppercaseString;
+    if ([NSURLProtocol propertyForKey:@"HookHandled" inRequest:request]) return NO;
 
-        if ([method isEqualToString:@"GET"]) {
-            if ([path containsString:@"/api/status"] || [path containsString:@"/api/app/config"]) {
-                NSLog(@"[Hook] ✅ Intercepted: %@", path);
-                return YES;
-            }
+    NSString *path = url.path;
+    NSString *method = request.HTTPMethod.uppercaseString;
+
+    if ([method isEqualToString:@"GET"]) {
+        if ([path containsString:@"/api/status"] ||
+            [path containsString:@"/api/app/config"] ||
+            [path containsString:@"/api/chat/messages"]) {
+            
+            NSLog(@"[Hook] ✅ Intercepted: %@", path);
+            return YES;
         }
     }
     return NO;
@@ -40,7 +43,7 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
     NSData *data = nil;
 
     // ─────────────────────────────
-    // 1. /api/status → Authorized
+    // 1. /api/status
     // ─────────────────────────────
     if ([path containsString:@"/api/status"]) {
         NSDictionary *json = @{
@@ -52,7 +55,7 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
     }
 
     // ─────────────────────────────
-    // 2. /api/app/config → keyless_mode = true
+    // 2. /api/app/config (keyless_mode = true)
     // ─────────────────────────────
     else if ([path containsString:@"/api/app/config"]) {
         NSDictionary *json = @{
@@ -94,6 +97,35 @@ static NSString *const kTargetHost = @"api.cheatiosvip.net";
         };
         data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
         NSLog(@"[Hook] App config spoofed with keyless_mode = true");
+    }
+
+    // ─────────────────────────────
+    // 3. /api/chat/messages (NEW - only 2 messages)
+    // ─────────────────────────────
+    else if ([path containsString:@"/api/chat/messages"]) {
+        NSDictionary *json = @{
+            @"success": @YES,
+            @"data": @[
+                @{
+                    @"_id": @"6a4535d648ce5311ab5f9781",
+                    @"maskedKey": @"📢 System",
+                    @"message": @"Quá đẳng cấp!!!",
+                    @"isSystem": @YES,
+                    @"createdAt": @"2026-07-04T00:00:00.000Z",
+                    @"__v": @0
+                },
+                @{
+                    @"_id": @"6a4706fa94db463b8cf37ce5",
+                    @"maskedKey": @"Admin",
+                    @"message": @"Đã bị crack bởi xD",
+                    @"isSystem": @NO,
+                    @"createdAt": @"2026-07-04T00:01:00.000Z",
+                    @"__v": @0
+                }
+            ]
+        };
+        data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+        NSLog(@"[Hook] Chat messages spoofed (2 messages only)");
     }
 
     if (!data) {
