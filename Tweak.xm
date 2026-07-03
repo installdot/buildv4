@@ -1,14 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <CFNetwork/CFNetwork.h>
 #import <substrate.h>
-
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <dlfcn.h>
-#include <unistd.h>
 
 // ─────────────────────────────────────────
 // Logger
@@ -57,34 +49,6 @@ static NSString *DataToString(NSData *data) {
     NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     return str ?: [NSString stringWithFormat:@"<binary> hex: %@",
                    DataToHexPreview(data, 64)];
-}
-
-// ─────────────────────────────────────────
-// Socket address helper
-// ─────────────────────────────────────────
-static NSString *SockAddrToString(const struct sockaddr *sa) {
-    if (!sa) return @"<null>";
-    char host[NI_MAXHOST] = {0};
-    char port[NI_MAXSERV] = {0};
-    int ret = getnameinfo(sa, sa->sa_len, host, sizeof(host),
-                          port, sizeof(port),
-                          NI_NUMERICHOST | NI_NUMERICSERV);
-    if (ret == 0) {
-        return [NSString stringWithFormat:@"%s:%s", host, port];
-    }
-    // Fallback manual parsing
-    if (sa->sa_family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)sa;
-        return [NSString stringWithFormat:@"%s:%d",
-                inet_ntoa(sin->sin_addr), ntohs(sin->sin_port)];
-    }
-    if (sa->sa_family == AF_INET6) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
-        char buf[INET6_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
-        return [NSString stringWithFormat:@"[%s]:%d", buf, ntohs(sin6->sin6_port)];
-    }
-    return [NSString stringWithFormat:@"<af=%d>", sa->sa_family];
 }
 
 // ─────────────────────────────────────────
@@ -168,161 +132,42 @@ static void AddFloatingButton(void) {
 }
 
 // ─────────────────────────────────────────
-// LAYER 1 — NSURLSession (high-level HTTP)
+// LAYER 1 — NSURLSession (HTTPS capture)
 // ─────────────────────────────────────────
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                             completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
 
-    AddLog([NSString stringWithFormat:
-            @"[L1·NSURLSession·REQUEST]\nURL:     %@\nMethod:  %@\nHeaders: %@\nBody:    %@",
-            request.URL.absoluteString,
-            request.HTTPMethod,
-            request.allHTTPHeaderFields,
-            DataToString(request.HTTPBody)]);
+    // Filter to capture ONLY HTTPS traffic
+    BOOL isHTTPS = [request.URL.scheme.lowercaseString isEqualToString:@"https"];
+
+    if (isHTTPS) {
+        AddLog([NSString stringWithFormat:
+                @"[HTTPS·REQUEST]\nURL:     %@\nMethod:  %@\nHeaders: %@\nBody:    %@",
+                request.URL.absoluteString,
+                request.HTTPMethod,
+                request.allHTTPHeaderFields,
+                DataToString(request.HTTPBody)]);
+    }
 
     void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
         ^(NSData *data, NSURLResponse *resp, NSError *err) {
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-            AddLog([NSString stringWithFormat:
-                    @"[L1·NSURLSession·RESPONSE]\nURL:     %@\nStatus:  %ld\nHeaders: %@\nBody:    %@",
-                    request.URL.absoluteString,
-                    (long)http.statusCode,
-                    http.allHeaderFields,
-                    DataToString(data)]);
+            if (isHTTPS) {
+                NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+                AddLog([NSString stringWithFormat:
+                        @"[HTTPS·RESPONSE]\nURL:     %@\nStatus:  %ld\nHeaders: %@\nBody:    %@",
+                        request.URL.absoluteString,
+                        (long)http.statusCode,
+                        http.allHeaderFields,
+                        DataToString(data)]);
+            }
             if (handler) handler(data, resp, err);
         };
     return %orig(request, wrapped);
 }
 
 %end
-
-// ─────────────────────────────────────────
-// LAYER 2 — CFNetwork (transport layer TLS/TCP streams)
-// ─────────────────────────────────────────
-
-// --- CFReadStreamRead ---
-typedef CFIndex (*CFReadStreamRead_t)(CFReadStreamRef, UInt8 *, CFIndex);
-static CFReadStreamRead_t orig_CFReadStreamRead = NULL;
-
-static CFIndex hook_CFReadStreamRead(CFReadStreamRef stream, UInt8 *buf, CFIndex len) {
-    CFIndex result = orig_CFReadStreamRead(stream, buf, len);
-    if (result > 0) {
-        NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)result];
-
-        // Extract URL from stream's associated property if available
-        CFTypeRef urlProp = CFReadStreamCopyProperty(stream, kCFStreamPropertyHTTPFinalURL);
-        NSString *urlStr  = urlProp
-            ? [(__bridge NSURL *)urlProp absoluteString]
-            : @"<unknown>";
-        if (urlProp) CFRelease(urlProp);
-
-        AddLog([NSString stringWithFormat:
-                @"[L2·CFReadStream·READ]\nURL:   %@\nBytes: %ld\nData:  %@",
-                urlStr, (long)result, DataToString(data)]);
-    }
-    return result;
-}
-
-// --- CFWriteStreamWrite ---
-typedef CFIndex (*CFWriteStreamWrite_t)(CFWriteStreamRef, const UInt8 *, CFIndex);
-static CFWriteStreamWrite_t orig_CFWriteStreamWrite = NULL;
-
-static CFIndex hook_CFWriteStreamWrite(CFWriteStreamRef stream,
-                                       const UInt8 *buf, CFIndex len) {
-    if (len > 0) {
-        NSData *data     = [NSData dataWithBytes:buf length:(NSUInteger)len];
-        CFTypeRef urlProp = CFWriteStreamCopyProperty(stream, kCFStreamPropertyHTTPFinalURL);
-        NSString *urlStr  = urlProp
-            ? [(__bridge NSURL *)urlProp absoluteString]
-            : @"<unknown>";
-        if (urlProp) CFRelease(urlProp);
-
-        AddLog([NSString stringWithFormat:
-                @"[L2·CFWriteStream·WRITE]\nURL:   %@\nBytes: %ld\nData:  %@",
-                urlStr, (long)len, DataToString(data)]);
-    }
-    return orig_CFWriteStreamWrite(stream, buf, len);
-}
-
-// ─────────────────────────────────────────
-// LAYER 3 — BSD sockets (kernel syscall boundary)
-// ─────────────────────────────────────────
-
-// --- connect ---
-typedef int (*connect_t)(int, const struct sockaddr *, socklen_t);
-static connect_t orig_connect = NULL;
-
-static int hook_connect(int fd, const struct sockaddr *addr, socklen_t len) {
-    AddLog([NSString stringWithFormat:
-            @"[L3·BSD·connect]\nfd:      %d\nremote:  %@",
-            fd, SockAddrToString(addr)]);
-    return orig_connect(fd, addr, len);
-}
-
-// --- send ---
-typedef ssize_t (*send_t)(int, const void *, size_t, int);
-static send_t orig_send = NULL;
-
-static ssize_t hook_send(int fd, const void *buf, size_t len, int flags) {
-    if (len > 0) {
-        NSData *data = [NSData dataWithBytes:buf length:MIN(len, 256)];
-        AddLog([NSString stringWithFormat:
-                @"[L3·BSD·send]\nfd:    %d\nflags: %d\nbytes: %zu\ndata:  %@",
-                fd, flags, len, DataToString(data)]);
-    }
-    return orig_send(fd, buf, len, flags);
-}
-
-// --- recv ---
-typedef ssize_t (*recv_t)(int, void *, size_t, int);
-static recv_t orig_recv = NULL;
-
-static ssize_t hook_recv(int fd, void *buf, size_t len, int flags) {
-    ssize_t result = orig_recv(fd, buf, len, flags);
-    if (result > 0) {
-        NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)MIN(result, 256)];
-        AddLog([NSString stringWithFormat:
-                @"[L3·BSD·recv]\nfd:    %d\nflags: %d\nbytes: %zd\ndata:  %@",
-                fd, flags, result, DataToString(data)]);
-    }
-    return result;
-}
-
-// --- sendto (UDP / raw sockets) ---
-typedef ssize_t (*sendto_t)(int, const void *, size_t, int,
-                            const struct sockaddr *, socklen_t);
-static sendto_t orig_sendto = NULL;
-
-static ssize_t hook_sendto(int fd, const void *buf, size_t len, int flags,
-                           const struct sockaddr *dest, socklen_t addrlen) {
-    if (len > 0) {
-        NSData *data = [NSData dataWithBytes:buf length:MIN(len, 256)];
-        AddLog([NSString stringWithFormat:
-                @"[L3·BSD·sendto]\nfd:     %d\nremote: %@\nbytes:  %zu\ndata:   %@",
-                fd, SockAddrToString(dest), len, DataToString(data)]);
-    }
-    return orig_sendto(fd, buf, len, flags, dest, addrlen);
-}
-
-// --- recvfrom (UDP / raw sockets) ---
-typedef ssize_t (*recvfrom_t)(int, void *, size_t, int,
-                              struct sockaddr *, socklen_t *);
-static recvfrom_t orig_recvfrom = NULL;
-
-static ssize_t hook_recvfrom(int fd, void *buf, size_t len, int flags,
-                             struct sockaddr *src, socklen_t *addrlen) {
-    ssize_t result = orig_recvfrom(fd, buf, len, flags, src, addrlen);
-    if (result > 0) {
-        NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)MIN(result, 256)];
-        AddLog([NSString stringWithFormat:
-                @"[L3·BSD·recvfrom]\nfd:     %d\nsource: %@\nbytes:  %zd\ndata:   %@",
-                fd, src ? SockAddrToString(src) : @"<any>",
-                result, DataToString(data)]);
-    }
-    return result;
-}
 
 // ─────────────────────────────────────────
 // App lifecycle hooks
@@ -338,53 +183,9 @@ didFinishLaunchingWithOptions:(NSDictionary *)opts {
 
 %end
 
-// ─────────────────────────────────────────
-// Constructor — install all C-level hooks
-// ─────────────────────────────────────────
-__attribute__((constructor(101))) static void init_hook(void) {
-    // ── Layer 2: CFNetwork ──
-    orig_CFReadStreamRead  = (CFReadStreamRead_t)
-        MSHookFunction((void *)CFReadStreamRead,
-                       (void *)hook_CFReadStreamRead,
-                       (void **)&orig_CFReadStreamRead);
-
-    orig_CFWriteStreamWrite = (CFWriteStreamWrite_t)
-        MSHookFunction((void *)CFWriteStreamWrite,
-                       (void *)hook_CFWriteStreamWrite,
-                       (void **)&orig_CFWriteStreamWrite);
-
-    // ── Layer 3: BSD sockets ──
-    // libsystem_kernel.dylib owns the real syscall stubs;
-    // libsystem_c.dylib wraps them with errno handling — hook the wrapper.
-    void *libC = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_NOLOAD);
-
-    orig_connect  = (connect_t)
-        MSHookFunction(dlsym(libC, "connect"),
-                       (void *)hook_connect,
-                       (void **)&orig_connect);
-
-    orig_send     = (send_t)
-        MSHookFunction(dlsym(libC, "send"),
-                       (void *)hook_send,
-                       (void **)&orig_send);
-
-    orig_recv     = (recv_t)
-        MSHookFunction(dlsym(libC, "recv"),
-                       (void *)hook_recv,
-                       (void **)&orig_recv);
-
-    orig_sendto   = (sendto_t)
-        MSHookFunction(dlsym(libC, "sendto"),
-                       (void *)hook_sendto,
-                       (void **)&orig_sendto);
-
-    orig_recvfrom = (recvfrom_t)
-        MSHookFunction(dlsym(libC, "recvfrom"),
-                       (void *)hook_recvfrom,
-                       (void **)&orig_recvfrom);
-
-    // Floating button fallback (fires after app window is ready)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+// Fallback in case the app doesn't trigger didFinishLaunchingWithOptions standardly
+__attribute__((constructor)) static void init_ui(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         AddFloatingButton();
     });
