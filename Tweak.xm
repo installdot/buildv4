@@ -1,225 +1,181 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <substrate.h>
 
-// ─────────────────────────────────────────
-// Logger State
-// ─────────────────────────────────────────
 static NSMutableArray *logs;
-static dispatch_queue_t logQueue;
 
-static void EnsureLogger(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        logs     = [NSMutableArray new];
-        logQueue = dispatch_queue_create("net.sniffer.log", DISPATCH_QUEUE_SERIAL);
-    });
-}
-
+// ─────────────────────────────────────────
+// Logger
+// ─────────────────────────────────────────
 static void AddLog(NSString *log) {
-    EnsureLogger();
-    NSString *ts    = [NSDateFormatter localizedStringFromDate:[NSDate date]
-                                                     dateStyle:NSDateFormatterNoStyle
-                                                     timeStyle:NSDateFormatterMediumStyle];
+    if (!logs) logs = [NSMutableArray new];
+
     NSString *entry = [NSString stringWithFormat:
-                       @"\n====================\n[%@] %@\n====================\n", ts, log];
-    dispatch_async(logQueue, ^{
-        [logs addObject:entry];
-    });
+                       @"\n====================\n%@\n====================\n", log];
+    [logs addObject:entry];
     NSLog(@"%@", entry);
 }
 
-static NSString *DataToHexPreview(NSData *data, NSUInteger maxBytes) {
-    if (!data || data.length == 0) return @"<empty>";
-    NSUInteger len     = MIN(data.length, maxBytes);
-    const uint8_t *buf = (const uint8_t *)data.bytes;
-    NSMutableString *hex = [NSMutableString stringWithCapacity:len * 3];
-    for (NSUInteger i = 0; i < len; i++) {
-        [hex appendFormat:@"%02x ", buf[i]];
-    }
-    if (data.length > maxBytes) {
-        [hex appendFormat:@"... (%lu bytes total)", (unsigned long)data.length];
-    }
-    return hex;
-}
-
 static NSString *DataToString(NSData *data) {
-    if (!data || data.length == 0) return @"<empty>";
-    // Try UTF-8 first, fall back to hex preview if binary data
+    if (!data) return @"<empty>";
     NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    return str ?: [NSString stringWithFormat:@"<binary> hex: %@",
-                   DataToHexPreview(data, 64)];
+    return str ?: [NSString stringWithFormat:@"<%lu bytes>", (unsigned long)data.length];
 }
 
 // ─────────────────────────────────────────
-// UI Window & Overlay Components
+// Copy to clipboard
+// ─────────────────────────────────────────
+static void CopyLogsToClipboard() {
+    NSString *all = [logs componentsJoinedByString:@"\n"];
+    [UIPasteboard generalPasteboard].string = all;
+
+    NSLog(@"[EXPORT] Copied logs to clipboard");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController
+                                    alertControllerWithTitle:@"Export"
+                                    message:@"Logs copied to clipboard"
+                                    preferredStyle:UIAlertControllerStyleAlert];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
+
+        UIWindow *keyWindow = [UIApplication sharedApplication].windows.firstObject;
+        if (keyWindow.rootViewController) {
+            [keyWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+        }
+    });
+}
+
+// ─────────────────────────────────────────
+// Floating button
 // ─────────────────────────────────────────
 @interface FloatingButton : UIButton
 @end
 
-@interface PassthroughWindow : UIWindow
+@implementation FloatingButton
+
+- (void)handleTap {
+    CopyLogsToClipboard();
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
+    CGPoint translation = [gesture translationInView:self.superview];
+    self.center = CGPointMake(self.center.x + translation.x,
+                              self.center.y + translation.y);
+    [gesture setTranslation:CGPointZero inView:self.superview];
+}
+
 @end
 
+// ─────────────────────────────────────────
+// Overlay window (always on top)
+// ─────────────────────────────────────────
 @interface PassthroughViewController : UIViewController
 @end
 
-@implementation PassthroughWindow
-- (UIView *)hitTest:(CGPoint)pt withEvent:(UIEvent *)e {
-    UIView *hit = [super hitTest:pt withEvent:e];
-    // If the user touches the transparent background window or view controller, pass it through to the app
-    if (hit == self.rootViewController.view || hit == self) return nil;
-    return hit; // Allow interactions with the button and the alert controller
-}
-@end
-
 @implementation PassthroughViewController
+// Let touches outside the button fall through to the app beneath
+- (UIView *)viewForBaselineLayout { return self.view; }
 @end
 
-static PassthroughWindow *overlayWindow = nil;
+static UIWindow *overlayWindow = nil;
 
 // ─────────────────────────────────────────
-// Thread-Safe Export to Clipboard
+// Add floating button
 // ─────────────────────────────────────────
-static void CopyLogsToClipboard(void) {
-    EnsureLogger(); 
-
-    __block NSString *all = nil;
-    __block NSUInteger currentCount = 0;
-    
-    // Safely pull entries from the array using the serial log queue
-    dispatch_sync(logQueue, ^{
-        currentCount = logs.count;
-        if (currentCount > 0) {
-            all = [logs componentsJoinedByString:@"\n"];
-        } else {
-            all = @"No HTTPS logs captured yet.";
-        }
-    });
-
-    // Handle UI interaction on the main thread
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (all) {
-            [UIPasteboard generalPasteboard].string = all;
-        }
-        
-        UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"Export"
-                                                message:[NSString stringWithFormat:
-                                                         @"Copied %lu entries to clipboard",
-                                                         (unsigned long)currentCount]
-                                         preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:nil]];
-        
-        // Present the alert over our safe overlay window hierarchy
-        if (overlayWindow && overlayWindow.rootViewController) {
-            [overlayWindow.rootViewController presentViewController:alert animated:YES completion:nil];
-        } else {
-            #pragma clang diagnostic push
-            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            UIWindow *w = [UIApplication sharedApplication].keyWindow;
-            #pragma clang diagnostic pop
-            [w.rootViewController presentViewController:alert animated:YES completion:nil];
-        }
-    });
-}
-
-@implementation FloatingButton
-- (void)handleTap { 
-    CopyLogsToClipboard(); 
-}
-- (void)handlePan:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
-    [g setTranslation:CGPointZero inView:self.superview];
-}
-@end
-
-static void AddFloatingButton(void) {
+static void AddFloatingButton() {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (overlayWindow) return;
-        
-        overlayWindow = [[PassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-        overlayWindow.windowLevel            = UIWindowLevelAlert + 100;
-        overlayWindow.backgroundColor        = [UIColor clearColor];
-        overlayWindow.userInteractionEnabled = YES;
-        overlayWindow.hidden                 = NO;
 
-        PassthroughViewController *vc     = [PassthroughViewController new];
-        vc.view.backgroundColor           = [UIColor clearColor];
-        overlayWindow.rootViewController  = vc;
+        // Dedicated window so the app can never draw over the button
+        overlayWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        overlayWindow.windowLevel = UIWindowLevelAlert + 100;
+        overlayWindow.backgroundColor = [UIColor clearColor];
+        overlayWindow.userInteractionEnabled = YES;
+        overlayWindow.hidden = NO;
+
+        PassthroughViewController *vc = [PassthroughViewController new];
+        vc.view.backgroundColor = [UIColor clearColor];
+        overlayWindow.rootViewController = vc;
 
         FloatingButton *btn = [FloatingButton buttonWithType:UIButtonTypeSystem];
-        btn.frame           = CGRectMake(40, 200, 130, 50);
-        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.75];
+        btn.frame = CGRectMake(40, 200, 120, 50);
+        btn.tag = 9999;
+        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
         [btn setTitle:@"Copy Logs" forState:UIControlStateNormal];
         [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         btn.layer.cornerRadius = 10;
-        
+
         [btn addTarget:btn action:@selector(handleTap) forControlEvents:UIControlEventTouchUpInside];
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:btn action:@selector(handlePan:)];
         [btn addGestureRecognizer:pan];
+
         [vc.view addSubview:btn];
     });
 }
 
 // ─────────────────────────────────────────
-// Hooks — HTTPS Network Interception
+// Hook NSURLSession
 // ─────────────────────────────────────────
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
 
-    // Enforce HTTPS filter exclusively
-    BOOL isHTTPS = [request.URL.scheme.lowercaseString isEqualToString:@"https"];
-
-    if (isHTTPS) {
-        AddLog([NSString stringWithFormat:
-                @"[HTTPS·REQUEST]\nURL:     %@\nMethod:  %@\nHeaders: %@\nBody:    %@",
-                request.URL.absoluteString,
-                request.HTTPMethod,
-                request.allHTTPHeaderFields,
-                DataToString(request.HTTPBody)]);
-    }
-
-    void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
-        ^(NSData *data, NSURLResponse *resp, NSError *err) {
-            if (isHTTPS) {
-                NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-                AddLog([NSString stringWithFormat:
-                        @"[HTTPS·RESPONSE]\nURL:     %@\nStatus:  %ld\nHeaders: %@\nBody:    %@",
+    NSString *reqLog = [NSString stringWithFormat:
+                        @"[REQUEST]\nURL: %@\nMethod: %@\nHeaders: %@\nBody: %@",
                         request.URL.absoluteString,
-                        (long)http.statusCode,
-                        http.allHeaderFields,
-                        DataToString(data)]);
+                        request.HTTPMethod,
+                        request.allHTTPHeaderFields,
+                        DataToString(request.HTTPBody)];
+
+    AddLog(reqLog);
+
+    // Block must be declared as a variable — Logos cannot parse a literal block inside %orig(...)
+    void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) =
+        ^(NSData *data, NSURLResponse *response, NSError *error) {
+
+            NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+
+            NSString *respLog = [NSString stringWithFormat:
+                                 @"[RESPONSE]\nURL: %@\nStatus: %ld\nHeaders: %@\nBody: %@",
+                                 request.URL.absoluteString,
+                                 (long)http.statusCode,
+                                 http.allHeaderFields,
+                                 DataToString(data)];
+
+            AddLog(respLog);
+
+            if (completionHandler) {
+                completionHandler(data, response, error);
             }
-            if (handler) handler(data, resp, err);
         };
-        
-    return %orig(request, wrapped);
+
+    return %orig(request, wrappedHandler);
 }
 
 %end
 
 // ─────────────────────────────────────────
-// Lifecycle Initializers
+// Add floating button on app launch
 // ─────────────────────────────────────────
 %hook UIApplication
 
-- (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
-    BOOL result = %orig(app, opts);
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    BOOL result = %orig(application, launchOptions);
     AddFloatingButton();
     return result;
 }
 
 %end
 
-__attribute__((constructor)) static void init_ui(void) {
-    // Background safety timer to guarantee button instantiation if application lifecycle hook is bypassed
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+// ─────────────────────────────────────────
+// Constructor fallback
+// ─────────────────────────────────────────
+__attribute__((constructor(101))) static void init_hook(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         AddFloatingButton();
     });
