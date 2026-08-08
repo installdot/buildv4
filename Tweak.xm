@@ -385,7 +385,7 @@ static const CGFloat kContentH = 34 + (kBtnH * 6) + (kBtnGap * 5) + 8;
     [self addSubview:self.contentPane];
 
     CGFloat w = kPanelW - kPad * 2;
-    CGFloat y = 4;
+    __block CGFloat y = 4; // ADDED __block HERE TO FIX OVERLAPPING BUTTONS[cite: 1]
 
     self.infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(kPad, y, w, 12)];
     self.infoLabel.textColor = [UIColor colorWithWhite:0.52 alpha:1];
