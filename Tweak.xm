@@ -55,8 +55,8 @@ static NSString *templateTxtPath(void) {
 }
 
 static NSArray<NSString *> *saveDataTypes(void) {
-    return @[@"bp", @"escape_season", @"item", @"misc", @"monsrise", 
-             @"season", @"statistic", @"task", @"weapon"];
+    return @[@"bp_data", @"escape_season_data", @"item_data", @"misc_data", @"monsrise_data", 
+             @"season_data", @"statistic", @"task", @"weapon_evolution_data"];
 }
 
 static BOOL requiredFilesExist(NSString **missingOut) {
