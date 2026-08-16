@@ -23,7 +23,6 @@ static const char *LogFilePath(void) {
             strlcpy(path, [fullPath UTF8String], sizeof(path));
         }
     });
-    q8
     return path;
 }
 
