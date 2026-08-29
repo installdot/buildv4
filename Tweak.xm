@@ -82,7 +82,6 @@ static void clearFiles() {
 // ==========================================
 // 4. IL2CPP HELPER FUNCTIONS
 // ==========================================
-// Scans all loaded assemblies to find a class, equivalent to Lua's Class.fromName()
 static void* FindClass(const char* namespaze, const char* name) {
     size_t size = 0;
     void** assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &size);
@@ -95,7 +94,6 @@ static void* FindClass(const char* namespaze, const char* name) {
     return nullptr;
 }
 
-// Replicates Lua's myClass:findObjects()[1]
 static void* FindUnityObjectOfType(void* targetKlass) {
     if (!targetKlass) return nullptr;
     
@@ -183,7 +181,6 @@ static void* FindUnityObjectOfType(void* targetKlass) {
                 void* platStr = il2cpp_string_new([distrID UTF8String]);
                 il2cpp_field_set_value(savingDataObj, platformIdField, platStr);
             } else {
-                NSLog(@"[ModMenu] savingData object is null!");
                 return NO;
             }
         }
@@ -205,13 +202,11 @@ static void* FindUnityObjectOfType(void* targetKlass) {
                 if (headersObj) {
                     void* headersBaseKlass = FindClass("System.Net.Http.Headers", "HttpHeaders");
                     
-                    // Remove("Authorization")
                     void* removeMethod = il2cpp_class_get_method_from_name(headersBaseKlass, "Remove", 1);
                     void* authStr = il2cpp_string_new("Authorization");
                     void* args1[1] = { authStr };
                     il2cpp_runtime_invoke(removeMethod, headersObj, args1, &exc);
                     
-                    // TryAddWithoutValidation("Authorization", "Bearer " + tok)
                     void* addMethod = il2cpp_class_get_method_from_name(headersBaseKlass, "TryAddWithoutValidation", 2);
                     NSString *bearerVal = [NSString stringWithFormat:@"Bearer %@", lastToken];
                     void* bearerStr = il2cpp_string_new([bearerVal UTF8String]);
@@ -220,7 +215,6 @@ static void* FindUnityObjectOfType(void* targetKlass) {
                 }
             }
         } else {
-            NSLog(@"[ModMenu] BlobSaveClient instance not found!");
             return NO;
         }
 
@@ -231,21 +225,18 @@ static void* FindUnityObjectOfType(void* targetKlass) {
             void* uploadMethod = il2cpp_class_get_method_from_name(runnerKlass, "DoUploadByBlobSave", 2);
             bool isAuto = false;
             void* exc = nullptr;
-            void* args[2] = { savingDataObj, &isAuto }; // Value types (bool) are passed as pointers
+            void* args[2] = { savingDataObj, &isAuto };
             
             il2cpp_runtime_invoke(uploadMethod, runnerInst, args, &exc);
             if (exc) {
-                NSLog(@"[ModMenu] DoUploadByBlobSave Threw Exception!");
                 return NO;
             }
         } else {
-            NSLog(@"[ModMenu] CloudSaveRunner not found!");
             return NO;
         }
         
         return YES;
     } @catch (NSException *e) {
-        NSLog(@"[ModMenu] IL2CPP Exception: %@", e.reason);
         return NO;
     }
 }
@@ -258,13 +249,9 @@ static void* FindUnityObjectOfType(void* targetKlass) {
             return;
         }
         
-        // 1. Inject into Game (Unity)
         BOOL il2cppSuccess = [self applyIl2cppLogic];
-        
-        // 2. Save to text file
         BOOL savedFile = appendLine(curDistro, lastEmail, lastPass);
         
-        // 3. Update Status
         if (il2cppSuccess && savedFile) {
             uploadMsg = [NSString stringWithFormat:@"OK cloud=%@ file=%@.txt saved=1", lastCloud, [curDistro lowercaseString]];
         } else {
@@ -359,7 +346,8 @@ static void* FindUnityObjectOfType(void* targetKlass) {
     self.scrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(10, 50, 300, 420)];
     [self.menuView addSubview:self.scrollView];
 
-    CGFloat y = 0;
+    // FIX: Add __block keyword here!
+    __block CGFloat y = 0;
     
     // Distro Selector
     UILabel *distroLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, y, 80, 30)];
@@ -379,11 +367,13 @@ static void* FindUnityObjectOfType(void* targetKlass) {
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, y, 200, 30)];
         lbl.textColor = [UIColor lightGrayColor];
         lbl.font = [UIFont systemFontOfSize:11];
-        lbl.tag = y; 
+        lbl.tag = (NSInteger)y; 
         [self.scrollView addSubview:lbl];
         
         UIButton *btn = [self makeBtn:@"Copy" frame:CGRectMake(210, y, 80, 30) action:action];
         [self.scrollView addSubview:btn];
+        
+        // This is safe now because of __block
         y += 40;
     };
 
