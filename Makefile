@@ -9,5 +9,5 @@ Bypass_CFLAGS = -fobjc-arc -Wunused-variable -Wno-error -Wno-deprecated-declarat
 Bypass_IPHONEOS_DEPLOYMENT_TARGET = 16.6.1
 ARCHS = arm64
 TARGET = iphone:clang:latest:14.0
-
+Bypass_LDFLAGS = -undefined dynamic_lookup
 include $(THEOS)/makefiles/tweak.mk
