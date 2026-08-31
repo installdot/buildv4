@@ -57,7 +57,9 @@ namespace IL2CPP {
 
     inline bool Initialize() {
         void* handle = RTLD_DEFAULT;
-        #define RESOLVE(name) name = (name##_t)dlsym(handle, "il2cpp_" #name); if(!name) return false;
+        
+        // Fixed macro casting here
+        #define RESOLVE(name) name = (il2cpp_##name##_t)dlsym(handle, "il2cpp_" #name); if(!name) return false;
         
         RESOLVE(domain_get);
         RESOLVE(thread_attach);
@@ -74,6 +76,8 @@ namespace IL2CPP {
         RESOLVE(class_get_type);
         RESOLVE(type_get_object);
         RESOLVE(runtime_invoke);
+        
+        #undef RESOLVE
         return true;
     }
 
