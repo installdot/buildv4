@@ -1,511 +1,183 @@
 #import <UIKit/UIKit.h>
-#import <Foundation/Foundation.h>
+#import "IL2CPPUtils.hpp"
 
 // ==========================================
-// 1. IL2CPP EXPORTS & STRUCTURES
+// User Interface Elements
 // ==========================================
-extern "C" {
-    void* il2cpp_domain_get();
-    void** il2cpp_domain_get_assemblies(const void* domain, size_t* size);
-    void* il2cpp_assembly_get_image(const void* assembly);
-    void* il2cpp_class_from_name(const void* image, const char* namespaze, const char* name);
-    void* il2cpp_class_get_field_from_name(void* klass, const char* name);
-    void* il2cpp_class_get_method_from_name(void* klass, const char* name, int argsCount);
-    void* il2cpp_object_get_class(void* obj);
-    void il2cpp_field_static_get_value(void* field, void* value);
-    void il2cpp_field_get_value(void* obj, void* field, void* value);
-    void il2cpp_field_set_value(void* obj, void* field, void* value);
-    void* il2cpp_string_new(const char* str);
-    void* il2cpp_class_get_type(void* klass);
-    void* il2cpp_type_get_object(void* type);
-    void* il2cpp_runtime_invoke(void* method, void* obj, void** params, void** exc);
-}
-
-// ==========================================
-// 2. CONSTANTS & STATE VARIABLES
-// ==========================================
-static NSString * const API_URL = @"https://bweab.id.vn/iossave.php";
-static NSString * const GLB_DISTRO = @"1e7d3ea8-a52c-4c63-9ced-ac384bba061d";
-static NSString * const VN_DISTRO = @"06d16cad-861b-4a16-87b7-2f42337932ce";
-
-static NSString *lastCloud = @"";
-static NSString *lastEmail = @"";
-static NSString *lastPass = @"";
-static NSString *lastToken = @"";
-static NSString *curDistro = @"GLB";
-static NSString *statusMsg = @"Idle";
-static NSString *uploadMsg = @"";
-static NSString *apiMsg = @"";
-static int batchN = 1;
-
-// ==========================================
-// 3. FILE SYSTEM & UTILITIES
-// ==========================================
-static void tryCopy(NSString *val) {
-    if (val && val.length > 0) {
-        [UIPasteboard generalPasteboard].string = val;
-    }
-}
-
-static NSString* getSaveDir() {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    return [paths firstObject];
-}
-
-static BOOL appendLine(NSString *distro, NSString *email, NSString *pass) {
-    NSString *fileName = [distro isEqualToString:@"VN"] ? @"vn.txt" : @"glb.txt";
-    NSString *filePath = [getSaveDir() stringByAppendingPathComponent:fileName];
-    
-    NSString *line = [NSString stringWithFormat:@"%@|%@\n", email, pass];
-    NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-    
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:filePath]) {
-        return [data writeToFile:filePath atomically:YES];
-    } else {
-        NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:filePath];
-        if (!fileHandle) return NO;
-        [fileHandle seekToEndOfFile];
-        [fileHandle writeData:data];
-        [fileHandle closeFile];
-        return YES;
-    }
-}
-
-static void clearFiles() {
-    NSString *dir = getSaveDir();
-    [[@"" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[dir stringByAppendingPathComponent:@"vn.txt"] atomically:YES];
-    [[@"" dataUsingEncoding:NSUTF8StringEncoding] writeToFile:[dir stringByAppendingPathComponent:@"glb.txt"] atomically:YES];
-}
-
-
-// ==========================================
-// 4. IL2CPP HELPER FUNCTIONS
-// ==========================================
-static void* FindClass(const char* namespaze, const char* name) {
-    size_t size = 0;
-    void** assemblies = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &size);
-    for(size_t i = 0; i < size; i++) {
-        void* image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) continue;
-        void* klass = il2cpp_class_from_name(image, namespaze, name);
-        if (klass) return klass;
-    }
-    return nullptr;
-}
-
-static void* FindUnityObjectOfType(void* targetKlass) {
-    if (!targetKlass) return nullptr;
-    
-    void* objKlass = FindClass("UnityEngine", "Object");
-    if (!objKlass) return nullptr;
-    
-    void* findMethod = il2cpp_class_get_method_from_name(objKlass, "FindObjectOfType", 1);
-    if (!findMethod) return nullptr;
-    
-    void* typeObj = il2cpp_type_get_object(il2cpp_class_get_type(targetKlass));
-    void* args[1] = { typeObj };
-    void* exc = nullptr;
-    
-    return il2cpp_runtime_invoke(findMethod, nullptr, args, &exc);
-}
-
-
-// ==========================================
-// 5. API & GAME LOGIC
-// ==========================================
-@interface LogicManager : NSObject
-+ (void)fetchAPIWithCompletion:(void(^)(BOOL success))completion;
-+ (void)runDoOneTask:(void(^)(void))completion;
-+ (void)runBatch:(int)count;
+@interface ModMenuUI : UIView
+@property (nonatomic, strong) UITextField *classField;
+@property (nonatomic, strong) UITextField *methodField;
+@property (nonatomic, strong) UITextView *console;
 @end
 
-@implementation LogicManager
+@implementation ModMenuUI
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
+        self.layer.cornerRadius = 10;
 
-+ (void)fetchAPIWithCompletion:(void(^)(BOOL success))completion {
-    statusMsg = @"Fetching API...";
-    NSURL *url = [NSURL URLWithString:API_URL];
-    
-    [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                apiMsg = @"Network Error";
-                statusMsg = @"Fetch Failed";
-                if (completion) completion(NO);
-            });
-            return;
-        }
-        
-        NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        NSError *jsonErr;
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            apiMsg = respStr;
-            if (!jsonErr && json) {
-                lastEmail = json[@"Email"] ?: @"";
-                lastPass = json[@"Pass"] ?: @"";
-                lastToken = json[@"Token"] ?: @"";
-                lastCloud = json[@"CloudID"] ?: @"";
-                statusMsg = @"Fetched";
-                if (completion) completion(YES);
-            } else {
-                statusMsg = @"JSON Parse Error";
-                if (completion) completion(NO);
-            }
-        });
-    }] resume];
-}
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(10, 10, frame.size.width - 20, 30)];
+        title.text = @"LibTool IL2CPP Inspector";
+        title.textColor = [UIColor whiteColor];
+        title.font = [UIFont boldSystemFontOfSize:16];
+        [self addSubview:title];
 
-+ (BOOL)applyIl2cppLogic {
-    @try {
-        NSString *distrID = [curDistro isEqualToString:@"VN"] ? VN_DISTRO : GLB_DISTRO;
-        void *savingDataObj = nullptr;
-        
-        // --- 1. NewCloudSaveAgent Logic ---
-        void* agentKlass = FindClass("RGScript.Other", "NewCloudSaveAgent");
-        if (agentKlass) {
-            void* savingDataField = il2cpp_class_get_field_from_name(agentKlass, "savingData");
-            if (savingDataField) {
-                il2cpp_field_static_get_value(savingDataField, &savingDataObj);
-            }
-            
-            if (savingDataObj) {
-                void* dataKlass = il2cpp_object_get_class(savingDataObj);
-                
-                void* cloudIdField = il2cpp_class_get_field_from_name(dataKlass, "cloudSaveId");
-                void* cloudStr = il2cpp_string_new([lastCloud UTF8String]);
-                il2cpp_field_set_value(savingDataObj, cloudIdField, cloudStr);
-                
-                void* platformIdField = il2cpp_class_get_field_from_name(dataKlass, "platformId");
-                void* platStr = il2cpp_string_new([distrID UTF8String]);
-                il2cpp_field_set_value(savingDataObj, platformIdField, platStr);
-            } else {
-                return NO;
-            }
-        }
-        
-        // --- 2. setBearer Logic ---
-        void* blobClientKlass = FindClass("ChillyRoom.SoulKnight.BlobSaveService.V1", "BlobSaveClient");
-        void* blobInst = FindUnityObjectOfType(blobClientKlass);
-        if (blobInst) {
-            void* httpClientField = il2cpp_class_get_field_from_name(blobClientKlass, "_httpClient");
-            void* httpClientObj = nullptr;
-            il2cpp_field_get_value(blobInst, httpClientField, &httpClientObj);
-            
-            if (httpClientObj) {
-                void* httpKlass = FindClass("System.Net.Http", "HttpClient");
-                void* getHeadersMethod = il2cpp_class_get_method_from_name(httpKlass, "get_DefaultRequestHeaders", 0);
-                void* exc = nullptr;
-                void* headersObj = il2cpp_runtime_invoke(getHeadersMethod, httpClientObj, nullptr, &exc);
-                
-                if (headersObj) {
-                    void* headersBaseKlass = FindClass("System.Net.Http.Headers", "HttpHeaders");
-                    
-                    void* removeMethod = il2cpp_class_get_method_from_name(headersBaseKlass, "Remove", 1);
-                    void* authStr = il2cpp_string_new("Authorization");
-                    void* args1[1] = { authStr };
-                    il2cpp_runtime_invoke(removeMethod, headersObj, args1, &exc);
-                    
-                    void* addMethod = il2cpp_class_get_method_from_name(headersBaseKlass, "TryAddWithoutValidation", 2);
-                    NSString *bearerVal = [NSString stringWithFormat:@"Bearer %@", lastToken];
-                    void* bearerStr = il2cpp_string_new([bearerVal UTF8String]);
-                    void* args2[2] = { authStr, bearerStr };
-                    il2cpp_runtime_invoke(addMethod, headersObj, args2, &exc);
-                }
-            }
-        } else {
-            return NO;
-        }
+        _classField = [[UITextField alloc] initWithFrame:CGRectMake(10, 50, frame.size.width - 20, 35)];
+        _classField.placeholder = @"Class Name (e.g. PlayerController)";
+        _classField.backgroundColor = [UIColor whiteColor];
+        _classField.layer.cornerRadius = 5;
+        [self addSubview:_classField];
 
-        // --- 3. CloudSaveRunner Logic ---
-        void* runnerKlass = FindClass("RGScript.Other.CloudSave", "CloudSaveRunner");
-        void* runnerInst = FindUnityObjectOfType(runnerKlass);
-        if (runnerInst && savingDataObj) {
-            void* uploadMethod = il2cpp_class_get_method_from_name(runnerKlass, "DoUploadByBlobSave", 2);
-            bool isAuto = false;
-            void* exc = nullptr;
-            void* args[2] = { savingDataObj, &isAuto };
-            
-            il2cpp_runtime_invoke(uploadMethod, runnerInst, args, &exc);
-            if (exc) {
-                return NO;
-            }
-        } else {
-            return NO;
-        }
-        
-        return YES;
-    } @catch (NSException *e) {
-        return NO;
-    }
-}
+        _methodField = [[UITextField alloc] initWithFrame:CGRectMake(10, 95, frame.size.width - 20, 35)];
+        _methodField.placeholder = @"Method Name (e.g. AddCoins)";
+        _methodField.backgroundColor = [UIColor whiteColor];
+        _methodField.layer.cornerRadius = 5;
+        [self addSubview:_methodField];
 
-+ (void)runDoOneTask:(void(^)(void))completion {
-    [self fetchAPIWithCompletion:^(BOOL success) {
-        if (!success || lastCloud.length == 0 || lastToken.length == 0) {
-            uploadMsg = @"ERR: no API data";
-            if (completion) completion();
-            return;
-        }
-        
-        BOOL il2cppSuccess = [self applyIl2cppLogic];
-        BOOL savedFile = appendLine(curDistro, lastEmail, lastPass);
-        
-        if (il2cppSuccess && savedFile) {
-            uploadMsg = [NSString stringWithFormat:@"OK cloud=%@ file=%@.txt saved=1", lastCloud, [curDistro lowercaseString]];
-        } else {
-            uploadMsg = [NSString stringWithFormat:@"ERR: il2cpp=%d, saved=%d", il2cppSuccess, savedFile];
-        }
-        
-        statusMsg = @"Task Complete";
-        if (completion) completion();
-    }];
-}
+        UIButton *execBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        execBtn.frame = CGRectMake(10, 140, frame.size.width - 20, 40);
+        [execBtn setTitle:@"Find Instances & Call Method" forState:UIControlStateNormal];
+        execBtn.backgroundColor = [UIColor systemBlueColor];
+        [execBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        execBtn.layer.cornerRadius = 5;
+        [execBtn addTarget:self action:@selector(executeLogic) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:execBtn];
 
-+ (void)runBatch:(int)count {
-    if (count <= 0) return;
-    
-    [self runDoOneTask:^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self runBatch:count - 1];
-        });
-    }];
-}
-@end
-
-
-// ==========================================
-// 6. MOD MENU UI (NATIVE UIKit)
-// ==========================================
-@interface ModMenuManager : NSObject
-@property (nonatomic, strong) UIWindow *menuWindow;
-@property (nonatomic, strong) UIView *menuView;
-@property (nonatomic, strong) UIScrollView *scrollView;
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UILabel *batchLabel;
-@property (nonatomic, strong) NSTimer *loopTimer;
-@property (nonatomic, strong) UIButton *btnGLB;
-@property (nonatomic, strong) UIButton *btnVN;
-+ (instancetype)sharedInstance;
-@end
-
-@implementation ModMenuManager
-
-+ (instancetype)sharedInstance {
-    static ModMenuManager *instance = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ instance = [[ModMenuManager alloc] init]; });
-    return instance;
-}
-
-- (instancetype)init {
-    if (self = [super init]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self setupUI];
-        });
+        _console = [[UITextView alloc] initWithFrame:CGRectMake(10, 190, frame.size.width - 20, frame.size.height - 200)];
+        _console.backgroundColor = [UIColor blackColor];
+        _console.textColor = [UIColor greenColor];
+        _console.editable = NO;
+        _console.font = [UIFont fontWithName:@"Courier" size:12];
+        [self addSubview:_console];
     }
     return self;
 }
 
-- (void)setupUI {
-    self.menuWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.menuWindow.windowLevel = UIWindowLevelStatusBar + 100;
-    self.menuWindow.hidden = NO;
-    self.menuWindow.backgroundColor = [UIColor clearColor];
-    
-    UIViewController *rootVC = [[UIViewController alloc] init];
-    self.menuWindow.rootViewController = rootVC;
-
-    // Toggle Button
-    UIButton *toggleBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    toggleBtn.frame = CGRectMake(20, 50, 50, 50);
-    toggleBtn.backgroundColor = [UIColor systemBlueColor];
-    toggleBtn.layer.cornerRadius = 25;
-    [toggleBtn setTitle:@"MENU" forState:UIControlStateNormal];
-    [toggleBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [toggleBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [rootVC.view addSubview:toggleBtn];
-    [toggleBtn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragView:)]];
-
-    // Main Menu
-    self.menuView = [[UIView alloc] initWithFrame:CGRectMake(20, 110, 320, 480)];
-    self.menuView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.9];
-    self.menuView.layer.cornerRadius = 10;
-    self.menuView.hidden = YES;
-    [rootVC.view addSubview:self.menuView];
-    [self.menuView addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragView:)]];
-    
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 10, 320, 30)];
-    title.text = @"Cloud Save -> vn.txt / glb.txt";
-    title.textColor = [UIColor whiteColor];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.font = [UIFont boldSystemFontOfSize:16];
-    [self.menuView addSubview:title];
-
-    self.scrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(10, 50, 300, 420)];
-    [self.menuView addSubview:self.scrollView];
-
-    // FIX: Add __block keyword here!
-    __block CGFloat y = 0;
-    
-    // Distro Selector
-    UILabel *distroLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, y, 80, 30)];
-    distroLbl.text = @"Distro:";
-    distroLbl.textColor = [UIColor whiteColor];
-    [self.scrollView addSubview:distroLbl];
-    
-    self.btnGLB = [self makeBtn:@"GLB" frame:CGRectMake(80, y, 60, 30) action:@selector(setGLB)];
-    self.btnVN = [self makeBtn:@"VN" frame:CGRectMake(150, y, 60, 30) action:@selector(setVN)];
-    [self.scrollView addSubview:self.btnGLB];
-    [self.scrollView addSubview:self.btnVN];
-    [self refreshDistroBtns];
-    y += 40;
-
-    // Info Rows
-    void (^addRow)(NSString*, SEL) = ^(NSString *labelPrefix, SEL action) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(0, y, 200, 30)];
-        lbl.textColor = [UIColor lightGrayColor];
-        lbl.font = [UIFont systemFontOfSize:11];
-        lbl.tag = (NSInteger)y; 
-        [self.scrollView addSubview:lbl];
-        
-        UIButton *btn = [self makeBtn:@"Copy" frame:CGRectMake(210, y, 80, 30) action:action];
-        [self.scrollView addSubview:btn];
-        
-        // This is safe now because of __block
-        y += 40;
-    };
-
-    addRow(@"CloudID", @selector(cpCloud));
-    addRow(@"Email", @selector(cpEmail));
-    addRow(@"Pass", @selector(cpPass));
-    addRow(@"Token", @selector(cpToken));
-
-    // Action Buttons
-    UIButton *fetchBtn = [self makeBtn:@"Fetch API" frame:CGRectMake(0, y, 290, 35) action:@selector(actionFetch)];
-    [self.scrollView addSubview:fetchBtn]; y += 45;
-    
-    UIButton *createBtn = [self makeBtn:@"Create x1" frame:CGRectMake(0, y, 290, 35) action:@selector(actionOne)];
-    [self.scrollView addSubview:createBtn]; y += 45;
-    
-    // Batch Controls
-    UISwitch *loopSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(0, y, 50, 30)];
-    [loopSwitch addTarget:self action:@selector(toggleLoop:) forControlEvents:UIControlEventValueChanged];
-    [self.scrollView addSubview:loopSwitch];
-    
-    UILabel *loopLbl = [[UILabel alloc] initWithFrame:CGRectMake(60, y, 100, 30)];
-    loopLbl.text = @"Loop (2.5s)";
-    loopLbl.textColor = [UIColor whiteColor];
-    [self.scrollView addSubview:loopLbl];
-    y += 40;
-
-    self.batchLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, y, 100, 30)];
-    self.batchLabel.text = @"Batch: 1";
-    self.batchLabel.textColor = [UIColor whiteColor];
-    [self.scrollView addSubview:self.batchLabel];
-    
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(100, y, 190, 30)];
-    slider.minimumValue = 1; slider.maximumValue = 30;
-    [slider addTarget:self action:@selector(sliderChange:) forControlEvents:UIControlEventValueChanged];
-    [self.scrollView addSubview:slider]; y += 40;
-
-    UIButton *batchBtn = [self makeBtn:@"Create Batch" frame:CGRectMake(0, y, 290, 35) action:@selector(actionBatch)];
-    [self.scrollView addSubview:batchBtn]; y += 45;
-
-    UIButton *clearBtn = [self makeBtn:@"Clear vn.txt & glb.txt" frame:CGRectMake(0, y, 290, 35) action:@selector(actionClear)];
-    clearBtn.backgroundColor = [UIColor systemRedColor];
-    [self.scrollView addSubview:clearBtn]; y += 45;
-
-    // Status Label
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, y, 290, 100)];
-    self.statusLabel.numberOfLines = 0;
-    self.statusLabel.textColor = [UIColor greenColor];
-    self.statusLabel.font = [UIFont systemFontOfSize:11];
-    [self updateUI];
-    [self.scrollView addSubview:self.statusLabel];
-    
-    self.scrollView.contentSize = CGSizeMake(300, y + 120);
-    
-    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
-        [self updateUI];
-    }];
+- (void)log:(NSString *)msg {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.console.text = [NSString stringWithFormat:@"%@\n%@", self.console.text, msg];
+        NSRange range = NSMakeRange(self.console.text.length, 0);
+        [self.console scrollRangeToVisible:range];
+    });
 }
 
-- (UIButton *)makeBtn:(NSString *)title frame:(CGRect)rect action:(SEL)action {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = rect;
-    btn.backgroundColor = [UIColor darkGrayColor];
-    btn.layer.cornerRadius = 5;
-    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [btn setTitle:title forState:UIControlStateNormal];
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    return btn;
-}
+- (void)executeLogic {
+    [self endEditing:YES]; // Hide keyboard
+    NSString *className = _classField.text;
+    NSString *methodName = _methodField.text;
 
-- (void)dragView:(UIPanGestureRecognizer *)gesture {
-    UIView *target = gesture.view;
-    CGPoint trans = [gesture translationInView:target.superview];
-    target.center = CGPointMake(target.center.x + trans.x, target.center.y + trans.y);
-    [gesture setTranslation:CGPointZero inView:target.superview];
-}
-
-- (void)toggleMenu { self.menuView.hidden = !self.menuView.hidden; }
-- (void)setGLB { curDistro = @"GLB"; [self refreshDistroBtns]; }
-- (void)setVN { curDistro = @"VN"; [self refreshDistroBtns]; }
-- (void)refreshDistroBtns {
-    self.btnGLB.backgroundColor = [curDistro isEqualToString:@"GLB"] ? [UIColor systemBlueColor] : [UIColor darkGrayColor];
-    self.btnVN.backgroundColor = [curDistro isEqualToString:@"VN"] ? [UIColor systemBlueColor] : [UIColor darkGrayColor];
-}
-- (void)cpCloud { tryCopy(lastCloud); }
-- (void)cpEmail { tryCopy(lastEmail); }
-- (void)cpPass { tryCopy(lastPass); }
-- (void)cpToken { tryCopy(lastToken); }
-
-- (void)actionFetch { [LogicManager fetchAPIWithCompletion:nil]; }
-- (void)actionOne { [LogicManager runDoOneTask:nil]; }
-- (void)actionBatch { [LogicManager runBatch:batchN]; }
-- (void)actionClear { clearFiles(); statusMsg = @"Files Cleared"; [self updateUI]; }
-
-- (void)sliderChange:(UISlider *)sender {
-    batchN = (int)round(sender.value);
-    self.batchLabel.text = [NSString stringWithFormat:@"Batch: %d", batchN];
-}
-
-- (void)toggleLoop:(UISwitch *)sender {
-    if (sender.isOn) {
-        self.loopTimer = [NSTimer scheduledTimerWithTimeInterval:2.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
-            [self actionOne];
-        }];
-    } else {
-        [self.loopTimer invalidate];
-        self.loopTimer = nil;
+    if (className.length == 0 || methodName.length == 0) {
+        [self log:@"[!] Error: Enter class and method name."];
+        return;
     }
-}
 
-- (void)updateUI {
-    for (UIView *view in self.scrollView.subviews) {
-        if ([view isKindOfClass:[UILabel class]]) {
-            UILabel *lbl = (UILabel *)view;
-            if (lbl.tag == 40) lbl.text = [NSString stringWithFormat:@"CloudID: %@", lastCloud];
-            if (lbl.tag == 80) lbl.text = [NSString stringWithFormat:@"Email: %@", lastEmail];
-            if (lbl.tag == 120) lbl.text = [NSString stringWithFormat:@"Pass: %@", lastPass];
-            if (lbl.tag == 160) lbl.text = [NSString stringWithFormat:@"Token: %@", lastToken];
+    [self log:[NSString stringWithFormat:@"[*] Searching for Class: %@", className]];
+    
+    // Attach thread just in case UIKit thread isn't registered
+    IL2CPP::thread_attach(IL2CPP::domain_get());
+
+    // 1. Find Class
+    Il2CppClass *klass = IL2CPP::FindClassGlobal(className.UTF8String);
+    if (!klass) {
+        [self log:@"[-] Class not found in any loaded assembly."];
+        return;
+    }
+
+    // 2. Find Method (assuming 0 parameters for dynamic invocation safety)
+    MethodInfo *method = IL2CPP::class_get_method_from_name(klass, methodName.UTF8String, 0);
+    if (!method) {
+        [self log:@"[-] Method not found. Ensure it takes 0 arguments (or update script to handle params)."];
+        return;
+    }
+
+    // 3. Find Instances dynamically via Unity Heap
+    [self log:@"[*] Class found. Scanning memory for active instances..."];
+    std::vector<void*> instances = IL2CPP::FindInstances(klass);
+    
+    if (instances.empty()) {
+        [self log:@"[-] No active instances found in the current scene."];
+        return;
+    }
+
+    [self log:[NSString stringWithFormat:@"[+] Found %zu instances. Invoking method...", instances.size()]];
+
+    // 4. Invoke Method on all found instances
+    for (size_t i = 0; i < instances.size(); i++) {
+        void* instance = instances[i];
+        [self log:[NSString stringWithFormat:@"  -> Invoking on instance at %p", instance]];
+        
+        Il2CppObject* exception = nullptr;
+        IL2CPP::runtime_invoke(method, instance, nullptr, &exception);
+        
+        if (exception) {
+            [self log:@"  [!] Exception thrown during execution!"];
+        } else {
+            [self log:@"  [+] Success!"];
         }
     }
-    
-    NSString *shortApi = apiMsg.length > 70 ? [[apiMsg substringToIndex:70] stringByAppendingString:@"..."] : apiMsg;
-    self.statusLabel.text = [NSString stringWithFormat:@"Status: %@\nLast: %@\nAPI: %@\nDir: %@", 
-                             statusMsg, uploadMsg, shortApi, getSaveDir()];
 }
 @end
 
+
 // ==========================================
-// 7. INJECTION POINT
+// Floating Button Logic
 // ==========================================
+ModMenuUI *menuView;
+
+@interface FloatingIcon : UIButton
+@end
+@implementation FloatingIcon
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    UITouch *touch = [touches anyObject];
+    CGPoint location = [touch locationInView:self.superview];
+    self.center = location;
+}
+@end
+
+void SetupUI() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = [UIApplication sharedApplication].keyWindow;
+        if (!window) return;
+
+        // The Main Menu Window
+        menuView = [[ModMenuUI alloc] initWithFrame:CGRectMake(20, 50, 300, 350)];
+        menuView.hidden = YES; // Hidden by default
+        [window addSubview:menuView];
+
+        // The Draggable Floating Icon
+        FloatingIcon *floater = [FloatingIcon buttonWithType:UIButtonTypeCustom];
+        floater.frame = CGRectMake(20, 100, 50, 50);
+        floater.backgroundColor = [UIColor redColor];
+        floater.layer.cornerRadius = 25;
+        floater.layer.borderWidth = 2;
+        floater.layer.borderColor = [UIColor whiteColor].CGColor;
+        [floater setTitle:@"🛠" forState:UIControlStateNormal];
+        
+        [floater addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
+            menuView.hidden = !menuView.hidden; // Toggle menu visibility
+            if(!menuView.hidden) [window bringSubviewToFront:menuView];
+        }] forControlEvents:UIControlEventTouchUpInside];
+        
+        [window addSubview:floater];
+    });
+}
+
+
+// ==========================================
+// Loader Initialization
+// ==========================================
+void WaitForUnity() {
+    // Poll until IL2CPP domain is fully loaded by the game engine
+    while (!IL2CPP::Initialize() || IL2CPP::domain_get() == nullptr) {
+        [NSThread sleepForTimeInterval:1.0];
+    }
+    NSLog(@"[LibTool-iOS] Unity IL2CPP Initialized!");
+    SetupUI();
+}
+
 %ctor {
-    NSLog(@"[CloudSaveMod] Loaded Native Mod Menu!");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [ModMenuManager sharedInstance];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        WaitForUnity();
     });
 }
