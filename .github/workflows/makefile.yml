@@ -34,26 +34,26 @@ jobs:
           echo "THEOS=$PWD/theos" >> $GITHUB_ENV
           echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
 
-      - name: Find Tweak.mm file
-        id: find_tweak_mm
+      - name: Find Tweak.xm file
+        id: find_tweak_xm
         run: |
-          TWEAK_mm_PATH=$(find . -name 'Tweak.mm' -print -quit)
+          TWEAK_xm_PATH=$(find . -name 'Tweak.xm' -print -quit)
 
-          if [ -z "$TWEAK_mm_PATH" ]; then
-            echo "Tweak.mm not found!"
+          if [ -z "$TWEAK_xm_PATH" ]; then
+            echo "Tweak.xm not found!"
             exit 1
           fi
 
-          echo "Tweak.mm found at $TWEAK_mm_PATH"
-          echo "tweak_mm=$TWEAK_mm_PATH" >> $GITHUB_ENV
+          echo "Tweak.xm found at $TWEAK_xm_PATH"
+          echo "tweak_xm=$TWEAK_xm_PATH" >> $GITHUB_ENV
 
       - name: Build the Tweak
         run: |
-          TWEAK_mm_PATH="${{ env.tweak_mm }}"
-          MAKEFILE_DIR=$(dirname "$TWEAK_mm_PATH")
+          TWEAK_xm_PATH="${{ env.tweak_xm }}"
+          MAKEFILE_DIR=$(dirname "$TWEAK_xm_PATH")
           cd "$MAKEFILE_DIR"
 
-          echo "Building tweak with Tweak.mm in directory: $MAKEFILE_DIR"
+          echo "Building tweak with Tweak.xm in directory: $MAKEFILE_DIR"
           make clean
           make
 
