@@ -1,7 +1,7 @@
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Bypass
-Bypass_FILES = Tweak.mm
+Bypass_FILES = Tweak.xm
 Bypass_LOAD_PRIORITY  = 1
 FRAMEWORKS = Network NetworkExtension Foundation UIKit Security DeviceCheck UserNotifications OpenGLES GLKit AVFoundation
 Bypass_LIBRARIES = substrate
