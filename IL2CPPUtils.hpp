@@ -4,6 +4,20 @@
 #include <vector>
 #include <iostream>
 
+// --- Corrected Memory Layouts ---
+struct Il2CppObject_Layout {
+    void* klass;   // 8 bytes on 64-bit
+    void* monitor; // 8 bytes on 64-bit
+}; // Total: 16 bytes
+
+struct Il2CppArray {
+    Il2CppObject_Layout obj; // Embedded struct, NOT a pointer (16 bytes)
+    void* bounds;            // 8 bytes
+    uintptr_t max_length;    // 8 bytes (Use uintptr_t for 64-bit safety)
+    void* vector[1];         // Start of element pointers
+};
+
+// C-APIs
 typedef void* Il2CppDomain;
 typedef void* Il2CppAssembly;
 typedef void* Il2CppImage;
@@ -13,15 +27,6 @@ typedef void* Il2CppObject;
 typedef void* Il2CppType;
 typedef void* Il2CppThread;
 
-// Runtime arrays in memory
-struct Il2CppArray {
-    Il2CppObject* obj;
-    void* bounds;
-    uint32_t max_length;
-    void* vector[32]; 
-};
-
-// C-APIs
 typedef Il2CppDomain* (*il2cpp_domain_get_t)();
 typedef Il2CppThread* (*il2cpp_thread_attach_t)(Il2CppDomain* domain);
 typedef const Il2CppAssembly** (*il2cpp_domain_get_assemblies_t)(const Il2CppDomain* domain, size_t* size);
@@ -58,7 +63,6 @@ namespace IL2CPP {
     inline bool Initialize() {
         void* handle = RTLD_DEFAULT;
         
-        // Fixed macro casting here
         #define RESOLVE(name) name = (il2cpp_##name##_t)dlsym(handle, "il2cpp_" #name); if(!name) return false;
         
         RESOLVE(domain_get);
@@ -81,7 +85,6 @@ namespace IL2CPP {
         return true;
     }
 
-    // Globally search for a class across all loaded DLLs
     inline Il2CppClass* FindClassGlobal(const std::string& className) {
         size_t assemblyCount = 0;
         const Il2CppAssembly** assemblies = domain_get_assemblies(domain_get(), &assemblyCount);
@@ -98,12 +101,11 @@ namespace IL2CPP {
         return nullptr;
     }
 
-    // Calls UnityEngine.Object.FindObjectsOfType(Type) internally to get all instances
     inline std::vector<void*> FindInstances(Il2CppClass* targetClass) {
         std::vector<void*> instances;
         if (!targetClass) return instances;
 
-        Il2CppClass* unityObjClass = FindClassGlobal("Object"); // UnityEngine.Object
+        Il2CppClass* unityObjClass = FindClassGlobal("Object"); 
         if (!unityObjClass) return instances;
 
         MethodInfo* findMethod = class_get_method_from_name(unityObjClass, "FindObjectsOfType", 1);
@@ -114,8 +116,18 @@ namespace IL2CPP {
         
         Il2CppArray* arr = (Il2CppArray*)runtime_invoke(findMethod, nullptr, args, nullptr);
         if (arr) {
-            for (uint32_t i = 0; i < arr->max_length; i++) {
-                instances.push_back(arr->vector[i]);
+            // Crash-safety sanity bounds check
+            uintptr_t array_length = arr->max_length;
+            if (array_length > 500000) { 
+                // If it reads an absurd number, bail out instead of crashing
+                std::cout << "[IL2CPP] Array length sanity check failed! Length: " << array_length << std::endl;
+                return instances; 
+            }
+
+            for (uintptr_t i = 0; i < array_length; i++) {
+                if (arr->vector[i]) {
+                    instances.push_back(arr->vector[i]);
+                }
             }
         }
         return instances;
