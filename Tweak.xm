@@ -2,6 +2,34 @@
 #import "IL2CPPUtils.hpp"
 
 // ==========================================
+// File Logger System
+// ==========================================
+static NSString *logFilePath = nil;
+
+static void SetupFileLogger() {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *documentsDirectory = [paths firstObject];
+    logFilePath = [documentsDirectory stringByAppendingPathComponent:@"LibTool_CrashLog.txt"];
+    
+    NSString *startupMsg = [NSString stringWithFormat:@"\n\n--- LibTool Initialized at %@ ---\n", [NSDate date]];
+    [startupMsg writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static void WriteToFileLog(NSString *message) {
+    if (!logFilePath) return;
+    NSString *formattedMessage = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], message];
+    
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForUpdatingAtPath:logFilePath];
+    if (fileHandle) {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[formattedMessage dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    } else {
+        [formattedMessage writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
+
+// ==========================================
 // User Interface Elements
 // ==========================================
 @interface ModMenuUI : UIView
@@ -63,7 +91,9 @@
     return self;
 }
 
+// Logs to both UI and File
 - (void)log:(NSString *)msg {
+    WriteToFileLog(msg); // Write to physical file
     dispatch_async(dispatch_get_main_queue(), ^{
         self.console.text = [NSString stringWithFormat:@"%@\n%@", self.console.text, msg];
         NSRange range = NSMakeRange(self.console.text.length, 0);
@@ -82,8 +112,6 @@
     }
 
     [self log:[NSString stringWithFormat:@"[*] Searching for Class: %@", className]];
-
-    // Attach thread if not already attached
     IL2CPP::thread_attach(IL2CPP::domain_get());
 
     Il2CppClass *klass = IL2CPP::FindClassGlobal(className.UTF8String);
@@ -94,7 +122,7 @@
 
     MethodInfo *method = IL2CPP::class_get_method_from_name(klass, methodName.UTF8String, 0);
     if (!method) {
-        [self log:@"[-] Method not found (0 arguments expected)."];
+        [self log:@"[-] Method not found (Ensure it takes 0 arguments)."];
         return;
     }
 
@@ -110,13 +138,13 @@
 
     for (size_t i = 0; i < instances.size(); i++) {
         void* instance = instances[i];
-        [self log:[NSString stringWithFormat:@"  -> Invoking on %p", instance]];
+        [self log:[NSString stringWithFormat:@"  -> Invoking on pointer %p", instance]];
 
         Il2CppObject* exception = nullptr;
         IL2CPP::runtime_invoke(method, instance, nullptr, &exception);
 
         if (exception) {
-            [self log:@"  [!] Exception thrown during execution."];
+            [self log:@"  [!] Exception thrown during execution!"];
         } else {
             [self log:@"  [+] Success!"];
         }
@@ -125,20 +153,18 @@
 @end
 
 // ==========================================
-// Floating Draggable Button
+// Floating Draggable Button & Init
 // ==========================================
 ModMenuUI *menuView = nil;
 
 @interface FloatingIcon : UIButton
 @end
-
 @implementation FloatingIcon
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *touch = [touches anyObject];
     CGPoint location = [touch locationInView:self.superview];
     self.center = location;
 }
-
 - (void)toggleMenu {
     if (menuView) {
         menuView.hidden = !menuView.hidden;
@@ -149,7 +175,6 @@ ModMenuUI *menuView = nil;
 }
 @end
 
-// Helper to safely get the active window across iOS 13–18+
 static UIWindow* GetActiveWindow() {
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
@@ -157,9 +182,7 @@ static UIWindow* GetActiveWindow() {
             for (UIWindow *window in windowScene.windows) {
                 if (window.isKeyWindow) return window;
             }
-            if (windowScene.windows.count > 0) {
-                return windowScene.windows.firstObject;
-            }
+            if (windowScene.windows.count > 0) return windowScene.windows.firstObject;
         }
     }
     return [UIApplication sharedApplication].windows.firstObject;
@@ -169,51 +192,43 @@ static void SetupUI() {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = GetActiveWindow();
         if (!window) {
-            // If window is not ready yet, retry in 1 second
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 SetupUI();
             });
             return;
         }
 
-        if (menuView) return; // Prevent double insertion
+        if (menuView) return; 
 
-        // Create Menu
         menuView = [[ModMenuUI alloc] initWithFrame:CGRectMake(20, 60, 300, 350)];
         menuView.hidden = YES;
         [window addSubview:menuView];
 
-        // Create Floating Icon
         FloatingIcon *floater = [FloatingIcon buttonWithType:UIButtonTypeCustom];
         floater.frame = CGRectMake(20, 100, 50, 50);
         floater.backgroundColor = [UIColor colorWithRed:0.85 green:0.2 blue:0.2 alpha:1.0];
         floater.layer.cornerRadius = 25;
         floater.layer.borderWidth = 2;
         floater.layer.borderColor = [UIColor whiteColor].CGColor;
-        floater.layer.masksToBounds = YES;
         [floater setTitle:@"🛠" forState:UIControlStateNormal];
         [floater addTarget:floater action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-
         [window addSubview:floater];
     });
 }
 
-// ==========================================
-// Initialization Loop
-// ==========================================
 static void WaitForUnity() {
-    // Wait until IL2CPP symbols and domain are initialized
     while (!IL2CPP::Initialize() || IL2CPP::domain_get() == nullptr) {
         [NSThread sleepForTimeInterval:0.5];
     }
-
-    NSLog(@"[LibTool-iOS] Unity & IL2CPP Ready!");
+    WriteToFileLog(@"IL2CPP runtime attached successfully.");
     SetupUI();
 }
 
 %ctor {
+    SetupFileLogger(); // Start file logging instantly
+    WriteToFileLog(@"Tweak loaded into process.");
+    
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // Delay initialization slightly to let the game binary load into memory
         [NSThread sleepForTimeInterval:1.0];
         WaitForUnity();
     });
