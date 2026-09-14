@@ -127,14 +127,17 @@ static UIImage *F4CMenuEmbeddedLogoImage(void) {
     static UIImage *image = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        ptrdiff_t byteCount = F4CMenuLogoPNGEnd - F4CMenuLogoPNGStart;
-        if (byteCount <= 0) return;
-
-        NSData *data =
-            [[NSData alloc] initWithBytesNoCopy:(void *)F4CMenuLogoPNGStart
-                                         length:(NSUInteger)byteCount
-                                   freeWhenDone:NO];
-        image = data ? [UIImage imageWithData:data] : nil;
+        @try {
+            if (&F4CMenuLogoPNGStart != NULL && &F4CMenuLogoPNGEnd != NULL) {
+                ptrdiff_t byteCount = F4CMenuLogoPNGEnd - F4CMenuLogoPNGStart;
+                if (byteCount > 0) {
+                    NSData *data = [[NSData alloc] initWithBytesNoCopy:(void *)F4CMenuLogoPNGStart
+                                                                 length:(NSUInteger)byteCount
+                                                           freeWhenDone:NO];
+                    image = data ? [UIImage imageWithData:data] : nil;
+                }
+            }
+        } @catch (id ex) {}
     });
     return image;
 }
@@ -13092,6 +13095,14 @@ static void F4SetupMenu(void) {
 
 static void F4StartUI(void) {
     if (gF4AuthorizedUIStarted) return;
+    UIWindow *window = F4CActiveWindow();
+    if (!window) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            F4StartUI();
+        });
+        return;
+    }
     gF4AuthorizedUIStarted = YES;
     F4SetupMenu();
 }
@@ -13099,10 +13110,12 @@ static void F4StartUI(void) {
 static void F4Initialize(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        F4RegisterDefaults();
-        TNMDAutoPerfectInitialize();
+        @try {
+            F4RegisterDefaults();
+            TNMDAutoPerfectInitialize();
+        } @catch (id ex) {}
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             F4StartUI();
         });
@@ -13115,7 +13128,9 @@ static void F4DidFinishLaunching(CFNotificationCenterRef center,
                                  const void *object,
                                  CFDictionaryRef userInfo) {
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
-    F4Initialize();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        F4Initialize();
+    });
 }
 
 __attribute__((constructor)) static void F4Constructor(void) {
@@ -13125,7 +13140,6 @@ __attribute__((constructor)) static void F4Constructor(void) {
                                      (CFStringRef)UIApplicationDidFinishLaunchingNotification,
                                      NULL,
                                      CFNotificationSuspensionBehaviorDrop);
-    dispatch_async(dispatch_get_main_queue(), ^{ F4Initialize(); });
 }
 
 
