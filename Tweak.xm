@@ -128,14 +128,12 @@ static UIImage *F4CMenuEmbeddedLogoImage(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         @try {
-            if (&F4CMenuLogoPNGStart != NULL && &F4CMenuLogoPNGEnd != NULL) {
-                ptrdiff_t byteCount = F4CMenuLogoPNGEnd - F4CMenuLogoPNGStart;
-                if (byteCount > 0) {
-                    NSData *data = [[NSData alloc] initWithBytesNoCopy:(void *)F4CMenuLogoPNGStart
-                                                                 length:(NSUInteger)byteCount
-                                                           freeWhenDone:NO];
-                    image = data ? [UIImage imageWithData:data] : nil;
-                }
+            ptrdiff_t byteCount = (ptrdiff_t)(F4CMenuLogoPNGEnd - F4CMenuLogoPNGStart);
+            if (byteCount > 0) {
+                NSData *data = [[NSData alloc] initWithBytesNoCopy:(void *)F4CMenuLogoPNGStart
+                                                             length:(NSUInteger)byteCount
+                                                       freeWhenDone:NO];
+                image = data ? [UIImage imageWithData:data] : nil;
             }
         } @catch (id ex) {}
     });
