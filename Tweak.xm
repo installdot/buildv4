@@ -8549,7 +8549,7 @@ static Il2CppObject *GetDanceLogic(Il2CppObject *module) {
     return logic;
 }
 
-static bool HandleStarlightBubbleNativeAutoPlay(int32_t danceMode, Il2CppObject *danceModule) {
+__attribute__((unused)) static bool HandleStarlightBubbleNativeAutoPlay(int32_t danceMode, Il2CppObject *danceModule) {
     if (danceMode != 14) return false;
 
     if (!danceModule || !gDanceGetLogic || !gStarlightBubbleDanceClass || !gBubbleNoteControllerClass ||
@@ -8779,7 +8779,7 @@ static void SkinEmit(NSString *state, NSString *reason, NSString *details = nil)
     }
 }
 
-static NSString *SkinTypeName(int32_t type) {
+__attribute__((unused)) static NSString *SkinTypeName(int32_t type) {
     switch (type) {
         case 0: return @"Hair"; case 1: return @"Coat"; case 2: return @"Pants"; case 3: return @"Shoes";
         case 5: return @"UpBody"; case 6: return @"AllBody"; case 7: return @"Top";
@@ -12592,7 +12592,7 @@ static void F4RefreshRuntimeLabels(void) {
     }
 }
 
-static void F4InstallRuntimeLogSink(void) {
+__attribute__((unused)) static void F4InstallRuntimeLogSink(void) {
     TNMDAutoPerfectSetUILogSink(^(NSString *feature, NSString *state, NSString *reason) {
         dispatch_async(dispatch_get_main_queue(), ^{
             gF4LastRuntimeEvent = [NSString stringWithFormat:@"[%@] %@ • %@",
@@ -12647,7 +12647,7 @@ static void F4ShowDiagnosticText(NSString *title, NSString *fullText) {
     if (vc) [vc presentViewController:alert animated:YES completion:nil];
 }
 
-static void F4ShowSelectedDiagnostic(void) {
+__attribute__((unused)) static void F4ShowSelectedDiagnostic(void) {
     NSString *feature = F4SelectedDiagnosticFeature();
     NSString *session = F4SelectedDiagnosticSession();
     NSString *text = TNMDDiagnosticTextForSelection(feature, session);
