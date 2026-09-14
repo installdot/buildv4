@@ -12791,7 +12791,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *F4AccentStyles(void) {
     ];
 }
 
-static NSArray<NSString *> *F4AccentNames(void) {
+__attribute__((unused)) static NSArray<NSString *> *F4AccentNames(void) {
     NSMutableArray<NSString *> *names = [NSMutableArray array];
     for (NSDictionary<NSString *, NSString *> *entry in F4AccentStyles()) {
         [names addObject:entry[@"name"] ?: @"Theme"];
