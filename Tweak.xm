@@ -12634,7 +12634,7 @@ __attribute__((unused)) static void F4ShowSelectedDiagnostic(void) {
 }
 
 
-static void F4OpenTelegram(void) {
+__attribute__((unused)) static void F4OpenTelegram(void) {
     NSURL *url = [NSURL URLWithString:kF4TelegramURL];
     if (!url) return;
     UIApplication *app = UIApplication.sharedApplication;
@@ -12691,7 +12691,7 @@ static void F4RefreshSkinLabels(void) {
     // FINAL CLEAN UI: no persistent skin status/debug rows.
 }
 
-static void F4SkinSelectType(NSInteger type, NSInteger selectedIndex) {
+__attribute__((unused)) static void F4SkinSelectType(NSInteger type, NSInteger selectedIndex) {
     if (selectedIndex <= 0) return; // index 0 = keep current/original for this slot.
     NSArray<NSDictionary *> *items = gF4SkinItemsByType[@(type)];
     NSInteger itemIndex = selectedIndex - 1;
@@ -12709,7 +12709,7 @@ static void F4SkinSelectType(NSInteger type, NSInteger selectedIndex) {
     F4RefreshSkinLabels();
 }
 
-static void F4ReloadSkinSelectors(MenuView *menu) {
+__attribute__((unused)) static void F4ReloadSkinSelectors(MenuView *menu) {
     if (!menu) return;
     if (!gF4SkinItemsByType) gF4SkinItemsByType = [NSMutableDictionary dictionary];
     if (!gF4SkinIndexByType) gF4SkinIndexByType = [NSMutableDictionary dictionary];
@@ -12729,7 +12729,7 @@ static void F4ReloadSkinSelectors(MenuView *menu) {
 }
 
 
-static void F4ReloadHeadSelectors(MenuView *menu) {
+__attribute__((unused)) static void F4ReloadHeadSelectors(MenuView *menu) {
     if (!menu) return;
     BOOL reloaded = TNMDHeadReloadCatalogs();
     NSArray<NSString *> *nameOptions = TNMDHeadNameEffectOptions() ?: @[];
@@ -12865,19 +12865,17 @@ static void F4SetupMenu(void) {
     gF4MenuConfigured = YES;
 
     [menu setMenuTitle:kF4GameName];
-    [menu setMenuSubtitle:@"SẢN PHẨM MIỄN PHÍ TỪ F4 TEAM"];
-    [menu setMenuLogoCharacter:@"F4"];
-    [menu setSidebarFooterText:kF4Credit];
-    [menu setFooterText:kF4Credit];
+    [menu setMenuSubtitle:@"AUTO PERFECT"];
+    [menu setMenuLogoCharacter:@"AP"];
+    [menu setSidebarFooterText:@"F4 TEAM"];
+    [menu setFooterText:@"F4 TEAM"];
     [menu setMenuCornerRadius:14.0];
     [menu setMenuBorderWidth:1.0];
     [menu setMenuGlassEffect:YES];
     menu.telegramURL = kF4TelegramURL;
     menu.alpha = 0.98;
 
-    [menu addTabSection:@"GAMEPLAY" tabs:@[@"AUTO"]];
-    [menu addTabSection:@"COSMETIC" tabs:@[@"SKIN", @"HIỆU ỨNG TRÊN ĐẦU", @"VIP"]];
-    [menu addTabSection:@"F4 TEAM" tabs:@[@"TELEGRAM", @"GIAO DIỆN"]];
+    [menu addTabSection:@"GAMEPLAY" tabs:@[@"AUTO PERFECT"]];
 
     [menu setTabIndex:0];
     [menu addSectionTitle:@"AUTO PERFECT"];
@@ -12886,181 +12884,7 @@ static void F4SetupMenu(void) {
         F4RefreshRuntimeLabels();
     }];
 
-    [menu setTabIndex:1];
-    [menu addSectionTitle:@"SKIN CHANGER — CHỌN THEO TỪNG Ô"];
-    __weak MenuView *weakSkinMenu = menu;
-    [menu addButton:@"Nạp / làm mới danh sách đồ" withHandler:^{
-        MenuView *strongMenu = weakSkinMenu;
-        F4ReloadSkinSelectors(strongMenu);
-    }];
-
-    NSString *lastGroup = nil;
-    for (NSDictionary *slot in F4SkinSlots()) {
-        NSString *group = slot[@"group"] ?: @"SKIN";
-        if (!lastGroup || ![lastGroup isEqualToString:group]) {
-            [menu addSectionTitle:group];
-            lastGroup = group;
-        }
-        NSString *title = slot[@"name"] ?: @"Skin";
-        NSInteger type = [slot[@"type"] integerValue];
-        [menu addComboSelector:title
-                       options:@[@"Đang nạp..."]
-                 selectedIndex:0
-                       handler:^(NSInteger selectedIndex) {
-            F4SkinSelectType(type, selectedIndex);
-        }];
-    }
-
-    [menu addButton:@"Restore toàn bộ outfit gốc" withHandler:^{
-        TNMDSkinRestoreOriginal();
-        [gF4SkinIndexByType removeAllObjects];
-        MenuView *strongMenu = weakSkinMenu;
-        for (NSDictionary *slot in F4SkinSlots()) {
-            NSString *title = slot[@"name"] ?: @"Skin";
-            NSInteger type = [slot[@"type"] integerValue];
-            NSArray<NSDictionary *> *items = gF4SkinItemsByType[@(type)] ?: @[];
-            [strongMenu updateComboSelector:title options:F4SkinOptionNames(items) selectedIndex:0];
-        }
-        gF4SkinSelectedID = 0;
-        gF4SkinSelectedType = -1;
-        gF4SkinSelectedName = nil;
-        F4RefreshSkinLabels();
-    }];
-
-    // Try once immediately; if config/player is not ready yet, the reload button above retries later.
-    F4ReloadSkinSelectors(menu);
-
-    [menu setTabIndex:2];
-    [menu addSectionTitle:@"HIỆU ỨNG TRÊN ĐẦU"];
-    gF4HeadCatalogLabel = [menu addStatusLabel:@"Bấm nút bên dưới để nạp danh sách hiệu ứng."];
-    __weak MenuView *weakHeadMenu = menu;
-    [menu addButton:@"Nạp / làm mới hiệu ứng" withHandler:^{
-        F4ReloadHeadSelectors(weakHeadMenu);
-    }];
-
-    NSArray<NSString *> *headNameOptions = TNMDHeadNameEffectOptions() ?: @[];
-    NSInteger savedHeadName = [NSUserDefaults.standardUserDefaults integerForKey:kF4HeadNameEffectIndexKey];
-    if (savedHeadName < 0 || savedHeadName >= (NSInteger)headNameOptions.count) savedHeadName = 0;
-    [menu addSectionTitle:@"HIỆU ỨNG TÊN"];
-    [menu addComboSelector:@"Chọn hiệu ứng tên"
-                   options:headNameOptions.count ? headNameOptions : @[@"Bình thường"]
-             selectedIndex:savedHeadName
-                   handler:^(NSInteger selectedIndex) {
-        [NSUserDefaults.standardUserDefaults setInteger:selectedIndex forKey:kF4HeadNameEffectIndexKey];
-        TNMDHeadNameEffectSet(selectedIndex);
-        F4RefreshRuntimeLabels();
-    }];
-
-    NSArray<NSString *> *headTitleOptions = TNMDHeadTitleOptions() ?: @[];
-    NSInteger savedHeadTitle = [NSUserDefaults.standardUserDefaults integerForKey:kF4HeadTitleIndexKey];
-    if (savedHeadTitle < 0 || savedHeadTitle >= (NSInteger)headTitleOptions.count) savedHeadTitle = 0;
-    BOOL savedHeadTitleDynamic = [NSUserDefaults.standardUserDefaults objectForKey:kF4HeadTitleDynamicKey] ? [NSUserDefaults.standardUserDefaults boolForKey:kF4HeadTitleDynamicKey] : YES;
-    [menu addSectionTitle:@"DANH HIỆU"];
-    [menu addComboSelector:@"Chọn danh hiệu"
-                   options:headTitleOptions.count ? headTitleOptions : @[@"Không chọn"]
-             selectedIndex:savedHeadTitle
-                   handler:^(NSInteger selectedIndex) {
-        [NSUserDefaults.standardUserDefaults setInteger:selectedIndex forKey:kF4HeadTitleIndexKey];
-        TNMDHeadTitleSet(selectedIndex);
-        F4RefreshRuntimeLabels();
-    }];
-    [menu addComboSelector:@"Danh hiệu động / tĩnh"
-                   options:@[@"Động", @"Tĩnh"]
-             selectedIndex:(savedHeadTitleDynamic ? 0 : 1)
-                   handler:^(NSInteger selectedIndex) {
-        BOOL dynamic = (selectedIndex == 0);
-        [NSUserDefaults.standardUserDefaults setBool:dynamic forKey:kF4HeadTitleDynamicKey];
-        TNMDHeadTitleSetDynamic(dynamic);
-        F4RefreshRuntimeLabels();
-    }];
-    [menu addButton:@"Xóa danh hiệu" withHandler:^{
-        [NSUserDefaults.standardUserDefaults setInteger:0 forKey:kF4HeadTitleIndexKey];
-        TNMDHeadTitleClear();
-        F4RefreshRuntimeLabels();
-    }];
-
-    NSArray<NSString *> *headRingOptions = TNMDHeadRingOptions() ?: @[];
-    NSInteger savedHeadRing = [NSUserDefaults.standardUserDefaults integerForKey:kF4HeadRingIndexKey];
-    if (savedHeadRing < 0 || savedHeadRing >= (NSInteger)headRingOptions.count) savedHeadRing = 0;
-    [menu addSectionTitle:@"VÒNG HIỆU ỨNG"];
-    [menu addComboSelector:@"Chọn vòng"
-                   options:headRingOptions.count ? headRingOptions : @[@"Không chọn"]
-             selectedIndex:savedHeadRing
-                   handler:^(NSInteger selectedIndex) {
-        [NSUserDefaults.standardUserDefaults setInteger:selectedIndex forKey:kF4HeadRingIndexKey];
-        TNMDHeadRingSet(selectedIndex);
-        F4RefreshRuntimeLabels();
-    }];
-    [menu addButton:@"Xóa vòng" withHandler:^{
-        [NSUserDefaults.standardUserDefaults setInteger:0 forKey:kF4HeadRingIndexKey];
-        TNMDHeadRingClear();
-        F4RefreshRuntimeLabels();
-    }];
-    if (savedHeadName > 0) TNMDHeadNameEffectSet(savedHeadName);
-    if (savedHeadTitle > 0) TNMDHeadTitleSet(savedHeadTitle);
-    TNMDHeadTitleSetDynamic(savedHeadTitleDynamic);
-    if (savedHeadRing > 0) TNMDHeadRingSet(savedHeadRing);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        F4ReloadHeadSelectors(weakHeadMenu);
-    });
-
-    [menu setTabIndex:3];
-    [menu addSectionTitle:@"VIP"];
-    NSArray<NSString *> *vipOptions = TNMDVIPVisualLevelOptions() ?: @[];
-    NSInteger savedVIP = [NSUserDefaults.standardUserDefaults integerForKey:kF4VIPVisualLevelKey];
-    if (savedVIP < 0 || savedVIP >= (NSInteger)vipOptions.count) savedVIP = 0;
-    [menu addComboSelector:@"VIP hiển thị"
-                   options:vipOptions.count ? vipOptions : @[@"VIP 0", @"VIP 1", @"VIP 2", @"VIP 3", @"VIP 4", @"VIP 5", @"VIP 6", @"VIP 7", @"VIP 8", @"VIP 9", @"VIP 10", @"VIP 11", @"VIP 12", @"VIP 13", @"VIP 14", @"VIP 15", @"VIP 16", @"VIP 17", @"VIP 18"]
-             selectedIndex:savedVIP
-                   handler:^(NSInteger selectedIndex) {
-        [NSUserDefaults.standardUserDefaults setInteger:selectedIndex forKey:kF4VIPVisualLevelKey];
-        [NSUserDefaults.standardUserDefaults setBool:YES forKey:kF4VIPVisualEnabledKey];
-        TNMDVIPVisualSetLevel(selectedIndex);
-        F4RefreshRuntimeLabels();
-    }];
-    [menu addButton:@"Áp lại VIP visual ngay" withHandler:^{
-        NSInteger level = [NSUserDefaults.standardUserDefaults integerForKey:kF4VIPVisualLevelKey];
-        [NSUserDefaults.standardUserDefaults setBool:YES forKey:kF4VIPVisualEnabledKey];
-        TNMDVIPVisualSetLevel(level);
-        F4RefreshRuntimeLabels();
-    }];
-    [menu addButton:@"Restore VIP thật" withHandler:^{
-        [NSUserDefaults.standardUserDefaults setBool:NO forKey:kF4VIPVisualEnabledKey];
-        TNMDVIPVisualRestore();
-        F4RefreshRuntimeLabels();
-    }];
-    if ([NSUserDefaults.standardUserDefaults boolForKey:kF4VIPVisualEnabledKey]) {
-        TNMDVIPVisualSetLevel(savedVIP);
-    }
-
-    [menu setTabIndex:4];
-    [menu addSectionTitle:@"F4 TEAM"];
-    [menu addStatusLabel:kF4Credit];
-    [menu addStatusLabel:@"t.me/F4CKMOD"];
-    [menu addButton:@"Mở Telegram F4CKMOD" withHandler:^{
-        F4OpenTelegram();
-    }];
-
-    [menu setTabIndex:5];
-    [menu addSectionTitle:@"GIAO DIỆN"];
     NSInteger accent = F4SavedAccentIndex();
-    __weak MenuView *weakMenu = menu;
-    [menu addComboSelector:@"Màu giao diện"
-                   options:F4AccentNames()
-             selectedIndex:accent
-                   handler:^(NSInteger selectedIndex) {
-        F4ApplyAccent(weakMenu, selectedIndex);
-    }];
-    [menu addSlider:@"Kích thước menu"
-                max:1.25
-                min:0.70
-              value:ui.menuScale
-            handler:^(CGFloat value) {
-        [UIManager.shared setMenuScale:value];
-    }];
-
-    // V10.29 FINAL CLEAN UI: diagnostic backend stays compiled for feature safety,
-    // but all diagnostic UI is intentionally hidden from the release menu.
     F4ApplyAccent(menu, accent);
     F4ApplySavedGameplaySettings(menu);
     [menu setTabIndex:0];
