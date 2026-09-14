@@ -114,30 +114,8 @@ static inline void F4CSetButtonTitleInsets(UIButton *button, UIEdgeInsets insets
 // Source: UI/EmbeddedLogo.h
 
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern const unsigned char F4CMenuLogoPNGStart[];
-extern const unsigned char F4CMenuLogoPNGEnd[];
-#ifdef __cplusplus
-}
-#endif
-
 static UIImage *F4CMenuEmbeddedLogoImage(void) {
-    static UIImage *image = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        @try {
-            ptrdiff_t byteCount = (ptrdiff_t)(F4CMenuLogoPNGEnd - F4CMenuLogoPNGStart);
-            if (byteCount > 0) {
-                NSData *data = [[NSData alloc] initWithBytesNoCopy:(void *)F4CMenuLogoPNGStart
-                                                             length:(NSUInteger)byteCount
-                                                       freeWhenDone:NO];
-                image = data ? [UIImage imageWithData:data] : nil;
-            }
-        } @catch (id ex) {}
-    });
-    return image;
+    return nil;
 }
 
 
@@ -13095,14 +13073,16 @@ static void F4StartUI(void) {
     if (gF4AuthorizedUIStarted) return;
     UIWindow *window = F4CActiveWindow();
     if (!window) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             F4StartUI();
         });
         return;
     }
     gF4AuthorizedUIStarted = YES;
-    F4SetupMenu();
+    @try {
+        F4SetupMenu();
+    } @catch (id ex) {}
 }
 
 static void F4Initialize(void) {
@@ -13113,7 +13093,7 @@ static void F4Initialize(void) {
             TNMDAutoPerfectInitialize();
         } @catch (id ex) {}
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             F4StartUI();
         });
@@ -13138,6 +13118,12 @@ __attribute__((constructor)) static void F4Constructor(void) {
                                      (CFStringRef)UIApplicationDidFinishLaunchingNotification,
                                      NULL,
                                      CFNotificationSuspensionBehaviorDrop);
+
+    // Fallback in case the notification already fired before dylib injection
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        F4Initialize();
+    });
 }
 
 
