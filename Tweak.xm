@@ -10,7 +10,7 @@
     if (real_name != NULL) {
         if (strstr(real_name, "CydiaSubstrate") != NULL ||
             strstr(real_name, "TrollStore") != NULL ||
-            strstr(real_name, "TenDylibCuaBan") != NULL) {
+            strstr(real_name, "Bypass") != NULL) {
             return "/usr/lib/libSystem.B.dylib";
         }
     }
