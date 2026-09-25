@@ -1,165 +1,110 @@
+// Tweak.xm
+// Hooks _dyld_get_image_name to detect usage + measure timing
+// Loads at app priority and saves logs to Documents/
+
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
 #import <mach-o/dyld.h>
-#include <string.h>
+#import <os/log.h>
+#import <sys/time.h>
 
-// ==========================================
-// PHẦN 1: TÀNG HÌNH (ẨN DYLIB KHỎI RAM)
-// ==========================================
-%hookf(const char *, _dyld_get_image_name, uint32_t image_index) {
-    const char *real_name = %orig(image_index);
-    if (real_name != NULL) {
-        if (strstr(real_name, "CydiaSubstrate") != NULL ||
-            strstr(real_name, "TrollStore") != NULL ||
-            strstr(real_name, "Bypass") != NULL) {
-            return "/usr/lib/libSystem.B.dylib";
-        }
-    }
-    return real_name;
+static NSMutableArray *g_logs = nil;
+static NSTimeInterval g_startTime = 0;
+static dispatch_queue_t g_logQueue = nil;
+static BOOL g_initialized = NO;
+
+static NSString *DocumentsPath(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return paths.firstObject ?: @"/tmp";
 }
 
-// ==========================================
-// PHẦN 2: HỆ THỐNG GHI LOG THREAD-SAFE
-// ==========================================
-void saveNetworkLog(NSString *logData) {
-    static dispatch_queue_t writeQueue;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        writeQueue = dispatch_queue_create("com.sniffer.writer", DISPATCH_QUEUE_SERIAL);
-    });
+static void WriteLogToFile(NSString *message) {
+    if (!g_logQueue) return;
     
-    dispatch_async(writeQueue, ^{
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *filePath = [[paths firstObject] stringByAppendingPathComponent:@"AppFullNetwork.txt"];
-        
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:filePath]) {
-            [logData writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        } else {
-            NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:filePath];
-            [handle seekToEndOfFile];
-            [handle writeData:[logData dataUsingEncoding:NSUTF8StringEncoding]];
-            [handle closeFile];
+    dispatch_async(g_logQueue, ^{
+        @autoreleasepool {
+            NSString *logPath = [DocumentsPath() stringByAppendingPathComponent:@"dyld_get_image_name_log.txt"];
+            NSString *timestamp = [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                               dateStyle:NSDateFormatterNoStyle
+                                                               timeStyle:NSDateFormatterMediumStyle];
+            NSString *line = [NSString stringWithFormat:@"[%@] %@\n", timestamp, message];
+            
+            NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:logPath];
+            if (!handle) {
+                [line writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } else {
+                [handle seekToEndOfFile];
+                [handle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                [handle closeFile];
+            }
         }
     });
 }
 
-// ==========================================
-// PHẦN 3: LỚP NSURLPROTOCOL TRUNG GIAN
-// Cần viết bằng Objective-C thuần, đặt trước các khối %hook
-// ==========================================
-static NSString *const kSnifferHandledKey = @"SnifferHandledKey";
-
-@interface FullAPIProtocol : NSURLProtocol <NSURLSessionDataDelegate, NSURLSessionTaskDelegate>
-@property (nonatomic, strong) NSURLSessionDataTask *dataTask;
-@property (nonatomic, strong) NSMutableData *responseData;
-@property (nonatomic, strong) NSURLResponse *currentResponse;
-@end
-
-@implementation FullAPIProtocol
-
-// Kích hoạt chặn các request HTTP/HTTPS
-+ (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    // Nếu request này đã bị ta chặn và đang xử lý, bỏ qua để chống vòng lặp vô hạn (Infinite Loop)
-    if ([NSURLProtocol propertyForKey:kSnifferHandledKey inRequest:request]) return NO;
-    if (![request.URL.scheme isEqualToString:@"http"] && ![request.URL.scheme isEqualToString:@"https"]) return NO;
-    return YES;
+static NSTimeInterval CurrentTime(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (NSTimeInterval)tv.tv_sec + (NSTimeInterval)tv.tv_usec / 1000000.0;
 }
 
-+ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
-    return request;
-}
+// Original function pointer
+static const char *(*orig_dyld_get_image_name)(uint32_t image_index) = NULL;
 
-// Khi app bắt đầu gửi request
-- (void)startLoading {
-    NSMutableURLRequest *newRequest = [self.request mutableCopy];
-    // Đánh dấu request này là "Đã bị Sniffer tóm"
-    [NSURLProtocol setProperty:@YES forKey:kSnifferHandledKey inRequest:newRequest];
+static const char *hooked_dyld_get_image_name(uint32_t image_index) {
+    NSTimeInterval callStart = CurrentTime();
     
-    self.responseData = [NSMutableData data];
+    const char *result = orig_dyld_get_image_name ? orig_dyld_get_image_name(image_index) : NULL;
     
-    // Tự tạo một session nội bộ để gửi request đi máy chủ thật
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration] 
-                                                          delegate:self 
-                                                     delegateQueue:nil];
-    self.dataTask = [session dataTaskWithRequest:newRequest];
-    [self.dataTask resume];
+    NSTimeInterval duration = (CurrentTime() - callStart) * 1000.0; // ms
+    NSTimeInterval sinceLoad = (CurrentTime() - g_startTime) * 1000.0; // ms since tweak loaded
+    
+    NSString *imageName = result ? [NSString stringWithUTF8String:result] : @"(null)";
+    
+    NSString *logMsg = [NSString stringWithFormat:
+        @"_dyld_get_image_name(%u) → \"%@\" | took %.4f ms | %.2f ms after tweak load",
+        image_index, imageName, duration, sinceLoad];
+    
+    // Also log to console (visible in Console.app / idevicesyslog)
+    NSLog(@"[dyld-hook] %@", logMsg);
+    WriteLogToFile(logMsg);
+    
+    return result;
 }
 
-- (void)stopLoading {
-    [self.dataTask cancel];
-    self.dataTask = nil;
-}
-
-// NHẬN HEADER TỪ SERVER
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    self.currentResponse = response;
-    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    completionHandler(NSURLSessionResponseAllow);
-}
-
-// NHẬN TỪNG CHUNK DATA (BODY) TỪ SERVER
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
-    [self.responseData appendData:data];
-    [self.client URLProtocol:self didLoadData:data];
-}
-
-// KHI REQUEST HOÀN TẤT -> TỔNG HỢP VÀ GHI LOG
-- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
-    if (error) {
-        [self.client URLProtocol:self didFailWithError:error];
-    } else {
-        [self.client URLProtocolDidFinishLoading:self];
-        
-        NSMutableString *log = [NSMutableString string];
-        [log appendString:@"\n======================================================\n"];
-        [log appendFormat:@"[REQUEST] %@ %@\n", self.request.HTTPMethod, self.request.URL.absoluteString];
-        [log appendFormat:@"[REQ_HEADERS] %@\n", self.request.allHTTPHeaderFields];
-        
-        if (self.request.HTTPBody) {
-            NSString *bodyStr = [[NSString alloc] initWithData:self.request.HTTPBody encoding:NSUTF8StringEncoding];
-            [log appendFormat:@"[REQ_BODY] %@\n", bodyStr ? bodyStr : @"<Binary Data>"];
-        }
-        
-        [log appendString:@"\n-------------------- RESPONSE --------------------\n"];
-        if ([self.currentResponse isKindOfClass:[NSHTTPURLResponse class]]) {
-            NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)self.currentResponse;
-            [log appendFormat:@"[STATUS] %ld\n", (long)httpResponse.statusCode];
-            [log appendFormat:@"[RES_HEADERS] %@\n", httpResponse.allHeaderFields];
-        }
-        
-        if (self.responseData.length > 0) {
-            NSString *resBody = [[NSString alloc] initWithData:self.responseData encoding:NSUTF8StringEncoding];
-            [log appendFormat:@"[RES_BODY] %@\n", resBody ? resBody : @"<Binary Data>"];
-        }
-        [log appendString:@"======================================================\n"];
-        
-        saveNetworkLog(log);
-    }
-}
-@end
-
-// ==========================================
-// PHẦN 4: ÉP ỨNG DỤNG PHẢI SỬ DỤNG TRẠM THU PHÍ (PROTOCOL) CỦA TA
-// ==========================================
-%hook NSURLSessionConfiguration
-
-// Ép vào mảng config mặc định
-- (NSArray *)protocolClasses {
-    NSArray *orig = %orig;
-    NSMutableArray *newProtocols = [NSMutableArray arrayWithObject:[FullAPIProtocol class]];
-    if (orig) [newProtocols addObjectsFromArray:orig];
-    return newProtocols;
-}
-
-- (void)setProtocolClasses:(NSArray *)protocolClasses {
-    NSMutableArray *newProtocols = [NSMutableArray arrayWithObject:[FullAPIProtocol class]];
-    if (protocolClasses) [newProtocols addObjectsFromArray:protocolClasses];
-    %orig(newProtocols);
-}
-
-%end
-
-// Tự động đăng ký khi app vừa khởi động
 %ctor {
-    [NSURLProtocol registerClass:[FullAPIProtocol class]];
+    // High priority so we load early in the app process
+    @autoreleasepool {
+        g_startTime = CurrentTime();
+        g_logs = [NSMutableArray new];
+        g_logQueue = dispatch_queue_create("com.dyldhook.logger", DISPATCH_QUEUE_SERIAL);
+        
+        // Resolve the real symbol
+        void *handle = dlopen(NULL, RTLD_NOW);
+        orig_dyld_get_image_name = (const char *(*)(uint32_t))dlsym(handle, "_dyld_get_image_name");
+        
+        if (orig_dyld_get_image_name) {
+            // Use MSHookFunction if available (MobileSubstrate / Substitute / ElleKit)
+            // For pure Logos + Theos we can also use %hookf
+            MSHookFunction((void *)orig_dyld_get_image_name,
+                           (void *)hooked_dyld_get_image_name,
+                           (void **)&orig_dyld_get_image_name);
+            
+            NSString *msg = [NSString stringWithFormat:
+                @"Tweak loaded at priority=app | _dyld_get_image_name hooked successfully | start=%.6f",
+                g_startTime];
+            NSLog(@"[dyld-hook] %@", msg);
+            WriteLogToFile(msg);
+            g_initialized = YES;
+        } else {
+            NSString *msg = @"Failed to resolve _dyld_get_image_name";
+            NSLog(@"[dyld-hook] %@", msg);
+            WriteLogToFile(msg);
+        }
+        
+        // Also log total number of images at load time for reference
+        uint32_t count = _dyld_image_count();
+        NSString *countMsg = [NSString stringWithFormat:@"_dyld_image_count() = %u at tweak load", count];
+        NSLog(@"[dyld-hook] %@", countMsg);
+        WriteLogToFile(countMsg);
+    }
 }
