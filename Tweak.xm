@@ -1,7 +1,5 @@
 // Tweak.xm
-// Force _g_PTIsFullyAuthorized = 1
-// Force _g_PTMatchedDay     = valid day (0-6)
-// Target: OxideMenu.dylib
+// OxideMenu.dylib – force authorization globals
 
 #import <Foundation/Foundation.h>
 #import <substrate.h>
@@ -9,64 +7,60 @@
 #import <mach-o/dyld.h>
 #import <stdint.h>
 
-// ---------- Offsets inside OxideMenu.dylib ----------
-static const uint64_t kOffset_PTIsFullyAuthorized = 0x621a48;
-static const uint64_t kOffset_PTMatchedDay        = 0x62185c;
+// Offsets inside OxideMenu.dylib (VA == file offset)
+static const uint64_t kOff_PTIsFullyAuthorized = 0x621A48;  // uint8_t
+static const uint64_t kOff_PTMatchedDay        = 0x62185C;  // uint32_t
 
-static const char *kTargetImageName = "OxideMenu.dylib";
+static uint8_t  *g_auth = NULL;
+static uint32_t *g_day  = NULL;
 
-// ---------------------------------------------------------
-
-static uint8_t  *g_PTIsFullyAuthorized = NULL;
-static uint32_t *g_PTMatchedDay        = NULL;
-
-static uint64_t getImageSlide(const char *imageName) {
+static uint64_t slideForImage(const char *name) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, imageName)) {
+        const char *img = _dyld_get_image_name(i);
+        if (img && strstr(img, name))
             return (uint64_t)_dyld_get_image_vmaddr_slide(i);
-        }
     }
     return 0;
 }
 
-static void forceAuthorize(void) {
-    if (!g_PTIsFullyAuthorized || !g_PTMatchedDay) return;
+static void force(void) {
+    if (!g_auth || !g_day) return;
 
-    // Always fully authorized
-    *g_PTIsFullyAuthorized = 1;
+    // Fully authorized
+    *g_auth = 1;
 
-    // Keep a valid day (0-6)
-    if (*g_PTMatchedDay > 6) {
-        *g_PTMatchedDay = 0;          // force valid day
-    }
+    // Valid day (0-6). Keep existing value if already valid, otherwise force 0.
+    if (*g_day > 6)
+        *g_day = 0;
 }
 
 %ctor {
     @autoreleasepool {
-        // Wait a bit so OxideMenu.dylib is loaded
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            uint64_t slide = getImageSlide(kTargetImageName);
-            if (slide == 0) {
+        // Give OxideMenu.dylib time to load
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+
+            uint64_t slide = slideForImage("OxideMenu.dylib");
+            if (!slide) {
                 NSLog(@"[PTAuth] OxideMenu.dylib not found");
                 return;
             }
 
-            g_PTIsFullyAuthorized = (uint8_t  *)(slide + kOffset_PTIsFullyAuthorized);
-            g_PTMatchedDay        = (uint32_t *)(slide + kOffset_PTMatchedDay);
+            g_auth = (uint8_t  *)(slide + kOff_PTIsFullyAuthorized);
+            g_day  = (uint32_t *)(slide + kOff_PTMatchedDay);
 
-            NSLog(@"[PTAuth] OxideMenu slide=0x%llx", slide);
-            NSLog(@"[PTAuth] auth @ %p   day @ %p", g_PTIsFullyAuthorized, g_PTMatchedDay);
+            NSLog(@"[PTAuth] slide = 0x%llx", slide);
+            NSLog(@"[PTAuth] auth  @ %p", g_auth);
+            NSLog(@"[PTAuth] day   @ %p", g_day);
 
-            // Immediate force
-            forceAuthorize();
+            // Initial force
+            force();
 
-            // Keep forcing (server / integrity checks may overwrite)
-            while (true) {
-                forceAuthorize();
-                [NSThread sleepForTimeInterval:0.4];
+            // Keep them forced (anti-tamper / server response may overwrite)
+            while (1) {
+                force();
+                [NSThread sleepForTimeInterval:0.35];
             }
         });
     }
