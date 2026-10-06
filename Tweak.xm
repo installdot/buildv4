@@ -1,67 +1,149 @@
 // Tweak.xm
-// OxideMenu.dylib – force authorization globals
 
 #import <Foundation/Foundation.h>
-#import <substrate.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <stdint.h>
+#import <UIKit/UIKit.h>
+#import <Security/Security.h>
 
-// Offsets inside OxideMenu.dylib (VA == file offset)
-static const uint64_t kOff_PTIsFullyAuthorized = 0x621A48;  // uint8_t
-static const uint64_t kOff_PTMatchedDay        = 0x62185C;  // uint32_t
+static void DumpKeychainMetadataForClass(CFTypeRef itemClass,
+                                         NSString *className,
+                                         NSMutableString *output)
+{
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)itemClass,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
 
-static uint8_t  *g_auth = NULL;
-static uint32_t *g_day  = NULL;
+        // Return attributes ONLY.
+        // Intentionally does NOT request kSecReturnData.
+        (__bridge id)kSecReturnAttributes: @YES
+    };
 
-static uint64_t slideForImage(const char *name) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *img = _dyld_get_image_name(i);
-        if (img && strstr(img, name))
-            return (uint64_t)_dyld_get_image_vmaddr_slide(i);
+    CFTypeRef result = NULL;
+
+    OSStatus status = SecItemCopyMatching(
+        (__bridge CFDictionaryRef)query,
+        &result
+    );
+
+    [output appendFormat:@"\n========== %@ ==========\n", className];
+
+    if (status == errSecItemNotFound) {
+        [output appendString:@"No items found.\n"];
+        return;
     }
-    return 0;
-}
 
-static void force(void) {
-    if (!g_auth || !g_day) return;
+    if (status != errSecSuccess) {
+        [output appendFormat:@"SecItemCopyMatching error: %d\n", (int)status];
+        return;
+    }
 
-    // Fully authorized
-    *g_auth = 1;
+    NSArray *items = CFBridgingRelease(result);
 
-    // Valid day (0-6). Keep existing value if already valid, otherwise force 0.
-    if (*g_day > 6)
-        *g_day = 0;
-}
+    if (![items isKindOfClass:[NSArray class]]) {
+        items = @[items];
+    }
 
-%ctor {
-    @autoreleasepool {
-        // Give OxideMenu.dylib time to load
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+    NSInteger index = 0;
 
-            uint64_t slide = slideForImage("OxideMenu.dylib");
-            if (!slide) {
-                NSLog(@"[PTAuth] OxideMenu.dylib not found");
-                return;
-            }
+    for (NSDictionary *item in items) {
+        index++;
 
-            g_auth = (uint8_t  *)(slide + kOff_PTIsFullyAuthorized);
-            g_day  = (uint32_t *)(slide + kOff_PTMatchedDay);
+        NSString *service = item[(__bridge id)kSecAttrService];
+        NSString *account = item[(__bridge id)kSecAttrAccount];
+        NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
+        NSString *label = item[(__bridge id)kSecAttrLabel];
 
-            NSLog(@"[PTAuth] slide = 0x%llx", slide);
-            NSLog(@"[PTAuth] auth  @ %p", g_auth);
-            NSLog(@"[PTAuth] day   @ %p", g_day);
+        [output appendFormat:@"\nItem #%ld\n", (long)index];
 
-            // Initial force
-            force();
+        if (service)
+            [output appendFormat:@"Service: %@\n", service];
 
-            // Keep them forced (anti-tamper / server response may overwrite)
-            while (1) {
-                force();
-                [NSThread sleepForTimeInterval:0.35];
-            }
-        });
+        if (account)
+            [output appendFormat:@"Account: %@\n", account];
+
+        if (label)
+            [output appendFormat:@"Label: %@\n", label];
+
+        if (accessGroup)
+            [output appendFormat:@"Access Group: %@\n", accessGroup];
     }
 }
+
+static void ExportKeychainMetadata(void)
+{
+    NSMutableString *output = [NSMutableString string];
+
+    [output appendFormat:@"Keychain Metadata Audit\n"];
+    [output appendFormat:@"Bundle ID: %@\n",
+        [[NSBundle mainBundle] bundleIdentifier]];
+
+    [output appendFormat:@"Date: %@\n", [NSDate date]];
+
+    DumpKeychainMetadataForClass(
+        kSecClassGenericPassword,
+        @"Generic Password",
+        output
+    );
+
+    DumpKeychainMetadataForClass(
+        kSecClassInternetPassword,
+        @"Internet Password",
+        output
+    );
+
+    DumpKeychainMetadataForClass(
+        kSecClassCertificate,
+        @"Certificate",
+        output
+    );
+
+    DumpKeychainMetadataForClass(
+        kSecClassKey,
+        @"Key",
+        output
+    );
+
+    DumpKeychainMetadataForClass(
+        kSecClassIdentity,
+        @"Identity",
+        output
+    );
+
+    NSString *documents =
+        NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory,
+            NSUserDomainMask,
+            YES
+        ).firstObject;
+
+    NSString *path =
+        [documents stringByAppendingPathComponent:@"keychain_metadata.txt"];
+
+    NSError *error = nil;
+
+    [output writeToFile:path
+             atomically:YES
+               encoding:NSUTF8StringEncoding
+                  error:&error];
+
+    if (error) {
+        NSLog(@"[KeychainAudit] Write error: %@", error);
+    } else {
+        NSLog(@"[KeychainAudit] Saved to %@", path);
+    }
+}
+
+%hook UIApplication
+
+- (BOOL)application:(UIApplication *)application
+didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
+{
+    BOOL result = %orig;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ExportKeychainMetadata();
+    });
+
+    return result;
+}
+
+%end
