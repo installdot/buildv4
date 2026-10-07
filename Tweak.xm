@@ -48,37 +48,6 @@ static NSString *SKYDataText(NSData *data) {
         [data base64EncodedStringWithOptions:0]];
 }
 
-static NSString *SKYObjectText(id object) {
-    if (!object) {
-        return @"<nil>";
-    }
-
-    if ([object isKindOfClass:[NSData class]]) {
-        return SKYDataText((NSData *)object);
-    }
-
-    if ([object isKindOfClass:[NSString class]]) {
-        return object;
-    }
-
-    if ([NSJSONSerialization isValidJSONObject:object]) {
-        NSData *json =
-            [NSJSONSerialization dataWithJSONObject:object
-                                             options:NSJSONWritingPrettyPrinted
-                                               error:nil];
-
-        NSString *text =
-            [[NSString alloc] initWithData:json
-                                   encoding:NSUTF8StringEncoding];
-
-        if (text) {
-            return text;
-        }
-    }
-
-    return [object description];
-}
-
 static void SKYWriteLog(NSString *text) {
     @autoreleasepool {
         NSString *line =
