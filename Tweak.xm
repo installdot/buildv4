@@ -1,149 +1,376 @@
-// Tweak.xm
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <Security/Security.h>
 
-static void DumpKeychainMetadataForClass(CFTypeRef itemClass,
-                                         NSString *className,
-                                         NSMutableString *output)
-{
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)itemClass,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+static NSString * const SKYLogFileName = @"sky_http.log";
 
-        // Return attributes ONLY.
-        // Intentionally does NOT request kSecReturnData.
-        (__bridge id)kSecReturnAttributes: @YES
-    };
-
-    CFTypeRef result = NULL;
-
-    OSStatus status = SecItemCopyMatching(
-        (__bridge CFDictionaryRef)query,
-        &result
-    );
-
-    [output appendFormat:@"\n========== %@ ==========\n", className];
-
-    if (status == errSecItemNotFound) {
-        [output appendString:@"No items found.\n"];
-        return;
-    }
-
-    if (status != errSecSuccess) {
-        [output appendFormat:@"SecItemCopyMatching error: %d\n", (int)status];
-        return;
-    }
-
-    NSArray *items = CFBridgingRelease(result);
-
-    if (![items isKindOfClass:[NSArray class]]) {
-        items = @[items];
-    }
-
-    NSInteger index = 0;
-
-    for (NSDictionary *item in items) {
-        index++;
-
-        NSString *service = item[(__bridge id)kSecAttrService];
-        NSString *account = item[(__bridge id)kSecAttrAccount];
-        NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
-        NSString *label = item[(__bridge id)kSecAttrLabel];
-
-        [output appendFormat:@"\nItem #%ld\n", (long)index];
-
-        if (service)
-            [output appendFormat:@"Service: %@\n", service];
-
-        if (account)
-            [output appendFormat:@"Account: %@\n", account];
-
-        if (label)
-            [output appendFormat:@"Label: %@\n", label];
-
-        if (accessGroup)
-            [output appendFormat:@"Access Group: %@\n", accessGroup];
-    }
-}
-
-static void ExportKeychainMetadata(void)
-{
-    NSMutableString *output = [NSMutableString string];
-
-    [output appendFormat:@"Keychain Metadata Audit\n"];
-    [output appendFormat:@"Bundle ID: %@\n",
-        [[NSBundle mainBundle] bundleIdentifier]];
-
-    [output appendFormat:@"Date: %@\n", [NSDate date]];
-
-    DumpKeychainMetadataForClass(
-        kSecClassGenericPassword,
-        @"Generic Password",
-        output
-    );
-
-    DumpKeychainMetadataForClass(
-        kSecClassInternetPassword,
-        @"Internet Password",
-        output
-    );
-
-    DumpKeychainMetadataForClass(
-        kSecClassCertificate,
-        @"Certificate",
-        output
-    );
-
-    DumpKeychainMetadataForClass(
-        kSecClassKey,
-        @"Key",
-        output
-    );
-
-    DumpKeychainMetadataForClass(
-        kSecClassIdentity,
-        @"Identity",
-        output
-    );
+static NSString *SKYDocumentsPath(void) {
+    NSArray *paths =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                            NSUserDomainMask,
+                                            YES);
 
     NSString *documents =
-        NSSearchPathForDirectoriesInDomains(
-            NSDocumentDirectory,
-            NSUserDomainMask,
-            YES
-        ).firstObject;
+        paths.firstObject ?: NSTemporaryDirectory();
 
-    NSString *path =
-        [documents stringByAppendingPathComponent:@"keychain_metadata.txt"];
+    return [documents stringByAppendingPathComponent:SKYLogFileName];
+}
 
-    NSError *error = nil;
+static NSString *SKYTimestamp(void) {
+    static NSDateFormatter *formatter;
+    static dispatch_once_t onceToken;
 
-    [output writeToFile:path
-             atomically:YES
-               encoding:NSUTF8StringEncoding
-                  error:&error];
+    dispatch_once(&onceToken, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.locale =
+            [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+    });
 
-    if (error) {
-        NSLog(@"[KeychainAudit] Write error: %@", error);
-    } else {
-        NSLog(@"[KeychainAudit] Saved to %@", path);
+    return [formatter stringFromDate:[NSDate date]];
+}
+
+static NSString *SKYDataText(NSData *data) {
+    if (!data || data.length == 0) {
+        return @"<empty>";
+    }
+
+    NSString *utf8 =
+        [[NSString alloc] initWithData:data
+                               encoding:NSUTF8StringEncoding];
+
+    if (utf8) {
+        return utf8;
+    }
+
+    return [NSString stringWithFormat:
+        @"<binary data: %lu bytes>\nBase64:\n%@",
+        (unsigned long)data.length,
+        [data base64EncodedStringWithOptions:0]];
+}
+
+static NSString *SKYObjectText(id object) {
+    if (!object) {
+        return @"<nil>";
+    }
+
+    if ([object isKindOfClass:[NSData class]]) {
+        return SKYDataText((NSData *)object);
+    }
+
+    if ([object isKindOfClass:[NSString class]]) {
+        return object;
+    }
+
+    if ([NSJSONSerialization isValidJSONObject:object]) {
+        NSData *json =
+            [NSJSONSerialization dataWithJSONObject:object
+                                             options:NSJSONWritingPrettyPrinted
+                                               error:nil];
+
+        NSString *text =
+            [[NSString alloc] initWithData:json
+                                   encoding:NSUTF8StringEncoding];
+
+        if (text) {
+            return text;
+        }
+    }
+
+    return [object description];
+}
+
+static void SKYWriteLog(NSString *text) {
+    @autoreleasepool {
+        NSString *line =
+            [NSString stringWithFormat:
+                @"[%@] %@\n",
+                SKYTimestamp(),
+                text];
+
+        @synchronized([NSObject class]) {
+            NSString *path = SKYDocumentsPath();
+
+            NSFileManager *fm = [NSFileManager defaultManager];
+
+            if (![fm fileExistsAtPath:path]) {
+                [fm createFileAtPath:path
+                            contents:nil
+                          attributes:nil];
+            }
+
+            NSFileHandle *handle =
+                [NSFileHandle fileHandleForWritingAtPath:path];
+
+            if (!handle) {
+                NSLog(@"[SkyHTTP] Cannot open log file: %@", path);
+                return;
+            }
+
+            @try {
+                [handle seekToEndOfFile];
+
+                NSData *data =
+                    [line dataUsingEncoding:NSUTF8StringEncoding];
+
+                [handle writeData:data];
+                [handle synchronizeFile];
+            }
+            @catch (NSException *exception) {
+                NSLog(@"[SkyHTTP] Log write exception: %@", exception);
+            }
+            @finally {
+                [handle closeFile];
+            }
+        }
     }
 }
 
-%hook UIApplication
+static void SKYLogRequest(NSURLRequest *request,
+                          NSData *overrideBody,
+                          NSString *source) {
+    @autoreleasepool {
+        if (!request) {
+            SKYWriteLog(
+                [NSString stringWithFormat:
+                    @"REQUEST source=%@ request=<nil>",
+                    source ?: @"unknown"]);
+            return;
+        }
 
-- (BOOL)application:(UIApplication *)application
-didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
-{
-    BOOL result = %orig;
+        NSURL *url = request.URL;
+        NSString *method = request.HTTPMethod ?: @"<unknown>";
+        NSDictionary *headers = request.allHTTPHeaderFields ?: @{};
+        NSData *body = overrideBody ?: request.HTTPBody;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        ExportKeychainMetadata();
-    });
+        NSString *log =
+            [NSString stringWithFormat:
+                @"\n"
+                 "========== REQUEST ==========\n"
+                 "Source: %@\n"
+                 "URL: %@\n"
+                 "Method: %@\n"
+                 "Headers: %@\n"
+                 "Body length: %lu\n"
+                 "Body:\n%@\n"
+                 "==============================\n",
+                source ?: @"unknown",
+                url.absoluteString ?: @"<no URL>",
+                method,
+                headers,
+                (unsigned long)body.length,
+                SKYDataText(body)];
 
-    return result;
+        SKYWriteLog(log);
+    }
+}
+
+static void SKYLogResponse(NSData *data,
+                           NSURLResponse *response,
+                           NSError *error,
+                           NSString *source) {
+    @autoreleasepool {
+        NSHTTPURLResponse *httpResponse = nil;
+
+        if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+            httpResponse = (NSHTTPURLResponse *)response;
+        }
+
+        NSString *url = response.URL.absoluteString ?: @"<no URL>";
+
+        NSString *log =
+            [NSString stringWithFormat:
+                @"\n"
+                 "========== RESPONSE ==========\n"
+                 "Source: %@\n"
+                 "URL: %@\n"
+                 "Status code: %ld\n"
+                 "Headers: %@\n"
+                 "Error: %@\n"
+                 "Body length: %lu\n"
+                 "Body:\n%@\n"
+                 "===============================\n",
+                source ?: @"unknown",
+                url,
+                (long)httpResponse.statusCode,
+                httpResponse.allHeaderFields ?: @{},
+                error ?: @"<none>",
+                (unsigned long)data.length,
+                SKYDataText(data)];
+
+        SKYWriteLog(log);
+    }
+}
+
+static void SKYLogUploadFile(NSURL *fileURL,
+                             NSURLRequest *request,
+                             NSString *source) {
+    @autoreleasepool {
+        NSError *error = nil;
+
+        NSData *body =
+            [NSData dataWithContentsOfURL:fileURL
+                                   options:NSDataReadingMappedIfSafe
+                                     error:&error];
+
+        if (error) {
+            SKYWriteLog(
+                [NSString stringWithFormat:
+                    @"UPLOAD FILE READ ERROR\n"
+                     "Source: %@\n"
+                     "File: %@\n"
+                     "Error: %@\n",
+                    source,
+                    fileURL,
+                    error]);
+        }
+
+        SKYLogRequest(request, body, source);
+    }
+}
+
+%hook NSURLSessionTask
+
+- (void)resume {
+    @autoreleasepool {
+        NSURLRequest *request =
+            self.currentRequest ?: self.originalRequest;
+
+        SKYLogRequest(request, nil, @"NSURLSessionTask resume");
+    }
+
+    %orig;
 }
 
 %end
+
+%hook NSURLSession
+
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *,
+                                                        NSURLResponse *,
+                                                        NSError *))completionHandler {
+    SKYLogRequest(request, nil, @"dataTaskWithRequest");
+
+    void (^wrappedCompletion)(NSData *,
+                              NSURLResponse *,
+                              NSError *) =
+        ^(NSData *data,
+          NSURLResponse *response,
+          NSError *error) {
+            SKYLogResponse(data,
+                           response,
+                           error,
+                           @"dataTask completion");
+
+            if (completionHandler) {
+                completionHandler(data, response, error);
+            }
+        };
+
+    return %orig(request, wrappedCompletion);
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
+                                          fromData:(NSData *)bodyData
+                                 completionHandler:(void (^)(NSData *,
+                                                             NSURLResponse *,
+                                                             NSError *))completionHandler {
+    SKYLogRequest(request,
+                  bodyData,
+                  @"uploadTaskWithRequest fromData");
+
+    void (^wrappedCompletion)(NSData *,
+                              NSURLResponse *,
+                              NSError *) =
+        ^(NSData *data,
+          NSURLResponse *response,
+          NSError *error) {
+            SKYLogResponse(data,
+                           response,
+                           error,
+                           @"uploadTask completion");
+
+            if (completionHandler) {
+                completionHandler(data, response, error);
+            }
+        };
+
+    return %orig(request, bodyData, wrappedCompletion);
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
+                                          fromFile:(NSURL *)fileURL
+                                 completionHandler:(void (^)(NSData *,
+                                                             NSURLResponse *,
+                                                             NSError *))completionHandler {
+    SKYLogUploadFile(fileURL,
+                     request,
+                     @"uploadTaskWithRequest fromFile");
+
+    void (^wrappedCompletion)(NSData *,
+                              NSURLResponse *,
+                              NSError *) =
+        ^(NSData *data,
+          NSURLResponse *response,
+          NSError *error) {
+            SKYLogResponse(data,
+                           response,
+                           error,
+                           @"uploadTask file completion");
+
+            if (completionHandler) {
+                completionHandler(data, response, error);
+            }
+        };
+
+    return %orig(request, fileURL, wrappedCompletion);
+}
+
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
+                        completionHandler:(void (^)(NSData *,
+                                                    NSURLResponse *,
+                                                    NSError *))completionHandler {
+    NSURLRequest *request =
+        [NSURLRequest requestWithURL:url];
+
+    SKYLogRequest(request,
+                  nil,
+                  @"dataTaskWithURL");
+
+    void (^wrappedCompletion)(NSData *,
+                              NSURLResponse *,
+                              NSError *) =
+        ^(NSData *data,
+          NSURLResponse *response,
+          NSError *error) {
+            SKYLogResponse(data,
+                           response,
+                           error,
+                           @"dataTask URL completion");
+
+            if (completionHandler) {
+                completionHandler(data, response, error);
+            }
+        };
+
+    return %orig(url, wrappedCompletion);
+}
+
+%end
+
+%ctor {
+    @autoreleasepool {
+        NSString *path = SKYDocumentsPath();
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        if (![fm fileExistsAtPath:path]) {
+            [fm createFileAtPath:path
+                        contents:nil
+                      attributes:nil];
+        }
+
+        SKYWriteLog(
+            @"========== tweak loaded; full HTTP logging enabled ==========");
+    }
+}
