@@ -1,5 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <Security/SecureTransport.h>
+#import <substrate.h>
+#import <dlfcn.h>
 
 static NSString * const SKYLogFileName = @"sky_http.log";
 
@@ -123,10 +125,6 @@ static void SKYLogRequest(NSURLRequest *request,
             return;
         }
 
-        NSURL *url = request.URL;
-        NSString *method = request.HTTPMethod ?: @"<unknown>";
-        NSDictionary *headers =
-            request.allHTTPHeaderFields ?: @{};
         NSData *body =
             overrideBody ?: request.HTTPBody;
 
@@ -142,9 +140,9 @@ static void SKYLogRequest(NSURLRequest *request,
                  "Body:\n%@\n"
                  "==============================\n",
                 source ?: @"unknown",
-                url.absoluteString ?: @"<no URL>",
-                method,
-                headers,
+                request.URL.absoluteString ?: @"<no URL>",
+                request.HTTPMethod ?: @"<unknown>",
+                request.allHTTPHeaderFields ?: @{},
                 (unsigned long)body.length,
                 SKYDataDescription(body)];
 
@@ -165,9 +163,6 @@ static void SKYLogResponse(NSData *data,
             httpResponse = (NSHTTPURLResponse *)response;
         }
 
-        NSString *url =
-            response.URL.absoluteString ?: @"<no URL>";
-
         NSString *message =
             [NSString stringWithFormat:
                 @"\n"
@@ -181,7 +176,7 @@ static void SKYLogResponse(NSData *data,
                  "Body:\n%@\n"
                  "===============================\n",
                 source ?: @"unknown",
-                url,
+                response.URL.absoluteString ?: @"<no URL>",
                 (long)httpResponse.statusCode,
                 httpResponse.allHeaderFields ?: @{},
                 error ?: @"<none>",
@@ -206,12 +201,10 @@ static void SKYLogUploadFile(NSURL *fileURL,
         if (error) {
             NSString *message =
                 [NSString stringWithFormat:
-                    @"\n"
-                     "========== UPLOAD FILE ERROR ==========\n"
+                    @"Upload file read error\n"
                      "Source: %@\n"
                      "File: %@\n"
-                     "Error: %@\n"
-                     "========================================\n",
+                     "Error: %@\n",
                     source ?: @"unknown",
                     fileURL,
                     error];
@@ -223,7 +216,7 @@ static void SKYLogUploadFile(NSURL *fileURL,
     }
 }
 
-#pragma mark - Native SecureTransport logging
+#pragma mark - SecureTransport logging
 
 static void SKYLogTLSBytes(const char *direction,
                            const void *bytes,
@@ -264,17 +257,32 @@ static void SKYLogTLSBytes(const char *direction,
     }
 }
 
-%hookf(OSStatus,
-       SSLWrite,
-       SSLContextRef context,
-       const void *data,
-       size_t dataLength,
-       size_t *processed) {
+typedef OSStatus (*SKYSSLWriteFunction)(SSLContextRef,
+                                        const void *,
+                                        size_t,
+                                        size_t *);
+
+typedef OSStatus (*SKYSSLReadFunction)(SSLContextRef,
+                                       void *,
+                                       size_t,
+                                       size_t *);
+
+static SKYSSLWriteFunction SKYOriginalSSLWrite = NULL;
+static SKYSSLReadFunction SKYOriginalSSLRead = NULL;
+
+static OSStatus SKYHookedSSLWrite(SSLContextRef context,
+                                  const void *data,
+                                  size_t dataLength,
+                                  size_t *processed) {
+    if (!SKYOriginalSSLWrite) {
+        return -1;
+    }
+
     OSStatus status =
-        %orig(context,
-              data,
-              dataLength,
-              processed);
+        SKYOriginalSSLWrite(context,
+                            data,
+                            dataLength,
+                            processed);
 
     size_t written =
         processed ? *processed : dataLength;
@@ -288,17 +296,19 @@ static void SKYLogTLSBytes(const char *direction,
     return status;
 }
 
-%hookf(OSStatus,
-       SSLRead,
-       SSLContextRef context,
-       void *data,
-       size_t dataLength,
-       size_t *processed) {
+static OSStatus SKYHookedSSLRead(SSLContextRef context,
+                                 void *data,
+                                 size_t dataLength,
+                                 size_t *processed) {
+    if (!SKYOriginalSSLRead) {
+        return -1;
+    }
+
     OSStatus status =
-        %orig(context,
-              data,
-              dataLength,
-              processed);
+        SKYOriginalSSLRead(context,
+                           data,
+                           dataLength,
+                           processed);
 
     size_t received =
         processed ? *processed : 0;
@@ -310,6 +320,35 @@ static void SKYLogTLSBytes(const char *direction,
                    status);
 
     return status;
+}
+
+static void SKYInstallSecureTransportHooks(void) {
+    void *sslWriteAddress =
+        dlsym(RTLD_DEFAULT, "SSLWrite");
+
+    void *sslReadAddress =
+        dlsym(RTLD_DEFAULT, "SSLRead");
+
+    if (sslWriteAddress) {
+        MSHookFunction(sslWriteAddress,
+                       (void *)SKYHookedSSLWrite,
+                       (void **)&SKYOriginalSSLWrite);
+    }
+
+    if (sslReadAddress) {
+        MSHookFunction(sslReadAddress,
+                       (void *)SKYHookedSSLRead,
+                       (void **)&SKYOriginalSSLRead);
+    }
+
+    NSString *message =
+        [NSString stringWithFormat:
+            @"SecureTransport hooks installed: "
+             "SSLWrite=%p SSLRead=%p",
+            sslWriteAddress,
+            sslReadAddress];
+
+    SKYWriteLog(message);
 }
 
 #pragma mark - GTMSessionFetcher hooks
@@ -353,7 +392,7 @@ static void SKYLogTLSBytes(const char *direction,
 
     SKYLogRequest(request,
                   nil,
-                  @"GTMSessionFetcher beginFetchMayDelay:mayAuthorize:");
+                  @"GTMSessionFetcher beginFetchMayDelay:");
 
     %orig(mayDelay, mayAuthorize);
 }
@@ -442,7 +481,7 @@ static void SKYLogTLSBytes(const char *direction,
             SKYLogResponse(data,
                            response,
                            error,
-                           @"NSURLSession dataTask URL completion");
+                           @"NSURLSession URL completion");
 
             if (completionHandler) {
                 completionHandler(data, response, error);
@@ -514,6 +553,8 @@ static void SKYLogTLSBytes(const char *direction,
 
 %ctor {
     @autoreleasepool {
+        SKYInstallSecureTransportHooks();
+
         NSString *path =
             SKYDocumentsLogPath();
 
@@ -532,7 +573,7 @@ static void SKYLogTLSBytes(const char *direction,
                  "================================================\n"
                  "Sky HTTP logging tweak loaded\n"
                  "Full request/response logging enabled\n"
-                 "SecureTransport SSLRead/SSLWrite hooks enabled\n"
+                 "SecureTransport hooks installed\n"
                  "Log path: %@\n"
                  "================================================\n",
                 path];
