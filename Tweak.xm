@@ -2,7 +2,7 @@
 
 static NSString * const SKYLogFileName = @"sky_http.log";
 
-#pragma mark - File logging
+#pragma mark - Log file
 
 static NSString *SKYDocumentsLogPath(void) {
     NSArray *paths =
@@ -43,6 +43,7 @@ static void SKYWriteLog(NSString *text) {
 
         @synchronized([NSObject class]) {
             NSString *path = SKYDocumentsLogPath();
+
             NSFileManager *fileManager =
                 [NSFileManager defaultManager];
 
@@ -56,7 +57,7 @@ static void SKYWriteLog(NSString *text) {
                 [NSFileHandle fileHandleForWritingAtPath:path];
 
             if (!handle) {
-                NSLog(@"[SkyHTTP] Could not open log file: %@", path);
+                NSLog(@"[SkyHTTP] Cannot open log file: %@", path);
                 return;
             }
 
@@ -108,15 +109,16 @@ static void SKYLogRequest(NSURLRequest *request,
                           NSString *source) {
     @autoreleasepool {
         if (!request) {
-            SKYWriteLog(
+            NSString *message =
                 [NSString stringWithFormat:
                     @"\n"
                      "========== REQUEST ==========\n"
                      "Source: %@\n"
                      "Request: <nil>\n"
                      "==============================\n",
-                    source ?: @"unknown"]);
+                    source ?: @"unknown"];
 
+            SKYWriteLog(message);
             return;
         }
 
@@ -127,7 +129,7 @@ static void SKYLogRequest(NSURLRequest *request,
         NSData *body =
             overrideBody ?: request.HTTPBody;
 
-        NSString *log =
+        NSString *message =
             [NSString stringWithFormat:
                 @"\n"
                  "========== REQUEST ==========\n"
@@ -145,7 +147,7 @@ static void SKYLogRequest(NSURLRequest *request,
                 (unsigned long)body.length,
                 SKYDataDescription(body)];
 
-        SKYWriteLog(log);
+        SKYWriteLog(message);
     }
 }
 
@@ -165,7 +167,7 @@ static void SKYLogResponse(NSData *data,
         NSString *url =
             response.URL.absoluteString ?: @"<no URL>";
 
-        NSString *log =
+        NSString *message =
             [NSString stringWithFormat:
                 @"\n"
                  "========== RESPONSE ==========\n"
@@ -185,7 +187,7 @@ static void SKYLogResponse(NSData *data,
                 (unsigned long)data.length,
                 SKYDataDescription(data)];
 
-        SKYWriteLog(log);
+        SKYWriteLog(message);
     }
 }
 
@@ -201,7 +203,7 @@ static void SKYLogUploadFile(NSURL *fileURL,
                                      error:&error];
 
         if (error) {
-            SKYWriteLog(
+            NSString *message =
                 [NSString stringWithFormat:
                     @"\n"
                      "========== UPLOAD FILE ERROR ==========\n"
@@ -211,7 +213,9 @@ static void SKYLogUploadFile(NSURL *fileURL,
                      "========================================\n",
                     source ?: @"unknown",
                     fileURL,
-                    error]);
+                    error];
+
+            SKYWriteLog(message);
         }
 
         SKYLogRequest(request, body, source);
@@ -427,13 +431,16 @@ static void SKYLogUploadFile(NSURL *fileURL,
                                 attributes:nil];
         }
 
-        SKYWriteLog(
-            @"\n"
-             "================================================\n"
-             "Sky HTTP logging tweak loaded\n"
-             "Full request/response logging enabled\n"
-             "Log path: %@\n"
-             "================================================",
-            path);
+        NSString *message =
+            [NSString stringWithFormat:
+                @"\n"
+                 "================================================\n"
+                 "Sky HTTP logging tweak loaded\n"
+                 "Full request/response logging enabled\n"
+                 "Log path: %@\n"
+                 "================================================\n",
+                path];
+
+        SKYWriteLog(message);
     }
 }
