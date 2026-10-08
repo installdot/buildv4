@@ -1,8 +1,9 @@
 #import <Foundation/Foundation.h>
+#import <Security/SecureTransport.h>
 
 static NSString * const SKYLogFileName = @"sky_http.log";
 
-#pragma mark - Log file
+#pragma mark - File logging
 
 static NSString *SKYDocumentsLogPath(void) {
     NSArray *paths =
@@ -222,6 +223,95 @@ static void SKYLogUploadFile(NSURL *fileURL,
     }
 }
 
+#pragma mark - Native SecureTransport logging
+
+static void SKYLogTLSBytes(const char *direction,
+                           const void *bytes,
+                           size_t length,
+                           size_t processed,
+                           OSStatus status) {
+    @autoreleasepool {
+        if (!bytes || length == 0) {
+            return;
+        }
+
+        size_t actualLength = processed;
+
+        if (actualLength == 0 || actualLength > length) {
+            actualLength = length;
+        }
+
+        NSData *data =
+            [NSData dataWithBytes:bytes
+                           length:actualLength];
+
+        NSString *message =
+            [NSString stringWithFormat:
+                @"\n"
+                 "========== TLS %s ==========\n"
+                 "Status: %d\n"
+                 "Requested length: %lu\n"
+                 "Processed length: %lu\n"
+                 "Data:\n%@\n"
+                 "============================\n",
+                direction ?: "UNKNOWN",
+                (int)status,
+                (unsigned long)length,
+                (unsigned long)actualLength,
+                SKYDataDescription(data)];
+
+        SKYWriteLog(message);
+    }
+}
+
+%hookf(OSStatus,
+       SSLWrite,
+       SSLContextRef context,
+       const void *data,
+       size_t dataLength,
+       size_t *processed) {
+    OSStatus status =
+        %orig(context,
+              data,
+              dataLength,
+              processed);
+
+    size_t written =
+        processed ? *processed : dataLength;
+
+    SKYLogTLSBytes("WRITE",
+                   data,
+                   dataLength,
+                   written,
+                   status);
+
+    return status;
+}
+
+%hookf(OSStatus,
+       SSLRead,
+       SSLContextRef context,
+       void *data,
+       size_t dataLength,
+       size_t *processed) {
+    OSStatus status =
+        %orig(context,
+              data,
+              dataLength,
+              processed);
+
+    size_t received =
+        processed ? *processed : 0;
+
+    SKYLogTLSBytes("READ",
+                   data,
+                   dataLength,
+                   received,
+                   status);
+
+    return status;
+}
+
 #pragma mark - GTMSessionFetcher hooks
 
 %hook GTMSessionFetcher
@@ -235,7 +325,8 @@ static void SKYLogUploadFile(NSURL *fileURL,
 }
 
 - (void)beginFetchWithCompletionHandler:(id)handler {
-    NSURLRequest *request = [(id)self request];
+    NSURLRequest *request =
+        [(id)self request];
 
     SKYLogRequest(request,
                   nil,
@@ -245,7 +336,8 @@ static void SKYLogUploadFile(NSURL *fileURL,
 }
 
 - (void)fetchWithCompletionHandler:(id)handler {
-    NSURLRequest *request = [(id)self request];
+    NSURLRequest *request =
+        [(id)self request];
 
     SKYLogRequest(request,
                   nil,
@@ -256,7 +348,8 @@ static void SKYLogUploadFile(NSURL *fileURL,
 
 - (void)beginFetchMayDelay:(BOOL)mayDelay
              mayAuthorize:(BOOL)mayAuthorize {
-    NSURLRequest *request = [(id)self request];
+    NSURLRequest *request =
+        [(id)self request];
 
     SKYLogRequest(request,
                   nil,
@@ -267,7 +360,8 @@ static void SKYLogUploadFile(NSURL *fileURL,
 
 - (void)beginFetchWithDelegate:(id)delegate
              didFinishSelector:(SEL)selector {
-    NSURLRequest *request = [(id)self request];
+    NSURLRequest *request =
+        [(id)self request];
 
     SKYLogRequest(request,
                   nil,
@@ -420,7 +514,8 @@ static void SKYLogUploadFile(NSURL *fileURL,
 
 %ctor {
     @autoreleasepool {
-        NSString *path = SKYDocumentsLogPath();
+        NSString *path =
+            SKYDocumentsLogPath();
 
         NSFileManager *fileManager =
             [NSFileManager defaultManager];
@@ -437,6 +532,7 @@ static void SKYLogUploadFile(NSURL *fileURL,
                  "================================================\n"
                  "Sky HTTP logging tweak loaded\n"
                  "Full request/response logging enabled\n"
+                 "SecureTransport SSLRead/SSLWrite hooks enabled\n"
                  "Log path: %@\n"
                  "================================================\n",
                 path];
