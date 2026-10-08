@@ -1,9 +1,10 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 
 static NSString * const SKYLogFileName = @"sky_http.log";
 
-static NSString *SKYDocumentsPath(void) {
+#pragma mark - File logging
+
+static NSString *SKYDocumentsLogPath(void) {
     NSArray *paths =
         NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
                                             NSUserDomainMask,
@@ -29,49 +30,33 @@ static NSString *SKYTimestamp(void) {
     return [formatter stringFromDate:[NSDate date]];
 }
 
-static NSString *SKYDataText(NSData *data) {
-    if (!data || data.length == 0) {
-        return @"<empty>";
-    }
-
-    NSString *utf8 =
-        [[NSString alloc] initWithData:data
-                               encoding:NSUTF8StringEncoding];
-
-    if (utf8) {
-        return utf8;
-    }
-
-    return [NSString stringWithFormat:
-        @"<binary data: %lu bytes>\nBase64:\n%@",
-        (unsigned long)data.length,
-        [data base64EncodedStringWithOptions:0]];
-}
-
 static void SKYWriteLog(NSString *text) {
     @autoreleasepool {
+        if (!text) {
+            return;
+        }
+
         NSString *line =
-            [NSString stringWithFormat:
-                @"[%@] %@\n",
-                SKYTimestamp(),
-                text];
+            [NSString stringWithFormat:@"[%@] %@\n",
+                                       SKYTimestamp(),
+                                       text];
 
         @synchronized([NSObject class]) {
-            NSString *path = SKYDocumentsPath();
+            NSString *path = SKYDocumentsLogPath();
+            NSFileManager *fileManager =
+                [NSFileManager defaultManager];
 
-            NSFileManager *fm = [NSFileManager defaultManager];
-
-            if (![fm fileExistsAtPath:path]) {
-                [fm createFileAtPath:path
-                            contents:nil
-                          attributes:nil];
+            if (![fileManager fileExistsAtPath:path]) {
+                [fileManager createFileAtPath:path
+                                      contents:nil
+                                    attributes:nil];
             }
 
             NSFileHandle *handle =
                 [NSFileHandle fileHandleForWritingAtPath:path];
 
             if (!handle) {
-                NSLog(@"[SkyHTTP] Cannot open log file: %@", path);
+                NSLog(@"[SkyHTTP] Could not open log file: %@", path);
                 return;
             }
 
@@ -94,6 +79,30 @@ static void SKYWriteLog(NSString *text) {
     }
 }
 
+#pragma mark - Data formatting
+
+static NSString *SKYDataDescription(NSData *data) {
+    if (!data || data.length == 0) {
+        return @"<empty>";
+    }
+
+    NSString *text =
+        [[NSString alloc] initWithData:data
+                               encoding:NSUTF8StringEncoding];
+
+    if (text) {
+        return text;
+    }
+
+    return [NSString stringWithFormat:
+        @"<binary data: %lu bytes>\n"
+         "Base64:\n%@",
+        (unsigned long)data.length,
+        [data base64EncodedStringWithOptions:0]];
+}
+
+#pragma mark - Request logging
+
 static void SKYLogRequest(NSURLRequest *request,
                           NSData *overrideBody,
                           NSString *source) {
@@ -101,15 +110,22 @@ static void SKYLogRequest(NSURLRequest *request,
         if (!request) {
             SKYWriteLog(
                 [NSString stringWithFormat:
-                    @"REQUEST source=%@ request=<nil>",
+                    @"\n"
+                     "========== REQUEST ==========\n"
+                     "Source: %@\n"
+                     "Request: <nil>\n"
+                     "==============================\n",
                     source ?: @"unknown"]);
+
             return;
         }
 
         NSURL *url = request.URL;
         NSString *method = request.HTTPMethod ?: @"<unknown>";
-        NSDictionary *headers = request.allHTTPHeaderFields ?: @{};
-        NSData *body = overrideBody ?: request.HTTPBody;
+        NSDictionary *headers =
+            request.allHTTPHeaderFields ?: @{};
+        NSData *body =
+            overrideBody ?: request.HTTPBody;
 
         NSString *log =
             [NSString stringWithFormat:
@@ -127,11 +143,13 @@ static void SKYLogRequest(NSURLRequest *request,
                 method,
                 headers,
                 (unsigned long)body.length,
-                SKYDataText(body)];
+                SKYDataDescription(body)];
 
         SKYWriteLog(log);
     }
 }
+
+#pragma mark - Response logging
 
 static void SKYLogResponse(NSData *data,
                            NSURLResponse *response,
@@ -144,7 +162,8 @@ static void SKYLogResponse(NSData *data,
             httpResponse = (NSHTTPURLResponse *)response;
         }
 
-        NSString *url = response.URL.absoluteString ?: @"<no URL>";
+        NSString *url =
+            response.URL.absoluteString ?: @"<no URL>";
 
         NSString *log =
             [NSString stringWithFormat:
@@ -164,7 +183,7 @@ static void SKYLogResponse(NSData *data,
                 httpResponse.allHeaderFields ?: @{},
                 error ?: @"<none>",
                 (unsigned long)data.length,
-                SKYDataText(data)];
+                SKYDataDescription(data)];
 
         SKYWriteLog(log);
     }
@@ -184,11 +203,13 @@ static void SKYLogUploadFile(NSURL *fileURL,
         if (error) {
             SKYWriteLog(
                 [NSString stringWithFormat:
-                    @"UPLOAD FILE READ ERROR\n"
+                    @"\n"
+                     "========== UPLOAD FILE ERROR ==========\n"
                      "Source: %@\n"
                      "File: %@\n"
-                     "Error: %@\n",
-                    source,
+                     "Error: %@\n"
+                     "========================================\n",
+                    source ?: @"unknown",
                     fileURL,
                     error]);
         }
@@ -197,6 +218,64 @@ static void SKYLogUploadFile(NSURL *fileURL,
     }
 }
 
+#pragma mark - GTMSessionFetcher hooks
+
+%hook GTMSessionFetcher
+
+- (void)setRequest:(NSURLRequest *)request {
+    SKYLogRequest(request,
+                  nil,
+                  @"GTMSessionFetcher setRequest:");
+
+    %orig(request);
+}
+
+- (void)beginFetchWithCompletionHandler:(id)handler {
+    NSURLRequest *request = [(id)self request];
+
+    SKYLogRequest(request,
+                  nil,
+                  @"GTMSessionFetcher beginFetchWithCompletionHandler:");
+
+    %orig(handler);
+}
+
+- (void)fetchWithCompletionHandler:(id)handler {
+    NSURLRequest *request = [(id)self request];
+
+    SKYLogRequest(request,
+                  nil,
+                  @"GTMSessionFetcher fetchWithCompletionHandler:");
+
+    %orig(handler);
+}
+
+- (void)beginFetchMayDelay:(BOOL)mayDelay
+             mayAuthorize:(BOOL)mayAuthorize {
+    NSURLRequest *request = [(id)self request];
+
+    SKYLogRequest(request,
+                  nil,
+                  @"GTMSessionFetcher beginFetchMayDelay:mayAuthorize:");
+
+    %orig(mayDelay, mayAuthorize);
+}
+
+- (void)beginFetchWithDelegate:(id)delegate
+             didFinishSelector:(SEL)selector {
+    NSURLRequest *request = [(id)self request];
+
+    SKYLogRequest(request,
+                  nil,
+                  @"GTMSessionFetcher beginFetchWithDelegate:");
+
+    %orig(delegate, selector);
+}
+
+%end
+
+#pragma mark - NSURLSessionTask hooks
+
 %hook NSURLSessionTask
 
 - (void)resume {
@@ -204,7 +283,9 @@ static void SKYLogUploadFile(NSURL *fileURL,
         NSURLRequest *request =
             self.currentRequest ?: self.originalRequest;
 
-        SKYLogRequest(request, nil, @"NSURLSessionTask resume");
+        SKYLogRequest(request,
+                      nil,
+                      @"NSURLSessionTask resume");
     }
 
     %orig;
@@ -212,13 +293,17 @@ static void SKYLogUploadFile(NSURL *fileURL,
 
 %end
 
+#pragma mark - NSURLSession hooks
+
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
                             completionHandler:(void (^)(NSData *,
                                                         NSURLResponse *,
                                                         NSError *))completionHandler {
-    SKYLogRequest(request, nil, @"dataTaskWithRequest");
+    SKYLogRequest(request,
+                  nil,
+                  @"NSURLSession dataTaskWithRequest:");
 
     void (^wrappedCompletion)(NSData *,
                               NSURLResponse *,
@@ -229,7 +314,7 @@ static void SKYLogUploadFile(NSURL *fileURL,
             SKYLogResponse(data,
                            response,
                            error,
-                           @"dataTask completion");
+                           @"NSURLSession dataTask completion");
 
             if (completionHandler) {
                 completionHandler(data, response, error);
@@ -239,14 +324,16 @@ static void SKYLogUploadFile(NSURL *fileURL,
     return %orig(request, wrappedCompletion);
 }
 
-- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
-                                          fromData:(NSData *)bodyData
-                                 completionHandler:(void (^)(NSData *,
-                                                             NSURLResponse *,
-                                                             NSError *))completionHandler {
+- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
+                        completionHandler:(void (^)(NSData *,
+                                                    NSURLResponse *,
+                                                    NSError *))completionHandler {
+    NSURLRequest *request =
+        [NSURLRequest requestWithURL:url];
+
     SKYLogRequest(request,
-                  bodyData,
-                  @"uploadTaskWithRequest fromData");
+                  nil,
+                  @"NSURLSession dataTaskWithURL:");
 
     void (^wrappedCompletion)(NSData *,
                               NSURLResponse *,
@@ -257,7 +344,35 @@ static void SKYLogUploadFile(NSURL *fileURL,
             SKYLogResponse(data,
                            response,
                            error,
-                           @"uploadTask completion");
+                           @"NSURLSession dataTask URL completion");
+
+            if (completionHandler) {
+                completionHandler(data, response, error);
+            }
+        };
+
+    return %orig(url, wrappedCompletion);
+}
+
+- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request
+                                          fromData:(NSData *)bodyData
+                                 completionHandler:(void (^)(NSData *,
+                                                             NSURLResponse *,
+                                                             NSError *))completionHandler {
+    SKYLogRequest(request,
+                  bodyData,
+                  @"NSURLSession uploadTask fromData:");
+
+    void (^wrappedCompletion)(NSData *,
+                              NSURLResponse *,
+                              NSError *) =
+        ^(NSData *data,
+          NSURLResponse *response,
+          NSError *error) {
+            SKYLogResponse(data,
+                           response,
+                           error,
+                           @"NSURLSession upload completion");
 
             if (completionHandler) {
                 completionHandler(data, response, error);
@@ -274,7 +389,7 @@ static void SKYLogUploadFile(NSURL *fileURL,
                                                              NSError *))completionHandler {
     SKYLogUploadFile(fileURL,
                      request,
-                     @"uploadTaskWithRequest fromFile");
+                     @"NSURLSession uploadTask fromFile:");
 
     void (^wrappedCompletion)(NSData *,
                               NSURLResponse *,
@@ -285,7 +400,7 @@ static void SKYLogUploadFile(NSURL *fileURL,
             SKYLogResponse(data,
                            response,
                            error,
-                           @"uploadTask file completion");
+                           @"NSURLSession file upload completion");
 
             if (completionHandler) {
                 completionHandler(data, response, error);
@@ -295,51 +410,30 @@ static void SKYLogUploadFile(NSURL *fileURL,
     return %orig(request, fileURL, wrappedCompletion);
 }
 
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url
-                        completionHandler:(void (^)(NSData *,
-                                                    NSURLResponse *,
-                                                    NSError *))completionHandler {
-    NSURLRequest *request =
-        [NSURLRequest requestWithURL:url];
-
-    SKYLogRequest(request,
-                  nil,
-                  @"dataTaskWithURL");
-
-    void (^wrappedCompletion)(NSData *,
-                              NSURLResponse *,
-                              NSError *) =
-        ^(NSData *data,
-          NSURLResponse *response,
-          NSError *error) {
-            SKYLogResponse(data,
-                           response,
-                           error,
-                           @"dataTask URL completion");
-
-            if (completionHandler) {
-                completionHandler(data, response, error);
-            }
-        };
-
-    return %orig(url, wrappedCompletion);
-}
-
 %end
+
+#pragma mark - Constructor
 
 %ctor {
     @autoreleasepool {
-        NSString *path = SKYDocumentsPath();
+        NSString *path = SKYDocumentsLogPath();
 
-        NSFileManager *fm = [NSFileManager defaultManager];
+        NSFileManager *fileManager =
+            [NSFileManager defaultManager];
 
-        if (![fm fileExistsAtPath:path]) {
-            [fm createFileAtPath:path
-                        contents:nil
-                      attributes:nil];
+        if (![fileManager fileExistsAtPath:path]) {
+            [fileManager createFileAtPath:path
+                                  contents:nil
+                                attributes:nil];
         }
 
         SKYWriteLog(
-            @"========== tweak loaded; full HTTP logging enabled ==========");
+            @"\n"
+             "================================================\n"
+             "Sky HTTP logging tweak loaded\n"
+             "Full request/response logging enabled\n"
+             "Log path: %@\n"
+             "================================================",
+            path);
     }
 }
