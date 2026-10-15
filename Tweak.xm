@@ -1,417 +1,144 @@
-// ==============================================================================
-// TempMailTrace & Auto-Decrypt Tweak
-// 1. Patches startup integrity checks & catches 0xdead crashes
-// 2. Automatically triggers key decryption without manual button clicks
-// 3. Captures decrypted CURLOPT_URL, CURLOPT_POSTFIELDS, and responses
-// 4. Saves full audit log to: Documents/TempMail_Audit.log
-// ==============================================================================
-
+// Original TempMail SHA256: 089555f848e2cfe6e53264edaa213214dca2c64305abe59151e157ed0c050fa1
+// Passive response observer. No integrity patch, signal handler or automatic login.
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <objc/message.h>
-#import <os/log.h>
 #import <mach-o/dyld.h>
-#import <mach/mach.h>
-#import <mach/vm_map.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdint>
 #include <pthread.h>
-#include <signal.h>
-#include <string.h>
-#include <stdlib.h>
-#include <libkern/OSCacheControl.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-void sys_icache_invalidate(void *start, size_t len);
-void sys_dcache_flush(void *start, size_t len);
-#ifdef __cplusplus
-}
-#endif
+using Perform = int (*)(void *);
+using Writer = size_t (*)(char *, size_t, size_t, void *);
+static Perform originalPerform;
+static NSString *directory;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned sequence;
+static thread_local bool insidePerform;
 
-// ------------------------------------------------------------------------------
-// Logging Infrastructure
-// ------------------------------------------------------------------------------
-static int auditFD = -1;
-static pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER;
-static NSString *auditLogPath = nil;
-
-static void WriteAuditLog(NSString *category, NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-
-    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    pid_t pid = getpid();
-    uid_t uid = getuid();
-    BOOL isMain = NSThread.isMainThread;
-    
-    NSString *entry = [NSString stringWithFormat:@"[%.3f][PID:%d][UID:%d][Main:%d][%@] %@\n",
-                       now, pid, uid, isMain, category, message];
-
-    // Console / os_log
-    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "%{public}s", entry.UTF8String);
-
-    // File write
-    pthread_mutex_lock(&logMutex);
-    if (auditFD >= 0) {
-        const char *buf = entry.UTF8String;
-        size_t len = strlen(buf);
-        write(auditFD, buf, len);
-    }
-    pthread_mutex_unlock(&logMutex);
-}
-
-// ------------------------------------------------------------------------------
-// Base Address & Memory Patching
-// ------------------------------------------------------------------------------
-static uintptr_t GetMainBinaryBase(void) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "TempMail.app/TempMail")) {
-            return (uintptr_t)_dyld_get_image_header(i);
+static void Log(NSString *message) {
+    int saved = errno;
+    NSLog(@"[TempMailTrace pid=%d] %@", getpid(), message);
+    if (directory) {
+        NSString *path = [directory stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"TempMailTrace-%d.log", getpid()]];
+        pthread_mutex_lock(&lock);
+        int fd = open(path.fileSystemRepresentation, O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC|O_NOFOLLOW, 0600);
+        if (fd >= 0) {
+            NSData *data = [[message stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+            const char *p = (const char *)data.bytes;
+            size_t left = data.length;
+            while (left) {
+                ssize_t n = write(fd,p,left);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                p += n; left -= (size_t)n;
+            }
+            close(fd);
         }
+        pthread_mutex_unlock(&lock);
     }
-    return (uintptr_t)_dyld_get_image_header(0);
+    errno = saved;
 }
 
-static BOOL PatchMemory(void *target, const void *bytes, size_t size) {
-    vm_prot_t prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY;
-    mach_port_t task = mach_task_self();
-    vm_address_t page = ((vm_address_t)target) & ~((vm_address_t)PAGE_SIZE - 1);
-    size_t pageSize = ((size + ((vm_address_t)target - page) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
-    
-    if (vm_protect(task, page, pageSize, FALSE, prot) == KERN_SUCCESS) {
-        memcpy(target, bytes, size);
-        vm_protect(task, page, pageSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-        sys_dcache_flush(target, size);
-        sys_icache_invalidate(target, size);
-        return YES;
+struct Capture {
+    Writer writer;
+    void *userdata;
+    int fd;
+    size_t stored;
+    bool truncated;
+    bool ioError;
+};
+
+static size_t ObserveBody(char *ptr, size_t size, size_t count, void *opaque) {
+    Capture *c = (Capture *)opaque;
+    int saved = errno;
+    if (size && count > SIZE_MAX/size) {
+        errno = saved;
+        return c->writer(ptr,size,count,c->userdata);
     }
-    return NO;
-}
-
-// ------------------------------------------------------------------------------
-// Crash Prevention: Catch SIGBUS / SIGSEGV at 0xdead
-// ------------------------------------------------------------------------------
-static void CrashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
-    ucontext_t *ctx = (ucontext_t *)ucontext;
-    uintptr_t fault_pc = 0;
-#if defined(__arm64__) || defined(__aarch64__)
-    fault_pc = (uintptr_t)ctx->uc_mcontext->__ss.__pc;
-#endif
-    WriteAuditLog(@"CRASH_GUARD", @"⚡ Intercepted Signal %d (fault_addr=%p, pc=0x%lx)", sig, info->si_addr, (unsigned long)fault_pc);
-
-    if (fault_pc == 0xdead || (uintptr_t)info->si_addr == 0xdead) {
-        WriteAuditLog(@"CRASH_GUARD", @"🛡️ Successfully caught 0xdead integrity check trap! Thread terminating gracefully.");
-        if (NSThread.isMainThread) {
-            WriteAuditLog(@"CRASH_GUARD", @"Main thread triggered 0xdead - returning safely.");
-            return;
-        } else {
-            pthread_exit(NULL);
+    size_t bytes = size*count;
+    // ponytail: first 1 MiB per response; raise only for a specifically needed larger capture.
+    size_t room = 1024*1024-c->stored;
+    size_t wanted = bytes < room ? bytes : room;
+    c->truncated |= wanted < bytes;
+    if (c->fd >= 0) {
+        size_t done=0;
+        while (done<wanted) {
+            ssize_t n=write(c->fd,ptr+done,wanted-done);
+            if (n<0 && errno==EINTR) continue;
+            if (n<=0) { c->ioError=true; break; }
+            done+=(size_t)n;
         }
+        c->stored+=done;
     }
-    
-    // For other crashes, exit cleanly with log
-    WriteAuditLog(@"CRASH_GUARD", @"Exiting process cleanly to preserve logs.");
-    exit(0);
+    errno=saved;
+    // Preserve the original consumer and its exact return value, including pause/error.
+    return c->writer(ptr,size,count,c->userdata);
 }
 
-static void InstallCrashGuards(uintptr_t base) {
-    // 1. Register signal handlers
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = CrashSignalHandler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGSEGV, &sa, NULL);
-    WriteAuditLog(@"PATCH", @"✅ Registered SIGBUS / SIGSEGV crash guards");
-
-    // 2. Patch Startup Integrity Gate: 0x100053c4c (offset 0x53c4c)
-    // Original: B.EQ #0x100053c7c (80 01 00 54)
-    // Patched:  B    #0x100053c7c (0c 00 00 14)
-    void *gate_addr = (void *)(base + 0x53c4c);
-    uint32_t patch_b = 0x1400000c; // B #0x30 (12 instructions)
-    if (PatchMemory(gate_addr, &patch_b, 4)) {
-        WriteAuditLog(@"PATCH", @"✅ Patched integrity check gate at 0x%lx -> Unconditional Jump (B #0x53c7c)", (unsigned long)gate_addr);
-    } else {
-        WriteAuditLog(@"PATCH", @"⚠️ Failed to patch memory at 0x%lx", (unsigned long)gate_addr);
-    }
-
-    // 3. Bypass secondary integrity check: sub_100607F44 (offset 0x1538918)
-    void *guard_byte = (void *)(base + 0x1538918);
-    uint8_t one = 1;
-    PatchMemory(guard_byte, &one, 1);
+template<typename T> static T Read(void *handle,size_t offset) {
+    T result; memcpy(&result,(char *)handle+offset,sizeof(result)); return result;
+}
+template<typename T> static void Store(void *handle,size_t offset,T value) {
+    memcpy((char *)handle+offset,&value,sizeof(value));
 }
 
-// ------------------------------------------------------------------------------
-// Dynamic Hooking Engine
-// ------------------------------------------------------------------------------
-typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
-typedef int (*DobbyHook_t)(void *function_address, void *replace_call_address, void **origin_call_address);
-
-static BOOL HookFunction(void *target, void *replacement, void **orig) {
-    if (!target) return NO;
-
-    MSHookFunction_t msHook = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (msHook) {
-        msHook(target, replacement, orig);
-        return YES;
-    }
-
-    DobbyHook_t dobbyHook = (DobbyHook_t)dlsym(RTLD_DEFAULT, "DobbyHook");
-    if (dobbyHook) {
-        return (dobbyHook(target, replacement, orig) == 0);
-    }
-
-    // Direct branch trampoline fallback
-    uint32_t trampoline[4];
-    trampoline[0] = 0x58000050; // LDR X16, #8
-    trampoline[1] = 0xd61f0200; // BR X16
-    memcpy(&trampoline[2], &replacement, 8);
-    return PatchMemory(target, trampoline, 16);
+static int ObservePerform(void *handle) {
+    if (!handle || insidePerform || Read<uint32_t>(handle,0)!=0xc0dedbad)
+        return originalPerform(handle);
+    insidePerform=true;
+    Writer writer=Read<Writer>(handle,520);
+    void *userdata=Read<void *>(handle,448);
+    if (!writer) { insidePerform=false; return originalPerform(handle); }
+    pthread_mutex_lock(&lock);
+    unsigned id=++sequence;
+    pthread_mutex_unlock(&lock);
+    NSString *path=directory ? [directory stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"response-%d-%u.bin",getpid(),id]] : nil;
+    Capture capture{writer,userdata,-1,0,false,false};
+    if (path) capture.fd=open(path.fileSystemRepresentation,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
+    const char *url=Read<const char *>(handle,2088);
+    NSString *address=url ? [[NSString alloc] initWithBytes:url length:strnlen(url,8192) encoding:NSUTF8StringEncoding] : nil;
+    // Do not log query/userinfo: may contain credentials. Raw response stays in private file only.
+    NSURLComponents *parts=address ? [NSURLComponents componentsWithString:address] : nil;
+    parts.query=nil; parts.fragment=nil; parts.user=nil; parts.password=nil;
+    Log([NSString stringWithFormat:@"BEGIN id=%u endpoint=%@ bodyFile=%@ fileOpen=%d",id,parts.string ?: @"unavailable",path,capture.fd>=0]);
+    Store<Writer>(handle,520,ObserveBody);
+    Store<void *>(handle,448,&capture);
+    int result=originalPerform(handle);
+    int saved=errno;
+    Store<Writer>(handle,520,writer);
+    Store<void *>(handle,448,userdata);
+    if(capture.fd>=0) close(capture.fd);
+    Log([NSString stringWithFormat:@"END id=%u CURLcode=%d captured=%zu truncated=%d writeError=%d (not HTTP status)",id,result,capture.stored,capture.truncated,capture.ioError]);
+    insidePerform=false;
+    errno=saved;
+    return result;
 }
 
-// ------------------------------------------------------------------------------
-// Anti-Debug Hook (Block PT_DENY_ATTACH)
-// ------------------------------------------------------------------------------
-typedef int (*ptrace_t)(int request, pid_t pid, caddr_t addr, int data);
-static ptrace_t orig_ptrace = NULL;
-
-static int my_ptrace(int request, pid_t pid, caddr_t addr, int data) {
-    if (request == 31) { // PT_DENY_ATTACH = 31
-        WriteAuditLog(@"ANTI_DEBUG", @"🛡️ Blocked ptrace(PT_DENY_ATTACH)");
-        return 0;
-    }
-    return orig_ptrace ? orig_ptrace(request, pid, addr, data) : 0;
-}
-
-// ------------------------------------------------------------------------------
-// CURL Hooks
-// ------------------------------------------------------------------------------
-#define CURLOPT_URL             10002
-#define CURLOPT_POSTFIELDS      10015
-#define CURLOPT_USERPWD         10018
-#define CURLOPT_PINNEDPUBLICKEY 10230
-
-static NSString *capturedEndpoint = nil;
-
-typedef uintptr_t (*curl_easy_setopt_t)(uintptr_t handle, int option, ...);
-static curl_easy_setopt_t orig_curl_easy_setopt = NULL;
-
-static uintptr_t my_curl_easy_setopt(uintptr_t handle, int option, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t val) {
+__attribute__((constructor)) static void InstallTrace(void) {
     @autoreleasepool {
-        switch (option) {
-            case CURLOPT_URL: {
-                const char *url = (const char *)val;
-                if (url) {
-                    capturedEndpoint = [NSString stringWithUTF8String:url];
-                    WriteAuditLog(@"CURL", @"🎯🎯🎯 [DECRYPTED ENDPOINT URL]: %s", url);
-                    
-                    // Show on-screen notification alert if on main thread
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        UIWindow *keyWindow = nil;
-                        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-                            if (w.isKeyWindow) { keyWindow = w; break; }
-                        }
-                        UIViewController *root = keyWindow.rootViewController;
-                        if (root) {
-                            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"🎯 Endpoint Captured!"
-                                                                                           message:[NSString stringWithFormat:@"URL: %s", url]
-                                                                                    preferredStyle:UIAlertControllerStyleAlert];
-                            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                            [root presentViewController:alert animated:YES completion:nil];
-                        }
-                    });
-                }
-                break;
-            }
-            case CURLOPT_POSTFIELDS: {
-                const char *body = (const char *)val;
-                WriteAuditLog(@"CURL", @"📦 [CURLOPT_POSTFIELDS]: %s", body ? body : "(null)");
-                break;
-            }
-            case CURLOPT_USERPWD: {
-                const char *userpwd = (const char *)val;
-                WriteAuditLog(@"CURL", @"🔑 [CURLOPT_USERPWD]: %s", userpwd ? userpwd : "(null)");
-                break;
-            }
-            case CURLOPT_PINNEDPUBLICKEY: {
-                const char *pin = (const char *)val;
-                WriteAuditLog(@"CURL", @"🔒 [CURLOPT_PINNEDPUBLICKEY]: %s", pin ? pin : "(null)");
-                break;
-            }
-            default:
-                break;
-        }
-    }
-    return orig_curl_easy_setopt(handle, option, a3, a4, a5, a6, a7, a8, val);
-}
-
-typedef uintptr_t (*curl_easy_perform_t)(uintptr_t handle);
-static curl_easy_perform_t orig_curl_easy_perform = NULL;
-
-static uintptr_t my_curl_easy_perform(uintptr_t handle) {
-    WriteAuditLog(@"CURL", @">>> curl_easy_perform: START HTTP REQUEST >>>");
-    uintptr_t ret = orig_curl_easy_perform(handle);
-    WriteAuditLog(@"CURL", @"<<< curl_easy_perform: FINISHED HTTP REQUEST, Code = %ld <<<", (long)ret);
-    return ret;
-}
-
-// ------------------------------------------------------------------------------
-// dlopen Hook
-// ------------------------------------------------------------------------------
-static void* (*orig_dlopen)(const char *filename, int flag) = NULL;
-
-static void* my_dlopen(const char *filename, int flag) {
-    void *h = orig_dlopen(filename, flag);
-    if (filename && (strstr(filename, "jailbreak") || strstr(filename, "jbroot") || strstr(filename, "basebin"))) {
-        WriteAuditLog(@"DLOPEN", @"dlopen('%s', %d) -> %p (dlerror: %s)", filename, flag, h, h ? "None" : dlerror());
-    }
-    return h;
-}
-
-// ------------------------------------------------------------------------------
-// Objective-C Method Swizzling
-// ------------------------------------------------------------------------------
-__attribute__((unused)) static void SwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-    if (origImp) *origImp = method_getImplementation(m);
-    method_setImplementation(m, newImp);
-}
-
-__attribute__((unused)) static void SwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
-    Method m = class_getClassMethod(cls, sel);
-    if (!m) return;
-    if (origImp) *origImp = method_getImplementation(m);
-    method_setImplementation(m, newImp);
-}
-
-// Hook: UIAlertController
-typedef id (*AlertImp_t)(id, SEL, NSString*, NSString*, UIAlertControllerStyle);
-static AlertImp_t orig_alert = NULL;
-
-static id my_alert(id self, SEL _cmd, NSString *title, NSString *message, UIAlertControllerStyle style) {
-    WriteAuditLog(@"ALERT_POPUP", @"⚠️ Popup triggered! Title: '%@', Message: '%@'", title, message);
-    return orig_alert(self, _cmd, title, message, style);
-}
-
-// ------------------------------------------------------------------------------
-// Auto-Trigger Decryption (Calls login action automatically after UI loads)
-// ------------------------------------------------------------------------------
-static void ScheduleAutoDecrypt(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (capturedEndpoint) {
-            WriteAuditLog(@"AUTO_DECRYPT", @"Endpoint already captured: %@", capturedEndpoint);
-            return;
-        }
-
-        WriteAuditLog(@"AUTO_DECRYPT", @"⚡ Executing Auto-Trigger to extract Endpoint URL...");
-
-        UIWindow *keyWindow = nil;
-        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-            if (w.isKeyWindow) { keyWindow = w; break; }
-        }
-        UIViewController *root = keyWindow ? keyWindow.rootViewController : nil;
-        if (!root) {
-            root = UIApplication.sharedApplication.windows.firstObject.rootViewController;
-        }
-
-        if (root && [NSStringFromClass(root.class) isEqualToString:@"VNTISFHTNSFJ"]) {
-            WriteAuditLog(@"AUTO_DECRYPT", @"Found VNTISFHTNSFJ controller at %p", root);
-
-            // Set textField to trigger valid length check
-            Ivar ivar = class_getInstanceVariable(root.class, "textField");
-            if (ivar) {
-                UITextField *tf = object_getIvar(root, ivar);
-                if (tf && [tf isKindOfClass:UITextField.class]) {
-                    tf.text = @"AutoAuditKey12345678901234567890";
-                    WriteAuditLog(@"AUTO_DECRYPT", @"Filled textField with test key");
-                }
-            }
-
-            // Call -[VNTISFHTNSFJ POWMFHANGHT:] directly
-            SEL loginSel = NSSelectorFromString(@"POWMFHANGHT:");
-            if ([root respondsToSelector:loginSel]) {
-                WriteAuditLog(@"AUTO_DECRYPT", @"Calling -[VNTISFHTNSFJ POWMFHANGHT:] to trigger verifier and URL decryption!");
-                #pragma clang diagnostic push
-                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                [root performSelector:loginSel withObject:nil];
-                #pragma clang diagnostic pop
-            }
-        } else {
-            WriteAuditLog(@"AUTO_DECRYPT", @"Root controller is not VNTISFHTNSFJ (found: %@)", root ? NSStringFromClass(root.class) : @"nil");
-        }
-    });
-}
-
-// ------------------------------------------------------------------------------
-// Constructor Entry Point
-// ------------------------------------------------------------------------------
-__attribute__((constructor)) static void InitializeTraceTweak(void) {
-    @autoreleasepool {
-        // 1. Setup Audit Log File in Documents directory
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *docDir = paths.firstObject;
-        if (!docDir) docDir = NSTemporaryDirectory();
-        
-        auditLogPath = [docDir stringByAppendingPathComponent:@"TempMail_Audit.log"];
-        auditFD = open(auditLogPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0666);
-
-        BOOL isOverlayProcess = [NSProcessInfo.processInfo.arguments containsObject:@"-a"];
-        WriteAuditLog(@"INIT", @"=================================================================");
-        WriteAuditLog(@"INIT", @"⚡ TempMailTrace Injected! Mode: %@", isOverlayProcess ? @"OVERLAY PROCESS (-a)" : @"MAIN APP PROCESS");
-        WriteAuditLog(@"INIT", @"📂 Audit Log Path: %@", auditLogPath);
-        WriteAuditLog(@"INIT", @"=================================================================");
-
-        // 2. Resolve Binary Base Address
-        uintptr_t base = GetMainBinaryBase();
-        WriteAuditLog(@"INIT", @"Main Binary Mach-O Base = 0x%lx", (unsigned long)base);
-
-        // 3. Patch Integrity Check & Install Crash Guards (Fixes crash on inject)
-        InstallCrashGuards(base);
-
-        // 4. Hook Anti-Debug ptrace
-        void *ptrace_ptr = dlsym(RTLD_DEFAULT, "ptrace");
-        if (ptrace_ptr) {
-            HookFunction(ptrace_ptr, (void *)my_ptrace, (void **)&orig_ptrace);
-        }
-
-        // 5. Hook libcurl Functions
-        void *target_setopt = (void *)(base + 0x00bd0dd4);
-        if (HookFunction(target_setopt, (void *)my_curl_easy_setopt, (void **)&orig_curl_easy_setopt)) {
-            WriteAuditLog(@"INIT", @"✅ Hooked curl_easy_setopt at 0x%lx", (unsigned long)target_setopt);
-        }
-
-        void *target_perform = (void *)(base + 0x00ba7c90);
-        if (HookFunction(target_perform, (void *)my_curl_easy_perform, (void **)&orig_curl_easy_perform)) {
-            WriteAuditLog(@"INIT", @"✅ Hooked curl_easy_perform at 0x%lx", (unsigned long)target_perform);
-        }
-
-        // 6. Hook dlopen
-        void *dlopen_ptr = dlsym(RTLD_DEFAULT, "dlopen");
-        if (dlopen_ptr) {
-            HookFunction(dlopen_ptr, (void *)my_dlopen, (void **)&orig_dlopen);
-        }
-
-        // 7. Hook Popups
-        Class alertClass = objc_getClass("UIAlertController");
-        if (alertClass) {
-            SwizzleClassMethod(alertClass, @selector(alertControllerWithTitle:message:preferredStyle:), (IMP)my_alert, (IMP *)&orig_alert);
-        }
-
-        // 8. Auto-Trigger Decryption (Auto calls login to decrypt URL without waiting for user)
-        if (!isOverlayProcess) {
-            ScheduleAutoDecrypt();
-        }
-
-        WriteAuditLog(@"INIT", @"🎉 All guards and auto-decrypt triggers installed successfully!");
+        if (![NSProcessInfo.processInfo.processName isEqualToString:@"TempMail"]) return;
+        NSURL *docs=[[NSFileManager defaultManager] URLForDirectory:NSDocumentDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
+        directory=docs.path;
+        Log([NSString stringWithFormat:@"START mode=%@ Documents=%@",[NSProcessInfo.processInfo.arguments containsObject:@"-a"] ? @"child" : @"main",directory]);
+        const mach_header *header=_dyld_get_image_header(0);
+        if (!header || header->cputype!=CPU_TYPE_ARM64) { Log(@"SKIP unsupported image"); return; }
+        const char *name=_dyld_get_image_name(0);
+        if (!name || ![[[NSString stringWithUTF8String:name] lastPathComponent] isEqualToString:@"TempMail"]) { Log(@"SKIP wrong executable"); return; }
+        uintptr_t base=(uintptr_t)header;
+        const unsigned char expected[]={0x60,0x02,0x00,0xb4,0xff,0xc3,0x01,0xd1,0xf6,0x57,0x04,0xa9,0xf4,0x4f,0x05,0xa9};
+        if (memcmp((void *)(base+0xba7c90),expected,sizeof(expected))!=0) { Log(@"SKIP perform fingerprint mismatch"); return; }
+        using Hook=void (*)(void *,void *,void **);
+        Hook hook=(Hook)dlsym(RTLD_DEFAULT,"MSHookFunction");
+        if (!hook) { Log(@"SKIP MSHookFunction unavailable; no unsafe inline fallback"); return; }
+        // A real relocating hook engine is required. Runtime code mutation may trigger integrity checks.
+        hook((void *)(base+0xba7c90),(void *)ObservePerform,(void **)&originalPerform);
+        if (!originalPerform) { Log(@"ERROR hook engine returned no trampoline"); return; }
+        Log(@"READY response observer; enter your own test key manually. No auth bypass or auto-request.");
     }
 }
