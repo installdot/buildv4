@@ -280,14 +280,14 @@ static void* my_dlopen(const char *filename, int flag) {
 // ------------------------------------------------------------------------------
 // Objective-C Method Swizzling
 // ------------------------------------------------------------------------------
-static void SwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
+__attribute__((unused)) static void SwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
     if (origImp) *origImp = method_getImplementation(m);
     method_setImplementation(m, newImp);
 }
 
-static void SwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
+__attribute__((unused)) static void SwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
     Method m = class_getClassMethod(cls, sel);
     if (!m) return;
     if (origImp) *origImp = method_getImplementation(m);
