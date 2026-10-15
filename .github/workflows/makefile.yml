@@ -1,80 +1,21 @@
 name: Build iOS Tweak
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Set up dependencies
-        run: |
-          git clone --recursive https://github.com/theos/theos.git
-          export THEOS=$(pwd)/theos
-          export PATH=$THEOS/bin:$PATH
-          echo "Theos installation complete."
+      - name: Compile TempMailTrace.dylib
+        run: sh build.sh
 
-      - name: Install Homebrew
-        run: |
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          echo "export PATH=/usr/local/bin:$PATH" >> ~/.bash_profile
-          source ~/.bash_profile
-
-      - name: Install ldid
-        run: |
-          brew install ldid
-
-      - name: Set up environment variables
-        run: |
-          echo "TARGET=iphone:clang:latest:7.0" >> $GITHUB_ENV  # Adjust this if targeting a different iOS version
-          echo "THEOS=$PWD/theos" >> $GITHUB_ENV
-          echo "PATH=$THEOS/bin:$PATH" >> $GITHUB_ENV
-
-      - name: Find Tweak.xm file
-        id: find_tweak_xm
-        run: |
-          TWEAK_XM_PATH=$(find . -name 'Tweak.xm' -print -quit)
-
-          if [ -z "$TWEAK_XM_PATH" ]; then
-            echo "Tweak.xm not found!"
-            exit 1
-          fi
-
-          echo "Tweak.xm found at $TWEAK_XM_PATH"
-          echo "tweak_xm=$TWEAK_XM_PATH" >> $GITHUB_ENV
-
-      - name: Build the Tweak
-        run: |
-          TWEAK_XM_PATH="${{ env.tweak_xm }}"
-          MAKEFILE_DIR=$(dirname "$TWEAK_XM_PATH")
-          cd "$MAKEFILE_DIR"
-
-          echo "Building tweak with Tweak.xm in directory: $MAKEFILE_DIR"
-          make clean
-          make
-
-      - name: Find and Upload the generated .dylib
-        id: find_dylib
-        run: |
-          # Search for the generated .dylib file anywhere in the workspace
-          DYLIB_PATH=$(find . -type f -name "*.dylib" -print -quit)
-
-          if [ -z "$DYLIB_PATH" ]; then
-            echo "No .dylib file found!"
-            exit 1
-          fi
-
-          echo "Found .dylib at: $DYLIB_PATH"
-          echo "dylib_path=$DYLIB_PATH" >> $GITHUB_ENV
-
-      - name: Upload the generated .dylib
-        uses: actions/upload-artifact@v4
+      - name: Upload the dylib
+        uses: actions/upload-artifact@v6
         with:
-          name: Tweak-dylib
-          path: "${{ env.dylib_path }}"
+          name: TempMailTrace-dylib
+          path: build/TempMailTrace.dylib
+          if-no-files-found: error
