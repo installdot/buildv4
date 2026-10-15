@@ -1,11 +1,7 @@
-ARCHS = arm64
-TARGET = iphone:clang:latest:latest
+# Not a Theos project. TempMailTrace.mm has no %hook directives and does not link Substrate.
+.PHONY: all clean
+all:
+	sh build.sh
 
-TWEAK_NAME = DungeonShooter
-DungeonShooter_FILES = Tweak.xm
-FRAMEWORKS = Foundation UIKit Security CommonCrypto
-LIBRARIES = crypto
-
-
-include $(THEOS)/makefiles/common.mk
-include $(THEOS)/makefiles/tweak.mk
+clean:
+	rm -rf build
