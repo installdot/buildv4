@@ -1,231 +1,358 @@
-// Plain Objective-C++: no Logos/Substrate dependency; build with build.sh.
+// ==============================================================================
+// TempMailTrace: Tweak & Audit Dylib
+// Captures verify API endpoints, headers, payload, response, and UI/render states
+// Saves full trace to: Documents/TempMail_Audit.log
+// ==============================================================================
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <os/log.h>
-#include <atomic>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
+#import <mach-o/dyld.h>
+#import <mach/mach.h>
+#import <mach/vm_map.h>
+#include <dlfcn.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <string.h>
+#include <stdlib.h>
 
-static int logFD = -1;
-static pthread_mutex_t logLock = PTHREAD_MUTEX_INITIALIZER;
-static unsigned logLines = 0;
-static NSString *logPath;
+// ------------------------------------------------------------------------------
+// Logging Infrastructure
+// ------------------------------------------------------------------------------
+static int auditFD = -1;
+static pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER;
+static NSString *auditLogPath = nil;
 
-static void Trace(NSString *event) {
-    int saved = errno;
-    pthread_mutex_lock(&logLock);
-    // ponytail: bounded diagnostic session; restart app for a fresh 20000-line log.
-    if (logLines++ < 20000) {
-        NSString *line = [NSString stringWithFormat:@"%.6f pid=%d uid=%d main=%d %@\n",
-            NSDate.date.timeIntervalSince1970, getpid(), getuid(), NSThread.isMainThread, event];
-        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "%{public}s", line.UTF8String);
-        if (logFD >= 0) {
-            NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-            const char *p = (const char *)data.bytes;
-            size_t remaining = data.length;
-            while (remaining) {
-                ssize_t n = write(logFD, p, remaining);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) break;
-                p += n;
-                remaining -= (size_t)n;
+static void WriteAuditLog(NSString *category, NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    pid_t pid = getpid();
+    uid_t uid = getuid();
+    BOOL isMain = NSThread.isMainThread;
+    
+    NSString *entry = [NSString stringWithFormat:@"[%.3f][PID:%d][UID:%d][Main:%d][%@] %@\n",
+                       now, pid, uid, isMain, category, message];
+
+    // 1. Console / os_log
+    os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "%{public}s", entry.UTF8String);
+
+    // 2. File write (Documents/TempMail_Audit.log)
+    pthread_mutex_lock(&logMutex);
+    if (auditFD >= 0) {
+        const char *buf = entry.UTF8String;
+        size_t len = strlen(buf);
+        write(auditFD, buf, len);
+    }
+    pthread_mutex_unlock(&logMutex);
+}
+
+// ------------------------------------------------------------------------------
+// Base Address Resolution
+// ------------------------------------------------------------------------------
+static uintptr_t GetMainBinaryBase(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "TempMail.app/TempMail")) {
+            return (uintptr_t)_dyld_get_image_header(i);
+        }
+    }
+    return (uintptr_t)_dyld_get_image_header(0);
+}
+
+// ------------------------------------------------------------------------------
+// Dynamic Hooking Engine (MSHookFunction -> DobbyHook -> Inline ARM64 fallback)
+// ------------------------------------------------------------------------------
+typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
+typedef int (*DobbyHook_t)(void *function_address, void *replace_call_address, void **origin_call_address);
+
+static BOOL HookFunction(void *target, void *replacement, void **orig) {
+    if (!target) return NO;
+
+    // 1. Try CydiaSubstrate / ElleKit MSHookFunction
+    MSHookFunction_t msHook = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (msHook) {
+        msHook(target, replacement, orig);
+        return YES;
+    }
+
+    // 2. Try DobbyHook
+    DobbyHook_t dobbyHook = (DobbyHook_t)dlsym(RTLD_DEFAULT, "DobbyHook");
+    if (dobbyHook) {
+        return (dobbyHook(target, replacement, orig) == 0);
+    }
+
+    // 3. Fallback: ARM64 Direct Branch Trampoline (if memory is writable / patchable)
+    vm_prot_t prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY;
+    mach_port_t task = mach_task_self();
+    vm_address_t page = ((vm_address_t)target) & ~((vm_address_t)PAGE_SIZE - 1);
+    
+    if (vm_protect(task, page, PAGE_SIZE * 2, FALSE, prot) == KERN_SUCCESS) {
+        // LDR X16, #8; BR X16; <target_ptr 8 bytes>
+        uint32_t trampoline[4];
+        trampoline[0] = 0x58000050; // LDR X16, #8
+        trampoline[1] = 0xd61f0200; // BR X16
+        memcpy(&trampoline[2], &replacement, 8);
+        
+        memcpy(target, trampoline, 16);
+        vm_protect(task, page, PAGE_SIZE * 2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        sys_icache_invalidate(target, 16);
+        return YES;
+    }
+    return NO;
+}
+
+// ------------------------------------------------------------------------------
+// CURL Hooks
+// ------------------------------------------------------------------------------
+#define CURLOPT_URL             10002
+#define CURLOPT_POSTFIELDS      10015
+#define CURLOPT_USERPWD         10018
+#define CURLOPT_PINNEDPUBLICKEY 10230
+
+typedef uintptr_t (*curl_easy_setopt_t)(uintptr_t handle, int option, ...);
+static curl_easy_setopt_t orig_curl_easy_setopt = NULL;
+
+static uintptr_t my_curl_easy_setopt(uintptr_t handle, int option, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8, uintptr_t val) {
+    @autoreleasepool {
+        switch (option) {
+            case CURLOPT_URL: {
+                const char *url = (const char *)val;
+                WriteAuditLog(@"CURL", @"🎯 [CURLOPT_URL] = %s", url ? url : "(null)");
+                break;
+            }
+            case CURLOPT_POSTFIELDS: {
+                const char *body = (const char *)val;
+                WriteAuditLog(@"CURL", @"📦 [CURLOPT_POSTFIELDS] = %s", body ? body : "(null)");
+                break;
+            }
+            case CURLOPT_USERPWD: {
+                const char *userpwd = (const char *)val;
+                WriteAuditLog(@"CURL", @"🔑 [CURLOPT_USERPWD] = %s", userpwd ? userpwd : "(null)");
+                break;
+            }
+            case CURLOPT_PINNEDPUBLICKEY: {
+                const char *pin = (const char *)val;
+                WriteAuditLog(@"CURL", @"🔒 [CURLOPT_PINNEDPUBLICKEY] = %s", pin ? pin : "(null)");
+                break;
+            }
+            default: {
+                WriteAuditLog(@"CURL", @"[setopt] opt=%d, val=0x%lx", option, (unsigned long)val);
+                break;
             }
         }
     }
-    pthread_mutex_unlock(&logLock);
-    errno = saved;
+    return orig_curl_easy_setopt(handle, option, a3, a4, a5, a6, a7, a8, val);
 }
 
-static void ViewState(id object, NSString *stage) {
-    if (!NSThread.isMainThread) {
-        Trace([stage stringByAppendingString:@" ui-snapshot-skipped=non-main-thread"]);
+typedef uintptr_t (*curl_easy_perform_t)(uintptr_t handle);
+static curl_easy_perform_t orig_curl_easy_perform = NULL;
+
+static uintptr_t my_curl_easy_perform(uintptr_t handle) {
+    WriteAuditLog(@"CURL", @">>> curl_easy_perform: START HTTP REQUEST >>>");
+    uintptr_t ret = orig_curl_easy_perform(handle);
+    WriteAuditLog(@"CURL", @"<<< curl_easy_perform: FINISHED HTTP REQUEST, Code = %ld <<<", (long)ret);
+    return ret;
+}
+
+// ------------------------------------------------------------------------------
+// dlopen Hook (Diagnose jailbreak backend loading)
+// ------------------------------------------------------------------------------
+static void* (*orig_dlopen)(const char *filename, int flag) = NULL;
+
+static void* my_dlopen(const char *filename, int flag) {
+    void *h = orig_dlopen(filename, flag);
+    if (filename && (strstr(filename, "jailbreak") || strstr(filename, "jbroot") || strstr(filename, "basebin"))) {
+        WriteAuditLog(@"DLOPEN", @"dlopen('%s', %d) -> %p (dlerror: %s)", filename, flag, h, h ? "None" : dlerror());
+    }
+    return h;
+}
+
+// ------------------------------------------------------------------------------
+// Objective-C Method Swizzling
+// ------------------------------------------------------------------------------
+static void SwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        WriteAuditLog(@"OBJC_HOOK", @"Method not found: -[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
         return;
     }
-    UIView *view = nil;
-    if ([object isKindOfClass:UIViewController.class]) {
-        UIViewController *vc = object;
-        if (vc.isViewLoaded) view = vc.view; // Never trigger loadView while observing.
-    } else if ([object isKindOfClass:UIView.class]) view = object;
-    Trace([NSString stringWithFormat:@"%@ object=%p view=%p window=%p hidden=%d alpha=%.3f frame=%@ subviews=%lu",
-        stage, (__bridge void *)object, (__bridge void *)view, (__bridge void *)view.window,
-        view.hidden, view.alpha, NSStringFromCGRect(view.frame), (unsigned long)view.subviews.count]);
-    if ([NSStringFromClass([object class]) isEqualToString:@"PSNVHRBF"]) {
-        Ivar iv = class_getInstanceVariable([object class], "_floatingIcon");
-        id icon = iv ? object_getIvar(object, iv) : nil;
-        if ([icon isKindOfClass:UIView.class]) {
-            UIView *v = icon;
-            Trace([NSString stringWithFormat:@"%@ icon=%p parent=%p window=%p hidden=%d alpha=%.3f frame=%@ gestures=%lu",
-                stage, (__bridge void *)v, (__bridge void *)v.superview, (__bridge void *)v.window,
-                v.hidden, v.alpha, NSStringFromCGRect(v.frame), (unsigned long)v.gestureRecognizers.count]);
-        } else Trace([stage stringByAppendingString:@" icon=nil-or-unavailable"]);
+    if (origImp) *origImp = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    WriteAuditLog(@"OBJC_HOOK", @"Swizzled -[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
+}
+
+static void SwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
+    Method m = class_getClassMethod(cls, sel);
+    if (!m) {
+        WriteAuditLog(@"OBJC_HOOK", @"Class method not found: +[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
+        return;
+    }
+    if (origImp) *origImp = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    WriteAuditLog(@"OBJC_HOOK", @"Swizzled +[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
+}
+
+// Hook: UIAlertController alertControllerWithTitle:message:preferredStyle:
+typedef id (*AlertImp_t)(id, SEL, NSString*, NSString*, UIAlertControllerStyle);
+static AlertImp_t orig_alert = NULL;
+
+static id my_alert(id self, SEL _cmd, NSString *title, NSString *message, UIAlertControllerStyle style) {
+    WriteAuditLog(@"ALERT_POPUP", @"⚠️ Popup triggered! Title: '%@', Message: '%@'", title, message);
+    return orig_alert(self, _cmd, title, message, style);
+}
+
+// Hook: -[VNTISFHTNSFJ GAJKGNRXCHR:] (Load Cheat trigger)
+typedef void (*LoadCheatImp_t)(id, SEL, id);
+static LoadCheatImp_t orig_loadCheat = NULL;
+
+static void my_loadCheat(id self, SEL _cmd, id sender) {
+    WriteAuditLog(@"ACTION", @"🚀 [User clicked LOAD CHEAT] (-[VNTISFHTNSFJ GAJKGNRXCHR:])");
+    orig_loadCheat(self, _cmd, sender);
+}
+
+// Hook: -[GWGCBAHTNSFR application:didFinishLaunchingWithOptions:] (Overlay Window & Delegate Init)
+typedef BOOL (*OverlayAppLaunch_t)(id, SEL, id, id);
+static OverlayAppLaunch_t orig_overlayLaunch = NULL;
+
+static BOOL my_overlayLaunch(id self, SEL _cmd, id app, id options) {
+    WriteAuditLog(@"OVERLAY_LIFECYCLE", @"🎬 Overlay Application launched (-[GWGCBAHTNSFR didFinishLaunching])");
+    BOOL res = orig_overlayLaunch(self, _cmd, app, options);
+    WriteAuditLog(@"OVERLAY_LIFECYCLE", @"🎬 Overlay Application returned: %d", res);
+    return res;
+}
+
+// Hook: -[PSNVHRBF viewDidLoad] (Floating Icon & Menu Root Controller)
+typedef void (*PSNVHRBF_viewDidLoad_t)(id, SEL);
+static PSNVHRBF_viewDidLoad_t orig_psnvhrbf_viewDidLoad = NULL;
+
+static void my_psnvhrbf_viewDidLoad(id self, SEL _cmd) {
+    WriteAuditLog(@"UI_VIEW", @"Entering -[PSNVHRBF viewDidLoad]");
+    orig_psnvhrbf_viewDidLoad(self, _cmd);
+    
+    // Inspect floatingIcon state
+    Ivar ivar = class_getInstanceVariable([self class], "_floatingIcon");
+    if (ivar) {
+        id icon = object_getIvar(self, ivar);
+        if ([icon isKindOfClass:[UIView class]]) {
+            UIView *iconView = (UIView *)icon;
+            WriteAuditLog(@"UI_VIEW", @"📌 Floating Icon: ptr=%p, frame=%@, hidden=%d, alpha=%.2f, superview=%p, window=%p",
+                          iconView, NSStringFromCGRect(iconView.frame), iconView.hidden, iconView.alpha, iconView.superview, iconView.window);
+        } else {
+            WriteAuditLog(@"UI_VIEW", @"⚠️ _floatingIcon is nil or not UIView!");
+        }
     }
 }
 
-static bool TypeIs(Method m, unsigned index, const char *expected) {
-    char *type = method_copyArgumentType(m, index);
-    bool same = type && strcmp(type, expected) == 0;
-    free(type);
-    return same;
+// Hook: -[LAFHTNFJTS initWithNibName:bundle:] (ImGui / Metal Renderer)
+typedef id (*LAFHTNFJTS_init_t)(id, SEL, id, id);
+static LAFHTNFJTS_init_t orig_lafhtnfjts_init = NULL;
+
+static id my_lafhtnfjts_init(id self, SEL _cmd, id nib, id bundle) {
+    WriteAuditLog(@"RENDERER", @"Entering -[LAFHTNFJTS initWithNibName:bundle:]");
+    id res = orig_lafhtnfjts_init(self, _cmd, nib, bundle);
+    WriteAuditLog(@"RENDERER", @"Exited -[LAFHTNFJTS initWithNibName:bundle:], result=%p", res);
+    return res;
 }
 
-static Method Checked(Class cls, SEL sel, unsigned argc, const char *ret) {
-    Method m = cls ? class_getInstanceMethod(cls, sel) : NULL;
-    char *actual = m ? method_copyReturnType(m) : NULL;
-    bool good = m && method_getNumberOfArguments(m) == argc && actual && strcmp(actual, ret) == 0;
-    free(actual);
-    if (!good) Trace([NSString stringWithFormat:@"SKIP %@ %@ absent-or-signature-mismatch",
-        cls ? NSStringFromClass(cls) : @"missing-class", NSStringFromSelector(sel)]);
-    return good ? m : NULL;
+// Hook: Window Hosting registration
+typedef void (*HostingReg_t)(id, SEL, unsigned int, double);
+static HostingReg_t orig_hostingReg = NULL;
+
+static void my_hostingReg(id self, SEL _cmd, unsigned int contextId, double level) {
+    WriteAuditLog(@"WINDOW_HOSTING", @"🖥️ registerWindowWithContextID:%u atLevel:%.1f", contextId, level);
+    orig_hostingReg(self, _cmd, contextId, level);
 }
 
-static void Install(Class cls, SEL sel, Method method, id block) {
-    IMP replacement = imp_implementationWithBlock(block);
-    // Add an override for inherited methods; never modify the superclass method.
-    class_replaceMethod(cls, sel, replacement, method_getTypeEncoding(method));
-    Trace([NSString stringWithFormat:@"HOOK %@ %@", NSStringFromClass(cls), NSStringFromSelector(sel)]);
-}
-
-static void HookVoid0(NSString *name, NSString *selector, bool meta = false) {
-    Class cls = NSClassFromString(name);
-    if (meta && cls) cls = object_getClass(cls);
-    SEL sel = NSSelectorFromString(selector);
-    Method m = Checked(cls, sel, 2, "v");
-    if (!m) return;
-    IMP original = method_getImplementation(m);
-    NSString *label = [NSString stringWithFormat:@"%@ %@", name, selector];
-    Install(cls, sel, m, ^(id self) {
-        Trace([@"ENTER " stringByAppendingString:label]);
-        @try { ((void (*)(id, SEL))original)(self, sel); }
-        @catch (NSException *ex) { Trace([NSString stringWithFormat:@"EXCEPTION %@ name=%@", label, ex.name]); @throw; }
-        Trace([@"EXIT " stringByAppendingString:label]);
-        if (!meta) ViewState(self, label);
-    });
-}
-
-static void HookVoid1(NSString *name, NSString *selector, bool firstOnly = false) {
-    Class cls = NSClassFromString(name);
-    SEL sel = NSSelectorFromString(selector);
-    Method m = Checked(cls, sel, 3, "v");
-    if (!m || !TypeIs(m, 2, "@")) return;
-    IMP original = method_getImplementation(m);
-    NSString *label = [NSString stringWithFormat:@"%@ %@", name, selector];
-    // Shared state survives the installed block; first-frame logging avoids frame-rate overhead.
-    auto *seen = new std::atomic<bool>(false);
-    Install(cls, sel, m, ^(id self, id argument) {
-        bool record = !firstOnly || !seen->exchange(true);
-        if (record) Trace([@"ENTER " stringByAppendingString:label]);
-        @try { ((void (*)(id, SEL, id))original)(self, sel, argument); }
-        @catch (NSException *ex) { Trace([NSString stringWithFormat:@"EXCEPTION %@ name=%@", label, ex.name]); @throw; }
-        if (record) {
-            Trace([@"EXIT " stringByAppendingString:label]);
-            ViewState(self, label);
-        }
-    });
-}
-
-static void HookRendererInit(void) {
-    Class cls = NSClassFromString(@"LAFHTNFJTS");
-    SEL sel = @selector(initWithNibName:bundle:);
-    Method m = Checked(cls, sel, 4, "@");
-    if (!m || !TypeIs(m, 2, "@") || !TypeIs(m, 3, "@")) return;
-    IMP original = method_getImplementation(m);
-    Install(cls, sel, m, ^id(id self, id nib, id bundle) {
-        Trace(@"ENTER renderer.initWithNibName:bundle:");
-        id result;
-        @try { result = ((id (*)(id, SEL, id, id))original)(self, sel, nib, bundle); }
-        @catch (NSException *ex) { Trace([@"EXCEPTION renderer.init " stringByAppendingString:ex.name]); @throw; }
-        Trace([NSString stringWithFormat:@"EXIT renderer.init result=%p", (__bridge void *)result]);
-        return result;
-    });
-}
-
-static void HookDelegate(void) {
-    Class cls = NSClassFromString(@"GWGCBAHTNSFR");
-    SEL sel = @selector(application:didFinishLaunchingWithOptions:);
-    Method m = Checked(cls, sel, 4, @encode(BOOL));
-    if (!m || !TypeIs(m, 2, "@") || !TypeIs(m, 3, "@")) return;
-    IMP original = method_getImplementation(m);
-    Install(cls, sel, m, ^BOOL(id self, id app, id options) {
-        Trace(@"ENTER overlay.didFinishLaunching");
-        BOOL result;
-        @try { result = ((BOOL (*)(id, SEL, id, id))original)(self, sel, app, options); }
-        @catch (NSException *ex) { Trace([@"EXCEPTION overlay.didFinishLaunching " stringByAppendingString:ex.name]); @throw; }
-        Trace([NSString stringWithFormat:@"EXIT overlay.didFinishLaunching result=%d", result]);
-        return result;
-    });
-}
-
-static void HookHosting(void) {
-    Class cls = NSClassFromString(@"SBSAccessibilityWindowHostingController");
-    SEL sel = NSSelectorFromString(@"registerWindowWithContextID:atLevel:");
-    Method m = Checked(cls, sel, 4, "v");
-    if (!m || !TypeIs(m, 2, @encode(unsigned int)) || !TypeIs(m, 3, @encode(double))) return;
-    IMP original = method_getImplementation(m);
-    Install(cls, sel, m, ^(id self, unsigned int context, double level) {
-        Trace([NSString stringWithFormat:@"ENTER hosting context=%u level=%.1f", context, level]);
-        ((void (*)(id, SEL, unsigned int, double))original)(self, sel, context, level);
-        Trace(@"EXIT hosting (return does not prove system accepted registration)");
-    });
-}
-
-static bool RelevantView(UIView *view) {
-    if ([view isKindOfClass:UIWindow.class]) return true;
-    for (UIResponder *r = view; r; r = r.nextResponder)
-        if ([NSStringFromClass(r.class) isEqualToString:@"PSNVHRBF"] ||
-            [NSStringFromClass(r.class) isEqualToString:@"LAFHTNFJTS"]) return true;
-    return false;
-}
-
-static void HookVisibility(void) {
-    Class cls = UIView.class;
-    SEL sel = @selector(setHidden:);
-    Method m = Checked(cls, sel, 3, "v");
-    if (!m || !TypeIs(m, 2, @encode(BOOL))) return;
-    IMP original = method_getImplementation(m);
-    Install(cls, sel, m, ^(UIView *self, BOOL hidden) {
-        ((void (*)(id, SEL, BOOL))original)(self, sel, hidden);
-        if (NSThread.isMainThread && RelevantView(self))
-            ViewState(self, [NSString stringWithFormat:@"setHidden:%d %@", hidden, NSStringFromClass(self.class)]);
-    });
-}
-
-__attribute__((constructor)) static void StartTrace(void) {
+// ------------------------------------------------------------------------------
+// Constructor Entry Point
+// ------------------------------------------------------------------------------
+__attribute__((constructor)) static void InitializeTraceTweak(void) {
     @autoreleasepool {
-        if (![NSProcessInfo.processInfo.processName isEqualToString:@"TempMail"]) return;
-        NSString *filename = [NSString stringWithFormat:@"TempMailTrace-%d-%d-%.0f.log", getuid(), getpid(), NSDate.date.timeIntervalSince1970];
-        NSURL *documents = [[NSFileManager defaultManager] URLForDirectory:NSDocumentDirectory
-            inDomain:NSUserDomainMask appropriateForURL:nil create:YES error:nil];
-        logPath = documents ? [[documents URLByAppendingPathComponent:filename] path] : nil;
-        if (logPath)
-            logFD = open(logPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-        BOOL child = [NSProcessInfo.processInfo.arguments containsObject:@"-a"];
-        Trace([NSString stringWithFormat:@"TRACE_START mode=%@ ppid=%d path=%@ file-open=%d",
-            child ? @"overlay(-a)" : @"main", getppid(), logPath, logFD >= 0]);
-        HookVoid1(@"VNTISFHTNSFJ", @"POWMFHANGHT:");
-        HookVoid1(@"VNTISFHTNSFJ", @"GAJKGNRXCHR:");
-        HookVoid0(@"GIAFNTHFSBTR", @"__completeAndRunAsPlugin");
-        HookDelegate();
-        HookRendererInit();
-        for (NSString *name in @[@"PSNVHRBF", @"LAFHTNFJTS"]) {
-            HookVoid0(name, @"loadView");
-            HookVoid0(name, @"viewDidLoad");
+        // 1. Setup Audit Log File in Documents directory
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docDir = paths.firstObject;
+        if (!docDir) docDir = NSTemporaryDirectory();
+        
+        auditLogPath = [docDir stringByAppendingPathComponent:@"TempMail_Audit.log"];
+        auditFD = open(auditLogPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0666);
+
+        BOOL isOverlayProcess = [NSProcessInfo.processInfo.arguments containsObject:@"-a"];
+        WriteAuditLog(@"INIT", @"=================================================================");
+        WriteAuditLog(@"INIT", @"⚡ TempMailTrace Injected! Mode: %@", isOverlayProcess ? @"OVERLAY PROCESS (-a)" : @"MAIN APP PROCESS");
+        WriteAuditLog(@"INIT", @"📂 Audit Log Path: %@", auditLogPath);
+        WriteAuditLog(@"INIT", @"=================================================================");
+
+        // 2. Resolve Binary Base Address
+        uintptr_t base = GetMainBinaryBase();
+        WriteAuditLog(@"INIT", @"Main Binary Mach-O Base = 0x%lx", (unsigned long)base);
+
+        // 3. Hook Statically Linked libcurl Functions
+        // curl_easy_setopt virtual 0x100bd0dd4 -> offset 0x00bd0dd4
+        void *target_setopt = (void *)(base + 0x00bd0dd4);
+        if (HookFunction(target_setopt, (void *)my_curl_easy_setopt, (void **)&orig_curl_easy_setopt)) {
+            WriteAuditLog(@"INIT", @"✅ Hooked curl_easy_setopt at 0x%lx", (unsigned long)target_setopt);
+        } else {
+            WriteAuditLog(@"INIT", @"❌ Failed to hook curl_easy_setopt");
         }
-        HookVoid0(@"PSNVHRBF", @"toggleImGuiView");
-        HookVoid0(@"PSNVHRBF", @"_clampFloatingIconToScreen");
-        HookVoid0(@"LAFHTNFJTS", @"HSFGTGV", true);
-        HookVoid1(@"LAFHTNFJTS", @"drawInMTKView:", true);
-        HookVoid0(@"UIWindow", @"makeKeyAndVisible");
-        HookHosting();
-        HookVisibility();
-        // Main-queue heartbeat: absence after ENTER can indicate main-thread blocking, not its cause.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            Trace(@"HEARTBEAT main-queue-after-5s");
-        });
-        Trace(@"HOOKS_READY; no key/token/body logging; no return-value modifications");
+
+        // curl_easy_perform virtual 0x100ba7c90 -> offset 0x00ba7c90
+        void *target_perform = (void *)(base + 0x00ba7c90);
+        if (HookFunction(target_perform, (void *)my_curl_easy_perform, (void **)&orig_curl_easy_perform)) {
+            WriteAuditLog(@"INIT", @"✅ Hooked curl_easy_perform at 0x%lx", (unsigned long)target_perform);
+        }
+
+        // 4. Hook dlopen to track libjailbreak loading
+        void *dlopen_ptr = dlsym(RTLD_DEFAULT, "dlopen");
+        if (dlopen_ptr) {
+            HookFunction(dlopen_ptr, (void *)my_dlopen, (void **)&orig_dlopen);
+            WriteAuditLog(@"INIT", @"✅ Hooked dlopen");
+        }
+
+        // 5. Hook Objective-C Methods
+        // Popups
+        Class alertClass = objc_getClass("UIAlertController");
+        if (alertClass) {
+            SwizzleClassMethod(alertClass, @selector(alertControllerWithTitle:message:preferredStyle:), (IMP)my_alert, (IMP *)&orig_alert);
+        }
+
+        // Load cheat trigger
+        Class vntisClass = objc_getClass("VNTISFHTNSFJ");
+        if (vntisClass) {
+            SwizzleInstanceMethod(vntisClass, NSSelectorFromString(@"GAJKGNRXCHR:"), (IMP)my_loadCheat, (IMP *)&orig_loadCheat);
+        }
+
+        // Overlay app delegate
+        Class gwgcClass = objc_getClass("GWGCBAHTNSFR");
+        if (gwgcClass) {
+            SwizzleInstanceMethod(gwgcClass, @selector(application:didFinishLaunchingWithOptions:), (IMP)my_overlayLaunch, (IMP *)&orig_overlayLaunch);
+        }
+
+        // Floating icon view controller
+        Class psnvClass = objc_getClass("PSNVHRBF");
+        if (psnvClass) {
+            SwizzleInstanceMethod(psnvClass, @selector(viewDidLoad), (IMP)my_psnvhrbf_viewDidLoad, (IMP *)&orig_psnvhrbf_viewDidLoad);
+        }
+
+        // Metal Renderer
+        Class lafhClass = objc_getClass("LAFHTNFJTS");
+        if (lafhClass) {
+            SwizzleInstanceMethod(lafhClass, @selector(initWithNibName:bundle:), (IMP)my_lafhtnfjts_init, (IMP *)&orig_lafhtnfjts_init);
+        }
+
+        // Window Hosting
+        Class hostingClass = objc_getClass("SBSAccessibilityWindowHostingController");
+        if (hostingClass) {
+            SwizzleInstanceMethod(hostingClass, NSSelectorFromString(@"registerWindowWithContextID:atLevel:"), (IMP)my_hostingReg, (IMP *)&orig_hostingReg);
+        }
+        
+        WriteAuditLog(@"INIT", @"🎉 All hooks initialized successfully!");
     }
 }
