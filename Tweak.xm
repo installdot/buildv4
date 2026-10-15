@@ -18,6 +18,16 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <libkern/OSCacheControl.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void sys_icache_invalidate(void *start, size_t len);
+void sys_dcache_flush(void *start, size_t len);
+#ifdef __cplusplus
+}
+#endif
 
 // ------------------------------------------------------------------------------
 // Logging Infrastructure
