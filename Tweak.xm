@@ -1,7 +1,9 @@
 // ==============================================================================
-// TempMailTrace: Tweak & Audit Dylib
-// Captures verify API endpoints, headers, payload, response, and UI/render states
-// Saves full trace to: Documents/TempMail_Audit.log
+// TempMailTrace & Auto-Decrypt Tweak
+// 1. Patches startup integrity checks & catches 0xdead crashes
+// 2. Automatically triggers key decryption without manual button clicks
+// 3. Captures decrypted CURLOPT_URL, CURLOPT_POSTFIELDS, and responses
+// 4. Saves full audit log to: Documents/TempMail_Audit.log
 // ==============================================================================
 
 #import <Foundation/Foundation.h>
@@ -16,6 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <signal.h>
 #include <string.h>
 #include <stdlib.h>
 #include <libkern/OSCacheControl.h>
@@ -50,10 +53,10 @@ static void WriteAuditLog(NSString *category, NSString *format, ...) {
     NSString *entry = [NSString stringWithFormat:@"[%.3f][PID:%d][UID:%d][Main:%d][%@] %@\n",
                        now, pid, uid, isMain, category, message];
 
-    // 1. Console / os_log
+    // Console / os_log
     os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "%{public}s", entry.UTF8String);
 
-    // 2. File write (Documents/TempMail_Audit.log)
+    // File write
     pthread_mutex_lock(&logMutex);
     if (auditFD >= 0) {
         const char *buf = entry.UTF8String;
@@ -64,7 +67,7 @@ static void WriteAuditLog(NSString *category, NSString *format, ...) {
 }
 
 // ------------------------------------------------------------------------------
-// Base Address Resolution
+// Base Address & Memory Patching
 // ------------------------------------------------------------------------------
 static uintptr_t GetMainBinaryBase(void) {
     uint32_t count = _dyld_image_count();
@@ -77,8 +80,78 @@ static uintptr_t GetMainBinaryBase(void) {
     return (uintptr_t)_dyld_get_image_header(0);
 }
 
+static BOOL PatchMemory(void *target, const void *bytes, size_t size) {
+    vm_prot_t prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY;
+    mach_port_t task = mach_task_self();
+    vm_address_t page = ((vm_address_t)target) & ~((vm_address_t)PAGE_SIZE - 1);
+    size_t pageSize = ((size + ((vm_address_t)target - page) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+    
+    if (vm_protect(task, page, pageSize, FALSE, prot) == KERN_SUCCESS) {
+        memcpy(target, bytes, size);
+        vm_protect(task, page, pageSize, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        sys_dcache_flush(target, size);
+        sys_icache_invalidate(target, size);
+        return YES;
+    }
+    return NO;
+}
+
 // ------------------------------------------------------------------------------
-// Dynamic Hooking Engine (MSHookFunction -> DobbyHook -> Inline ARM64 fallback)
+// Crash Prevention: Catch SIGBUS / SIGSEGV at 0xdead
+// ------------------------------------------------------------------------------
+static void CrashSignalHandler(int sig, siginfo_t *info, void *ucontext) {
+    ucontext_t *ctx = (ucontext_t *)ucontext;
+    uintptr_t fault_pc = 0;
+#if defined(__arm64__) || defined(__aarch64__)
+    fault_pc = (uintptr_t)ctx->uc_mcontext->__ss.__pc;
+#endif
+    WriteAuditLog(@"CRASH_GUARD", @"⚡ Intercepted Signal %d (fault_addr=%p, pc=0x%lx)", sig, info->si_addr, (unsigned long)fault_pc);
+
+    if (fault_pc == 0xdead || (uintptr_t)info->si_addr == 0xdead) {
+        WriteAuditLog(@"CRASH_GUARD", @"🛡️ Successfully caught 0xdead integrity check trap! Thread terminating gracefully.");
+        if (NSThread.isMainThread) {
+            WriteAuditLog(@"CRASH_GUARD", @"Main thread triggered 0xdead - returning safely.");
+            return;
+        } else {
+            pthread_exit(NULL);
+        }
+    }
+    
+    // For other crashes, exit cleanly with log
+    WriteAuditLog(@"CRASH_GUARD", @"Exiting process cleanly to preserve logs.");
+    exit(0);
+}
+
+static void InstallCrashGuards(uintptr_t base) {
+    // 1. Register signal handlers
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = CrashSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
+    WriteAuditLog(@"PATCH", @"✅ Registered SIGBUS / SIGSEGV crash guards");
+
+    // 2. Patch Startup Integrity Gate: 0x100053c4c (offset 0x53c4c)
+    // Original: B.EQ #0x100053c7c (80 01 00 54)
+    // Patched:  B    #0x100053c7c (0c 00 00 14)
+    void *gate_addr = (void *)(base + 0x53c4c);
+    uint32_t patch_b = 0x1400000c; // B #0x30 (12 instructions)
+    if (PatchMemory(gate_addr, &patch_b, 4)) {
+        WriteAuditLog(@"PATCH", @"✅ Patched integrity check gate at 0x%lx -> Unconditional Jump (B #0x53c7c)", (unsigned long)gate_addr);
+    } else {
+        WriteAuditLog(@"PATCH", @"⚠️ Failed to patch memory at 0x%lx", (unsigned long)gate_addr);
+    }
+
+    // 3. Bypass secondary integrity check: sub_100607F44 (offset 0x1538918)
+    void *guard_byte = (void *)(base + 0x1538918);
+    uint8_t one = 1;
+    PatchMemory(guard_byte, &one, 1);
+}
+
+// ------------------------------------------------------------------------------
+// Dynamic Hooking Engine
 // ------------------------------------------------------------------------------
 typedef void (*MSHookFunction_t)(void *symbol, void *hook, void **old);
 typedef int (*DobbyHook_t)(void *function_address, void *replace_call_address, void **origin_call_address);
@@ -86,37 +159,37 @@ typedef int (*DobbyHook_t)(void *function_address, void *replace_call_address, v
 static BOOL HookFunction(void *target, void *replacement, void **orig) {
     if (!target) return NO;
 
-    // 1. Try CydiaSubstrate / ElleKit MSHookFunction
     MSHookFunction_t msHook = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (msHook) {
         msHook(target, replacement, orig);
         return YES;
     }
 
-    // 2. Try DobbyHook
     DobbyHook_t dobbyHook = (DobbyHook_t)dlsym(RTLD_DEFAULT, "DobbyHook");
     if (dobbyHook) {
         return (dobbyHook(target, replacement, orig) == 0);
     }
 
-    // 3. Fallback: ARM64 Direct Branch Trampoline (if memory is writable / patchable)
-    vm_prot_t prot = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY;
-    mach_port_t task = mach_task_self();
-    vm_address_t page = ((vm_address_t)target) & ~((vm_address_t)PAGE_SIZE - 1);
-    
-    if (vm_protect(task, page, PAGE_SIZE * 2, FALSE, prot) == KERN_SUCCESS) {
-        // LDR X16, #8; BR X16; <target_ptr 8 bytes>
-        uint32_t trampoline[4];
-        trampoline[0] = 0x58000050; // LDR X16, #8
-        trampoline[1] = 0xd61f0200; // BR X16
-        memcpy(&trampoline[2], &replacement, 8);
-        
-        memcpy(target, trampoline, 16);
-        vm_protect(task, page, PAGE_SIZE * 2, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-        sys_icache_invalidate(target, 16);
-        return YES;
+    // Direct branch trampoline fallback
+    uint32_t trampoline[4];
+    trampoline[0] = 0x58000050; // LDR X16, #8
+    trampoline[1] = 0xd61f0200; // BR X16
+    memcpy(&trampoline[2], &replacement, 8);
+    return PatchMemory(target, trampoline, 16);
+}
+
+// ------------------------------------------------------------------------------
+// Anti-Debug Hook (Block PT_DENY_ATTACH)
+// ------------------------------------------------------------------------------
+typedef int (*ptrace_t)(int request, pid_t pid, caddr_t addr, int data);
+static ptrace_t orig_ptrace = NULL;
+
+static int my_ptrace(int request, pid_t pid, caddr_t addr, int data) {
+    if (request == 31) { // PT_DENY_ATTACH = 31
+        WriteAuditLog(@"ANTI_DEBUG", @"🛡️ Blocked ptrace(PT_DENY_ATTACH)");
+        return 0;
     }
-    return NO;
+    return orig_ptrace ? orig_ptrace(request, pid, addr, data) : 0;
 }
 
 // ------------------------------------------------------------------------------
@@ -127,6 +200,8 @@ static BOOL HookFunction(void *target, void *replacement, void **orig) {
 #define CURLOPT_USERPWD         10018
 #define CURLOPT_PINNEDPUBLICKEY 10230
 
+static NSString *capturedEndpoint = nil;
+
 typedef uintptr_t (*curl_easy_setopt_t)(uintptr_t handle, int option, ...);
 static curl_easy_setopt_t orig_curl_easy_setopt = NULL;
 
@@ -135,28 +210,45 @@ static uintptr_t my_curl_easy_setopt(uintptr_t handle, int option, uintptr_t a3,
         switch (option) {
             case CURLOPT_URL: {
                 const char *url = (const char *)val;
-                WriteAuditLog(@"CURL", @"🎯 [CURLOPT_URL] = %s", url ? url : "(null)");
+                if (url) {
+                    capturedEndpoint = [NSString stringWithUTF8String:url];
+                    WriteAuditLog(@"CURL", @"🎯🎯🎯 [DECRYPTED ENDPOINT URL]: %s", url);
+                    
+                    // Show on-screen notification alert if on main thread
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        UIWindow *keyWindow = nil;
+                        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                            if (w.isKeyWindow) { keyWindow = w; break; }
+                        }
+                        UIViewController *root = keyWindow.rootViewController;
+                        if (root) {
+                            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"🎯 Endpoint Captured!"
+                                                                                           message:[NSString stringWithFormat:@"URL: %s", url]
+                                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                            [root presentViewController:alert animated:YES completion:nil];
+                        }
+                    });
+                }
                 break;
             }
             case CURLOPT_POSTFIELDS: {
                 const char *body = (const char *)val;
-                WriteAuditLog(@"CURL", @"📦 [CURLOPT_POSTFIELDS] = %s", body ? body : "(null)");
+                WriteAuditLog(@"CURL", @"📦 [CURLOPT_POSTFIELDS]: %s", body ? body : "(null)");
                 break;
             }
             case CURLOPT_USERPWD: {
                 const char *userpwd = (const char *)val;
-                WriteAuditLog(@"CURL", @"🔑 [CURLOPT_USERPWD] = %s", userpwd ? userpwd : "(null)");
+                WriteAuditLog(@"CURL", @"🔑 [CURLOPT_USERPWD]: %s", userpwd ? userpwd : "(null)");
                 break;
             }
             case CURLOPT_PINNEDPUBLICKEY: {
                 const char *pin = (const char *)val;
-                WriteAuditLog(@"CURL", @"🔒 [CURLOPT_PINNEDPUBLICKEY] = %s", pin ? pin : "(null)");
+                WriteAuditLog(@"CURL", @"🔒 [CURLOPT_PINNEDPUBLICKEY]: %s", pin ? pin : "(null)");
                 break;
             }
-            default: {
-                WriteAuditLog(@"CURL", @"[setopt] opt=%d, val=0x%lx", option, (unsigned long)val);
+            default:
                 break;
-            }
         }
     }
     return orig_curl_easy_setopt(handle, option, a3, a4, a5, a6, a7, a8, val);
@@ -173,7 +265,7 @@ static uintptr_t my_curl_easy_perform(uintptr_t handle) {
 }
 
 // ------------------------------------------------------------------------------
-// dlopen Hook (Diagnose jailbreak backend loading)
+// dlopen Hook
 // ------------------------------------------------------------------------------
 static void* (*orig_dlopen)(const char *filename, int flag) = NULL;
 
@@ -190,27 +282,19 @@ static void* my_dlopen(const char *filename, int flag) {
 // ------------------------------------------------------------------------------
 static void SwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        WriteAuditLog(@"OBJC_HOOK", @"Method not found: -[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
-        return;
-    }
+    if (!m) return;
     if (origImp) *origImp = method_getImplementation(m);
     method_setImplementation(m, newImp);
-    WriteAuditLog(@"OBJC_HOOK", @"Swizzled -[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
 }
 
 static void SwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *origImp) {
     Method m = class_getClassMethod(cls, sel);
-    if (!m) {
-        WriteAuditLog(@"OBJC_HOOK", @"Class method not found: +[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
-        return;
-    }
+    if (!m) return;
     if (origImp) *origImp = method_getImplementation(m);
     method_setImplementation(m, newImp);
-    WriteAuditLog(@"OBJC_HOOK", @"Swizzled +[%@ %@]", NSStringFromClass(cls), NSStringFromSelector(sel));
 }
 
-// Hook: UIAlertController alertControllerWithTitle:message:preferredStyle:
+// Hook: UIAlertController
 typedef id (*AlertImp_t)(id, SEL, NSString*, NSString*, UIAlertControllerStyle);
 static AlertImp_t orig_alert = NULL;
 
@@ -219,66 +303,53 @@ static id my_alert(id self, SEL _cmd, NSString *title, NSString *message, UIAler
     return orig_alert(self, _cmd, title, message, style);
 }
 
-// Hook: -[VNTISFHTNSFJ GAJKGNRXCHR:] (Load Cheat trigger)
-typedef void (*LoadCheatImp_t)(id, SEL, id);
-static LoadCheatImp_t orig_loadCheat = NULL;
-
-static void my_loadCheat(id self, SEL _cmd, id sender) {
-    WriteAuditLog(@"ACTION", @"🚀 [User clicked LOAD CHEAT] (-[VNTISFHTNSFJ GAJKGNRXCHR:])");
-    orig_loadCheat(self, _cmd, sender);
-}
-
-// Hook: -[GWGCBAHTNSFR application:didFinishLaunchingWithOptions:] (Overlay Window & Delegate Init)
-typedef BOOL (*OverlayAppLaunch_t)(id, SEL, id, id);
-static OverlayAppLaunch_t orig_overlayLaunch = NULL;
-
-static BOOL my_overlayLaunch(id self, SEL _cmd, id app, id options) {
-    WriteAuditLog(@"OVERLAY_LIFECYCLE", @"🎬 Overlay Application launched (-[GWGCBAHTNSFR didFinishLaunching])");
-    BOOL res = orig_overlayLaunch(self, _cmd, app, options);
-    WriteAuditLog(@"OVERLAY_LIFECYCLE", @"🎬 Overlay Application returned: %d", res);
-    return res;
-}
-
-// Hook: -[PSNVHRBF viewDidLoad] (Floating Icon & Menu Root Controller)
-typedef void (*PSNVHRBF_viewDidLoad_t)(id, SEL);
-static PSNVHRBF_viewDidLoad_t orig_psnvhrbf_viewDidLoad = NULL;
-
-static void my_psnvhrbf_viewDidLoad(id self, SEL _cmd) {
-    WriteAuditLog(@"UI_VIEW", @"Entering -[PSNVHRBF viewDidLoad]");
-    orig_psnvhrbf_viewDidLoad(self, _cmd);
-    
-    // Inspect floatingIcon state
-    Ivar ivar = class_getInstanceVariable([self class], "_floatingIcon");
-    if (ivar) {
-        id icon = object_getIvar(self, ivar);
-        if ([icon isKindOfClass:[UIView class]]) {
-            UIView *iconView = (UIView *)icon;
-            WriteAuditLog(@"UI_VIEW", @"📌 Floating Icon: ptr=%p, frame=%@, hidden=%d, alpha=%.2f, superview=%p, window=%p",
-                          iconView, NSStringFromCGRect(iconView.frame), iconView.hidden, iconView.alpha, iconView.superview, iconView.window);
-        } else {
-            WriteAuditLog(@"UI_VIEW", @"⚠️ _floatingIcon is nil or not UIView!");
+// ------------------------------------------------------------------------------
+// Auto-Trigger Decryption (Calls login action automatically after UI loads)
+// ------------------------------------------------------------------------------
+static void ScheduleAutoDecrypt(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (capturedEndpoint) {
+            WriteAuditLog(@"AUTO_DECRYPT", @"Endpoint already captured: %@", capturedEndpoint);
+            return;
         }
-    }
-}
 
-// Hook: -[LAFHTNFJTS initWithNibName:bundle:] (ImGui / Metal Renderer)
-typedef id (*LAFHTNFJTS_init_t)(id, SEL, id, id);
-static LAFHTNFJTS_init_t orig_lafhtnfjts_init = NULL;
+        WriteAuditLog(@"AUTO_DECRYPT", @"⚡ Executing Auto-Trigger to extract Endpoint URL...");
 
-static id my_lafhtnfjts_init(id self, SEL _cmd, id nib, id bundle) {
-    WriteAuditLog(@"RENDERER", @"Entering -[LAFHTNFJTS initWithNibName:bundle:]");
-    id res = orig_lafhtnfjts_init(self, _cmd, nib, bundle);
-    WriteAuditLog(@"RENDERER", @"Exited -[LAFHTNFJTS initWithNibName:bundle:], result=%p", res);
-    return res;
-}
+        UIWindow *keyWindow = nil;
+        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+            if (w.isKeyWindow) { keyWindow = w; break; }
+        }
+        UIViewController *root = keyWindow ? keyWindow.rootViewController : nil;
+        if (!root) {
+            root = UIApplication.sharedApplication.windows.firstObject.rootViewController;
+        }
 
-// Hook: Window Hosting registration
-typedef void (*HostingReg_t)(id, SEL, unsigned int, double);
-static HostingReg_t orig_hostingReg = NULL;
+        if (root && [NSStringFromClass(root.class) isEqualToString:@"VNTISFHTNSFJ"]) {
+            WriteAuditLog(@"AUTO_DECRYPT", @"Found VNTISFHTNSFJ controller at %p", root);
 
-static void my_hostingReg(id self, SEL _cmd, unsigned int contextId, double level) {
-    WriteAuditLog(@"WINDOW_HOSTING", @"🖥️ registerWindowWithContextID:%u atLevel:%.1f", contextId, level);
-    orig_hostingReg(self, _cmd, contextId, level);
+            // Set textField to trigger valid length check
+            Ivar ivar = class_getInstanceVariable(root.class, "textField");
+            if (ivar) {
+                UITextField *tf = object_getIvar(root, ivar);
+                if (tf && [tf isKindOfClass:UITextField.class]) {
+                    tf.text = @"AutoAuditKey12345678901234567890";
+                    WriteAuditLog(@"AUTO_DECRYPT", @"Filled textField with test key");
+                }
+            }
+
+            // Call -[VNTISFHTNSFJ POWMFHANGHT:] directly
+            SEL loginSel = NSSelectorFromString(@"POWMFHANGHT:");
+            if ([root respondsToSelector:loginSel]) {
+                WriteAuditLog(@"AUTO_DECRYPT", @"Calling -[VNTISFHTNSFJ POWMFHANGHT:] to trigger verifier and URL decryption!");
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                [root performSelector:loginSel withObject:nil];
+                #pragma clang diagnostic pop
+            }
+        } else {
+            WriteAuditLog(@"AUTO_DECRYPT", @"Root controller is not VNTISFHTNSFJ (found: %@)", root ? NSStringFromClass(root.class) : @"nil");
+        }
+    });
 }
 
 // ------------------------------------------------------------------------------
@@ -304,65 +375,43 @@ __attribute__((constructor)) static void InitializeTraceTweak(void) {
         uintptr_t base = GetMainBinaryBase();
         WriteAuditLog(@"INIT", @"Main Binary Mach-O Base = 0x%lx", (unsigned long)base);
 
-        // 3. Hook Statically Linked libcurl Functions
-        // curl_easy_setopt virtual 0x100bd0dd4 -> offset 0x00bd0dd4
+        // 3. Patch Integrity Check & Install Crash Guards (Fixes crash on inject)
+        InstallCrashGuards(base);
+
+        // 4. Hook Anti-Debug ptrace
+        void *ptrace_ptr = dlsym(RTLD_DEFAULT, "ptrace");
+        if (ptrace_ptr) {
+            HookFunction(ptrace_ptr, (void *)my_ptrace, (void **)&orig_ptrace);
+        }
+
+        // 5. Hook libcurl Functions
         void *target_setopt = (void *)(base + 0x00bd0dd4);
         if (HookFunction(target_setopt, (void *)my_curl_easy_setopt, (void **)&orig_curl_easy_setopt)) {
             WriteAuditLog(@"INIT", @"✅ Hooked curl_easy_setopt at 0x%lx", (unsigned long)target_setopt);
-        } else {
-            WriteAuditLog(@"INIT", @"❌ Failed to hook curl_easy_setopt");
         }
 
-        // curl_easy_perform virtual 0x100ba7c90 -> offset 0x00ba7c90
         void *target_perform = (void *)(base + 0x00ba7c90);
         if (HookFunction(target_perform, (void *)my_curl_easy_perform, (void **)&orig_curl_easy_perform)) {
             WriteAuditLog(@"INIT", @"✅ Hooked curl_easy_perform at 0x%lx", (unsigned long)target_perform);
         }
 
-        // 4. Hook dlopen to track libjailbreak loading
+        // 6. Hook dlopen
         void *dlopen_ptr = dlsym(RTLD_DEFAULT, "dlopen");
         if (dlopen_ptr) {
             HookFunction(dlopen_ptr, (void *)my_dlopen, (void **)&orig_dlopen);
-            WriteAuditLog(@"INIT", @"✅ Hooked dlopen");
         }
 
-        // 5. Hook Objective-C Methods
-        // Popups
+        // 7. Hook Popups
         Class alertClass = objc_getClass("UIAlertController");
         if (alertClass) {
             SwizzleClassMethod(alertClass, @selector(alertControllerWithTitle:message:preferredStyle:), (IMP)my_alert, (IMP *)&orig_alert);
         }
 
-        // Load cheat trigger
-        Class vntisClass = objc_getClass("VNTISFHTNSFJ");
-        if (vntisClass) {
-            SwizzleInstanceMethod(vntisClass, NSSelectorFromString(@"GAJKGNRXCHR:"), (IMP)my_loadCheat, (IMP *)&orig_loadCheat);
+        // 8. Auto-Trigger Decryption (Auto calls login to decrypt URL without waiting for user)
+        if (!isOverlayProcess) {
+            ScheduleAutoDecrypt();
         }
 
-        // Overlay app delegate
-        Class gwgcClass = objc_getClass("GWGCBAHTNSFR");
-        if (gwgcClass) {
-            SwizzleInstanceMethod(gwgcClass, @selector(application:didFinishLaunchingWithOptions:), (IMP)my_overlayLaunch, (IMP *)&orig_overlayLaunch);
-        }
-
-        // Floating icon view controller
-        Class psnvClass = objc_getClass("PSNVHRBF");
-        if (psnvClass) {
-            SwizzleInstanceMethod(psnvClass, @selector(viewDidLoad), (IMP)my_psnvhrbf_viewDidLoad, (IMP *)&orig_psnvhrbf_viewDidLoad);
-        }
-
-        // Metal Renderer
-        Class lafhClass = objc_getClass("LAFHTNFJTS");
-        if (lafhClass) {
-            SwizzleInstanceMethod(lafhClass, @selector(initWithNibName:bundle:), (IMP)my_lafhtnfjts_init, (IMP *)&orig_lafhtnfjts_init);
-        }
-
-        // Window Hosting
-        Class hostingClass = objc_getClass("SBSAccessibilityWindowHostingController");
-        if (hostingClass) {
-            SwizzleInstanceMethod(hostingClass, NSSelectorFromString(@"registerWindowWithContextID:atLevel:"), (IMP)my_hostingReg, (IMP *)&orig_hostingReg);
-        }
-        
-        WriteAuditLog(@"INIT", @"🎉 All hooks initialized successfully!");
+        WriteAuditLog(@"INIT", @"🎉 All guards and auto-decrypt triggers installed successfully!");
     }
 }
