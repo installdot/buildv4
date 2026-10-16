@@ -52,6 +52,17 @@ static void (*runtime_class_init)(Class*);
 static bool ready = false;
 static bool auto_save_enabled = true;
 
+// Combat Hack States
+static float g_MoveSpeedMultiplier = 1.0f;
+static int g_AttackSpeedBonus = 0;
+static float g_DamageMultiplier = 1.0f;
+static bool g_GodMode = false;
+static bool g_ZeroMana = false;
+static bool g_InfiniteMana = false;
+static bool g_OneHitKill = false;
+static bool g_NoCooldown = false;
+static bool g_AttackAoE = false;
+
 static void Fail(NSString* msg) {
     @throw [NSException exceptionWithName:@"HeroAgeException" reason:msg userInfo:nil];
 }
@@ -317,7 +328,6 @@ static void UnlockAllSkills(bool maxPoints) {
         int skillId = (int)GetFieldValue<int16_t>(object_get_class(skill), skill, "Id");
         if (skillId <= 0) continue;
         
-        // Check ForClass
         Object* forClassArr = GetFieldValue<Object*>(object_get_class(skill), skill, "ForClass");
         bool classMatch = false;
         if (forClassArr) {
@@ -375,32 +385,71 @@ static void FinishAllQuests() {
 }
 
 // -------------------------------------------------------------
-// Combat Parameters (Speed, Cooldown, Damage, AoE)
+// Combat Parameters (Speed, Cooldown, Damage, AoE, GodMode, Mana)
 // -------------------------------------------------------------
-
-static float g_MoveSpeedMultiplier = 1.0f;
-static int g_AttackSpeedBonus = 0;
-static float g_DamageMultiplier = 1.0f;
-static bool g_NoCooldown = false;
-static bool g_AttackAoE = false;
 
 static void ApplyCombatModifiers() {
     Object* ch = GetMainCharacter();
     if (ch) {
-        // IncreaseMovementSpeedBuff is at offset 0x300 (float)
-        float* pMoveBuff = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ch) + 0x300);
-        *pMoveBuff = (g_MoveSpeedMultiplier - 1.0f) * 100.0f;
+        uint8_t* pCh = reinterpret_cast<uint8_t*>(ch);
         
-        // IncreaseAttackSpeedBuff is at offset 0x304 (int32)
-        int32_t* pAtkBuff = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(ch) + 0x304);
+        // Movement speed via MovementSpeedRune (offset 0x150 = 336 int32)
+        // Normal base is 100, rune adds directly
+        int32_t* pMoveRune = reinterpret_cast<int32_t*>(pCh + 0x150);
+        *pMoveRune = static_cast<int32_t>((g_MoveSpeedMultiplier - 1.0f) * 100.0f);
+        
+        // Attack speed via AttackSpeedRune (offset 0x14C = 332 int32)
+        int32_t* pAtkRune = reinterpret_cast<int32_t*>(pCh + 0x14C);
+        *pAtkRune = g_AttackSpeedBonus;
+        
+        // IncreaseAttackSpeedBuff at offset 0x304
+        int32_t* pAtkBuff = reinterpret_cast<int32_t*>(pCh + 0x304);
         *pAtkBuff = g_AttackSpeedBonus;
         
-        // WLIncreasingDamage is at offset 0x11C (float)
-        float* pDmgMul = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ch) + 0x11C);
-        *pDmgMul = (g_DamageMultiplier - 1.0f) * 100.0f;
+        // ApproachSpeed (offset 0x230 float)
+        float* pApproach = reinterpret_cast<float*>(pCh + 0x230);
+        if (g_MoveSpeedMultiplier > 1.0f) *pApproach = 30.0f;
+        
+        // God Mode (Bất tử): DamageDecreasePercent at offset 0x100 (float)
+        float* pDmgDecrease = reinterpret_cast<float*>(pCh + 0x100);
+        if (g_GodMode) {
+            *pDmgDecrease = 100.0f; // 100% damage reduction
+        }
+        
+        // Damage Multiplier & One-Hit Kill
+        float* pWlDmg = reinterpret_cast<float*>(pCh + 0x11C);
+        int32_t* pMinDmg = reinterpret_cast<int32_t*>(pCh + 0xE0);
+        int32_t* pMaxDmg = reinterpret_cast<int32_t*>(pCh + 0xE4);
+        int32_t* pMaxDmgRune = reinterpret_cast<int32_t*>(pCh + 0x13C);
+        
+        if (g_OneHitKill) {
+            *pMinDmg = 99999999;
+            *pMaxDmg = 99999999;
+            *pMaxDmgRune = 99999999;
+            *pWlDmg = 99999.0f;
+        } else if (g_DamageMultiplier > 1.0f) {
+            *pWlDmg = (g_DamageMultiplier - 1.0f) * 100.0f;
+        }
     }
     
-    // Modify Skills in GameController
+    // CharacterData HP & MP handling
+    Object* p = GetPlayer();
+    if (p) {
+        if (g_GodMode) {
+            int maxHp = 99999999;
+            void* hpArgs[] = { &maxHp };
+            Invoke(p, "set_Health", 1, hpArgs);
+            Invoke(p, "set_CurrentHealth", 1, hpArgs);
+        }
+        if (g_InfiniteMana) {
+            int maxMp = 99999999;
+            void* mpArgs[] = { &maxMp };
+            Invoke(p, "set_Mana", 1, mpArgs);
+            Invoke(p, "set_CurrentMana", 1, mpArgs);
+        }
+    }
+    
+    // SkillModel modifications
     Object* gc = GetSingleton("GameController", "instance");
     if (gc) {
         Object* skillModelsArr = GetFieldValue<Object*>(object_get_class(gc), gc, "SkillModels");
@@ -411,22 +460,35 @@ static void ApplyCombatModifiers() {
                 if (!sk) continue;
                 
                 uint8_t* pSk = reinterpret_cast<uint8_t*>(sk);
-                // CoolDown is float at offset 0x80
+                
+                // CoolDown (offset 0x80 float)
                 float* pCd = reinterpret_cast<float*>(pSk + 0x80);
                 if (g_NoCooldown) {
                     *pCd = 0.0f;
                 }
                 
-                // Range is float at offset 0x58, RangeY at 0x5C
+                // ManaConst (offset 0x50 float) - 0 Mana Cost
+                float* pManaCost = reinterpret_cast<float*>(pSk + 0x50);
+                if (g_ZeroMana) {
+                    *pManaCost = 0.0f;
+                }
+                
+                // Range & AoE
                 float* pRangeX = reinterpret_cast<float*>(pSk + 0x58);
                 float* pRangeY = reinterpret_cast<float*>(pSk + 0x5C);
-                // KillAround is bool at offset 0x54
                 bool* pKillAround = reinterpret_cast<bool*>(pSk + 0x54);
-                
                 if (g_AttackAoE) {
-                    *pRangeX = 50.0f;
-                    *pRangeY = 50.0f;
+                    *pRangeX = 60.0f;
+                    *pRangeY = 60.0f;
                     *pKillAround = true;
+                }
+                
+                // One-Hit on skill damage
+                if (g_OneHitKill) {
+                    float* pSkMin = reinterpret_cast<float*>(pSk + 0x48);
+                    float* pSkMax = reinterpret_cast<float*>(pSk + 0x4C);
+                    *pSkMin = 99999999.0f;
+                    *pSkMax = 99999999.0f;
                 }
             }
         }
@@ -434,7 +496,7 @@ static void ApplyCombatModifiers() {
 }
 
 // -------------------------------------------------------------
-// Monster Management & Boss Spawning
+// Monster Management & Boss Drops
 // -------------------------------------------------------------
 
 static int ConvertAllMonstersToBossDrop() {
@@ -444,16 +506,15 @@ static int ConvertAllMonstersToBossDrop() {
     Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
     if (!list) return 0;
     
-    Method* mCount = class_get_method_from_name(object_get_class(list), "get_Count", 0);
-    int cnt = 0;
-    if (mCount) {
-        cnt = Unbox<int>(Invoke(list, "get_Count"));
-    }
+    // In List<T>, size is at offset 0x18, items array is at offset 0x10
+    int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
+    uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
+    if (!itemsArray || size <= 0) return 0;
     
+    Object** items = reinterpret_cast<Object**>(itemsArray + 0x20);
     int converted = 0;
-    for (int i = 0; i < cnt; ++i) {
-        void* getArgs[] = { &i };
-        Object* monster = Invoke(list, "get_Item", 1, getArgs);
+    for (int i = 0; i < size; ++i) {
+        Object* monster = items[i];
         if (!monster) continue;
         
         uint8_t* pM = reinterpret_cast<uint8_t*>(monster);
@@ -486,21 +547,31 @@ static int KillAllMonsters() {
     Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
     if (!list) return 0;
     
-    Method* mCount = class_get_method_from_name(object_get_class(list), "get_Count", 0);
-    int cnt = 0;
-    if (mCount) {
-        cnt = Unbox<int>(Invoke(list, "get_Count"));
-    }
+    // Read directly from List<BaseMonster> memory structure
+    int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
+    uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
+    if (!itemsArray || size <= 0) return 0;
     
+    Object** items = reinterpret_cast<Object**>(itemsArray + 0x20);
     int killed = 0;
-    for (int i = 0; i < cnt; ++i) {
-        void* getArgs[] = { &i };
-        Object* monster = Invoke(list, "get_Item", 1, getArgs);
+    
+    int finalDmg = 99999999;
+    bool bFalse = false;
+    void* hitArgs[] = { nullptr, &finalDmg, &finalDmg, &bFalse, &bFalse, &bFalse, &bFalse };
+    
+    for (int i = 0; i < size; ++i) {
+        Object* monster = items[i];
         if (!monster) continue;
         
         bool isDied = GetFieldValue<bool>(object_get_class(monster), monster, "IsDied");
         if (!isDied) {
-            Invoke(monster, "Die");
+            // Hit deals lethal damage, which invokes the game's drop code, exp, and sounds!
+            @try {
+                Invoke(monster, "Hit", 7, hitArgs);
+            } @catch (id) {
+                // Fallback to Die if Hit fails
+                Invoke(monster, "Die");
+            }
             killed++;
         }
     }
@@ -533,7 +604,7 @@ static void SetExpRateMultiplier(int multiplier) {
 }
 
 // -------------------------------------------------------------
-// Dynamic Catalog & Option Detection
+// Dynamic Catalog & Comprehensive Item Creation
 // -------------------------------------------------------------
 
 static NSArray<NSDictionary*>* GetOptionListForCategory(int category) {
@@ -620,10 +691,25 @@ static NSArray<NSDictionary*>* GetRuntimeCatalog() {
 }
 
 // -------------------------------------------------------------
-// Robust Item Creation & Inventory Injection
+// Advanced Item Creation: Full Options, God Type, Harmony, Sockets
 // -------------------------------------------------------------
 
-static void AddItemToInventory(int category, int itemId, int level, bool isSuper, int quantity, const std::vector<int>& activeOptions) {
+struct ItemOptionsConfig {
+    int category;
+    int itemId;
+    int level;
+    int quantity;
+    bool isSuper;
+    bool isHarmony;
+    bool isChip;
+    bool isPrimitive;
+    int godType;       // 0 = none, 1..10 = God Set (Dòng Vàng)
+    int legendOption;  // -1 = none, 0..7 = Legend Opt
+    int specialOption; // -1 = none, 0..7 = Special Opt
+    std::vector<int> subOptions; // 0..7 (Ex Options)
+};
+
+static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     Object* p = GetPlayer();
     Object* bucket = GetFieldValue<Object*>(object_get_class(p), p, "InventoryItems");
     if (!bucket) Fail(@"Không tìm thấy Inventory.");
@@ -636,21 +722,21 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
         if (val == 0) freeSlots.push_back(i);
     }
     
-    if (freeSlots.size() < (size_t)quantity) {
-        Fail([NSString stringWithFormat:@"Không đủ ô trống trong túi đồ (Cần %d, Còn %lu).", quantity, freeSlots.size()]);
+    if (freeSlots.size() < (size_t)cfg.quantity) {
+        Fail([NSString stringWithFormat:@"Không đủ ô trống trong túi đồ (Cần %d, Còn %lu).", cfg.quantity, freeSlots.size()]);
     }
     
     Class* itemUtils = FindClass("ItemUtils");
     Class* gameConfig = FindClass("GameConfig");
     
-    bool isConsumable = (category == 6 || category == 8 || category == 10 || category == 17 || category == 20);
+    bool isConsumable = (cfg.category == 6 || cfg.category == 8 || cfg.category == 10 || cfg.category == 17 || cfg.category == 20);
     
-    for (int q = 0; q < quantity; ++q) {
+    for (int q = 0; q < cfg.quantity; ++q) {
         int opt1 = 0, opt2 = 0, opt3 = 0, opt4 = 0, opt5 = 0, opt6 = 0, opt7 = 0;
         int64_t opt8 = 0;
         
         if (!isConsumable) {
-            for (int optIdx : activeOptions) {
+            for (int optIdx : cfg.subOptions) {
                 switch (optIdx) {
                     case 0: opt1 = 1; break;
                     case 1: opt2 = 1; break;
@@ -664,34 +750,82 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
             }
         }
         
+        int cat = cfg.category;
+        int idVal = cfg.itemId;
+        int lvl = cfg.level;
+        
         void* createArgs[] = {
-            &category, &itemId, &level,
+            &cat, &idVal, &lvl,
             &opt1, &opt2, &opt3, &opt4, &opt5, &opt6, &opt7, &opt8
         };
         
         int64_t rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "CreateItem", 11, createArgs));
         if (rawItem == 0) Fail(@"Không tạo được item qua ItemUtils.CreateItem.");
         
-        if (isSuper) {
+        // 1. Dòng Hoàn Hảo (Super / Ex)
+        if (cfg.isSuper) {
             void* superArgs[] = { &rawItem };
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetSuper", 1, superArgs));
         }
         
+        // 2. Dòng Tím (Harmony / Đá Tạo Hóa)
+        if (cfg.isHarmony) {
+            void* harmArgs[] = { &rawItem };
+            rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetHarmony", 1, harmArgs));
+        }
+        
+        // 3. Dòng Chip (Chip Attribute)
+        if (cfg.isChip) {
+            void* chipArgs[] = { &rawItem };
+            rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetChipAttribute", 1, chipArgs));
+        }
+        
+        // 4. Dòng Vàng (God Type / Set Thần)
+        if (cfg.godType > 0) {
+            int gType = cfg.godType;
+            void* godArgs[] = { &rawItem, &gType };
+            Invoke(itemUtils, nullptr, "SetGodType", 2, godArgs);
+        }
+        
+        // 5. Dòng Truyền Thuyết (Legend Option)
+        if (cfg.legendOption >= 0) {
+            int lOpt = cfg.legendOption;
+            void* legArgs[] = { &rawItem, &lOpt };
+            Invoke(itemUtils, nullptr, "SetLegendOption", 2, legArgs);
+        }
+        
+        // 6. Dòng Đặc Biệt (Special Option)
+        if (cfg.specialOption >= 0) {
+            int sOpt = cfg.specialOption;
+            void* specArgs[] = { &rawItem, &sOpt };
+            Invoke(itemUtils, nullptr, "SetSpecialOption", 2, specArgs);
+        }
+        
+        // 7. Dòng Nguyên Thủy (Primitive)
+        if (cfg.isPrimitive) {
+            bool bTrue = true;
+            void* primArgs[] = { &rawItem, &bTrue };
+            Invoke(itemUtils, nullptr, "SetPrimitive", 2, primArgs);
+        }
+        
+        // Consumables: amount >= 1
         if (isConsumable) {
             uint8_t amt = 1;
             void* amtArgs[] = { &rawItem, &amt };
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetAmount", 2, amtArgs));
         }
         
+        // Inject to slot
         int slot = freeSlots[q];
         void* setArgs[] = { &slot, &rawItem };
         Invoke(bucket, "set_Item", 2, setArgs);
         
+        // Register in GameConfig
         void* regArgs[] = { &rawItem };
         Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
     }
     
-    // Safely refresh UI without crashing if dialog is not open
+    // Refresh Inventory safely
     @try {
         Object* uiMgr = GetSingleton("UIManager", "instance");
         if (uiMgr) {
@@ -719,6 +853,10 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
 @property (nonatomic, assign) NSInteger itemLevel;
 @property (nonatomic, assign) NSInteger quantity;
 @property (nonatomic, assign) BOOL isSuper;
+@property (nonatomic, assign) BOOL isHarmony;
+@property (nonatomic, assign) BOOL isChip;
+@property (nonatomic, assign) BOOL isPrimitive;
+@property (nonatomic, assign) NSInteger godType;
 @end
 
 @interface HAMenuMainVC : UIViewController <UITableViewDelegate, UITableViewDataSource, UISearchResultsUpdating>
@@ -738,11 +876,19 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     
     self.selectedOptions = [NSMutableSet set];
     self.quantity = 1;
-    self.itemLevel = 0;
-    self.isSuper = NO;
+    self.itemLevel = 15;
+    self.isSuper = YES;
+    self.isHarmony = YES;
+    self.isChip = YES;
+    self.isPrimitive = NO;
+    self.godType = 1; // Default God Set
     
     int cat = [self.itemData[@"category"] intValue];
     self.availableOptions = HA::GetOptionListForCategory(cat);
+    // Pre-select all available sub-options for maximum god item
+    for (NSDictionary* opt in self.availableOptions) {
+        [self.selectedOptions addObject:opt[@"index"]];
+    }
     
     self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -757,20 +903,29 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
 }
 
 - (void)onAddTapped {
-    std::vector<int> opts;
-    for (NSNumber* n in self.selectedOptions) {
-        opts.push_back([n intValue]);
-    }
+    HA::ItemOptionsConfig cfg;
+    cfg.category = [self.itemData[@"category"] intValue];
+    cfg.itemId = [self.itemData[@"id"] intValue];
+    cfg.level = (int)self.itemLevel;
+    cfg.quantity = (int)self.quantity;
+    cfg.isSuper = self.isSuper;
+    cfg.isHarmony = self.isHarmony;
+    cfg.isChip = self.isChip;
+    cfg.isPrimitive = self.isPrimitive;
+    cfg.godType = (int)self.godType;
+    cfg.legendOption = 0;
+    cfg.specialOption = 0;
     
-    int cat = [self.itemData[@"category"] intValue];
-    int itemId = [self.itemData[@"id"] intValue];
+    for (NSNumber* n in self.selectedOptions) {
+        cfg.subOptions.push_back([n intValue]);
+    }
     
     @try {
         HA::ThreadScope scope;
-        HA::AddItemToInventory(cat, itemId, (int)self.itemLevel, self.isSuper, (int)self.quantity, opts);
+        HA::CreateAndInjectItem(cfg);
         
         UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Thành công"
-                                                                   message:[NSString stringWithFormat:@"Đã thêm %ldx %@ vào túi đồ!", (long)self.quantity, self.itemData[@"name"]]
+                                                                   message:[NSString stringWithFormat:@"Đã tạo và thêm %ldx %@ Full Dòng vào túi đồ!", (long)self.quantity, self.itemData[@"name"]]
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             [self.navigationController popViewControllerAnimated:YES];
@@ -786,18 +941,20 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return self.availableOptions.count > 0 ? 3 : 2;
+    return self.availableOptions.count > 0 ? 4 : 3;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"Thông tin & Cấu hình";
-    if (section == 1) return @"Cài đặt Cấp độ & Thuộc tính";
-    return @"Chọn dòng phụ (Option dòng)";
+    if (section == 0) return @"Thông tin Vật phẩm";
+    if (section == 1) return @"Cài đặt Cấp độ & Số lượng";
+    if (section == 2) return @"Dòng Đặc Biệt (Tím / Vàng / Super / Chip)";
+    return @"Dòng phụ thường (Option dòng)";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 3;
-    if (section == 1) return 3;
+    if (section == 1) return 2;
+    if (section == 2) return 5; // Super, Harmony, Chip, God Set, Primitive
     return self.availableOptions.count;
 }
 
@@ -805,6 +962,7 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     UITableViewCell* cell = [tableView dequeueReusableCellWithIdentifier:@"C"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"C"];
     cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.accessoryView = nil;
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     
     if (indexPath.section == 0) {
@@ -826,15 +984,42 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
             cell.textLabel.text = @"Số lượng thêm";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld", (long)self.quantity];
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (indexPath.row == 1) {
+        } else {
             cell.textLabel.text = @"Cấp độ (Level 0 - 15)";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"+%ld", (long)self.itemLevel];
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else {
-            cell.textLabel.text = @"Vật phẩm Super (Hoàn hảo)";
+        }
+    } else if (indexPath.section == 2) {
+        if (indexPath.row == 0) {
+            cell.textLabel.text = @"Dòng Hoàn Hảo (Super / Ex)";
             UISwitch* sw = [[UISwitch alloc] init];
             sw.on = self.isSuper;
             [sw addTarget:self action:@selector(onSuperToggled:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (indexPath.row == 1) {
+            cell.textLabel.text = @"Dòng Tím (Harmony / Đá Tạo Hóa)";
+            UISwitch* sw = [[UISwitch alloc] init];
+            sw.on = self.isHarmony;
+            [sw addTarget:self action:@selector(onHarmonyToggled:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (indexPath.row == 2) {
+            cell.textLabel.text = @"Dòng Chip (Chip Attribute)";
+            UISwitch* sw = [[UISwitch alloc] init];
+            sw.on = self.isChip;
+            [sw addTarget:self action:@selector(onChipToggled:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (indexPath.row == 3) {
+            cell.textLabel.text = @"Dòng Vàng / Thần (God Set)";
+            cell.detailTextLabel.text = self.godType > 0 ? [NSString stringWithFormat:@"Set Thần #%ld", (long)self.godType] : @"Tắt";
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        } else {
+            cell.textLabel.text = @"Dòng Nguyên Thủy (Primitive)";
+            UISwitch* sw = [[UISwitch alloc] init];
+            sw.on = self.isPrimitive;
+            [sw addTarget:self action:@selector(onPrimitiveToggled:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
         }
@@ -849,9 +1034,10 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     return cell;
 }
 
-- (void)onSuperToggled:(UISwitch*)sw {
-    self.isSuper = sw.on;
-}
+- (void)onSuperToggled:(UISwitch*)sw { self.isSuper = sw.on; }
+- (void)onHarmonyToggled:(UISwitch*)sw { self.isHarmony = sw.on; }
+- (void)onChipToggled:(UISwitch*)sw { self.isChip = sw.on; }
+- (void)onPrimitiveToggled:(UISwitch*)sw { self.isPrimitive = sw.on; }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
@@ -883,7 +1069,20 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
             [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
             [self presentViewController:a animated:YES completion:nil];
         }
-    } else if (indexPath.section == 2) {
+    } else if (indexPath.section == 2 && indexPath.row == 3) {
+        UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Set Thần (Dòng Vàng)" message:@"Nhập ID Set Thần (0 = Tắt, 1 đến 10)" preferredStyle:UIAlertControllerStyleAlert];
+        [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+            textField.keyboardType = UIKeyboardTypeNumberPad;
+            textField.text = [NSString stringWithFormat:@"%ld", (long)self.godType];
+        }];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            int g = [a.textFields.firstObject.text intValue];
+            if (g >= 0 && g <= 100) self.godType = g;
+            [self.tableView reloadData];
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+    } else if (indexPath.section == 3) {
         NSDictionary* opt = self.availableOptions[indexPath.row];
         NSNumber* idx = opt[@"index"];
         if ([self.selectedOptions containsObject:idx]) {
@@ -907,7 +1106,7 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(onClose)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(onReload)];
     
-    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"Vật Phẩm", @"Chỉ Số", @"Chiến Đấu", @"Tiến Trình"]];
+    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"Vật Phẩm", @"Chỉ Số", @"Chiến Đấu", @"Quái & Boss", @"Tiến Trình"]];
     self.tabControl.selectedSegmentIndex = 0;
     [self.tabControl addTarget:self action:@selector(onTabChanged) forControlEvents:UIControlEventValueChanged];
     self.navigationItem.titleView = self.tabControl;
@@ -974,7 +1173,8 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     if (tab == 0) return 1;
     if (tab == 1) return 3; // Level/Exp, Stats, Currencies
-    if (tab == 2) return 3; // Speed & Damage, Skill Modifiers, Monster/Boss Controls
+    if (tab == 2) return 3; // GodMode/OneHit/Mana, Speed/Damage, Skill Cooldown/AoE
+    if (tab == 3) return 2; // Monster Kill/Boss drops, Boss Spawns & Exp
     return 2; // Skills/Quests, Save & Options
 }
 
@@ -987,9 +1187,13 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
         return @"Tiền tệ Game";
     }
     if (tab == 2) {
-        if (section == 0) return @"Thông số Nhân vật (Tốc độ & Sát thương)";
-        if (section == 1) return @"Cơ chế Kỹ năng (Hồi chiêu & AoE)";
-        return @"Quái & Boss Map";
+        if (section == 0) return @"Đặc Quyền Bất Tử & Sát Thương";
+        if (section == 1) return @"Tốc Độ & Sát Thương";
+        return @"Cơ Chế Kỹ Năng";
+    }
+    if (tab == 3) {
+        if (section == 0) return @"Tiêu Diệt & Rớt Đồ";
+        return @"Triệu Hồi Boss & Hệ Số Exp";
     }
     return section == 0 ? @"Mở Khóa Nhân Vật & Tiến Trình" : @"Lưu Trữ Dữ Liệu";
 }
@@ -998,16 +1202,20 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     if (tab == 0) return self.filteredItems.count;
     if (tab == 1) {
-        if (section == 0) return 5; // Level, Exp, Point, SkillPoint, ResetCount
-        if (section == 1) return 7; // Strength, Agility, Vitality, Energy, Command, HP, MP
-        return 3; // Coin, Diamond, WarehouseCoin
+        if (section == 0) return 5;
+        if (section == 1) return 7;
+        return 3;
     }
     if (tab == 2) {
-        if (section == 0) return 3;
-        if (section == 1) return 2;
-        return 8;
+        if (section == 0) return 4; // God Mode, Infinite Mana, Zero Mana, One Hit
+        if (section == 1) return 3; // Move Speed, Attack Speed, Damage Mul
+        return 2; // No Cooldown, Attack AoE
     }
-    return section == 0 ? 4 : 2; // Unlock all chars, Unlock skills, Max skills, Finish quests / Save Now, Auto Save Toggle
+    if (tab == 3) {
+        if (section == 0) return 2; // Kill All, Convert All to Boss Drop
+        return 6; // Spawn Map Boss, Global, Narkan, Shadow, Dark Mona, Exp Rate
+    }
+    return section == 0 ? 4 : 2;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1051,6 +1259,32 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     } else if (tab == 2) {
         if (indexPath.section == 0) {
             if (indexPath.row == 0) {
+                cell.textLabel.text = @"Bất Tử (God Mode / 100% Defense)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_GodMode;
+                [sw addTarget:self action:@selector(onGodModeToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            } else if (indexPath.row == 1) {
+                cell.textLabel.text = @"Vô Hạn Mana (Infinite MP)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_InfiniteMana;
+                [sw addTarget:self action:@selector(onInfiniteManaToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            } else if (indexPath.row == 2) {
+                cell.textLabel.text = @"0 Mana Cost (Skill không tốn MP)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_ZeroMana;
+                [sw addTarget:self action:@selector(onZeroManaToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            } else {
+                cell.textLabel.text = @"One-Hit Kill (Một Đòn Hạ Quái)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_OneHitKill;
+                [sw addTarget:self action:@selector(onOneHitToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
+        } else if (indexPath.section == 1) {
+            if (indexPath.row == 0) {
                 cell.textLabel.text = @"Tốc độ di chuyển (Move Speed)";
                 cell.detailTextLabel.text = [NSString stringWithFormat:@"%.1fx bình thường", HA::g_MoveSpeedMultiplier];
             } else if (indexPath.row == 1) {
@@ -1060,7 +1294,7 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
                 cell.textLabel.text = @"Khuếch đại sát thương (Damage Multiplier)";
                 cell.detailTextLabel.text = [NSString stringWithFormat:@"%.1fx sát thương", HA::g_DamageMultiplier];
             }
-        } else if (indexPath.section == 1) {
+        } else {
             if (indexPath.row == 0) {
                 cell.textLabel.text = @"Bỏ hồi chiêu (0s Cooldown All Skills)";
                 UISwitch* sw = [[UISwitch alloc] init];
@@ -1074,10 +1308,18 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
                 [sw addTarget:self action:@selector(onAttackAoEToggled:) forControlEvents:UIControlEventValueChanged];
                 cell.accessoryView = sw;
             }
+        }
+    } else if (tab == 3) {
+        if (indexPath.section == 0) {
+            if (indexPath.row == 0) {
+                cell.textLabel.text = @"Tiêu diệt toàn bộ quái (Kill All Monsters)";
+                cell.detailTextLabel.text = @"Hạ quái hợp lệ, kích hoạt rơi đồ, exp và nhiệm vụ";
+            } else {
+                cell.textLabel.text = @"Chuyển drop quái thành Boss (Super & God Drop)";
+                cell.detailTextLabel.text = @"Toàn bộ quái trên map thành cấp 350 + Super/God Effect";
+            }
         } else {
-            NSArray* monsterActions = @[
-                @"Tiêu diệt toàn bộ quái (Kill All Monsters)",
-                @"Chuyển drop quái thành Boss (Super & God Drop)",
+            NSArray* bossList = @[
                 @"Triệu hồi Boss Map (Spawn Map Boss)",
                 @"Triệu hồi Global Boss",
                 @"Triệu hồi Narkan Boss",
@@ -1085,7 +1327,7 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
                 @"Kích hoạt Dark Mona Event",
                 @"Nhân hệ số Exp quái (Exp Rate Multiplier)"
             ];
-            cell.textLabel.text = monsterActions[indexPath.row];
+            cell.textLabel.text = bossList[indexPath.row];
             cell.detailTextLabel.text = @"Nhấn để kích hoạt";
         }
     } else {
@@ -1120,20 +1362,34 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     return cell;
 }
 
+- (void)onGodModeToggled:(UISwitch*)sw {
+    HA::g_GodMode = sw.on;
+    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
+}
+
+- (void)onInfiniteManaToggled:(UISwitch*)sw {
+    HA::g_InfiniteMana = sw.on;
+    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
+}
+
+- (void)onZeroManaToggled:(UISwitch*)sw {
+    HA::g_ZeroMana = sw.on;
+    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
+}
+
+- (void)onOneHitToggled:(UISwitch*)sw {
+    HA::g_OneHitKill = sw.on;
+    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
+}
+
 - (void)onNoCooldownToggled:(UISwitch*)sw {
     HA::g_NoCooldown = sw.on;
-    @try {
-        HA::ThreadScope scope;
-        HA::ApplyCombatModifiers();
-    } @catch (id) {}
+    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
 }
 
 - (void)onAttackAoEToggled:(UISwitch*)sw {
     HA::g_AttackAoE = sw.on;
-    @try {
-        HA::ThreadScope scope;
-        HA::ApplyCombatModifiers();
-    } @catch (id) {}
+    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
 }
 
 - (void)onAutoSaveToggled:(UISwitch*)sw {
@@ -1164,7 +1420,7 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
             [self promptInputForCurrency:c];
         }
     } else if (tab == 2) {
-        if (indexPath.section == 0) {
+        if (indexPath.section == 1) {
             if (indexPath.row == 0) {
                 UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Tốc độ di chuyển" message:@"Nhập hệ số tốc độ (Ví dụ: 1.0, 2.5, 5.0, 10.0)" preferredStyle:UIAlertControllerStyleAlert];
                 [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
@@ -1223,19 +1479,28 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
                 [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
                 [self presentViewController:a animated:YES completion:nil];
             }
-        } else if (indexPath.section == 2) {
+        }
+    } else if (tab == 3) {
+        if (indexPath.section == 0) {
             @try {
                 HA::ThreadScope scope;
                 if (indexPath.row == 0) {
                     int killed = HA::KillAllMonsters();
-                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã tiêu diệt %d quái vật trên map!", killed]];
-                } else if (indexPath.row == 1) {
+                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã tiêu diệt %d quái vật trên map và kích hoạt rơi đồ!", killed]];
+                } else {
                     int conv = HA::ConvertAllMonstersToBossDrop();
-                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã chuyển %d quái vật trên map thành cấp Boss (Cấp 350 + Super/God Drop)!", conv]];
-                } else if (indexPath.row >= 2 && indexPath.row <= 6) {
-                    HA::SpawnBoss((int)indexPath.row - 2);
+                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã chuyển %d quái vật trên map thành cấp Boss (Cấp 350 + Super/God Effect)!", conv]];
+                }
+            } @catch (NSException* e) {
+                [self showErrorAlert:e.reason];
+            }
+        } else {
+            @try {
+                HA::ThreadScope scope;
+                if (indexPath.row >= 0 && indexPath.row <= 4) {
+                    HA::SpawnBoss((int)indexPath.row);
                     [self showSuccessAlert:@"Đã gửi lệnh triệu hồi Boss thành công!"];
-                } else if (indexPath.row == 7) {
+                } else if (indexPath.row == 5) {
                     UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Hệ số Exp" message:@"Nhập hệ số nhân kinh nghiệm (Ví dụ: 10, 50, 100)" preferredStyle:UIAlertControllerStyleAlert];
                     [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
                         textField.keyboardType = UIKeyboardTypeNumberPad;
