@@ -5,12 +5,15 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <stdint.h>
 #include <cstring>
 #include <climits>
 #include <vector>
 #include <string>
+
+extern "C" void MSHookFunction(void *symbol, void *replace, void **result);
 
 namespace HA {
 
@@ -66,7 +69,31 @@ static bool g_AttackAoE = false;
 static bool g_AutoKill = false;
 static bool g_BossDropEnabled = false;
 static bool g_FreeCraft = true;
-static bool g_BypassRequirements = true;
+
+// 100% Craft Success Rate Hook
+typedef int (*RandomRangeInt_t)(int min, int max);
+static RandomRangeInt_t orig_RandomRangeInt = nullptr;
+
+static int hooked_RandomRangeInt(int min, int max) {
+    if (g_FreeCraft && min == 0 && max == 100) {
+        return 0; // 0 is always < rate (rate >= 1), so craft 100% SUCCEEDS!
+    }
+    if (orig_RandomRangeInt) {
+        return orig_RandomRangeInt(min, max);
+    }
+    return min;
+}
+
+static uintptr_t GetUnityFrameworkBase() {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "UnityFramework")) {
+            return (uintptr_t)_dyld_get_image_header(i);
+        }
+    }
+    return 0;
+}
 
 static void Fail(NSString* msg) {
     @throw [NSException exceptionWithName:@"HeroAgeException" reason:msg userInfo:nil];
@@ -412,21 +439,17 @@ static int ConvertAllMonstersToBossDrop() {
         
         uint8_t* pM = reinterpret_cast<uint8_t*>(monster);
         
-        // Level (0x74) -> Set to 350 so dropped item level roll is maximum tier
         int32_t* pLevel = reinterpret_cast<int32_t*>(pM + 0x74);
         if (*pLevel < 350) *pLevel = 350;
         
-        // EffectLevel (0xB0) -> Set to 3 (Gold Boss effect)
         int32_t* pEffectLvl = reinterpret_cast<int32_t*>(pM + 0xB0);
         *pEffectLvl = 3;
         
-        // HasSuperEffect (0xB4) & HasGodEffect (0xB5)
         bool* pSuper = reinterpret_cast<bool*>(pM + 0xB4);
         *pSuper = true;
         bool* pGod = reinterpret_cast<bool*>(pM + 0xB5);
         *pGod = true;
         
-        // Remove defense/resistance so damage multiplier works 100% on bosses!
         float* pDef = reinterpret_cast<float*>(pM + 0x90);
         *pDef = 0.0f;
         float* pDefRate = reinterpret_cast<float*>(pM + 0x94);
@@ -448,7 +471,6 @@ static int KillAllMonsters() {
     Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
     if (!list) return 0;
     
-    // Read directly from List<BaseMonster> memory structure
     int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
     uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
     if (!itemsArray || size <= 0) return 0;
@@ -523,7 +545,6 @@ static void ApplyCombatModifiers() {
         uint8_t* pCh = reinterpret_cast<uint8_t*>(ch);
         
         // 1. Move Speed via MovementSpeedRune (offset 0x150 = 336 int32)
-        // Normal base is 100, rune adds directly
         int32_t* pMoveRune = reinterpret_cast<int32_t*>(pCh + 0x150);
         *pMoveRune = static_cast<int32_t>((g_MoveSpeedMultiplier - 1.0f) * 100.0f);
         
@@ -544,7 +565,6 @@ static void ApplyCombatModifiers() {
         }
         
         // 5. Penetrate Boss Defense (Fix boss damage multiplier!)
-        // Bypass all boss defense and boss elite reductions
         *reinterpret_cast<int32_t*>(pCh + 0x334) = 99999999; // EliteIgnoreDefense
         *reinterpret_cast<int32_t*>(pCh + 0x314) = 99999999; // LegendIgnoreDefense
         *reinterpret_cast<int32_t*>(pCh + 0x324) = 100;      // LegendIgnoreDefenseRate
@@ -878,7 +898,6 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
                         }
                     }
                 } @catch (id) {
-                    // Fallback to free slot if ground spawn is unavailable
                     if (!freeSlots.empty()) {
                         int slot = freeSlots.back();
                         freeSlots.pop_back();
@@ -909,105 +928,8 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
 }
 
 // -------------------------------------------------------------
-// Free Crafting Engine (Không Cần Nguyên Liệu / Yêu Cầu)
+// In-Game Craft Machine Helper (Free Crafting, No Materials Needed)
 // -------------------------------------------------------------
-
-static void CraftWing(int tier, int wingId = -1) {
-    Object* p = GetPlayer();
-    int playerClass = Unbox<int>(Invoke(p, "get_ClassType"));
-    
-    int targetId = 1;
-    if (tier == 1) {
-        switch (playerClass) {
-            case 0: targetId = 1; break;
-            case 16: targetId = 2; break;
-            case 32: targetId = 3; break;
-            case 48: targetId = 4; break;
-            case 80: targetId = 6; break;
-            case 96: targetId = 7; break;
-            case 112: targetId = 8; break;
-            default: targetId = 1; break;
-        }
-    } else if (tier == 2) {
-        switch (playerClass) {
-            case 0: targetId = 16; break;
-            case 16: targetId = 17; break;
-            case 32: targetId = 18; break;
-            case 48: targetId = 19; break;
-            case 64: targetId = 20; break;
-            case 80: targetId = 21; break;
-            case 96: targetId = 22; break;
-            case 112: targetId = 23; break;
-            default: targetId = 16; break;
-        }
-    } else if (tier == 3) {
-        switch (playerClass) {
-            case 0: targetId = 32; break;
-            case 16: targetId = 33; break;
-            case 32: targetId = 34; break;
-            case 48: targetId = 35; break;
-            case 64: targetId = 36; break;
-            case 80: targetId = 37; break;
-            case 96: targetId = 38; break;
-            default: targetId = 32; break;
-        }
-    }
-    if (wingId > 0) targetId = wingId;
-    
-    ItemOptionsConfig cfg;
-    cfg.category = 14; // Wing
-    cfg.itemId = targetId;
-    cfg.level = 15;
-    cfg.quantity = 1;
-    cfg.isSuper = true;
-    cfg.isHarmony = true;
-    cfg.isChip = true;
-    cfg.isPrimitive = true;
-    cfg.godType = 1;
-    cfg.legendOption = 0;
-    cfg.specialOption = 0;
-    cfg.dropAtPlayer = false;
-    for (int i = 0; i < 8; ++i) cfg.subOptions.push_back(i);
-    
-    CreateAndInjectItem(cfg);
-}
-
-static void CraftPet(int petId) {
-    ItemOptionsConfig cfg;
-    cfg.category = 16; // Pet
-    cfg.itemId = petId;
-    cfg.level = 15;
-    cfg.quantity = 1;
-    cfg.isSuper = true;
-    cfg.isHarmony = true;
-    cfg.isChip = true;
-    cfg.isPrimitive = false;
-    cfg.godType = 0;
-    cfg.legendOption = 0;
-    cfg.specialOption = 0;
-    cfg.dropAtPlayer = false;
-    
-    CreateAndInjectItem(cfg);
-}
-
-static void CraftSpecialItem(int category, int itemId, int level = 15) {
-    ItemOptionsConfig cfg;
-    cfg.category = category;
-    cfg.itemId = itemId;
-    cfg.level = level;
-    cfg.quantity = 1;
-    cfg.isSuper = true;
-    cfg.isHarmony = true;
-    cfg.isChip = true;
-    cfg.isPrimitive = (category != 6 && category != 8);
-    cfg.godType = (category == 1 || category == 2 || category == 3 || category == 4 || category == 5 || category == 21) ? 1 : 0;
-    cfg.legendOption = 0;
-    cfg.specialOption = 0;
-    cfg.dropAtPlayer = false;
-    for (int i = 0; i < 8; ++i) cfg.subOptions.push_back(i);
-    
-    CreateAndInjectItem(cfg);
-}
 
 static int UpgradeAllEquippedToMax() {
     Object* p = GetPlayer();
@@ -1055,52 +977,6 @@ static int UpgradeAllEquippedToMax() {
     return upgraded;
 }
 
-static int BypassEquipmentRequirements() {
-    Object* gc = GetSingleton("GameController", "instance");
-    if (!gc) return 0;
-    
-    int count = 0;
-    void* iter = nullptr;
-    while (Field* f = class_get_fields(object_get_class(gc), &iter)) {
-        Class* ft = class_from_type(field_get_type(f));
-        if (!ft || strcmp(class_get_name(ft), "ItemModel[]") != 0) continue;
-        
-        Object* arr = nullptr;
-        field_get_value(gc, f, &arr);
-        if (!arr) continue;
-        
-        int n = ArrayLength(arr);
-        for (int i = 0; i < n; ++i) {
-            Object* m = ArrayGet(arr, i);
-            if (!m) continue;
-            
-            uint8_t* pM = reinterpret_cast<uint8_t*>(m);
-            // 0x40 = StrengthRequired
-            *reinterpret_cast<int32_t*>(pM + 0x40) = 0;
-            // 0x44 = AgileRequire
-            *reinterpret_cast<int32_t*>(pM + 0x44) = 0;
-            // 0x48 = VitalityRequired
-            *reinterpret_cast<int32_t*>(pM + 0x48) = 0;
-            // 0x4C = EnergyRequired
-            *reinterpret_cast<int32_t*>(pM + 0x4C) = 0;
-            // 0x50 = LevelRequired
-            *reinterpret_cast<int32_t*>(pM + 0x50) = 0;
-            // 0x54 = HeroLevelRequired
-            *reinterpret_cast<int32_t*>(pM + 0x54) = 0;
-            
-            // 0x38 = ForClass array
-            uint8_t* forClass = *reinterpret_cast<uint8_t**>(pM + 0x38);
-            if (forClass) {
-                // Set length = 0 to bypass class matching in CheckItemSetLogic
-                *reinterpret_cast<int32_t*>(forClass + 0x18) = 0;
-            }
-            
-            count++;
-        }
-    }
-    return count;
-}
-
 static bool AutoFillCraftMachine() {
     Object* uiMgr = GetSingleton("UIManager", "instance");
     if (!uiMgr) return false;
@@ -1108,7 +984,6 @@ static bool AutoFillCraftMachine() {
     Object* craftDiag = GetFieldValue<Object*>(object_get_class(uiMgr), uiMgr, "CraftDialog");
     if (!craftDiag) return false;
     
-    // Check if CraftDialog gameObject is active
     Method* mGetGo = class_get_method_from_name(object_get_class(craftDiag), "get_gameObject", 0);
     if (!mGetGo) return false;
     Object* go = Invoke(craftDiag, "get_gameObject");
@@ -1284,7 +1159,6 @@ static bool AutoFillCraftMachine() {
     
     @try {
         HA::ThreadScope scope;
-        // Continuously maintain combat parameters so game Update/CalculateValues cannot reset them!
         HA::ApplyCombatModifiers();
         
         // Auto-kill loop: runs every ~10 frames (~6 times per second)
@@ -1292,14 +1166,9 @@ static bool AutoFillCraftMachine() {
             HA::KillAllMonsters();
         }
         
-        // Auto-craft machine helper: runs every ~15 frames
+        // Free craft machine auto-fill: runs every ~15 frames
         if (HA::g_FreeCraft && (tickCount % 15 == 0)) {
             HA::AutoFillCraftMachine();
-        }
-        
-        // Equipment requirement bypass: runs every ~30 frames
-        if (HA::g_BypassRequirements && (tickCount % 30 == 0)) {
-            HA::BypassEquipmentRequirements();
         }
     } @catch (id) {}
 }
@@ -1346,7 +1215,7 @@ static bool AutoFillCraftMachine() {
     self.isHarmony = YES;
     self.isChip = YES;
     self.isPrimitive = NO;
-    self.godType = 1; // Default God Set
+    self.godType = 1;
     
     int cat = [self.itemData[@"category"] intValue];
     self.availableOptions = HA::GetOptionListForCategory(cat);
@@ -1429,7 +1298,7 @@ static bool AutoFillCraftMachine() {
     if (section == 0) return 3;
     if (section == 1) return 2;
     if (section == 2) return 5;
-    if (section == 3) return 2; // Rớt ngay chân, Bật Full Tất Cả Dòng
+    if (section == 3) return 2;
     return self.availableOptions.count;
 }
 
@@ -1569,7 +1438,6 @@ static bool AutoFillCraftMachine() {
         if (indexPath.row == 0) {
             [self executeCreateItem:YES];
         } else {
-            // Max God Item All Options
             self.itemLevel = 15;
             self.isSuper = YES;
             self.isHarmony = YES;
@@ -1673,7 +1541,7 @@ static bool AutoFillCraftMachine() {
     if (tab == 0) return 1;
     if (tab == 1) return 3; // Level/Exp, Stats, Currencies
     if (tab == 2) return 3; // GodMode/OneHit/Mana, Speed/Damage, Skill Cooldown/AoE
-    if (tab == 3) return 4; // Máy Ép Đồ & Nâng Cấp, Chế Tạo Cánh, Thú Cưỡi & Thần Thú, Bảo Vật & Ngọc
+    if (tab == 3) return 1; // In-Game Craft Machine (100% Rate & Auto-Fill)
     if (tab == 4) return 2; // Monster Kill/Boss drops, Boss Spawns & Exp
     return 2; // Skills/Quests, Save & Options
 }
@@ -1692,15 +1560,13 @@ static bool AutoFillCraftMachine() {
         return @"Cơ Chế Kỹ Năng";
     }
     if (tab == 3) {
-        if (section == 0) return @"Máy Ép Đồ Game & Trang Bị";
-        if (section == 1) return @"Chế Tạo Cánh (Wings)";
-        if (section == 2) return @"Thú Cưỡi & Thần Thú (Pets)";
-        return @"Bảo Vật, Bông Tai & Ngọc (Artifacts)";
+        return @"Máy Ép Đồ Game & Trang Bị (100% Success Rate)";
     }
     if (tab == 4) {
         if (section == 0) return @"Tiêu Diệt & Rớt Đồ";
         return @"Triệu Hồi Boss & Hệ Số Exp";
-    }    return section == 0 ? @"Mở Khóa Nhân Vật & Tiến Trình" : @"Lưu Trữ Dữ Liệu";
+    }
+    return section == 0 ? @"Mở Khóa Nhân Vật & Tiến Trình" : @"Lưu Trữ Dữ Liệu";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1712,20 +1578,18 @@ static bool AutoFillCraftMachine() {
         return 3;
     }
     if (tab == 2) {
-        if (section == 0) return 4; // God Mode, Infinite Mana, Zero Mana, One Hit
-        if (section == 1) return 3; // Move Speed, Attack Speed, Damage Mul
-        return 2; // No Cooldown, Attack AoE
+        if (section == 0) return 4;
+        if (section == 1) return 3;
+        return 2;
     }
     if (tab == 3) {
-        if (section == 0) return 3; // Free Craft Switch, Bypass Equip Switch, Max Upgrade All Equipped
-        if (section == 1) return 3; // Wing 1, Wing 2, Wing 3
-        if (section == 2) return 5; // Fenrir, Dark Horse, Raven, Dark Bear, Broken Horn
-        return 5; // Earring, Jewel of Infinity, Feather of Icarus, Ancient Formula, Anti-lost Star
+        return 2; // Free Craft Mode Switch, Max Upgrade All Equipped
     }
     if (tab == 4) {
         if (section == 0) return 3;
         return 6;
-    }    return section == 0 ? 4 : 2;
+    }
+    return section == 0 ? 4 : 2;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1820,56 +1684,16 @@ static bool AutoFillCraftMachine() {
             }
         }
     } else if (tab == 3) {
-        if (indexPath.section == 0) {
-            if (indexPath.row == 0) {
-                cell.textLabel.text = @"Chế Tạo Tự Động Miễn Phí (Free Craft Mode)";
-                UISwitch* sw = [[UISwitch alloc] init];
-                sw.on = HA::g_FreeCraft;
-                [sw addTarget:self action:@selector(onFreeCraftToggled:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = sw;
-            } else if (indexPath.row == 1) {
-                cell.textLabel.text = @"Bỏ Qua Yêu Cầu Trang Bị (Bypass Equip Requirements)";
-                UISwitch* sw = [[UISwitch alloc] init];
-                sw.on = HA::g_BypassRequirements;
-                [sw addTarget:self action:@selector(onBypassEquipToggled:) forControlEvents:UIControlEventValueChanged];
-                cell.accessoryView = sw;
-            } else {
-                cell.textLabel.text = @"Nâng cấp toàn bộ đồ đang mặc lên +15 Full Dòng";
-                cell.detailTextLabel.text = @"Vũ khí, giáp, cánh, nhẫn, bông tai đang mặc lên +15, Tím, Vàng, Chip";
-            }
-        } else if (indexPath.section == 1) {
-            NSArray* wingTitles = @[
-                @"Chế tạo Cánh Cấp 1 (Wing 1) +15 Full Dòng",
-                @"Chế tạo Cánh Cấp 2 (Wing 2) +15 Full Dòng",
-                @"Chế tạo Cánh Cấp 3 / Huyền Thoại (Wing 3) +15 Full Dòng"
-            ];
-            NSArray* wingDescs = @[
-                @"Tạo ngay Cánh 1 chuẩn theo Class hiện tại của bạn",
-                @"Tạo ngay Cánh 2 chuẩn theo Class hiện tại của bạn",
-                @"Tạo ngay Cánh 3 tối thượng chuẩn theo Class của bạn"
-            ];
-            cell.textLabel.text = wingTitles[indexPath.row];
-            cell.detailTextLabel.text = wingDescs[indexPath.row];
-        } else if (indexPath.section == 2) {
-            NSArray* petTitles = @[
-                @"Chế tạo Thú Cưỡi Fenrir (Horn of Fenrir)",
-                @"Chế tạo Ngựa Bóng Tối (Dark Horse)",
-                @"Chế tạo Quạ Tinh (Dark Raven)",
-                @"Chế tạo Gấu Bóng Tối (Orb of Dark Bear)",
-                @"Chế tạo Sừng Gãy Fenrir (Broken Horn)"
-            ];
-            cell.textLabel.text = petTitles[indexPath.row];
-            cell.detailTextLabel.text = @"Tạo ngay vào túi đồ, không cần nguyên liệu";
+        if (indexPath.row == 0) {
+            cell.textLabel.text = @"Chế Tạo Miễn Phí 100% (Free Craft Mode)";
+            cell.detailTextLabel.text = @"Mở máy ép đồ game là bấm ép được luôn, tỷ lệ 100% không xịt";
+            UISwitch* sw = [[UISwitch alloc] init];
+            sw.on = HA::g_FreeCraft;
+            [sw addTarget:self action:@selector(onFreeCraftToggled:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
         } else {
-            NSArray* artTitles = @[
-                @"Chế tạo Bông Tai Hợp Nhất (Earring of Fusion)",
-                @"Chế tạo Ngọc Ngũ Hành / Vô Cực (Jewel of Infinity)",
-                @"Chế tạo Lông Vũ Icarus (Feather of Icarus)",
-                @"Chế tạo Công Thức Cổ Đại (Ancient Formula)",
-                @"Chế tạo Ngôi Sao Bảo Mệnh (Anti-lost Star)"
-            ];
-            cell.textLabel.text = artTitles[indexPath.row];
-            cell.detailTextLabel.text = @"Tạo ngay vào túi đồ, không cần nguyên liệu";
+            cell.textLabel.text = @"Nâng cấp toàn bộ đồ đang mặc lên +15 Full Dòng";
+            cell.detailTextLabel.text = @"Vũ khí, giáp, cánh, nhẫn, bông tai đang mặc lên +15, Tím, Vàng, Chip";
         }
     } else if (tab == 4) {
         if (indexPath.section == 0) {
@@ -1933,34 +1757,13 @@ static bool AutoFillCraftMachine() {
     return cell;
 }
 
-- (void)onGodModeToggled:(UISwitch*)sw {
-    HA::g_GodMode = sw.on;
-}
-
-- (void)onInfiniteManaToggled:(UISwitch*)sw {
-    HA::g_InfiniteMana = sw.on;
-}
-
-- (void)onZeroManaToggled:(UISwitch*)sw {
-    HA::g_ZeroMana = sw.on;
-}
-
-- (void)onOneHitToggled:(UISwitch*)sw {
-    HA::g_OneHitKill = sw.on;
-}
-
-- (void)onNoCooldownToggled:(UISwitch*)sw {
-    HA::g_NoCooldown = sw.on;
-}
-
-- (void)onAttackAoEToggled:(UISwitch*)sw {
-    HA::g_AttackAoE = sw.on;
-}
-
-- (void)onAutoKillToggled:(UISwitch*)sw {
-    HA::g_AutoKill = sw.on;
-}
-
+- (void)onGodModeToggled:(UISwitch*)sw { HA::g_GodMode = sw.on; }
+- (void)onInfiniteManaToggled:(UISwitch*)sw { HA::g_InfiniteMana = sw.on; }
+- (void)onZeroManaToggled:(UISwitch*)sw { HA::g_ZeroMana = sw.on; }
+- (void)onOneHitToggled:(UISwitch*)sw { HA::g_OneHitKill = sw.on; }
+- (void)onNoCooldownToggled:(UISwitch*)sw { HA::g_NoCooldown = sw.on; }
+- (void)onAttackAoEToggled:(UISwitch*)sw { HA::g_AttackAoE = sw.on; }
+- (void)onAutoKillToggled:(UISwitch*)sw { HA::g_AutoKill = sw.on; }
 - (void)onBossDropToggled:(UISwitch*)sw {
     HA::g_BossDropEnabled = sw.on;
     if (sw.on) {
@@ -1970,10 +1773,13 @@ static bool AutoFillCraftMachine() {
         } @catch (id) {}
     }
 }
-
-- (void)onAutoSaveToggled:(UISwitch*)sw {
-    HA::auto_save_enabled = sw.on;
+- (void)onFreeCraftToggled:(UISwitch*)sw {
+    HA::g_FreeCraft = sw.on;
+    if (sw.on) {
+        @try { HA::ThreadScope sc; HA::AutoFillCraftMachine(); } @catch (id) {}
+    }
 }
+- (void)onAutoSaveToggled:(UISwitch*)sw { HA::auto_save_enabled = sw.on; }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
@@ -2050,23 +1856,9 @@ static bool AutoFillCraftMachine() {
     } else if (tab == 3) {
         @try {
             HA::ThreadScope scope;
-            if (indexPath.section == 0) {
-                if (indexPath.row == 2) {
-                    int up = HA::UpgradeAllEquippedToMax();
-                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã nâng cấp %d trang bị đang mặc lên +15 Full Dòng thành công!", up]];
-                }
-            } else if (indexPath.section == 1) {
-                HA::CraftWing((int)indexPath.row + 1);
-                [self showSuccessAlert:[NSString stringWithFormat:@"Đã chế tạo thành công Cánh Cấp %ld +15 Full Dòng vào túi đồ!", (long)indexPath.row + 1]];
-            } else if (indexPath.section == 2) {
-                int petIds[] = { 32, 17, 16, 33, 108 };
-                HA::CraftPet(petIds[indexPath.row]);
-                [self showSuccessAlert:@"Đã chế tạo Thú Cưỡi / Thần Thú thành công vào túi đồ!"];
-            } else {
-                int cats[] = { 24, 6, 6, 6, 6 };
-                int ids[] = { 1, 14, 13, 15, 12 };
-                HA::CraftSpecialItem(cats[indexPath.row], ids[indexPath.row]);
-                [self showSuccessAlert:@"Đã chế tạo Bảo Vật thành công vào túi đồ!"];
+            if (indexPath.row == 1) {
+                int up = HA::UpgradeAllEquippedToMax();
+                [self showSuccessAlert:[NSString stringWithFormat:@"Đã nâng cấp %d trang bị đang mặc lên +15 Full Dòng thành công!", up]];
             }
         } @catch (NSException* e) {
             [self showErrorAlert:e.reason];
@@ -2264,12 +2056,19 @@ static bool AutoFillCraftMachine() {
 @end
 
 __attribute__((constructor)) static void Entry() {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        uintptr_t base = HA::GetUnityFrameworkBase();
+        if (base) {
+            void* target = reinterpret_cast<void*>(base + 0x1AF1A74);
+            MSHookFunction(target, reinterpret_cast<void*>(HA::hooked_RandomRangeInt), reinterpret_cast<void**>(&HA::orig_RandomRangeInt));
+        }
+    });
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         static HAButtonLauncher* launcher;
         launcher = [[HAButtonLauncher alloc] init];
         [launcher attach];
         
-        // Start persistent frame loop
         [HAEngineLoop.shared start];
         
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
