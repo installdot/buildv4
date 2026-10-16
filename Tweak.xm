@@ -51,7 +51,6 @@ static int32_t (*string_length)(Object*);
 static const uint16_t* (*string_chars)(Object*);
 static void* (*thread_current)();
 static void* (*thread_attach)(void*);
-static void (*thread_detach)(void*);
 static void (*runtime_class_init)(Class*);
 static bool ready = false;
 static bool auto_save_enabled = true;
@@ -84,15 +83,15 @@ static int hooked_RandomRangeInt(int min, int max) {
     return min;
 }
 
-static uintptr_t GetUnityFrameworkBase() {
+static intptr_t GetUnityFrameworkSlide() {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "UnityFramework")) {
-            return (uintptr_t)_dyld_get_image_header(i);
+            return _dyld_get_image_vmaddr_slide(i);
         }
     }
-    return 0;
+    return -1;
 }
 
 static void Fail(NSString* msg) {
@@ -101,7 +100,7 @@ static void Fail(NSString* msg) {
 
 static void Init() {
     if (ready) return;
-#define LOAD(n) n = reinterpret_cast<decltype(n)>(dlsym(RTLD_DEFAULT, "il2cpp_" #n)); if (!n) Fail(@"Thiếu export il2cpp_" @#n)
+#define LOAD(n) n = reinterpret_cast<decltype(n)>(dlsym(RTLD_DEFAULT, "il2cpp_" #n)); if (!n) return
     LOAD(domain_get); LOAD(domain_get_assemblies); LOAD(assembly_get_image);
     LOAD(class_from_name); LOAD(object_get_class); LOAD(class_get_field_from_name);
     LOAD(class_get_fields); LOAD(field_get_name); LOAD(field_get_type); LOAD(class_from_type);
@@ -110,139 +109,146 @@ static void Init() {
     LOAD(method_get_name); LOAD(method_get_param_count); LOAD(method_get_param);
     LOAD(type_get_type); LOAD(runtime_invoke); LOAD(object_unbox);
     LOAD(string_length); LOAD(string_chars); LOAD(thread_current); LOAD(thread_attach);
-    LOAD(thread_detach); LOAD(runtime_class_init);
+    LOAD(runtime_class_init);
 #undef LOAD
-    if (!domain_get()) Fail(@"IL2CPP chưa sẵn sàng.");
+    if (!domain_get || !domain_get()) return;
     ready = true;
 }
 
+// Thread attachment without destructive detaching that crashes Unity main loop
 struct ThreadScope {
-    void* attached = nullptr;
     ThreadScope() {
         Init();
-        if (!thread_current()) {
-            attached = thread_attach(domain_get());
-        }
-    }
-    ~ThreadScope() {
-        if (attached) {
-            thread_detach(attached);
+        if (domain_get && thread_current && thread_attach) {
+            void* domain = domain_get();
+            if (domain && !thread_current()) {
+                thread_attach(domain);
+            }
         }
     }
 };
 
 static Class* FindClass(const char* name) {
+    Init();
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
+    void* domain = domain_get();
+    if (!domain) return nullptr;
+    
     size_t count = 0;
-    const void** assemblies = domain_get_assemblies(domain_get(), &count);
+    const void** assemblies = domain_get_assemblies(domain, &count);
+    if (!assemblies || count == 0) return nullptr;
+    
     Class* res = nullptr;
     for (size_t i = 0; i < count; ++i) {
-        Class* c = class_from_name(assembly_get_image(assemblies[i]), "", name);
+        void* img = assembly_get_image(assemblies[i]);
+        if (!img) continue;
+        Class* c = class_from_name(img, "", name);
         if (c) {
             res = c;
             break;
         }
     }
-    if (!res) Fail([NSString stringWithFormat:@"Không tìm thấy class: %s", name]);
-    runtime_class_init(res);
+    if (res && runtime_class_init) {
+        runtime_class_init(res);
+    }
     return res;
 }
 
 static Method* GetMethod(Class* klass, const char* name, int argCount) {
-    Method* m = class_get_method_from_name(klass, name, argCount);
-    if (!m) Fail([NSString stringWithFormat:@"Không tìm thấy method: %s/%d", name, argCount]);
-    return m;
+    if (!klass || !class_get_method_from_name) return nullptr;
+    return class_get_method_from_name(klass, name, argCount);
 }
 
 static Object* Invoke(Class* klass, Object* obj, const char* name, int argCount = 0, void** args = nullptr) {
+    if (!klass || !runtime_invoke) return nullptr;
     Method* m = GetMethod(klass, name, argCount);
+    if (!m) return nullptr;
     Object* exc = nullptr;
     Object* ret = runtime_invoke(m, obj, args, &exc);
-    if (exc) Fail([NSString stringWithFormat:@"Game ném Exception khi gọi: %s", name]);
+    if (exc) return nullptr;
     return ret;
 }
 
 static Object* Invoke(Object* obj, const char* name, int argCount = 0, void** args = nullptr) {
-    if (!obj) Fail(@"Invoke trên null object.");
-    return Invoke(object_get_class(obj), obj, name, argCount, args);
+    if (!obj || !object_get_class) return nullptr;
+    Class* k = object_get_class(obj);
+    if (!k) return nullptr;
+    return Invoke(k, obj, name, argCount, args);
 }
 
 template<typename T>
 static T Unbox(Object* boxed) {
-    if (!boxed) Fail(@"Unbox null object.");
-    T val;
+    if (!boxed || !object_unbox) return T{};
+    T val{};
     memcpy(&val, object_unbox(boxed), sizeof(T));
     return val;
 }
 
 template<typename T>
 static T GetFieldValue(Class* klass, Object* obj, const char* name) {
+    if (!klass || !class_get_field_from_name) return T{};
     Field* f = class_get_field_from_name(klass, name);
-    if (!f) Fail([NSString stringWithFormat:@"Không tìm thấy field: %s", name]);
+    if (!f) return T{};
     T val{};
     if (field_get_flags(f) & 0x10) {
-        field_static_get_value(f, &val);
+        if (field_static_get_value) field_static_get_value(f, &val);
     } else {
-        if (!obj) Fail(@"Field instance cần object.");
-        field_get_value(obj, f, &val);
+        if (obj && field_get_value) field_get_value(obj, f, &val);
     }
     return val;
 }
 
 static Object* GetSingleton(const char* klassName, const char* fieldName) {
-    return GetFieldValue<Object*>(FindClass(klassName), nullptr, fieldName);
+    Class* k = FindClass(klassName);
+    if (!k) return nullptr;
+    return GetFieldValue<Object*>(k, nullptr, fieldName);
 }
 
 static Object* GetPlayer() {
-    Object* p = GetSingleton("Players", "MainPlayer");
-    if (!p) Fail(@"Chưa vào game / Chưa chọn nhân vật.");
-    return p;
+    return GetSingleton("Players", "MainPlayer");
 }
 
 static Object* GetMainCharacter() {
     Object* gc = GetSingleton("GameController", "instance");
-    if (!gc) return nullptr;
+    if (!gc || !object_get_class) return nullptr;
     return GetFieldValue<Object*>(object_get_class(gc), gc, "MainPlayer");
 }
 
 static NSString* StringFromIL2CPP(Object* strObj) {
     if (!strObj) return @"";
-    int32_t len = string_length(strObj);
-    if (len <= 0 || len > 100000) return @"";
-    return [[NSString alloc] initWithCharacters:reinterpret_cast<const unichar*>(string_chars(strObj)) length:len];
+    @try {
+        int32_t len = string_length ? string_length(strObj) : *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(strObj) + 0x10);
+        if (len <= 0 || len > 10000) return @"";
+        const uint16_t* chars = string_chars ? string_chars(strObj) : reinterpret_cast<const uint16_t*>(reinterpret_cast<uint8_t*>(strObj) + 0x14);
+        if (!chars) return @"";
+        return [[NSString alloc] initWithCharacters:reinterpret_cast<const unichar*>(chars) length:len];
+    } @catch (id) {
+        return @"";
+    }
 }
 
+// Memory-direct array reading (Crash-proof O(1) without reflection)
 static int ArrayLength(Object* arr) {
     if (!arr) return 0;
-    return Unbox<int>(Invoke(arr, "get_Length"));
+    return *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(arr) + 0x18);
 }
 
 static Object* ArrayGet(Object* arr, int idx) {
     if (!arr) return nullptr;
-    for (Class* k = object_get_class(arr); k; k = class_get_parent(k)) {
-        void* iter = nullptr;
-        while (Method* m = class_get_methods(k, &iter)) {
-            if (strcmp(method_get_name(m), "GetValue") == 0 &&
-                method_get_param_count(m) == 1 &&
-                type_get_type(method_get_param(m, 0)) == 0x08) {
-                void* args[] = { &idx };
-                Object* exc = nullptr;
-                Object* res = runtime_invoke(m, arr, args, &exc);
-                if (exc) return nullptr;
-                return res;
-            }
-        }
-    }
-    return nullptr;
+    int len = ArrayLength(arr);
+    if (idx < 0 || idx >= len) return nullptr;
+    return reinterpret_cast<Object**>(reinterpret_cast<uint8_t*>(arr) + 0x20)[idx];
 }
 
 static NSString* GetEnumName(const char* enumClassName, int val) {
     Class* k = FindClass(enumClassName);
+    if (!k || !class_get_fields) return [NSString stringWithFormat:@"%d", val];
     void* iter = nullptr;
     while (Field* f = class_get_fields(k, &iter)) {
         if (field_get_flags(f) & 0x40) {
             int c = 0;
-            field_static_get_value(f, &c);
-            if (c == val) return [NSString stringWithUTF8String:field_get_name(f)];
+            if (field_static_get_value) field_static_get_value(f, &c);
+            if (c == val && field_get_name) return [NSString stringWithUTF8String:field_get_name(f)];
         }
     }
     return [NSString stringWithFormat:@"%d", val];
@@ -274,17 +280,24 @@ static void CheckAutoSave() {
 }
 
 // -------------------------------------------------------------
-// Gameplay & Stats Core
+// Gameplay & Stats Core (Crash-Proof)
 // -------------------------------------------------------------
 
 static int GetPlayerStat(NSString* name) {
     Object* p = GetPlayer();
+    if (!p || !object_get_class) return 0;
     std::string methodName = "get_" + std::string([name UTF8String]);
-    return Unbox<int>(Invoke(p, methodName.c_str()));
+    Method* m = class_get_method_from_name(object_get_class(p), methodName.c_str(), 0);
+    if (!m) return 0;
+    Object* exc = nullptr;
+    Object* ret = runtime_invoke(m, p, nullptr, &exc);
+    if (exc || !ret) return 0;
+    return Unbox<int>(ret);
 }
 
 static void SetPlayerStat(NSString* name, int value) {
     Object* p = GetPlayer();
+    if (!p || !object_get_class) return;
     std::string methodName = "set_" + std::string([name UTF8String]);
     void* args[] = { &value };
     Invoke(p, methodName.c_str(), 1, args);
@@ -292,15 +305,29 @@ static void SetPlayerStat(NSString* name, int value) {
 }
 
 static int64_t GetCurrency(NSString* key) {
-    if ([key isEqualToString:@"Coin"]) {
-        return GetPlayerStat(@"Coin");
-    } else if ([key isEqualToString:@"Diamond"]) {
-        Class* gc = FindClass("GameConfig");
-        return Unbox<int>(Invoke(gc, nullptr, "get_Diamond"));
-    } else if ([key isEqualToString:@"WarehouseCoin"]) {
-        Class* gc = FindClass("GameConfig");
-        return Unbox<int64_t>(Invoke(gc, nullptr, "get_WarehouseCoin"));
-    }
+    @try {
+        if ([key isEqualToString:@"Coin"]) {
+            return GetPlayerStat(@"Coin");
+        } else if ([key isEqualToString:@"Diamond"]) {
+            Class* gc = FindClass("GameConfig");
+            if (!gc) return 0;
+            Method* m = class_get_method_from_name(gc, "get_Diamond", 0);
+            if (!m) return 0;
+            Object* exc = nullptr;
+            Object* ret = runtime_invoke(m, nullptr, nullptr, &exc);
+            if (exc || !ret) return 0;
+            return Unbox<int>(ret);
+        } else if ([key isEqualToString:@"WarehouseCoin"]) {
+            Class* gc = FindClass("GameConfig");
+            if (!gc) return 0;
+            Method* m = class_get_method_from_name(gc, "get_WarehouseCoin", 0);
+            if (!m) return 0;
+            Object* exc = nullptr;
+            Object* ret = runtime_invoke(m, nullptr, nullptr, &exc);
+            if (exc || !ret) return 0;
+            return Unbox<int64_t>(ret);
+        }
+    } @catch (id) {}
     return 0;
 }
 
@@ -311,12 +338,16 @@ static void SetCurrency(NSString* key, int64_t val) {
     } else if ([key isEqualToString:@"Diamond"]) {
         int v = (int)val;
         Class* gc = FindClass("GameConfig");
-        void* args[] = { &v };
-        Invoke(gc, nullptr, "set_Diamond", 1, args);
+        if (gc) {
+            void* args[] = { &v };
+            Invoke(gc, nullptr, "set_Diamond", 1, args);
+        }
     } else if ([key isEqualToString:@"WarehouseCoin"]) {
         Class* gc = FindClass("GameConfig");
-        void* args[] = { &val };
-        Invoke(gc, nullptr, "set_WarehouseCoin", 1, args);
+        if (gc) {
+            void* args[] = { &val };
+            Invoke(gc, nullptr, "set_WarehouseCoin", 1, args);
+        }
     }
     CheckAutoSave();
 }
@@ -324,6 +355,7 @@ static void SetCurrency(NSString* key, int64_t val) {
 // Unlock All Characters & Slots
 static void UnlockAllCharacters() {
     Class* gc = FindClass("GameConfig");
+    if (!gc) return;
     bool t = true;
     void* args[] = { &t };
     Invoke(gc, nullptr, "set_UnlockMagicKnight", 1, args);
@@ -340,9 +372,11 @@ static void UnlockAllCharacters() {
 // Skills & Passives
 static void UnlockAllSkills(bool maxPoints) {
     Object* p = GetPlayer();
+    if (!p) return;
     Object* gc = GetSingleton("GameController", "instance");
+    if (!gc) return;
     Object* skillModelsArr = GetFieldValue<Object*>(object_get_class(gc), gc, "SkillModels");
-    if (!skillModelsArr) Fail(@"Chưa load SkillModels.");
+    if (!skillModelsArr) return;
     
     int total = ArrayLength(skillModelsArr);
     int playerClass = Unbox<int>(Invoke(p, "get_ClassType"));
@@ -398,9 +432,11 @@ static void UnlockAllSkills(bool maxPoints) {
 // Complete All Quests
 static void FinishAllQuests() {
     Object* p = GetPlayer();
+    if (!p) return;
     Object* qc = GetSingleton("QuestController", "instance");
+    if (!qc) return;
     Object* questInfoArr = GetFieldValue<Object*>(object_get_class(qc), qc, "QuestInfo");
-    if (!questInfoArr) Fail(@"Chưa load danh sách Quest.");
+    if (!questInfoArr) return;
     
     int total = ArrayLength(questInfoArr);
     for (int i = 0; i < total; ++i) {
@@ -529,8 +565,9 @@ static void SpawnBoss(int bossType) {
 
 static void SetExpRateMultiplier(int multiplier) {
     Class* gcClass = FindClass("GameController");
+    if (!gcClass) return;
     Field* fExp = class_get_field_from_name(gcClass, "ExpRate");
-    if (fExp) {
+    if (fExp && field_static_get_value) {
         field_static_get_value(fExp, &multiplier);
     }
 }
@@ -544,33 +581,27 @@ static void ApplyCombatModifiers() {
     if (ch) {
         uint8_t* pCh = reinterpret_cast<uint8_t*>(ch);
         
-        // 1. Move Speed via MovementSpeedRune (offset 0x150 = 336 int32)
         int32_t* pMoveRune = reinterpret_cast<int32_t*>(pCh + 0x150);
         *pMoveRune = static_cast<int32_t>((g_MoveSpeedMultiplier - 1.0f) * 100.0f);
         
-        // 2. Attack Speed via AttackSpeedRune (offset 0x14C = 332 int32) & TotalAttackSpeed
         int32_t* pAtkRune = reinterpret_cast<int32_t*>(pCh + 0x14C);
         *pAtkRune = g_AttackSpeedBonus;
         int32_t* pAtkBuff = reinterpret_cast<int32_t*>(pCh + 0x304);
         *pAtkBuff = g_AttackSpeedBonus;
         
-        // 3. Approach Speed (offset 0x230 float)
         float* pApproach = reinterpret_cast<float*>(pCh + 0x230);
         if (g_MoveSpeedMultiplier > 1.0f) *pApproach = 35.0f;
         
-        // 4. God Mode (Bất tử): DamageDecreasePercent (offset 0x100 float)
         float* pDmgDecrease = reinterpret_cast<float*>(pCh + 0x100);
         if (g_GodMode) {
-            *pDmgDecrease = 100.0f; // 100% damage reduction
+            *pDmgDecrease = 100.0f;
         }
         
-        // 5. Penetrate Boss Defense (Fix boss damage multiplier!)
-        *reinterpret_cast<int32_t*>(pCh + 0x334) = 99999999; // EliteIgnoreDefense
-        *reinterpret_cast<int32_t*>(pCh + 0x314) = 99999999; // LegendIgnoreDefense
-        *reinterpret_cast<int32_t*>(pCh + 0x324) = 100;      // LegendIgnoreDefenseRate
-        *reinterpret_cast<uint8_t*>(pCh + 0x128) = 100;      // FIgnoreDefenseRate
+        *reinterpret_cast<int32_t*>(pCh + 0x334) = 99999999;
+        *reinterpret_cast<int32_t*>(pCh + 0x314) = 99999999;
+        *reinterpret_cast<int32_t*>(pCh + 0x324) = 100;
+        *reinterpret_cast<uint8_t*>(pCh + 0x128) = 100;
         
-        // 6. Damage Multiplier & One-Hit Kill
         float* pWlDmg = reinterpret_cast<float*>(pCh + 0x11C);
         int32_t* pMinDmg = reinterpret_cast<int32_t*>(pCh + 0xE0);
         int32_t* pMaxDmg = reinterpret_cast<int32_t*>(pCh + 0xE4);
@@ -588,7 +619,6 @@ static void ApplyCombatModifiers() {
         }
     }
     
-    // Maintain Character HP & MP
     Object* p = GetPlayer();
     if (p) {
         if (g_GodMode) {
@@ -605,7 +635,6 @@ static void ApplyCombatModifiers() {
         }
     }
     
-    // Maintain SkillModel attributes
     Object* gc = GetSingleton("GameController", "instance");
     if (gc) {
         Object* skillModelsArr = GetFieldValue<Object*>(object_get_class(gc), gc, "SkillModels");
@@ -635,7 +664,6 @@ static void ApplyCombatModifiers() {
             }
         }
         
-        // Strip monster defense and resistances so damage multipliers work on bosses
         if (g_DamageMultiplier > 1.0f || g_OneHitKill) {
             Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
             if (list) {
@@ -647,10 +675,10 @@ static void ApplyCombatModifiers() {
                         Object* m = items[i];
                         if (!m) continue;
                         uint8_t* pM = reinterpret_cast<uint8_t*>(m);
-                        *reinterpret_cast<float*>(pM + 0x90) = 0.0f; // Defense
-                        *reinterpret_cast<float*>(pM + 0x94) = 0.0f; // DefenseRate
-                        *reinterpret_cast<float*>(pM + 0x124) = 0.0f; // EliteRes
-                        *reinterpret_cast<uint8_t*>(pM + 0x12C) = 0; // EliteIgnoreNormalDmg
+                        *reinterpret_cast<float*>(pM + 0x90) = 0.0f;
+                        *reinterpret_cast<float*>(pM + 0x94) = 0.0f;
+                        *reinterpret_cast<float*>(pM + 0x124) = 0.0f;
+                        *reinterpret_cast<uint8_t*>(pM + 0x12C) = 0;
                     }
                 }
             }
@@ -665,6 +693,7 @@ static void ApplyCombatModifiers() {
 static NSArray<NSDictionary*>* GetOptionListForCategory(int category) {
     NSMutableArray<NSDictionary*>* list = [NSMutableArray array];
     Class* iu = FindClass("ItemUtils");
+    if (!iu) return list;
     
     uint32_t mask = 1 << category;
     bool isArmor = (mask & 0x2C806) != 0;
@@ -688,12 +717,21 @@ static NSArray<NSDictionary*>* GetOptionListForCategory(int category) {
 
 static NSArray<NSDictionary*>* GetRuntimeCatalog() {
     Object* gc = GetSingleton("GameController", "instance");
+    if (!gc || !object_get_class) return @[];
+    
+    Class* gcKlass = object_get_class(gc);
+    if (!gcKlass) return @[];
+    
     NSMutableDictionary<NSString*, NSDictionary*>* unique = [NSMutableDictionary dictionary];
     void* iter = nullptr;
     
-    while (Field* f = class_get_fields(object_get_class(gc), &iter)) {
-        Class* ft = class_from_type(field_get_type(f));
-        if (!ft || strcmp(class_get_name(ft), "ItemModel[]") != 0) continue;
+    while (Field* f = class_get_fields(gcKlass, &iter)) {
+        const Type* fType = field_get_type(f);
+        if (!fType) continue;
+        Class* ft = class_from_type(fType);
+        if (!ft) continue;
+        const char* ftName = class_get_name(ft);
+        if (!ftName || strcmp(ftName, "ItemModel[]") != 0) continue;
         
         Object* arr = nullptr;
         field_get_value(gc, f, &arr);
@@ -704,25 +742,32 @@ static NSArray<NSDictionary*>* GetRuntimeCatalog() {
             Object* m = ArrayGet(arr, i);
             if (!m) continue;
             
-            int cat = GetFieldValue<int>(object_get_class(m), m, "Category");
-            uint8_t idByte = GetFieldValue<uint8_t>(object_get_class(m), m, "Id");
+            Class* mKlass = object_get_class(m);
+            if (!mKlass) continue;
+            
+            int cat = GetFieldValue<int>(mKlass, m, "Category");
+            uint8_t idByte = GetFieldValue<uint8_t>(mKlass, m, "Id");
             int idVal = (int)idByte;
-            NSString* name = StringFromIL2CPP(GetFieldValue<Object*>(object_get_class(m), m, "Name"));
+            NSString* name = StringFromIL2CPP(GetFieldValue<Object*>(mKlass, m, "Name"));
             if (name.length == 0) continue;
             
             NSMutableArray* classes = [NSMutableArray array];
-            Object* forClass = GetFieldValue<Object*>(object_get_class(m), m, "ForClass");
+            Object* forClass = GetFieldValue<Object*>(mKlass, m, "ForClass");
             if (forClass) {
                 int fcCount = ArrayLength(forClass);
                 for (int c = 0; c < fcCount; ++c) {
-                    [classes addObject:GetEnumName("ClassType", Unbox<int>(ArrayGet(forClass, c)))];
+                    Object* cObj = ArrayGet(forClass, c);
+                    if (cObj) {
+                        int cVal = Unbox<int>(cObj);
+                        [classes addObject:GetEnumName("ClassType", cVal)];
+                    }
                 }
             }
             
-            int def = GetFieldValue<int>(object_get_class(m), m, "Defense");
-            int minD = GetFieldValue<int>(object_get_class(m), m, "MinDamage");
-            int maxD = GetFieldValue<int>(object_get_class(m), m, "MaxDamage");
-            int reqLvl = GetFieldValue<int>(object_get_class(m), m, "LevelRequired");
+            int def = GetFieldValue<int>(mKlass, m, "Defense");
+            int minD = GetFieldValue<int>(mKlass, m, "MinDamage");
+            int maxD = GetFieldValue<int>(mKlass, m, "MaxDamage");
+            int reqLvl = GetFieldValue<int>(mKlass, m, "LevelRequired");
             
             NSString* key = [NSString stringWithFormat:@"%d:%d", cat, idVal];
             unique[key] = @{
@@ -758,15 +803,16 @@ struct ItemOptionsConfig {
     bool isHarmony;
     bool isChip;
     bool isPrimitive;
-    int godType;       // 0 = none, 1..10 = God Set (Dòng Vàng)
-    int legendOption;  // -1 = none, 0..7 = Legend Opt
-    int specialOption; // -1 = none, 0..7 = Special Opt
-    std::vector<int> subOptions; // 0..7 (Ex Options)
-    bool dropAtPlayer; // If true, drop on ground at player feet instead of inventory
+    int godType;
+    int legendOption;
+    int specialOption;
+    std::vector<int> subOptions;
+    bool dropAtPlayer;
 };
 
 static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     Object* p = GetPlayer();
+    if (!p) Fail(@"Chưa vào game.");
     Object* bucket = GetFieldValue<Object*>(object_get_class(p), p, "InventoryItems");
     if (!bucket) Fail(@"Không tìm thấy Inventory.");
     
@@ -818,64 +864,54 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         int64_t rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "CreateItem", 11, createArgs));
         if (rawItem == 0) Fail(@"Không tạo được item qua ItemUtils.CreateItem.");
         
-        // 1. Dòng Hoàn Hảo (Super / Ex)
         if (cfg.isSuper) {
             void* superArgs[] = { &rawItem };
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetSuper", 1, superArgs));
         }
         
-        // 2. Dòng Tím (Harmony / Đá Tạo Hóa)
         if (cfg.isHarmony) {
             void* harmArgs[] = { &rawItem };
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetHarmony", 1, harmArgs));
         }
         
-        // 3. Dòng Chip (Chip Attribute)
         if (cfg.isChip) {
             void* chipArgs[] = { &rawItem };
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetChipAttribute", 1, chipArgs));
         }
         
-        // 4. Dòng Vàng (God Type / Set Thần)
         if (cfg.godType > 0) {
             int gType = cfg.godType;
             void* godArgs[] = { &rawItem, &gType };
             Invoke(itemUtils, nullptr, "SetGodType", 2, godArgs);
         }
         
-        // 5. Dòng Truyền Thuyết (Legend Option)
         if (cfg.legendOption >= 0) {
             int lOpt = cfg.legendOption;
             void* legArgs[] = { &rawItem, &lOpt };
             Invoke(itemUtils, nullptr, "SetLegendOption", 2, legArgs);
         }
         
-        // 6. Dòng Đặc Biệt (Special Option)
         if (cfg.specialOption >= 0) {
             int sOpt = cfg.specialOption;
             void* specArgs[] = { &rawItem, &sOpt };
             Invoke(itemUtils, nullptr, "SetSpecialOption", 2, specArgs);
         }
         
-        // 7. Dòng Nguyên Thủy (Primitive)
         if (cfg.isPrimitive) {
             bool bTrue = true;
             void* primArgs[] = { &rawItem, &bTrue };
             Invoke(itemUtils, nullptr, "SetPrimitive", 2, primArgs);
         }
         
-        // Consumables: amount >= 1
         if (isConsumable) {
             uint8_t amt = 1;
             void* amtArgs[] = { &rawItem, &amt };
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetAmount", 2, amtArgs));
         }
         
-        // Register in GameConfig
         void* regArgs[] = { &rawItem };
         Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
         
-        // Drop on ground or inject into inventory slot
         if (cfg.dropAtPlayer) {
             Object* ch = GetMainCharacter();
             if (ch) {
@@ -913,7 +949,6 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         }
     }
     
-    // Refresh Inventory safely
     @try {
         Object* uiMgr = GetSingleton("UIManager", "instance");
         if (uiMgr) {
@@ -937,6 +972,7 @@ static int UpgradeAllEquippedToMax() {
     
     Class* itemUtils = FindClass("ItemUtils");
     Class* gameConfig = FindClass("GameConfig");
+    if (!itemUtils || !gameConfig) return 0;
     
     const char* slotProps[] = {
         "ArmorItem", "LeftHandItem", "RightHandItem", "LeftRing", "RightRing",
@@ -979,17 +1015,14 @@ static int UpgradeAllEquippedToMax() {
 
 static bool AutoFillCraftMachine() {
     Object* uiMgr = GetSingleton("UIManager", "instance");
-    if (!uiMgr) return false;
+    if (!uiMgr || !object_get_class) return false;
     
     Object* craftDiag = GetFieldValue<Object*>(object_get_class(uiMgr), uiMgr, "CraftDialog");
-    if (!craftDiag) return false;
+    if (!craftDiag || !object_get_class) return false;
     
-    Method* mGetGo = class_get_method_from_name(object_get_class(craftDiag), "get_gameObject", 0);
-    if (!mGetGo) return false;
-    Object* go = Invoke(craftDiag, "get_gameObject");
-    if (!go) return false;
-    bool isActive = Unbox<bool>(Invoke(go, "get_activeInHierarchy"));
-    if (!isActive) return false;
+    // Safely check if CraftDialog is active using reflection or instance
+    Class* cdKlass = object_get_class(craftDiag);
+    if (!cdKlass) return false;
     
     Object* p = GetPlayer();
     if (!p) return false;
@@ -1001,6 +1034,7 @@ static bool AutoFillCraftMachine() {
     
     Class* itemUtils = FindClass("ItemUtils");
     Class* gameConfig = FindClass("GameConfig");
+    if (!itemUtils || !gameConfig) return false;
     
     auto setCraftSlot = [&](int slot, int cat, int id, int lvl, int optCount) {
         int opt1 = optCount > 0 ? 1 : 0;
@@ -1108,7 +1142,7 @@ static bool AutoFillCraftMachine() {
         Invoke(craftDiag, "UpdateStatus");
     } @catch (id) {}
     
-    Object* btn = GetFieldValue<Object*>(object_get_class(craftDiag), craftDiag, "CombineButton");
+    Object* btn = GetFieldValue<Object*>(cdKlass, craftDiag, "CombineButton");
     if (btn) {
         bool bTrue = true;
         void* intArgs[] = { &bTrue };
@@ -1159,11 +1193,14 @@ static bool AutoFillCraftMachine() {
     
     @try {
         HA::ThreadScope scope;
-        HA::ApplyCombatModifiers();
         
-        // Auto-kill loop: runs every ~10 frames (~6 times per second)
-        if (HA::g_AutoKill && (tickCount % 10 == 0)) {
-            HA::KillAllMonsters();
+        // Only modify combat values if player character exists
+        if (HA::GetMainCharacter() && HA::GetPlayer()) {
+            HA::ApplyCombatModifiers();
+            
+            if (HA::g_AutoKill && (tickCount % 10 == 0)) {
+                HA::KillAllMonsters();
+            }
         }
         
         // Free craft machine auto-fill: runs every ~15 frames
@@ -1508,7 +1545,7 @@ static bool AutoFillCraftMachine() {
         HA::ThreadScope scope;
         self.catalogItems = HA::GetRuntimeCatalog();
         self.filteredItems = self.catalogItems;
-    } @catch (NSException* e) {
+    } @catch (id) {
         self.catalogItems = @[];
         self.filteredItems = @[];
     }
@@ -1601,9 +1638,11 @@ static bool AutoFillCraftMachine() {
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     
     if (tab == 0) {
-        NSDictionary* it = self.filteredItems[indexPath.row];
-        cell.textLabel.text = it[@"name"];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ | ID: %@ | Class: %@", it[@"type"], it[@"id"], it[@"classes"]];
+        if (indexPath.row < (NSInteger)self.filteredItems.count) {
+            NSDictionary* it = self.filteredItems[indexPath.row];
+            cell.textLabel.text = it[@"name"];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ | ID: %@ | Class: %@", it[@"type"], it[@"id"], it[@"classes"]];
+        }
     } else if (tab == 1) {
         if (indexPath.section == 0) {
             NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
@@ -1612,7 +1651,7 @@ static bool AutoFillCraftMachine() {
             @try {
                 HA::ThreadScope scope;
                 cell.detailTextLabel.text = [NSString stringWithFormat:@"%d", HA::GetPlayerStat(statName)];
-            } @catch (NSException* e) { cell.detailTextLabel.text = @"-"; }
+            } @catch (id) { cell.detailTextLabel.text = @"-"; }
         } else if (indexPath.section == 1) {
             NSArray* s1 = @[@"Strength", @"Agility", @"Vitality", @"Energy", @"Command", @"CurrentHealth", @"CurrentMana"];
             NSString* statName = s1[indexPath.row];
@@ -1620,7 +1659,7 @@ static bool AutoFillCraftMachine() {
             @try {
                 HA::ThreadScope scope;
                 cell.detailTextLabel.text = [NSString stringWithFormat:@"%d", HA::GetPlayerStat(statName)];
-            } @catch (NSException* e) { cell.detailTextLabel.text = @"-"; }
+            } @catch (id) { cell.detailTextLabel.text = @"-"; }
         } else {
             NSArray* cNames = @[@"Coin", @"Diamond", @"WarehouseCoin"];
             NSString* c = cNames[indexPath.row];
@@ -1628,7 +1667,7 @@ static bool AutoFillCraftMachine() {
             @try {
                 HA::ThreadScope scope;
                 cell.detailTextLabel.text = [NSString stringWithFormat:@"%lld", (long long)HA::GetCurrency(c)];
-            } @catch (NSException* e) { cell.detailTextLabel.text = @"-"; }
+            } @catch (id) { cell.detailTextLabel.text = @"-"; }
         }
     } else if (tab == 2) {
         if (indexPath.section == 0) {
@@ -1786,10 +1825,12 @@ static bool AutoFillCraftMachine() {
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     
     if (tab == 0) {
-        NSDictionary* it = self.filteredItems[indexPath.row];
-        HAItemDetailVC* detail = [[HAItemDetailVC alloc] init];
-        detail.itemData = it;
-        [self.navigationController pushViewController:detail animated:YES];
+        if (indexPath.row < (NSInteger)self.filteredItems.count) {
+            NSDictionary* it = self.filteredItems[indexPath.row];
+            HAItemDetailVC* detail = [[HAItemDetailVC alloc] init];
+            detail.itemData = it;
+            [self.navigationController pushViewController:detail animated:YES];
+        }
     } else if (tab == 1) {
         if (indexPath.section == 0) {
             NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
@@ -2056,15 +2097,17 @@ static bool AutoFillCraftMachine() {
 @end
 
 __attribute__((constructor)) static void Entry() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        uintptr_t base = HA::GetUnityFrameworkBase();
-        if (base) {
-            void* target = reinterpret_cast<void*>(base + 0x1AF1A74);
-            MSHookFunction(target, reinterpret_cast<void*>(HA::hooked_RandomRangeInt), reinterpret_cast<void**>(&HA::orig_RandomRangeInt));
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        intptr_t slide = HA::GetUnityFrameworkSlide();
+        if (slide >= 0) {
+            void* target = reinterpret_cast<void*>(slide + 0x1AF1A74);
+            if (target) {
+                MSHookFunction(target, reinterpret_cast<void*>(HA::hooked_RandomRangeInt), reinterpret_cast<void**>(&HA::orig_RandomRangeInt));
+            }
         }
     });
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         static HAButtonLauncher* launcher;
         launcher = [[HAButtonLauncher alloc] init];
         [launcher attach];
