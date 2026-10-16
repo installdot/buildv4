@@ -13,8 +13,6 @@
 #include <vector>
 #include <string>
 
-extern "C" void MSHookFunction(void *symbol, void *replace, void **result);
-
 namespace HA {
 
 struct Object;
@@ -69,13 +67,13 @@ static bool g_AutoKill = false;
 static bool g_BossDropEnabled = false;
 static bool g_FreeCraft = true;
 
-// 100% Craft Success Rate Hook
+// 100% Craft Success Rate Hook via __DATA Function Pointer Redirection
 typedef int (*RandomRangeInt_t)(int min, int max);
 static RandomRangeInt_t orig_RandomRangeInt = nullptr;
 
 static int hooked_RandomRangeInt(int min, int max) {
     if (g_FreeCraft && min == 0 && max == 100) {
-        return 0; // 0 is always < rate (rate >= 1), so craft 100% SUCCEEDS!
+        return 0; // 0 < rate (any rate >= 1) is always false for fail check, so craft 100% SUCCEEDS!
     }
     if (orig_RandomRangeInt) {
         return orig_RandomRangeInt(min, max);
@@ -94,8 +92,27 @@ static intptr_t GetUnityFrameworkSlide() {
     return -1;
 }
 
-static void Fail(NSString* msg) {
-    @throw [NSException exceptionWithName:@"HeroAgeException" reason:msg userInfo:nil];
+static void InstallCraftSuccessHook() {
+    intptr_t slide = GetUnityFrameworkSlide();
+    if (slide >= 0) {
+        // 0x25252D8 is off_25252D8 in __DATA segment
+        uint8_t* base = reinterpret_cast<uint8_t*>(slide);
+        void** pFuncPtr = reinterpret_cast<void**>(base + 0x25252D8);
+        if (pFuncPtr) {
+            // Trigger resolution if not yet resolved
+            if (*pFuncPtr == nullptr) {
+                typedef int (*TriggerFn)(int, int);
+                TriggerFn trigger = reinterpret_cast<TriggerFn>(base + 0x1AF1A74);
+                if (trigger) {
+                    @try { trigger(0, 10); } @catch (id) {}
+                }
+            }
+            if (*pFuncPtr != nullptr && *pFuncPtr != reinterpret_cast<void*>(hooked_RandomRangeInt)) {
+                orig_RandomRangeInt = reinterpret_cast<RandomRangeInt_t>(*pFuncPtr);
+                *pFuncPtr = reinterpret_cast<void*>(hooked_RandomRangeInt);
+            }
+        }
+    }
 }
 
 static void Init() {
@@ -154,14 +171,10 @@ static Class* FindClass(const char* name) {
     return res;
 }
 
-static Method* GetMethod(Class* klass, const char* name, int argCount) {
-    if (!klass || !class_get_method_from_name) return nullptr;
-    return class_get_method_from_name(klass, name, argCount);
-}
-
+// Safe invoke that never throws or crashes
 static Object* Invoke(Class* klass, Object* obj, const char* name, int argCount = 0, void** args = nullptr) {
-    if (!klass || !runtime_invoke) return nullptr;
-    Method* m = GetMethod(klass, name, argCount);
+    if (!klass || !runtime_invoke || !class_get_method_from_name) return nullptr;
+    Method* m = class_get_method_from_name(klass, name, argCount);
     if (!m) return nullptr;
     Object* exc = nullptr;
     Object* ret = runtime_invoke(m, obj, args, &exc);
@@ -400,8 +413,11 @@ static void UnlockAllSkills(bool maxPoints) {
             int fcCount = ArrayLength(forClassArr);
             if (fcCount == 0) classMatch = true;
             for (int c = 0; c < fcCount; ++c) {
-                int cType = Unbox<int>(ArrayGet(forClassArr, c));
-                if (cType == playerClass) { classMatch = true; break; }
+                Object* cObj = ArrayGet(forClassArr, c);
+                if (cObj) {
+                    int cType = Unbox<int>(cObj);
+                    if (cType == playerClass) { classMatch = true; break; }
+                }
             }
         } else {
             classMatch = true;
@@ -465,7 +481,7 @@ static int ConvertAllMonstersToBossDrop() {
     
     int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
     uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
-    if (!itemsArray || size <= 0) return 0;
+    if (!itemsArray || size <= 0 || size > 1000) return 0;
     
     Object** items = reinterpret_cast<Object**>(itemsArray + 0x20);
     int converted = 0;
@@ -509,7 +525,7 @@ static int KillAllMonsters() {
     
     int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
     uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
-    if (!itemsArray || size <= 0) return 0;
+    if (!itemsArray || size <= 0 || size > 1000) return 0;
     
     Object** items = reinterpret_cast<Object**>(itemsArray + 0x20);
     int killed = 0;
@@ -548,10 +564,10 @@ static int KillAllMonsters() {
 
 static void SpawnBoss(int bossType) {
     Object* gc = GetSingleton("GameController", "instance");
-    if (!gc) Fail(@"Chưa vào game.");
+    if (!gc) return;
     
     Object* wm = GetFieldValue<Object*>(object_get_class(gc), gc, "WorldManager");
-    if (!wm) Fail(@"Chưa có WorldManager.");
+    if (!wm) return;
     
     switch (bossType) {
         case 0: Invoke(wm, "CheckAndCreateBoss"); break;
@@ -669,7 +685,7 @@ static void ApplyCombatModifiers() {
             if (list) {
                 int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
                 uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
-                if (itemsArray && size > 0) {
+                if (itemsArray && size > 0 && size <= 1000) {
                     Object** items = reinterpret_cast<Object**>(itemsArray + 0x20);
                     for (int i = 0; i < size; ++i) {
                         Object* m = items[i];
@@ -1014,142 +1030,157 @@ static int UpgradeAllEquippedToMax() {
 }
 
 static bool AutoFillCraftMachine() {
-    Object* uiMgr = GetSingleton("UIManager", "instance");
-    if (!uiMgr || !object_get_class) return false;
-    
-    Object* craftDiag = GetFieldValue<Object*>(object_get_class(uiMgr), uiMgr, "CraftDialog");
-    if (!craftDiag || !object_get_class) return false;
-    
-    // Safely check if CraftDialog is active using reflection or instance
-    Class* cdKlass = object_get_class(craftDiag);
-    if (!cdKlass) return false;
-    
-    Object* p = GetPlayer();
-    if (!p) return false;
-    Object* craftBucket = GetFieldValue<Object*>(object_get_class(p), p, "CraftItems");
-    if (!craftBucket) return false;
-    
-    uint8_t* pDiag = reinterpret_cast<uint8_t*>(craftDiag);
-    int mode = *reinterpret_cast<int32_t*>(pDiag + 0x120);
-    
-    Class* itemUtils = FindClass("ItemUtils");
-    Class* gameConfig = FindClass("GameConfig");
-    if (!itemUtils || !gameConfig) return false;
-    
-    auto setCraftSlot = [&](int slot, int cat, int id, int lvl, int optCount) {
-        int opt1 = optCount > 0 ? 1 : 0;
-        int opt2 = optCount > 1 ? 1 : 0;
-        int opt3 = optCount > 2 ? 1 : 0;
-        int opt4 = optCount > 3 ? 1 : 0;
-        int opt5 = optCount > 4 ? 1 : 0;
-        int opt6 = optCount > 5 ? 1 : 0;
-        int opt7 = optCount > 6 ? 1 : 0;
-        int64_t opt8 = optCount > 7 ? 1 : 0;
-        
-        void* createArgs[] = { &cat, &id, &lvl, &opt1, &opt2, &opt3, &opt4, &opt5, &opt6, &opt7, &opt8 };
-        int64_t rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "CreateItem", 11, createArgs));
-        if (cat == 6 || cat == 8 || cat == 20) {
-            uint8_t amt = 10;
-            void* amtArgs[] = { &rawItem, &amt };
-            rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetAmount", 2, amtArgs));
-        }
-        void* setArgs[] = { &slot, &rawItem };
-        Invoke(craftBucket, "set_Item", 2, setArgs);
-        void* regArgs[] = { &rawItem };
-        Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
-    };
-    
-    int dummySlot = 0;
-    void* slot0Args[] = { &dummySlot };
-    int64_t slot0Val = Unbox<int64_t>(Invoke(craftBucket, "get_Item", 1, slot0Args));
-    
-    if (slot0Val == 0) {
-        switch (mode) {
-            case 1:
-                setCraftSlot(0, 3, 1, 10, 4);
-                setCraftSlot(1, 6, 1, 0, 0);
-                break;
-            case 2:
-                setCraftSlot(0, 3, 1, 10, 6);
-                setCraftSlot(1, 6, 11, 0, 0);
-                break;
-            case 3:
-                setCraftSlot(0, 14, 1, 10, 6);
-                setCraftSlot(1, 6, 11, 0, 0);
-                setCraftSlot(2, 6, 13, 0, 0);
-                break;
-            case 4:
-                setCraftSlot(0, 14, 16, 15, 8);
-                setCraftSlot(1, 6, 14, 0, 0);
-                setCraftSlot(2, 6, 15, 0, 0);
-                break;
-            case 5:
-            case 6:
-                setCraftSlot(0, 6, 18, 0, 0);
-                setCraftSlot(1, 6, 19, 0, 0);
-                break;
-            case 7:
-                setCraftSlot(0, 6, 22, 0, 0);
-                setCraftSlot(1, 6, 2, 0, 0);
-                setCraftSlot(2, 6, 3, 0, 0);
-                setCraftSlot(3, 6, 4, 0, 0);
-                setCraftSlot(4, 6, 5, 0, 0);
-                break;
-            case 8:
-                setCraftSlot(0, 6, 23, 0, 0);
-                break;
-            case 11:
-                setCraftSlot(0, 6, 24, 0, 0);
-                setCraftSlot(1, 3, 1, 15, 8);
-                break;
-            case 12:
-            case 20:
-                setCraftSlot(0, 16, 32, 0, 0);
-                setCraftSlot(1, 6, 1, 0, 0);
-                break;
-            case 16:
-                setCraftSlot(0, 14, 16, 15, 8);
-                setCraftSlot(1, 14, 17, 15, 8);
-                break;
-            case 18:
-                setCraftSlot(0, 6, 37, 0, 0);
-                setCraftSlot(1, 6, 39, 0, 0);
-                setCraftSlot(2, 6, 40, 0, 0);
-                break;
-            case 19:
-                setCraftSlot(0, 6, 52, 0, 0);
-                break;
-            case 21:
-                setCraftSlot(0, 6, 26, 0, 0);
-                setCraftSlot(1, 6, 27, 0, 0);
-                setCraftSlot(2, 6, 28, 0, 0);
-                break;
-            case 22:
-                setCraftSlot(0, 23, 1, 0, 0);
-                setCraftSlot(1, 23, 2, 0, 0);
-                setCraftSlot(2, 23, 3, 0, 0);
-                setCraftSlot(3, 23, 4, 0, 0);
-                break;
-            default:
-                setCraftSlot(0, 3, 1, 15, 8);
-                setCraftSlot(1, 6, 1, 0, 0);
-                setCraftSlot(2, 6, 11, 0, 0);
-                break;
-        }
-    }
-    
     @try {
+        Object* uiMgr = GetSingleton("UIManager", "instance");
+        if (!uiMgr || !object_get_class) return false;
+        
+        Object* craftDiag = GetFieldValue<Object*>(object_get_class(uiMgr), uiMgr, "CraftDialog");
+        if (!craftDiag || !object_get_class) return false;
+        
+        // Check if CraftDialog is active using Component.get_gameObject and GameObject.get_activeInHierarchy
+        Class* compClass = FindClass("Component");
+        if (!compClass) return false;
+        Object* go = Invoke(compClass, craftDiag, "get_gameObject");
+        if (!go || !object_get_class) return false;
+        
+        Class* goClass = object_get_class(go);
+        if (!goClass) return false;
+        Method* mActive = class_get_method_from_name(goClass, "get_activeInHierarchy", 0);
+        if (!mActive) return false;
+        Object* exc = nullptr;
+        Object* resActive = runtime_invoke(mActive, go, nullptr, &exc);
+        if (exc || !resActive) return false;
+        bool isActive = Unbox<bool>(resActive);
+        if (!isActive) return false; // Dialog is closed! Don't do anything!
+        
+        Object* p = GetPlayer();
+        if (!p) return false;
+        Object* craftBucket = GetFieldValue<Object*>(object_get_class(p), p, "CraftItems");
+        if (!craftBucket) return false;
+        
+        uint8_t* pDiag = reinterpret_cast<uint8_t*>(craftDiag);
+        int mode = *reinterpret_cast<int32_t*>(pDiag + 0x120);
+        
+        Class* itemUtils = FindClass("ItemUtils");
+        Class* gameConfig = FindClass("GameConfig");
+        if (!itemUtils || !gameConfig) return false;
+        
+        auto setCraftSlot = [&](int slot, int cat, int id, int lvl, int optCount) {
+            int opt1 = optCount > 0 ? 1 : 0;
+            int opt2 = optCount > 1 ? 1 : 0;
+            int opt3 = optCount > 2 ? 1 : 0;
+            int opt4 = optCount > 3 ? 1 : 0;
+            int opt5 = optCount > 4 ? 1 : 0;
+            int opt6 = optCount > 5 ? 1 : 0;
+            int opt7 = optCount > 6 ? 1 : 0;
+            int64_t opt8 = optCount > 7 ? 1 : 0;
+            
+            void* createArgs[] = { &cat, &id, &lvl, &opt1, &opt2, &opt3, &opt4, &opt5, &opt6, &opt7, &opt8 };
+            int64_t rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "CreateItem", 11, createArgs));
+            if (cat == 6 || cat == 8 || cat == 20) {
+                uint8_t amt = 10;
+                void* amtArgs[] = { &rawItem, &amt };
+                rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetAmount", 2, amtArgs));
+            }
+            void* setArgs[] = { &slot, &rawItem };
+            Invoke(craftBucket, "set_Item", 2, setArgs);
+            void* regArgs[] = { &rawItem };
+            Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
+        };
+        
+        int dummySlot = 0;
+        void* slot0Args[] = { &dummySlot };
+        int64_t slot0Val = Unbox<int64_t>(Invoke(craftBucket, "get_Item", 1, slot0Args));
+        
+        if (slot0Val == 0) {
+            switch (mode) {
+                case 1:
+                    setCraftSlot(0, 3, 1, 10, 4);
+                    setCraftSlot(1, 6, 1, 0, 0);
+                    break;
+                case 2:
+                    setCraftSlot(0, 3, 1, 10, 6);
+                    setCraftSlot(1, 6, 11, 0, 0);
+                    break;
+                case 3:
+                    setCraftSlot(0, 14, 1, 10, 6);
+                    setCraftSlot(1, 6, 11, 0, 0);
+                    setCraftSlot(2, 6, 13, 0, 0);
+                    break;
+                case 4:
+                    setCraftSlot(0, 14, 16, 15, 8);
+                    setCraftSlot(1, 6, 14, 0, 0);
+                    setCraftSlot(2, 6, 15, 0, 0);
+                    break;
+                case 5:
+                case 6:
+                    setCraftSlot(0, 6, 18, 0, 0);
+                    setCraftSlot(1, 6, 19, 0, 0);
+                    break;
+                case 7:
+                    setCraftSlot(0, 6, 22, 0, 0);
+                    setCraftSlot(1, 6, 2, 0, 0);
+                    setCraftSlot(2, 6, 3, 0, 0);
+                    setCraftSlot(3, 6, 4, 0, 0);
+                    setCraftSlot(4, 6, 5, 0, 0);
+                    break;
+                case 8:
+                    setCraftSlot(0, 6, 23, 0, 0);
+                    break;
+                case 11:
+                    setCraftSlot(0, 6, 24, 0, 0);
+                    setCraftSlot(1, 3, 1, 15, 8);
+                    break;
+                case 12:
+                case 20:
+                    setCraftSlot(0, 16, 32, 0, 0);
+                    setCraftSlot(1, 6, 1, 0, 0);
+                    break;
+                case 16:
+                    setCraftSlot(0, 14, 16, 15, 8);
+                    setCraftSlot(1, 14, 17, 15, 8);
+                    break;
+                case 18:
+                    setCraftSlot(0, 6, 37, 0, 0);
+                    setCraftSlot(1, 6, 39, 0, 0);
+                    setCraftSlot(2, 6, 40, 0, 0);
+                    break;
+                case 19:
+                    setCraftSlot(0, 6, 52, 0, 0);
+                    break;
+                case 21:
+                    setCraftSlot(0, 6, 26, 0, 0);
+                    setCraftSlot(1, 6, 27, 0, 0);
+                    setCraftSlot(2, 6, 28, 0, 0);
+                    break;
+                case 22:
+                    setCraftSlot(0, 23, 1, 0, 0);
+                    setCraftSlot(1, 23, 2, 0, 0);
+                    setCraftSlot(2, 23, 3, 0, 0);
+                    setCraftSlot(3, 23, 4, 0, 0);
+                    break;
+                default:
+                    setCraftSlot(0, 3, 1, 15, 8);
+                    setCraftSlot(1, 6, 1, 0, 0);
+                    setCraftSlot(2, 6, 11, 0, 0);
+                    break;
+            }
+        }
+        
         Invoke(craftDiag, "UpdateStatus");
-    } @catch (id) {}
-    
-    Object* btn = GetFieldValue<Object*>(cdKlass, craftDiag, "CombineButton");
-    if (btn) {
-        bool bTrue = true;
-        void* intArgs[] = { &bTrue };
-        Invoke(btn, "set_interactable", 1, intArgs);
+        
+        Class* cdKlass = object_get_class(craftDiag);
+        Object* btn = GetFieldValue<Object*>(cdKlass, craftDiag, "CombineButton");
+        if (btn) {
+            bool bTrue = true;
+            void* intArgs[] = { &bTrue };
+            Invoke(btn, "set_interactable", 1, intArgs);
+        }
+        
+        return true;
+    } @catch (id) {
+        return false;
     }
-    
-    return true;
 }
 
 } // namespace HA
@@ -1194,18 +1225,22 @@ static bool AutoFillCraftMachine() {
     @try {
         HA::ThreadScope scope;
         
-        // Only modify combat values if player character exists
+        // Hook 100% craft success rate if not yet hooked
+        if (tickCount % 60 == 0) {
+            HA::InstallCraftSuccessHook();
+        }
+        
+        // Only run combat modifications if character exists
         if (HA::GetMainCharacter() && HA::GetPlayer()) {
             HA::ApplyCombatModifiers();
             
             if (HA::g_AutoKill && (tickCount % 10 == 0)) {
                 HA::KillAllMonsters();
             }
-        }
-        
-        // Free craft machine auto-fill: runs every ~15 frames
-        if (HA::g_FreeCraft && (tickCount % 15 == 0)) {
-            HA::AutoFillCraftMachine();
+            
+            if (HA::g_FreeCraft && (tickCount % 30 == 0)) {
+                HA::AutoFillCraftMachine();
+            }
         }
     } @catch (id) {}
 }
@@ -2097,16 +2132,6 @@ static bool AutoFillCraftMachine() {
 @end
 
 __attribute__((constructor)) static void Entry() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        intptr_t slide = HA::GetUnityFrameworkSlide();
-        if (slide >= 0) {
-            void* target = reinterpret_cast<void*>(slide + 0x1AF1A74);
-            if (target) {
-                MSHookFunction(target, reinterpret_cast<void*>(HA::hooked_RandomRangeInt), reinterpret_cast<void**>(&HA::orig_RandomRangeInt));
-            }
-        }
-    });
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         static HAButtonLauncher* launcher;
         launcher = [[HAButtonLauncher alloc] init];
