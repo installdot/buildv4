@@ -437,6 +437,48 @@ static void ApplyCombatModifiers() {
 // Monster Management & Boss Spawning
 // -------------------------------------------------------------
 
+static int ConvertAllMonstersToBossDrop() {
+    Object* gc = GetSingleton("GameController", "instance");
+    if (!gc) return 0;
+    
+    Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
+    if (!list) return 0;
+    
+    Method* mCount = class_get_method_from_name(object_get_class(list), "get_Count", 0);
+    int cnt = 0;
+    if (mCount) {
+        cnt = Unbox<int>(Invoke(list, "get_Count"));
+    }
+    
+    int converted = 0;
+    for (int i = 0; i < cnt; ++i) {
+        void* getArgs[] = { &i };
+        Object* monster = Invoke(list, "get_Item", 1, getArgs);
+        if (!monster) continue;
+        
+        uint8_t* pM = reinterpret_cast<uint8_t*>(monster);
+        
+        // Level (int32 at offset 0x74) - higher level = higher tier equipment drops
+        int32_t* pLevel = reinterpret_cast<int32_t*>(pM + 0x74);
+        if (*pLevel < 350) *pLevel = 350;
+        
+        // EffectLevel (int32 at offset 0xB0) - tier 3 is golden/boss effect
+        int32_t* pEffectLvl = reinterpret_cast<int32_t*>(pM + 0xB0);
+        *pEffectLvl = 3;
+        
+        // HasSuperEffect (bool at offset 0xB4) - triggers Super item drops
+        bool* pSuper = reinterpret_cast<bool*>(pM + 0xB4);
+        *pSuper = true;
+        
+        // HasGodEffect (bool at offset 0xB5) - triggers God item drops
+        bool* pGod = reinterpret_cast<bool*>(pM + 0xB5);
+        *pGod = true;
+        
+        converted++;
+    }
+    return converted;
+}
+
 static int KillAllMonsters() {
     Object* gc = GetSingleton("GameController", "instance");
     if (!gc) Fail(@"Chưa vào game.");
@@ -753,10 +795,6 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     return @"Chọn dòng phụ (Option dòng)";
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return self.availableOptions.count > 0 ? 3 : 2;
-}
-
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 3;
     if (section == 1) return 3;
@@ -960,16 +998,16 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     if (tab == 0) return self.filteredItems.count;
     if (tab == 1) {
-        if (section == 0) return 5;
-        if (section == 1) return 7;
-        return 3;
+        if (section == 0) return 5; // Level, Exp, Point, SkillPoint, ResetCount
+        if (section == 1) return 7; // Strength, Agility, Vitality, Energy, Command, HP, MP
+        return 3; // Coin, Diamond, WarehouseCoin
     }
     if (tab == 2) {
         if (section == 0) return 3;
         if (section == 1) return 2;
-        return 6;
+        return 8;
     }
-    return section == 0 ? 4 : 2;
+    return section == 0 ? 4 : 2; // Unlock all chars, Unlock skills, Max skills, Finish quests / Save Now, Auto Save Toggle
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1039,9 +1077,11 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
         } else {
             NSArray* monsterActions = @[
                 @"Tiêu diệt toàn bộ quái (Kill All Monsters)",
+                @"Chuyển drop quái thành Boss (Super & God Drop)",
                 @"Triệu hồi Boss Map (Spawn Map Boss)",
                 @"Triệu hồi Global Boss",
                 @"Triệu hồi Narkan Boss",
+                @"Triệu hồi Shadow of Natas",
                 @"Kích hoạt Dark Mona Event",
                 @"Nhân hệ số Exp quái (Exp Rate Multiplier)"
             ];
@@ -1189,10 +1229,13 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
                 if (indexPath.row == 0) {
                     int killed = HA::KillAllMonsters();
                     [self showSuccessAlert:[NSString stringWithFormat:@"Đã tiêu diệt %d quái vật trên map!", killed]];
-                } else if (indexPath.row >= 1 && indexPath.row <= 4) {
-                    HA::SpawnBoss((int)indexPath.row - 1);
+                } else if (indexPath.row == 1) {
+                    int conv = HA::ConvertAllMonstersToBossDrop();
+                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã chuyển %d quái vật trên map thành cấp Boss (Cấp 350 + Super/God Drop)!", conv]];
+                } else if (indexPath.row >= 2 && indexPath.row <= 6) {
+                    HA::SpawnBoss((int)indexPath.row - 2);
                     [self showSuccessAlert:@"Đã gửi lệnh triệu hồi Boss thành công!"];
-                } else if (indexPath.row == 5) {
+                } else if (indexPath.row == 7) {
                     UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Hệ số Exp" message:@"Nhập hệ số nhân kinh nghiệm (Ví dụ: 10, 50, 100)" preferredStyle:UIAlertControllerStyleAlert];
                     [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
                         textField.keyboardType = UIKeyboardTypeNumberPad;
