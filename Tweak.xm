@@ -244,7 +244,7 @@ static NSString* StringFromIL2CPP(Object* strObj) {
     }
 }
 
-// Memory-direct array reading (Crash-proof O(1) without reflection)
+// Reference arrays and inline Int32 enum arrays require different element strides.
 static int ArrayLength(Object* arr) {
     if (!arr) return 0;
     return *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(arr) + 0x18);
@@ -255,6 +255,13 @@ static Object* ArrayGet(Object* arr, int idx) {
     int len = ArrayLength(arr);
     if (idx < 0 || idx >= len) return nullptr;
     return reinterpret_cast<Object**>(reinterpret_cast<uint8_t*>(arr) + 0x20)[idx];
+}
+
+static int32_t ArrayGetInt32(Object* arr, int idx) {
+    if (!arr || idx < 0 || idx >= ArrayLength(arr)) Fail(@"Chỉ số mảng class không hợp lệ.");
+    int32_t value;
+    memcpy(&value, reinterpret_cast<const uint8_t*>(arr) + 0x20 + sizeof(value) * idx, sizeof(value));
+    return value;
 }
 
 static NSString* GetEnumName(const char* enumClassName, int val) {
@@ -417,11 +424,8 @@ static void UnlockAllSkills(bool maxPoints) {
             int fcCount = ArrayLength(forClassArr);
             if (fcCount == 0) classMatch = true;
             for (int c = 0; c < fcCount; ++c) {
-                Object* cObj = ArrayGet(forClassArr, c);
-                if (cObj) {
-                    int cType = Unbox<int>(cObj);
-                    if (cType == playerClass) { classMatch = true; break; }
-                }
+                int cType = ArrayGetInt32(forClassArr, c);
+                if (cType == playerClass) { classMatch = true; break; }
             }
         } else {
             classMatch = true;
@@ -776,11 +780,8 @@ static NSArray<NSDictionary*>* GetRuntimeCatalog() {
             if (forClass) {
                 int fcCount = ArrayLength(forClass);
                 for (int c = 0; c < fcCount; ++c) {
-                    Object* cObj = ArrayGet(forClass, c);
-                    if (cObj) {
-                        int cVal = Unbox<int>(cObj);
-                        [classes addObject:GetEnumName("ClassType", cVal)];
-                    }
+                    int cVal = ArrayGetInt32(forClass, c);
+                    [classes addObject:GetEnumName("ClassType", cVal)];
                 }
             }
             
