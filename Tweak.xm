@@ -50,6 +50,7 @@ static void* (*thread_attach)(void*);
 static void (*thread_detach)(void*);
 static void (*runtime_class_init)(Class*);
 static bool ready = false;
+static bool auto_save_enabled = true;
 
 static void Fail(NSString* msg) {
     @throw [NSException exceptionWithName:@"HeroAgeException" reason:msg userInfo:nil];
@@ -144,7 +145,6 @@ static T GetFieldValue(Class* klass, Object* obj, const char* name) {
     return val;
 }
 
-
 static Object* GetSingleton(const char* klassName, const char* fieldName) {
     return GetFieldValue<Object*>(FindClass(klassName), nullptr, fieldName);
 }
@@ -153,6 +153,12 @@ static Object* GetPlayer() {
     Object* p = GetSingleton("Players", "MainPlayer");
     if (!p) Fail(@"Chưa vào game / Chưa chọn nhân vật.");
     return p;
+}
+
+static Object* GetMainCharacter() {
+    Object* gc = GetSingleton("GameController", "instance");
+    if (!gc) return nullptr;
+    return GetFieldValue<Object*>(object_get_class(gc), gc, "MainPlayer");
 }
 
 static NSString* StringFromIL2CPP(Object* strObj) {
@@ -200,6 +206,31 @@ static NSString* GetEnumName(const char* enumClassName, int val) {
 }
 
 // -------------------------------------------------------------
+// Auto-Save & Manual Save
+// -------------------------------------------------------------
+
+static void SaveGameData() {
+    @try {
+        Object* p = GetPlayer();
+        if (p) {
+            bool collect = true;
+            void* args[] = { &collect };
+            Invoke(p, "Save", 1, args);
+        }
+        Class* gc = FindClass("GameConfig");
+        if (gc) {
+            Invoke(gc, nullptr, "Save");
+        }
+    } @catch (id) {}
+}
+
+static void CheckAutoSave() {
+    if (auto_save_enabled) {
+        SaveGameData();
+    }
+}
+
+// -------------------------------------------------------------
 // Gameplay & Stats Core
 // -------------------------------------------------------------
 
@@ -214,6 +245,7 @@ static void SetPlayerStat(NSString* name, int value) {
     std::string methodName = "set_" + std::string([name UTF8String]);
     void* args[] = { &value };
     Invoke(p, methodName.c_str(), 1, args);
+    CheckAutoSave();
 }
 
 static int64_t GetCurrency(NSString* key) {
@@ -243,6 +275,7 @@ static void SetCurrency(NSString* key, int64_t val) {
         void* args[] = { &val };
         Invoke(gc, nullptr, "set_WarehouseCoin", 1, args);
     }
+    CheckAutoSave();
 }
 
 // Unlock All Characters & Slots
@@ -258,6 +291,7 @@ static void UnlockAllCharacters() {
     Invoke(gc, nullptr, "set_HasBoughtSlot4", 1, args);
     Invoke(gc, nullptr, "set_HasBoughtSlot5", 1, args);
     Invoke(gc, nullptr, "set_HasBoughtExpandInventory", 1, args);
+    CheckAutoSave();
 }
 
 // Skills & Passives
@@ -316,6 +350,7 @@ static void UnlockAllSkills(bool maxPoints) {
             }
         }
     }
+    CheckAutoSave();
 }
 
 // Complete All Quests
@@ -329,13 +364,129 @@ static void FinishAllQuests() {
     for (int i = 0; i < total; ++i) {
         Object* qObj = ArrayGet(questInfoArr, i);
         if (!qObj) continue;
-        // QuestInfo is a struct, Id is at offset 0
         int qId = *reinterpret_cast<int*>(object_unbox(qObj));
         if (qId <= 0) continue;
         
         void* args[] = { &qId };
         Invoke(p, "SetQuestReceived", 1, args);
         Invoke(p, "SetQuestCompleted", 1, args);
+    }
+    CheckAutoSave();
+}
+
+// -------------------------------------------------------------
+// Combat Parameters (Speed, Cooldown, Damage, AoE)
+// -------------------------------------------------------------
+
+static float g_MoveSpeedMultiplier = 1.0f;
+static int g_AttackSpeedBonus = 0;
+static float g_DamageMultiplier = 1.0f;
+static bool g_NoCooldown = false;
+static bool g_AttackAoE = false;
+
+static void ApplyCombatModifiers() {
+    Object* ch = GetMainCharacter();
+    if (ch) {
+        // IncreaseMovementSpeedBuff is at offset 0x300 (float)
+        float* pMoveBuff = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ch) + 0x300);
+        *pMoveBuff = (g_MoveSpeedMultiplier - 1.0f) * 100.0f;
+        
+        // IncreaseAttackSpeedBuff is at offset 0x304 (int32)
+        int32_t* pAtkBuff = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(ch) + 0x304);
+        *pAtkBuff = g_AttackSpeedBonus;
+        
+        // WLIncreasingDamage is at offset 0x11C (float)
+        float* pDmgMul = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ch) + 0x11C);
+        *pDmgMul = (g_DamageMultiplier - 1.0f) * 100.0f;
+    }
+    
+    // Modify Skills in GameController
+    Object* gc = GetSingleton("GameController", "instance");
+    if (gc) {
+        Object* skillModelsArr = GetFieldValue<Object*>(object_get_class(gc), gc, "SkillModels");
+        if (skillModelsArr) {
+            int cnt = ArrayLength(skillModelsArr);
+            for (int i = 0; i < cnt; ++i) {
+                Object* sk = ArrayGet(skillModelsArr, i);
+                if (!sk) continue;
+                
+                uint8_t* pSk = reinterpret_cast<uint8_t*>(sk);
+                // CoolDown is float at offset 0x80
+                float* pCd = reinterpret_cast<float*>(pSk + 0x80);
+                if (g_NoCooldown) {
+                    *pCd = 0.0f;
+                }
+                
+                // Range is float at offset 0x58, RangeY at 0x5C
+                float* pRangeX = reinterpret_cast<float*>(pSk + 0x58);
+                float* pRangeY = reinterpret_cast<float*>(pSk + 0x5C);
+                // KillAround is bool at offset 0x54
+                bool* pKillAround = reinterpret_cast<bool*>(pSk + 0x54);
+                
+                if (g_AttackAoE) {
+                    *pRangeX = 50.0f;
+                    *pRangeY = 50.0f;
+                    *pKillAround = true;
+                }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// Monster Management & Boss Spawning
+// -------------------------------------------------------------
+
+static int KillAllMonsters() {
+    Object* gc = GetSingleton("GameController", "instance");
+    if (!gc) Fail(@"Chưa vào game.");
+    
+    Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
+    if (!list) return 0;
+    
+    Method* mCount = class_get_method_from_name(object_get_class(list), "get_Count", 0);
+    int cnt = 0;
+    if (mCount) {
+        cnt = Unbox<int>(Invoke(list, "get_Count"));
+    }
+    
+    int killed = 0;
+    for (int i = 0; i < cnt; ++i) {
+        void* getArgs[] = { &i };
+        Object* monster = Invoke(list, "get_Item", 1, getArgs);
+        if (!monster) continue;
+        
+        bool isDied = GetFieldValue<bool>(object_get_class(monster), monster, "IsDied");
+        if (!isDied) {
+            Invoke(monster, "Die");
+            killed++;
+        }
+    }
+    return killed;
+}
+
+static void SpawnBoss(int bossType) {
+    Object* gc = GetSingleton("GameController", "instance");
+    if (!gc) Fail(@"Chưa vào game.");
+    
+    Object* wm = GetFieldValue<Object*>(object_get_class(gc), gc, "WorldManager");
+    if (!wm) Fail(@"Chưa có WorldManager.");
+    
+    switch (bossType) {
+        case 0: Invoke(wm, "CheckAndCreateBoss"); break;
+        case 1: Invoke(wm, "CheckAndCreateGlobalBoss"); break;
+        case 2: Invoke(wm, "CheckAndCreateNarkanBoss"); break;
+        case 3: Invoke(wm, "CheckAndCheckShadowOfNatas"); break;
+        case 4: Invoke(wm, "CreateDarkMonaEvent"); break;
+        default: break;
+    }
+}
+
+static void SetExpRateMultiplier(int multiplier) {
+    Class* gcClass = FindClass("GameController");
+    Field* fExp = class_get_field_from_name(gcClass, "ExpRate");
+    if (fExp) {
+        field_static_get_value(fExp, &multiplier);
     }
 }
 
@@ -347,9 +498,6 @@ static NSArray<NSDictionary*>* GetOptionListForCategory(int category) {
     NSMutableArray<NSDictionary*>* list = [NSMutableArray array];
     Class* iu = FindClass("ItemUtils");
     
-    // Check if category is armor or weapon
-    // Weapon categories: Sword=3, Staff=4, Bow=5, Scepter=21
-    // Armor categories: Armor=1, Shield=2, Ring=11, Pendant=12, Wing=14, Earring=24
     uint32_t mask = 1 << category;
     bool isArmor = (mask & 0x2C806) != 0;
     bool isWeapon = (mask & 0x201038) != 0;
@@ -453,7 +601,6 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     Class* itemUtils = FindClass("ItemUtils");
     Class* gameConfig = FindClass("GameConfig");
     
-    // Check if category is stackable/consumable
     bool isConsumable = (category == 6 || category == 8 || category == 10 || category == 17 || category == 20);
     
     for (int q = 0; q < quantity; ++q) {
@@ -489,30 +636,31 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
         }
         
         if (isConsumable) {
-            // Set amount = 1 per slot
             uint8_t amt = 1;
             void* amtArgs[] = { &rawItem, &amt };
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetAmount", 2, amtArgs));
         }
         
-        // Place in free slot
         int slot = freeSlots[q];
         void* setArgs[] = { &slot, &rawItem };
         Invoke(bucket, "set_Item", 2, setArgs);
         
-        // Register item in GameConfig to prevent disappearance
         void* regArgs[] = { &rawItem };
         Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
     }
     
-    // Refresh UI if open
-    Object* uiMgr = GetSingleton("UIManager", "instance");
-    if (uiMgr) {
-        Object* invDiag = GetFieldValue<Object*>(object_get_class(uiMgr), uiMgr, "InventoryDialog");
-        if (invDiag) {
-            Invoke(invDiag, "FillData");
+    // Safely refresh UI without crashing if dialog is not open
+    @try {
+        Object* uiMgr = GetSingleton("UIManager", "instance");
+        if (uiMgr) {
+            Object* invDiag = GetFieldValue<Object*>(object_get_class(uiMgr), uiMgr, "InventoryDialog");
+            if (invDiag) {
+                Invoke(invDiag, "FillData");
+            }
         }
-    }
+    } @catch (id) {}
+    
+    CheckAutoSave();
 }
 
 } // namespace HA
@@ -603,6 +751,10 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     if (section == 0) return @"Thông tin & Cấu hình";
     if (section == 1) return @"Cài đặt Cấp độ & Thuộc tính";
     return @"Chọn dòng phụ (Option dòng)";
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return self.availableOptions.count > 0 ? 3 : 2;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -717,7 +869,7 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(onClose)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(onReload)];
     
-    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"Vật Phẩm", @"Chỉ Số", @"Tiền Tệ", @"Tiến Trình"]];
+    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"Vật Phẩm", @"Chỉ Số", @"Chiến Đấu", @"Tiến Trình"]];
     self.tabControl.selectedSegmentIndex = 0;
     [self.tabControl addTarget:self action:@selector(onTabChanged) forControlEvents:UIControlEventValueChanged];
     self.navigationItem.titleView = self.tabControl;
@@ -783,25 +935,41 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     if (tab == 0) return 1;
-    if (tab == 1) return 2; // Level/Exp, Stats
-    if (tab == 2) return 1; // Currencies
-    return 2; // Skills, Quests & Characters
+    if (tab == 1) return 3; // Level/Exp, Stats, Currencies
+    if (tab == 2) return 3; // Speed & Damage, Skill Modifiers, Monster/Boss Controls
+    return 2; // Skills/Quests, Save & Options
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     if (tab == 0) return [NSString stringWithFormat:@"Danh mục Item (%lu)", (unsigned long)self.filteredItems.count];
-    if (tab == 1) return section == 0 ? @"Cấp độ & Điểm" : @"Thuộc tính Nhân vật";
-    if (tab == 2) return @"Tài chính / Tiền tệ Game";
-    return section == 0 ? @"Mở Khóa Nhân Vật & Túi" : @"Kỹ Năng & Nhiệm Vụ";
+    if (tab == 1) {
+        if (section == 0) return @"Cấp độ & Điểm";
+        if (section == 1) return @"Thuộc tính Nhân vật";
+        return @"Tiền tệ Game";
+    }
+    if (tab == 2) {
+        if (section == 0) return @"Thông số Nhân vật (Tốc độ & Sát thương)";
+        if (section == 1) return @"Cơ chế Kỹ năng (Hồi chiêu & AoE)";
+        return @"Quái & Boss Map";
+    }
+    return section == 0 ? @"Mở Khóa Nhân Vật & Tiến Trình" : @"Lưu Trữ Dữ Liệu";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     if (tab == 0) return self.filteredItems.count;
-    if (tab == 1) return section == 0 ? 5 : 7;
-    if (tab == 2) return 3; // Coin, Diamond, WarehouseCoin
-    return section == 0 ? 1 : 3;
+    if (tab == 1) {
+        if (section == 0) return 5;
+        if (section == 1) return 7;
+        return 3;
+    }
+    if (tab == 2) {
+        if (section == 0) return 3;
+        if (section == 1) return 2;
+        return 6;
+    }
+    return section == 0 ? 4 : 2;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -809,6 +977,7 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
     UITableViewCell* cell = [tableView dequeueReusableCellWithIdentifier:@"M"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"M"];
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.accessoryView = nil;
     cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
     
     if (tab == 0) {
@@ -816,38 +985,119 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
         cell.textLabel.text = it[@"name"];
         cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ | ID: %@ | Class: %@", it[@"type"], it[@"id"], it[@"classes"]];
     } else if (tab == 1) {
-        NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
-        NSArray* s1 = @[@"Strength", @"Agility", @"Vitality", @"Energy", @"Command", @"CurrentHealth", @"CurrentMana"];
-        NSString* statName = (indexPath.section == 0) ? s0[indexPath.row] : s1[indexPath.row];
-        cell.textLabel.text = statName;
-        @try {
-            HA::ThreadScope scope;
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%d", HA::GetPlayerStat(statName)];
-        } @catch (NSException* e) {
-            cell.detailTextLabel.text = @"-";
+        if (indexPath.section == 0) {
+            NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
+            NSString* statName = s0[indexPath.row];
+            cell.textLabel.text = statName;
+            @try {
+                HA::ThreadScope scope;
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"%d", HA::GetPlayerStat(statName)];
+            } @catch (NSException* e) { cell.detailTextLabel.text = @"-"; }
+        } else if (indexPath.section == 1) {
+            NSArray* s1 = @[@"Strength", @"Agility", @"Vitality", @"Energy", @"Command", @"CurrentHealth", @"CurrentMana"];
+            NSString* statName = s1[indexPath.row];
+            cell.textLabel.text = statName;
+            @try {
+                HA::ThreadScope scope;
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"%d", HA::GetPlayerStat(statName)];
+            } @catch (NSException* e) { cell.detailTextLabel.text = @"-"; }
+        } else {
+            NSArray* cNames = @[@"Coin", @"Diamond", @"WarehouseCoin"];
+            NSString* c = cNames[indexPath.row];
+            cell.textLabel.text = c;
+            @try {
+                HA::ThreadScope scope;
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"%lld", (long long)HA::GetCurrency(c)];
+            } @catch (NSException* e) { cell.detailTextLabel.text = @"-"; }
         }
     } else if (tab == 2) {
-        NSArray* cNames = @[@"Coin", @"Diamond", @"WarehouseCoin"];
-        NSString* c = cNames[indexPath.row];
-        cell.textLabel.text = c;
-        @try {
-            HA::ThreadScope scope;
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%lld", (long long)HA::GetCurrency(c)];
-        } @catch (NSException* e) {
-            cell.detailTextLabel.text = @"-";
+        if (indexPath.section == 0) {
+            if (indexPath.row == 0) {
+                cell.textLabel.text = @"Tốc độ di chuyển (Move Speed)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"%.1fx bình thường", HA::g_MoveSpeedMultiplier];
+            } else if (indexPath.row == 1) {
+                cell.textLabel.text = @"Tốc độ đánh (Attack Speed Buff)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"+%d tốc đánh", HA::g_AttackSpeedBonus];
+            } else {
+                cell.textLabel.text = @"Khuếch đại sát thương (Damage Multiplier)";
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"%.1fx sát thương", HA::g_DamageMultiplier];
+            }
+        } else if (indexPath.section == 1) {
+            if (indexPath.row == 0) {
+                cell.textLabel.text = @"Bỏ hồi chiêu (0s Cooldown All Skills)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_NoCooldown;
+                [sw addTarget:self action:@selector(onNoCooldownToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            } else {
+                cell.textLabel.text = @"Phạm vi đánh AoE toàn map (Max Range + 360°)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_AttackAoE;
+                [sw addTarget:self action:@selector(onAttackAoEToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
+        } else {
+            NSArray* monsterActions = @[
+                @"Tiêu diệt toàn bộ quái (Kill All Monsters)",
+                @"Triệu hồi Boss Map (Spawn Map Boss)",
+                @"Triệu hồi Global Boss",
+                @"Triệu hồi Narkan Boss",
+                @"Kích hoạt Dark Mona Event",
+                @"Nhân hệ số Exp quái (Exp Rate Multiplier)"
+            ];
+            cell.textLabel.text = monsterActions[indexPath.row];
+            cell.detailTextLabel.text = @"Nhấn để kích hoạt";
         }
     } else {
         if (indexPath.section == 0) {
-            cell.textLabel.text = @"Mở khóa tất cả Nhân vật & Kho";
-            cell.detailTextLabel.text = @"MagicKnight, Summoner, Warlord, Fighter, Lancer, Slot 4/5";
-        } else {
-            NSArray* acts = @[@"Mở khóa tất cả Kỹ năng", @"Max điểm toàn bộ Kỹ năng", @"Hoàn thành toàn bộ Nhiệm vụ"];
-            NSArray* descs = @[@"Mở khóa mọi skill của Class hiện tại", @"Nâng tối đa level tất cả skill đã học", @"Kích hoạt xong tất cả nhiệm vụ trong game"];
+            NSArray* acts = @[
+                @"Mở khóa tất cả Nhân vật & Ô Slot",
+                @"Mở khóa tất cả Kỹ năng",
+                @"Max điểm toàn bộ Kỹ năng",
+                @"Hoàn thành toàn bộ Nhiệm vụ"
+            ];
+            NSArray* descs = @[
+                @"MagicKnight, Summoner, Warlord, Fighter, Lancer, Slot 4/5",
+                @"Mở khóa toàn bộ skill của Class hiện tại",
+                @"Nâng tối đa level tất cả skill đã học",
+                @"Hoàn tất toàn bộ quest trong game"
+            ];
             cell.textLabel.text = acts[indexPath.row];
             cell.detailTextLabel.text = descs[indexPath.row];
+        } else {
+            if (indexPath.row == 0) {
+                cell.textLabel.text = @"Lưu Dữ Liệu Game (Save Now)";
+                cell.detailTextLabel.text = @"Ghi toàn bộ trạng thái vào bộ nhớ lưu trữ";
+            } else {
+                cell.textLabel.text = @"Tự động lưu sau mỗi thao tác (Auto-Save)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::auto_save_enabled;
+                [sw addTarget:self action:@selector(onAutoSaveToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
         }
     }
     return cell;
+}
+
+- (void)onNoCooldownToggled:(UISwitch*)sw {
+    HA::g_NoCooldown = sw.on;
+    @try {
+        HA::ThreadScope scope;
+        HA::ApplyCombatModifiers();
+    } @catch (id) {}
+}
+
+- (void)onAttackAoEToggled:(UISwitch*)sw {
+    HA::g_AttackAoE = sw.on;
+    @try {
+        HA::ThreadScope scope;
+        HA::ApplyCombatModifiers();
+    } @catch (id) {}
+}
+
+- (void)onAutoSaveToggled:(UISwitch*)sw {
+    HA::auto_save_enabled = sw.on;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -860,69 +1110,188 @@ static void AddItemToInventory(int category, int itemId, int level, bool isSuper
         detail.itemData = it;
         [self.navigationController pushViewController:detail animated:YES];
     } else if (tab == 1) {
-        NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
-        NSArray* s1 = @[@"Strength", @"Agility", @"Vitality", @"Energy", @"Command", @"CurrentHealth", @"CurrentMana"];
-        NSString* statName = (indexPath.section == 0) ? s0[indexPath.row] : s1[indexPath.row];
-        
-        UIAlertController* a = [UIAlertController alertControllerWithTitle:statName message:@"Nhập giá trị mới" preferredStyle:UIAlertControllerStyleAlert];
-        [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-            textField.keyboardType = UIKeyboardTypeNumberPad;
-        }];
-        [a addAction:[UIAlertAction actionWithTitle:@"Cập nhật" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            int val = [a.textFields.firstObject.text intValue];
-            @try {
-                HA::ThreadScope scope;
-                HA::SetPlayerStat(statName, val);
-                [self.tableView reloadData];
-            } @catch (NSException* e) {
-                // handle error
-            }
-        }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
+        if (indexPath.section == 0) {
+            NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
+            NSString* statName = s0[indexPath.row];
+            [self promptInputForStat:statName];
+        } else if (indexPath.section == 1) {
+            NSArray* s1 = @[@"Strength", @"Agility", @"Vitality", @"Energy", @"Command", @"CurrentHealth", @"CurrentMana"];
+            NSString* statName = s1[indexPath.row];
+            [self promptInputForStat:statName];
+        } else {
+            NSArray* cNames = @[@"Coin", @"Diamond", @"WarehouseCoin"];
+            NSString* c = cNames[indexPath.row];
+            [self promptInputForCurrency:c];
+        }
     } else if (tab == 2) {
-        NSArray* cNames = @[@"Coin", @"Diamond", @"WarehouseCoin"];
-        NSString* c = cNames[indexPath.row];
-        
-        UIAlertController* a = [UIAlertController alertControllerWithTitle:c message:@"Nhập số lượng" preferredStyle:UIAlertControllerStyleAlert];
-        [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-            textField.keyboardType = UIKeyboardTypeNumberPad;
-        }];
-        [a addAction:[UIAlertAction actionWithTitle:@"Xác nhận" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            long long val = [a.textFields.firstObject.text longLongValue];
+        if (indexPath.section == 0) {
+            if (indexPath.row == 0) {
+                UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Tốc độ di chuyển" message:@"Nhập hệ số tốc độ (Ví dụ: 1.0, 2.5, 5.0, 10.0)" preferredStyle:UIAlertControllerStyleAlert];
+                [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+                    textField.keyboardType = UIKeyboardTypeDecimalPad;
+                    textField.text = [NSString stringWithFormat:@"%.1f", HA::g_MoveSpeedMultiplier];
+                }];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    float val = [a.textFields.firstObject.text floatValue];
+                    if (val >= 1.0f && val <= 50.0f) {
+                        HA::g_MoveSpeedMultiplier = val;
+                        @try {
+                            HA::ThreadScope scope;
+                            HA::ApplyCombatModifiers();
+                        } @catch (id) {}
+                    }
+                    [self.tableView reloadData];
+                }]];
+                [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+                [self presentViewController:a animated:YES completion:nil];
+            } else if (indexPath.row == 1) {
+                UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Tốc độ đánh" message:@"Nhập chỉ số cộng thêm (+100, +500, +1000)" preferredStyle:UIAlertControllerStyleAlert];
+                [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+                    textField.keyboardType = UIKeyboardTypeNumberPad;
+                    textField.text = [NSString stringWithFormat:@"%d", HA::g_AttackSpeedBonus];
+                }];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    int val = [a.textFields.firstObject.text intValue];
+                    if (val >= 0 && val <= 10000) {
+                        HA::g_AttackSpeedBonus = val;
+                        @try {
+                            HA::ThreadScope scope;
+                            HA::ApplyCombatModifiers();
+                        } @catch (id) {}
+                    }
+                    [self.tableView reloadData];
+                }]];
+                [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+                [self presentViewController:a animated:YES completion:nil];
+            } else {
+                UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Khuếch đại sát thương" message:@"Nhập hệ số nhân dame (Ví dụ: 2.0, 10.0, 100.0)" preferredStyle:UIAlertControllerStyleAlert];
+                [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+                    textField.keyboardType = UIKeyboardTypeDecimalPad;
+                    textField.text = [NSString stringWithFormat:@"%.1f", HA::g_DamageMultiplier];
+                }];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    float val = [a.textFields.firstObject.text floatValue];
+                    if (val >= 1.0f && val <= 10000.0f) {
+                        HA::g_DamageMultiplier = val;
+                        @try {
+                            HA::ThreadScope scope;
+                            HA::ApplyCombatModifiers();
+                        } @catch (id) {}
+                    }
+                    [self.tableView reloadData];
+                }]];
+                [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+                [self presentViewController:a animated:YES completion:nil];
+            }
+        } else if (indexPath.section == 2) {
             @try {
                 HA::ThreadScope scope;
-                HA::SetCurrency(c, val);
-                [self.tableView reloadData];
-            } @catch (NSException* e) {}
-        }]];
-        [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
+                if (indexPath.row == 0) {
+                    int killed = HA::KillAllMonsters();
+                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã tiêu diệt %d quái vật trên map!", killed]];
+                } else if (indexPath.row >= 1 && indexPath.row <= 4) {
+                    HA::SpawnBoss((int)indexPath.row - 1);
+                    [self showSuccessAlert:@"Đã gửi lệnh triệu hồi Boss thành công!"];
+                } else if (indexPath.row == 5) {
+                    UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Hệ số Exp" message:@"Nhập hệ số nhân kinh nghiệm (Ví dụ: 10, 50, 100)" preferredStyle:UIAlertControllerStyleAlert];
+                    [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+                        textField.keyboardType = UIKeyboardTypeNumberPad;
+                        textField.text = @"10";
+                    }];
+                    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        int r = [a.textFields.firstObject.text intValue];
+                        if (r >= 1 && r <= 10000) {
+                            @try {
+                                HA::ThreadScope sc;
+                                HA::SetExpRateMultiplier(r);
+                            } @catch (id) {}
+                        }
+                    }]];
+                    [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+                    [self presentViewController:a animated:YES completion:nil];
+                }
+            } @catch (NSException* e) {
+                [self showErrorAlert:e.reason];
+            }
+        }
     } else {
         if (indexPath.section == 0) {
             @try {
                 HA::ThreadScope scope;
-                HA::UnlockAllCharacters();
-                UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Thành công" message:@"Đã mở khóa toàn bộ nhân vật và ô slot!" preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:a animated:YES completion:nil];
-            } @catch (NSException* e) {}
-        } else {
-            @try {
-                HA::ThreadScope scope;
                 if (indexPath.row == 0) {
-                    HA::UnlockAllSkills(false);
+                    HA::UnlockAllCharacters();
+                    [self showSuccessAlert:@"Đã mở khóa toàn bộ nhân vật và slot!"];
                 } else if (indexPath.row == 1) {
-                    HA::UnlockAllSkills(true);
+                    HA::UnlockAllSkills(false);
+                    [self showSuccessAlert:@"Đã mở khóa toàn bộ kỹ năng!"];
                 } else if (indexPath.row == 2) {
+                    HA::UnlockAllSkills(true);
+                    [self showSuccessAlert:@"Đã nâng tối đa điểm kỹ năng!"];
+                } else if (indexPath.row == 3) {
                     HA::FinishAllQuests();
+                    [self showSuccessAlert:@"Đã hoàn thành toàn bộ nhiệm vụ!"];
                 }
-                UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Thành công" message:@"Đã thực hiện xong thao tác!" preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:a animated:YES completion:nil];
-            } @catch (NSException* e) {}
+            } @catch (NSException* e) {
+                [self showErrorAlert:e.reason];
+            }
+        } else {
+            if (indexPath.row == 0) {
+                @try {
+                    HA::ThreadScope scope;
+                    HA::SaveGameData();
+                    [self showSuccessAlert:@"Đã lưu dữ liệu nhân vật và cấu hình game thành công!"];
+                } @catch (NSException* e) {
+                    [self showErrorAlert:e.reason];
+                }
+            }
         }
     }
+}
+
+- (void)promptInputForStat:(NSString*)statName {
+    UIAlertController* a = [UIAlertController alertControllerWithTitle:statName message:@"Nhập giá trị mới" preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cập nhật" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        int val = [a.textFields.firstObject.text intValue];
+        @try {
+            HA::ThreadScope scope;
+            HA::SetPlayerStat(statName, val);
+            [self.tableView reloadData];
+        } @catch (NSException* e) {}
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)promptInputForCurrency:(NSString*)c {
+    UIAlertController* a = [UIAlertController alertControllerWithTitle:c message:@"Nhập số lượng" preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    [a addAction:[UIAlertAction actionWithTitle:@"Xác nhận" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        long long val = [a.textFields.firstObject.text longLongValue];
+        @try {
+            HA::ThreadScope scope;
+            HA::SetCurrency(c, val);
+            [self.tableView reloadData];
+        } @catch (NSException* e) {}
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)showSuccessAlert:(NSString*)msg {
+    UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Thành công" message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)showErrorAlert:(NSString*)msg {
+    UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Lỗi" message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 
 @end
