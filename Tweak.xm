@@ -65,6 +65,8 @@ static bool g_NoCooldown = false;
 static bool g_AttackAoE = false;
 static bool g_AutoKill = false;
 static bool g_BossDropEnabled = false;
+static bool g_FreeCraft = true;
+static bool g_BypassRequirements = true;
 
 static void Fail(NSString* msg) {
     @throw [NSException exceptionWithName:@"HeroAgeException" reason:msg userInfo:nil];
@@ -906,6 +908,341 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     CheckAutoSave();
 }
 
+// -------------------------------------------------------------
+// Free Crafting Engine (Không Cần Nguyên Liệu / Yêu Cầu)
+// -------------------------------------------------------------
+
+static void CraftWing(int tier, int wingId = -1) {
+    Object* p = GetPlayer();
+    int playerClass = Unbox<int>(Invoke(p, "get_ClassType"));
+    
+    int targetId = 1;
+    if (tier == 1) {
+        switch (playerClass) {
+            case 0: targetId = 1; break;
+            case 16: targetId = 2; break;
+            case 32: targetId = 3; break;
+            case 48: targetId = 4; break;
+            case 80: targetId = 6; break;
+            case 96: targetId = 7; break;
+            case 112: targetId = 8; break;
+            default: targetId = 1; break;
+        }
+    } else if (tier == 2) {
+        switch (playerClass) {
+            case 0: targetId = 16; break;
+            case 16: targetId = 17; break;
+            case 32: targetId = 18; break;
+            case 48: targetId = 19; break;
+            case 64: targetId = 20; break;
+            case 80: targetId = 21; break;
+            case 96: targetId = 22; break;
+            case 112: targetId = 23; break;
+            default: targetId = 16; break;
+        }
+    } else if (tier == 3) {
+        switch (playerClass) {
+            case 0: targetId = 32; break;
+            case 16: targetId = 33; break;
+            case 32: targetId = 34; break;
+            case 48: targetId = 35; break;
+            case 64: targetId = 36; break;
+            case 80: targetId = 37; break;
+            case 96: targetId = 38; break;
+            default: targetId = 32; break;
+        }
+    }
+    if (wingId > 0) targetId = wingId;
+    
+    ItemOptionsConfig cfg;
+    cfg.category = 14; // Wing
+    cfg.itemId = targetId;
+    cfg.level = 15;
+    cfg.quantity = 1;
+    cfg.isSuper = true;
+    cfg.isHarmony = true;
+    cfg.isChip = true;
+    cfg.isPrimitive = true;
+    cfg.godType = 1;
+    cfg.legendOption = 0;
+    cfg.specialOption = 0;
+    cfg.dropAtPlayer = false;
+    for (int i = 0; i < 8; ++i) cfg.subOptions.push_back(i);
+    
+    CreateAndInjectItem(cfg);
+}
+
+static void CraftPet(int petId) {
+    ItemOptionsConfig cfg;
+    cfg.category = 16; // Pet
+    cfg.itemId = petId;
+    cfg.level = 15;
+    cfg.quantity = 1;
+    cfg.isSuper = true;
+    cfg.isHarmony = true;
+    cfg.isChip = true;
+    cfg.isPrimitive = false;
+    cfg.godType = 0;
+    cfg.legendOption = 0;
+    cfg.specialOption = 0;
+    cfg.dropAtPlayer = false;
+    
+    CreateAndInjectItem(cfg);
+}
+
+static void CraftSpecialItem(int category, int itemId, int level = 15) {
+    ItemOptionsConfig cfg;
+    cfg.category = category;
+    cfg.itemId = itemId;
+    cfg.level = level;
+    cfg.quantity = 1;
+    cfg.isSuper = true;
+    cfg.isHarmony = true;
+    cfg.isChip = true;
+    cfg.isPrimitive = (category != 6 && category != 8);
+    cfg.godType = (category == 1 || category == 2 || category == 3 || category == 4 || category == 5 || category == 21) ? 1 : 0;
+    cfg.legendOption = 0;
+    cfg.specialOption = 0;
+    cfg.dropAtPlayer = false;
+    for (int i = 0; i < 8; ++i) cfg.subOptions.push_back(i);
+    
+    CreateAndInjectItem(cfg);
+}
+
+static int UpgradeAllEquippedToMax() {
+    Object* p = GetPlayer();
+    if (!p) return 0;
+    
+    Class* itemUtils = FindClass("ItemUtils");
+    Class* gameConfig = FindClass("GameConfig");
+    
+    const char* slotProps[] = {
+        "ArmorItem", "LeftHandItem", "RightHandItem", "LeftRing", "RightRing",
+        "Pendant", "Wing", "Pet", "LeftEarring", "RightEarring"
+    };
+    
+    int upgraded = 0;
+    for (const char* prop : slotProps) {
+        std::string getter = "get_" + std::string(prop);
+        std::string setter = "set_" + std::string(prop);
+        
+        int64_t item = Unbox<int64_t>(Invoke(p, getter.c_str()));
+        if (item != 0) {
+            int lvl = 15;
+            void* lvlArgs[] = { &item, &lvl };
+            int64_t newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetLevel", 2, lvlArgs));
+            
+            void* itemArgs[] = { &newItem };
+            newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetSuper", 1, itemArgs));
+            newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetHarmony", 1, itemArgs));
+            newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetChipAttribute", 1, itemArgs));
+            
+            for (int opt = 0; opt < 8; ++opt) {
+                void* optArgs[] = { &newItem, &opt };
+                newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetOption", 2, optArgs));
+            }
+            
+            void* setArgs[] = { &newItem };
+            Invoke(p, setter.c_str(), 1, setArgs);
+            
+            void* regArgs[] = { &newItem };
+            Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
+            
+            upgraded++;
+        }
+    }
+    CheckAutoSave();
+    return upgraded;
+}
+
+static int BypassEquipmentRequirements() {
+    Object* gc = GetSingleton("GameController", "instance");
+    if (!gc) return 0;
+    
+    int count = 0;
+    void* iter = nullptr;
+    while (Field* f = class_get_fields(object_get_class(gc), &iter)) {
+        Class* ft = class_from_type(field_get_type(f));
+        if (!ft || strcmp(class_get_name(ft), "ItemModel[]") != 0) continue;
+        
+        Object* arr = nullptr;
+        field_get_value(gc, f, &arr);
+        if (!arr) continue;
+        
+        int n = ArrayLength(arr);
+        for (int i = 0; i < n; ++i) {
+            Object* m = ArrayGet(arr, i);
+            if (!m) continue;
+            
+            uint8_t* pM = reinterpret_cast<uint8_t*>(m);
+            // 0x40 = StrengthRequired
+            *reinterpret_cast<int32_t*>(pM + 0x40) = 0;
+            // 0x44 = AgileRequire
+            *reinterpret_cast<int32_t*>(pM + 0x44) = 0;
+            // 0x48 = VitalityRequired
+            *reinterpret_cast<int32_t*>(pM + 0x48) = 0;
+            // 0x4C = EnergyRequired
+            *reinterpret_cast<int32_t*>(pM + 0x4C) = 0;
+            // 0x50 = LevelRequired
+            *reinterpret_cast<int32_t*>(pM + 0x50) = 0;
+            // 0x54 = HeroLevelRequired
+            *reinterpret_cast<int32_t*>(pM + 0x54) = 0;
+            
+            // 0x38 = ForClass array
+            uint8_t* forClass = *reinterpret_cast<uint8_t**>(pM + 0x38);
+            if (forClass) {
+                // Set length = 0 to bypass class matching in CheckItemSetLogic
+                *reinterpret_cast<int32_t*>(forClass + 0x18) = 0;
+            }
+            
+            count++;
+        }
+    }
+    return count;
+}
+
+static bool AutoFillCraftMachine() {
+    Object* uiMgr = GetSingleton("UIManager", "instance");
+    if (!uiMgr) return false;
+    
+    Object* craftDiag = GetFieldValue<Object*>(object_get_class(uiMgr), uiMgr, "CraftDialog");
+    if (!craftDiag) return false;
+    
+    // Check if CraftDialog gameObject is active
+    Method* mGetGo = class_get_method_from_name(object_get_class(craftDiag), "get_gameObject", 0);
+    if (!mGetGo) return false;
+    Object* go = Invoke(craftDiag, "get_gameObject");
+    if (!go) return false;
+    bool isActive = Unbox<bool>(Invoke(go, "get_activeInHierarchy"));
+    if (!isActive) return false;
+    
+    Object* p = GetPlayer();
+    if (!p) return false;
+    Object* craftBucket = GetFieldValue<Object*>(object_get_class(p), p, "CraftItems");
+    if (!craftBucket) return false;
+    
+    uint8_t* pDiag = reinterpret_cast<uint8_t*>(craftDiag);
+    int mode = *reinterpret_cast<int32_t*>(pDiag + 0x120);
+    
+    Class* itemUtils = FindClass("ItemUtils");
+    Class* gameConfig = FindClass("GameConfig");
+    
+    auto setCraftSlot = [&](int slot, int cat, int id, int lvl, int optCount) {
+        int opt1 = optCount > 0 ? 1 : 0;
+        int opt2 = optCount > 1 ? 1 : 0;
+        int opt3 = optCount > 2 ? 1 : 0;
+        int opt4 = optCount > 3 ? 1 : 0;
+        int opt5 = optCount > 4 ? 1 : 0;
+        int opt6 = optCount > 5 ? 1 : 0;
+        int opt7 = optCount > 6 ? 1 : 0;
+        int64_t opt8 = optCount > 7 ? 1 : 0;
+        
+        void* createArgs[] = { &cat, &id, &lvl, &opt1, &opt2, &opt3, &opt4, &opt5, &opt6, &opt7, &opt8 };
+        int64_t rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "CreateItem", 11, createArgs));
+        if (cat == 6 || cat == 8 || cat == 20) {
+            uint8_t amt = 10;
+            void* amtArgs[] = { &rawItem, &amt };
+            rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetAmount", 2, amtArgs));
+        }
+        void* setArgs[] = { &slot, &rawItem };
+        Invoke(craftBucket, "set_Item", 2, setArgs);
+        void* regArgs[] = { &rawItem };
+        Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
+    };
+    
+    int dummySlot = 0;
+    void* slot0Args[] = { &dummySlot };
+    int64_t slot0Val = Unbox<int64_t>(Invoke(craftBucket, "get_Item", 1, slot0Args));
+    
+    if (slot0Val == 0) {
+        switch (mode) {
+            case 1:
+                setCraftSlot(0, 3, 1, 10, 4);
+                setCraftSlot(1, 6, 1, 0, 0);
+                break;
+            case 2:
+                setCraftSlot(0, 3, 1, 10, 6);
+                setCraftSlot(1, 6, 11, 0, 0);
+                break;
+            case 3:
+                setCraftSlot(0, 14, 1, 10, 6);
+                setCraftSlot(1, 6, 11, 0, 0);
+                setCraftSlot(2, 6, 13, 0, 0);
+                break;
+            case 4:
+                setCraftSlot(0, 14, 16, 15, 8);
+                setCraftSlot(1, 6, 14, 0, 0);
+                setCraftSlot(2, 6, 15, 0, 0);
+                break;
+            case 5:
+            case 6:
+                setCraftSlot(0, 6, 18, 0, 0);
+                setCraftSlot(1, 6, 19, 0, 0);
+                break;
+            case 7:
+                setCraftSlot(0, 6, 22, 0, 0);
+                setCraftSlot(1, 6, 2, 0, 0);
+                setCraftSlot(2, 6, 3, 0, 0);
+                setCraftSlot(3, 6, 4, 0, 0);
+                setCraftSlot(4, 6, 5, 0, 0);
+                break;
+            case 8:
+                setCraftSlot(0, 6, 23, 0, 0);
+                break;
+            case 11:
+                setCraftSlot(0, 6, 24, 0, 0);
+                setCraftSlot(1, 3, 1, 15, 8);
+                break;
+            case 12:
+            case 20:
+                setCraftSlot(0, 16, 32, 0, 0);
+                setCraftSlot(1, 6, 1, 0, 0);
+                break;
+            case 16:
+                setCraftSlot(0, 14, 16, 15, 8);
+                setCraftSlot(1, 14, 17, 15, 8);
+                break;
+            case 18:
+                setCraftSlot(0, 6, 37, 0, 0);
+                setCraftSlot(1, 6, 39, 0, 0);
+                setCraftSlot(2, 6, 40, 0, 0);
+                break;
+            case 19:
+                setCraftSlot(0, 6, 52, 0, 0);
+                break;
+            case 21:
+                setCraftSlot(0, 6, 26, 0, 0);
+                setCraftSlot(1, 6, 27, 0, 0);
+                setCraftSlot(2, 6, 28, 0, 0);
+                break;
+            case 22:
+                setCraftSlot(0, 23, 1, 0, 0);
+                setCraftSlot(1, 23, 2, 0, 0);
+                setCraftSlot(2, 23, 3, 0, 0);
+                setCraftSlot(3, 23, 4, 0, 0);
+                break;
+            default:
+                setCraftSlot(0, 3, 1, 15, 8);
+                setCraftSlot(1, 6, 1, 0, 0);
+                setCraftSlot(2, 6, 11, 0, 0);
+                break;
+        }
+    }
+    
+    @try {
+        Invoke(craftDiag, "UpdateStatus");
+    } @catch (id) {}
+    
+    Object* btn = GetFieldValue<Object*>(object_get_class(craftDiag), craftDiag, "CombineButton");
+    if (btn) {
+        bool bTrue = true;
+        void* intArgs[] = { &bTrue };
+        Invoke(btn, "set_interactable", 1, intArgs);
+    }
+    
+    return true;
+}
+
 } // namespace HA
 
 // -------------------------------------------------------------
@@ -953,6 +1290,16 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         // Auto-kill loop: runs every ~10 frames (~6 times per second)
         if (HA::g_AutoKill && (tickCount % 10 == 0)) {
             HA::KillAllMonsters();
+        }
+        
+        // Auto-craft machine helper: runs every ~15 frames
+        if (HA::g_FreeCraft && (tickCount % 15 == 0)) {
+            HA::AutoFillCraftMachine();
+        }
+        
+        // Equipment requirement bypass: runs every ~30 frames
+        if (HA::g_BypassRequirements && (tickCount % 30 == 0)) {
+            HA::BypassEquipmentRequirements();
         }
     } @catch (id) {}
 }
@@ -1258,7 +1605,7 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(onClose)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(onReload)];
     
-    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"Vật Phẩm", @"Chỉ Số", @"Chiến Đấu", @"Quái & Boss", @"Tiến Trình"]];
+    self.tabControl = [[UISegmentedControl alloc] initWithItems:@[@"Vật Phẩm", @"Chỉ Số", @"Chiến Đấu", @"Chế Tạo", @"Quái & Boss", @"Tiến Trình"]];
     self.tabControl.selectedSegmentIndex = 0;
     [self.tabControl addTarget:self action:@selector(onTabChanged) forControlEvents:UIControlEventValueChanged];
     self.navigationItem.titleView = self.tabControl;
@@ -1326,7 +1673,8 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     if (tab == 0) return 1;
     if (tab == 1) return 3; // Level/Exp, Stats, Currencies
     if (tab == 2) return 3; // GodMode/OneHit/Mana, Speed/Damage, Skill Cooldown/AoE
-    if (tab == 3) return 2; // Monster Kill/Boss drops, Boss Spawns & Exp
+    if (tab == 3) return 4; // Máy Ép Đồ & Nâng Cấp, Chế Tạo Cánh, Thú Cưỡi & Thần Thú, Bảo Vật & Ngọc
+    if (tab == 4) return 2; // Monster Kill/Boss drops, Boss Spawns & Exp
     return 2; // Skills/Quests, Save & Options
 }
 
@@ -1344,10 +1692,15 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         return @"Cơ Chế Kỹ Năng";
     }
     if (tab == 3) {
+        if (section == 0) return @"Máy Ép Đồ Game & Trang Bị";
+        if (section == 1) return @"Chế Tạo Cánh (Wings)";
+        if (section == 2) return @"Thú Cưỡi & Thần Thú (Pets)";
+        return @"Bảo Vật, Bông Tai & Ngọc (Artifacts)";
+    }
+    if (tab == 4) {
         if (section == 0) return @"Tiêu Diệt & Rớt Đồ";
         return @"Triệu Hồi Boss & Hệ Số Exp";
-    }
-    return section == 0 ? @"Mở Khóa Nhân Vật & Tiến Trình" : @"Lưu Trữ Dữ Liệu";
+    }    return section == 0 ? @"Mở Khóa Nhân Vật & Tiến Trình" : @"Lưu Trữ Dữ Liệu";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1364,10 +1717,15 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         return 2; // No Cooldown, Attack AoE
     }
     if (tab == 3) {
-        if (section == 0) return 3; // Auto Kill Switch, Kill All Now, Convert All to Boss Drop
-        return 6; // Spawn Map Boss, Global, Narkan, Shadow, Dark Mona, Exp Rate
+        if (section == 0) return 3; // Free Craft Switch, Bypass Equip Switch, Max Upgrade All Equipped
+        if (section == 1) return 3; // Wing 1, Wing 2, Wing 3
+        if (section == 2) return 5; // Fenrir, Dark Horse, Raven, Dark Bear, Broken Horn
+        return 5; // Earring, Jewel of Infinity, Feather of Icarus, Ancient Formula, Anti-lost Star
     }
-    return section == 0 ? 4 : 2;
+    if (tab == 4) {
+        if (section == 0) return 3;
+        return 6;
+    }    return section == 0 ? 4 : 2;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -1462,6 +1820,58 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
             }
         }
     } else if (tab == 3) {
+        if (indexPath.section == 0) {
+            if (indexPath.row == 0) {
+                cell.textLabel.text = @"Chế Tạo Tự Động Miễn Phí (Free Craft Mode)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_FreeCraft;
+                [sw addTarget:self action:@selector(onFreeCraftToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            } else if (indexPath.row == 1) {
+                cell.textLabel.text = @"Bỏ Qua Yêu Cầu Trang Bị (Bypass Equip Requirements)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_BypassRequirements;
+                [sw addTarget:self action:@selector(onBypassEquipToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            } else {
+                cell.textLabel.text = @"Nâng cấp toàn bộ đồ đang mặc lên +15 Full Dòng";
+                cell.detailTextLabel.text = @"Vũ khí, giáp, cánh, nhẫn, bông tai đang mặc lên +15, Tím, Vàng, Chip";
+            }
+        } else if (indexPath.section == 1) {
+            NSArray* wingTitles = @[
+                @"Chế tạo Cánh Cấp 1 (Wing 1) +15 Full Dòng",
+                @"Chế tạo Cánh Cấp 2 (Wing 2) +15 Full Dòng",
+                @"Chế tạo Cánh Cấp 3 / Huyền Thoại (Wing 3) +15 Full Dòng"
+            ];
+            NSArray* wingDescs = @[
+                @"Tạo ngay Cánh 1 chuẩn theo Class hiện tại của bạn",
+                @"Tạo ngay Cánh 2 chuẩn theo Class hiện tại của bạn",
+                @"Tạo ngay Cánh 3 tối thượng chuẩn theo Class của bạn"
+            ];
+            cell.textLabel.text = wingTitles[indexPath.row];
+            cell.detailTextLabel.text = wingDescs[indexPath.row];
+        } else if (indexPath.section == 2) {
+            NSArray* petTitles = @[
+                @"Chế tạo Thú Cưỡi Fenrir (Horn of Fenrir)",
+                @"Chế tạo Ngựa Bóng Tối (Dark Horse)",
+                @"Chế tạo Quạ Tinh (Dark Raven)",
+                @"Chế tạo Gấu Bóng Tối (Orb of Dark Bear)",
+                @"Chế tạo Sừng Gãy Fenrir (Broken Horn)"
+            ];
+            cell.textLabel.text = petTitles[indexPath.row];
+            cell.detailTextLabel.text = @"Tạo ngay vào túi đồ, không cần nguyên liệu";
+        } else {
+            NSArray* artTitles = @[
+                @"Chế tạo Bông Tai Hợp Nhất (Earring of Fusion)",
+                @"Chế tạo Ngọc Ngũ Hành / Vô Cực (Jewel of Infinity)",
+                @"Chế tạo Lông Vũ Icarus (Feather of Icarus)",
+                @"Chế tạo Công Thức Cổ Đại (Ancient Formula)",
+                @"Chế tạo Ngôi Sao Bảo Mệnh (Anti-lost Star)"
+            ];
+            cell.textLabel.text = artTitles[indexPath.row];
+            cell.detailTextLabel.text = @"Tạo ngay vào túi đồ, không cần nguyên liệu";
+        }
+    } else if (tab == 4) {
         if (indexPath.section == 0) {
             if (indexPath.row == 0) {
                 cell.textLabel.text = @"Tự Động Diệt Quái Liên Tục (Auto-Kill Loop)";
@@ -1638,6 +2048,30 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
             }
         }
     } else if (tab == 3) {
+        @try {
+            HA::ThreadScope scope;
+            if (indexPath.section == 0) {
+                if (indexPath.row == 2) {
+                    int up = HA::UpgradeAllEquippedToMax();
+                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã nâng cấp %d trang bị đang mặc lên +15 Full Dòng thành công!", up]];
+                }
+            } else if (indexPath.section == 1) {
+                HA::CraftWing((int)indexPath.row + 1);
+                [self showSuccessAlert:[NSString stringWithFormat:@"Đã chế tạo thành công Cánh Cấp %ld +15 Full Dòng vào túi đồ!", (long)indexPath.row + 1]];
+            } else if (indexPath.section == 2) {
+                int petIds[] = { 32, 17, 16, 33, 108 };
+                HA::CraftPet(petIds[indexPath.row]);
+                [self showSuccessAlert:@"Đã chế tạo Thú Cưỡi / Thần Thú thành công vào túi đồ!"];
+            } else {
+                int cats[] = { 24, 6, 6, 6, 6 };
+                int ids[] = { 1, 14, 13, 15, 12 };
+                HA::CraftSpecialItem(cats[indexPath.row], ids[indexPath.row]);
+                [self showSuccessAlert:@"Đã chế tạo Bảo Vật thành công vào túi đồ!"];
+            }
+        } @catch (NSException* e) {
+            [self showErrorAlert:e.reason];
+        }
+    } else if (tab == 4) {
         if (indexPath.section == 0) {
             if (indexPath.row == 1) {
                 @try {
