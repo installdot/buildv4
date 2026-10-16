@@ -1,9 +1,10 @@
 // HeroAge 6.2.10 Mod Menu Tweak
 // Source-only delivery for compile with Theos / iOS toolchain
 // Architecture: arm64 / arm64e, iOS 14.0+
-// Frameworks: UIKit, Foundation, CoreGraphics
+// Frameworks: UIKit, Foundation, CoreGraphics, QuartzCore
 
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
 #include <stdint.h>
 #include <cstring>
@@ -52,7 +53,7 @@ static void (*runtime_class_init)(Class*);
 static bool ready = false;
 static bool auto_save_enabled = true;
 
-// Combat Hack States
+// Continuous Combat Hack States
 static float g_MoveSpeedMultiplier = 1.0f;
 static int g_AttackSpeedBonus = 0;
 static float g_DamageMultiplier = 1.0f;
@@ -62,6 +63,8 @@ static bool g_InfiniteMana = false;
 static bool g_OneHitKill = false;
 static bool g_NoCooldown = false;
 static bool g_AttackAoE = false;
+static bool g_AutoKill = false;
+static bool g_BossDropEnabled = false;
 
 static void Fail(NSString* msg) {
     @throw [NSException exceptionWithName:@"HeroAgeException" reason:msg userInfo:nil];
@@ -385,118 +388,7 @@ static void FinishAllQuests() {
 }
 
 // -------------------------------------------------------------
-// Combat Parameters (Speed, Cooldown, Damage, AoE, GodMode, Mana)
-// -------------------------------------------------------------
-
-static void ApplyCombatModifiers() {
-    Object* ch = GetMainCharacter();
-    if (ch) {
-        uint8_t* pCh = reinterpret_cast<uint8_t*>(ch);
-        
-        // Movement speed via MovementSpeedRune (offset 0x150 = 336 int32)
-        // Normal base is 100, rune adds directly
-        int32_t* pMoveRune = reinterpret_cast<int32_t*>(pCh + 0x150);
-        *pMoveRune = static_cast<int32_t>((g_MoveSpeedMultiplier - 1.0f) * 100.0f);
-        
-        // Attack speed via AttackSpeedRune (offset 0x14C = 332 int32)
-        int32_t* pAtkRune = reinterpret_cast<int32_t*>(pCh + 0x14C);
-        *pAtkRune = g_AttackSpeedBonus;
-        
-        // IncreaseAttackSpeedBuff at offset 0x304
-        int32_t* pAtkBuff = reinterpret_cast<int32_t*>(pCh + 0x304);
-        *pAtkBuff = g_AttackSpeedBonus;
-        
-        // ApproachSpeed (offset 0x230 float)
-        float* pApproach = reinterpret_cast<float*>(pCh + 0x230);
-        if (g_MoveSpeedMultiplier > 1.0f) *pApproach = 30.0f;
-        
-        // God Mode (Bất tử): DamageDecreasePercent at offset 0x100 (float)
-        float* pDmgDecrease = reinterpret_cast<float*>(pCh + 0x100);
-        if (g_GodMode) {
-            *pDmgDecrease = 100.0f; // 100% damage reduction
-        }
-        
-        // Damage Multiplier & One-Hit Kill
-        float* pWlDmg = reinterpret_cast<float*>(pCh + 0x11C);
-        int32_t* pMinDmg = reinterpret_cast<int32_t*>(pCh + 0xE0);
-        int32_t* pMaxDmg = reinterpret_cast<int32_t*>(pCh + 0xE4);
-        int32_t* pMaxDmgRune = reinterpret_cast<int32_t*>(pCh + 0x13C);
-        
-        if (g_OneHitKill) {
-            *pMinDmg = 99999999;
-            *pMaxDmg = 99999999;
-            *pMaxDmgRune = 99999999;
-            *pWlDmg = 99999.0f;
-        } else if (g_DamageMultiplier > 1.0f) {
-            *pWlDmg = (g_DamageMultiplier - 1.0f) * 100.0f;
-        }
-    }
-    
-    // CharacterData HP & MP handling
-    Object* p = GetPlayer();
-    if (p) {
-        if (g_GodMode) {
-            int maxHp = 99999999;
-            void* hpArgs[] = { &maxHp };
-            Invoke(p, "set_Health", 1, hpArgs);
-            Invoke(p, "set_CurrentHealth", 1, hpArgs);
-        }
-        if (g_InfiniteMana) {
-            int maxMp = 99999999;
-            void* mpArgs[] = { &maxMp };
-            Invoke(p, "set_Mana", 1, mpArgs);
-            Invoke(p, "set_CurrentMana", 1, mpArgs);
-        }
-    }
-    
-    // SkillModel modifications
-    Object* gc = GetSingleton("GameController", "instance");
-    if (gc) {
-        Object* skillModelsArr = GetFieldValue<Object*>(object_get_class(gc), gc, "SkillModels");
-        if (skillModelsArr) {
-            int cnt = ArrayLength(skillModelsArr);
-            for (int i = 0; i < cnt; ++i) {
-                Object* sk = ArrayGet(skillModelsArr, i);
-                if (!sk) continue;
-                
-                uint8_t* pSk = reinterpret_cast<uint8_t*>(sk);
-                
-                // CoolDown (offset 0x80 float)
-                float* pCd = reinterpret_cast<float*>(pSk + 0x80);
-                if (g_NoCooldown) {
-                    *pCd = 0.0f;
-                }
-                
-                // ManaConst (offset 0x50 float) - 0 Mana Cost
-                float* pManaCost = reinterpret_cast<float*>(pSk + 0x50);
-                if (g_ZeroMana) {
-                    *pManaCost = 0.0f;
-                }
-                
-                // Range & AoE
-                float* pRangeX = reinterpret_cast<float*>(pSk + 0x58);
-                float* pRangeY = reinterpret_cast<float*>(pSk + 0x5C);
-                bool* pKillAround = reinterpret_cast<bool*>(pSk + 0x54);
-                if (g_AttackAoE) {
-                    *pRangeX = 60.0f;
-                    *pRangeY = 60.0f;
-                    *pKillAround = true;
-                }
-                
-                // One-Hit on skill damage
-                if (g_OneHitKill) {
-                    float* pSkMin = reinterpret_cast<float*>(pSk + 0x48);
-                    float* pSkMax = reinterpret_cast<float*>(pSk + 0x4C);
-                    *pSkMin = 99999999.0f;
-                    *pSkMax = 99999999.0f;
-                }
-            }
-        }
-    }
-}
-
-// -------------------------------------------------------------
-// Monster Management & Boss Drops
+// Monster Management & Boss Drops (Direct Memory List Access)
 // -------------------------------------------------------------
 
 static int ConvertAllMonstersToBossDrop() {
@@ -506,7 +398,6 @@ static int ConvertAllMonstersToBossDrop() {
     Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
     if (!list) return 0;
     
-    // In List<T>, size is at offset 0x18, items array is at offset 0x10
     int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
     uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
     if (!itemsArray || size <= 0) return 0;
@@ -519,21 +410,29 @@ static int ConvertAllMonstersToBossDrop() {
         
         uint8_t* pM = reinterpret_cast<uint8_t*>(monster);
         
-        // Level (int32 at offset 0x74) - higher level = higher tier equipment drops
+        // Level (0x74) -> Set to 350 so dropped item level roll is maximum tier
         int32_t* pLevel = reinterpret_cast<int32_t*>(pM + 0x74);
         if (*pLevel < 350) *pLevel = 350;
         
-        // EffectLevel (int32 at offset 0xB0) - tier 3 is golden/boss effect
+        // EffectLevel (0xB0) -> Set to 3 (Gold Boss effect)
         int32_t* pEffectLvl = reinterpret_cast<int32_t*>(pM + 0xB0);
         *pEffectLvl = 3;
         
-        // HasSuperEffect (bool at offset 0xB4) - triggers Super item drops
+        // HasSuperEffect (0xB4) & HasGodEffect (0xB5)
         bool* pSuper = reinterpret_cast<bool*>(pM + 0xB4);
         *pSuper = true;
-        
-        // HasGodEffect (bool at offset 0xB5) - triggers God item drops
         bool* pGod = reinterpret_cast<bool*>(pM + 0xB5);
         *pGod = true;
+        
+        // Remove defense/resistance so damage multiplier works 100% on bosses!
+        float* pDef = reinterpret_cast<float*>(pM + 0x90);
+        *pDef = 0.0f;
+        float* pDefRate = reinterpret_cast<float*>(pM + 0x94);
+        *pDefRate = 0.0f;
+        float* pEliteRes = reinterpret_cast<float*>(pM + 0x124);
+        *pEliteRes = 0.0f;
+        uint8_t* pIgnoreDmg = reinterpret_cast<uint8_t*>(pM + 0x12C);
+        *pIgnoreDmg = 0;
         
         converted++;
     }
@@ -542,7 +441,7 @@ static int ConvertAllMonstersToBossDrop() {
 
 static int KillAllMonsters() {
     Object* gc = GetSingleton("GameController", "instance");
-    if (!gc) Fail(@"Chưa vào game.");
+    if (!gc) return 0;
     
     Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
     if (!list) return 0;
@@ -565,12 +464,21 @@ static int KillAllMonsters() {
         
         bool isDied = GetFieldValue<bool>(object_get_class(monster), monster, "IsDied");
         if (!isDied) {
-            // Hit deals lethal damage, which invokes the game's drop code, exp, and sounds!
+            if (g_BossDropEnabled) {
+                uint8_t* pM = reinterpret_cast<uint8_t*>(monster);
+                *reinterpret_cast<int32_t*>(pM + 0x74) = 350;
+                *reinterpret_cast<int32_t*>(pM + 0xB0) = 3;
+                *reinterpret_cast<bool*>(pM + 0xB4) = true;
+                *reinterpret_cast<bool*>(pM + 0xB5) = true;
+                *reinterpret_cast<float*>(pM + 0x90) = 0.0f;
+                *reinterpret_cast<float*>(pM + 0x94) = 0.0f;
+                *reinterpret_cast<float*>(pM + 0x124) = 0.0f;
+                *reinterpret_cast<uint8_t*>(pM + 0x12C) = 0;
+            }
             @try {
                 Invoke(monster, "Hit", 7, hitArgs);
             } @catch (id) {
-                // Fallback to Die if Hit fails
-                Invoke(monster, "Die");
+                @try { Invoke(monster, "Die"); } @catch (id) {}
             }
             killed++;
         }
@@ -600,6 +508,131 @@ static void SetExpRateMultiplier(int multiplier) {
     Field* fExp = class_get_field_from_name(gcClass, "ExpRate");
     if (fExp) {
         field_static_get_value(fExp, &multiplier);
+    }
+}
+
+// -------------------------------------------------------------
+// Continuous Combat Parameters Applicator (Frame Loop)
+// -------------------------------------------------------------
+
+static void ApplyCombatModifiers() {
+    Object* ch = GetMainCharacter();
+    if (ch) {
+        uint8_t* pCh = reinterpret_cast<uint8_t*>(ch);
+        
+        // 1. Move Speed via MovementSpeedRune (offset 0x150 = 336 int32)
+        // Normal base is 100, rune adds directly
+        int32_t* pMoveRune = reinterpret_cast<int32_t*>(pCh + 0x150);
+        *pMoveRune = static_cast<int32_t>((g_MoveSpeedMultiplier - 1.0f) * 100.0f);
+        
+        // 2. Attack Speed via AttackSpeedRune (offset 0x14C = 332 int32) & TotalAttackSpeed
+        int32_t* pAtkRune = reinterpret_cast<int32_t*>(pCh + 0x14C);
+        *pAtkRune = g_AttackSpeedBonus;
+        int32_t* pAtkBuff = reinterpret_cast<int32_t*>(pCh + 0x304);
+        *pAtkBuff = g_AttackSpeedBonus;
+        
+        // 3. Approach Speed (offset 0x230 float)
+        float* pApproach = reinterpret_cast<float*>(pCh + 0x230);
+        if (g_MoveSpeedMultiplier > 1.0f) *pApproach = 35.0f;
+        
+        // 4. God Mode (Bất tử): DamageDecreasePercent (offset 0x100 float)
+        float* pDmgDecrease = reinterpret_cast<float*>(pCh + 0x100);
+        if (g_GodMode) {
+            *pDmgDecrease = 100.0f; // 100% damage reduction
+        }
+        
+        // 5. Penetrate Boss Defense (Fix boss damage multiplier!)
+        // Bypass all boss defense and boss elite reductions
+        *reinterpret_cast<int32_t*>(pCh + 0x334) = 99999999; // EliteIgnoreDefense
+        *reinterpret_cast<int32_t*>(pCh + 0x314) = 99999999; // LegendIgnoreDefense
+        *reinterpret_cast<int32_t*>(pCh + 0x324) = 100;      // LegendIgnoreDefenseRate
+        *reinterpret_cast<uint8_t*>(pCh + 0x128) = 100;      // FIgnoreDefenseRate
+        
+        // 6. Damage Multiplier & One-Hit Kill
+        float* pWlDmg = reinterpret_cast<float*>(pCh + 0x11C);
+        int32_t* pMinDmg = reinterpret_cast<int32_t*>(pCh + 0xE0);
+        int32_t* pMaxDmg = reinterpret_cast<int32_t*>(pCh + 0xE4);
+        int32_t* pMaxDmgRune = reinterpret_cast<int32_t*>(pCh + 0x13C);
+        
+        if (g_OneHitKill) {
+            *pMinDmg = 99999999;
+            *pMaxDmg = 99999999;
+            *pMaxDmgRune = 99999999;
+            *pWlDmg = 99999.0f;
+        } else if (g_DamageMultiplier > 1.0f) {
+            *pWlDmg = (g_DamageMultiplier - 1.0f) * 100.0f;
+            *pMinDmg = static_cast<int32_t>(*pMinDmg * g_DamageMultiplier);
+            *pMaxDmg = static_cast<int32_t>(*pMaxDmg * g_DamageMultiplier);
+        }
+    }
+    
+    // Maintain Character HP & MP
+    Object* p = GetPlayer();
+    if (p) {
+        if (g_GodMode) {
+            int maxHp = 99999999;
+            void* hpArgs[] = { &maxHp };
+            Invoke(p, "set_Health", 1, hpArgs);
+            Invoke(p, "set_CurrentHealth", 1, hpArgs);
+        }
+        if (g_InfiniteMana) {
+            int maxMp = 99999999;
+            void* mpArgs[] = { &maxMp };
+            Invoke(p, "set_Mana", 1, mpArgs);
+            Invoke(p, "set_CurrentMana", 1, mpArgs);
+        }
+    }
+    
+    // Maintain SkillModel attributes
+    Object* gc = GetSingleton("GameController", "instance");
+    if (gc) {
+        Object* skillModelsArr = GetFieldValue<Object*>(object_get_class(gc), gc, "SkillModels");
+        if (skillModelsArr) {
+            int cnt = ArrayLength(skillModelsArr);
+            for (int i = 0; i < cnt; ++i) {
+                Object* sk = ArrayGet(skillModelsArr, i);
+                if (!sk) continue;
+                
+                uint8_t* pSk = reinterpret_cast<uint8_t*>(sk);
+                
+                if (g_NoCooldown) {
+                    *reinterpret_cast<float*>(pSk + 0x80) = 0.0f;
+                }
+                if (g_ZeroMana) {
+                    *reinterpret_cast<float*>(pSk + 0x50) = 0.0f;
+                }
+                if (g_AttackAoE) {
+                    *reinterpret_cast<float*>(pSk + 0x58) = 60.0f;
+                    *reinterpret_cast<float*>(pSk + 0x5C) = 60.0f;
+                    *reinterpret_cast<bool*>(pSk + 0x54) = true;
+                }
+                if (g_OneHitKill) {
+                    *reinterpret_cast<float*>(pSk + 0x48) = 99999999.0f;
+                    *reinterpret_cast<float*>(pSk + 0x4C) = 99999999.0f;
+                }
+            }
+        }
+        
+        // Strip monster defense and resistances so damage multipliers work on bosses
+        if (g_DamageMultiplier > 1.0f || g_OneHitKill) {
+            Object* list = GetFieldValue<Object*>(object_get_class(gc), gc, "_monsters");
+            if (list) {
+                int32_t size = *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(list) + 0x18);
+                uint8_t* itemsArray = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(list) + 0x10);
+                if (itemsArray && size > 0) {
+                    Object** items = reinterpret_cast<Object**>(itemsArray + 0x20);
+                    for (int i = 0; i < size; ++i) {
+                        Object* m = items[i];
+                        if (!m) continue;
+                        uint8_t* pM = reinterpret_cast<uint8_t*>(m);
+                        *reinterpret_cast<float*>(pM + 0x90) = 0.0f; // Defense
+                        *reinterpret_cast<float*>(pM + 0x94) = 0.0f; // DefenseRate
+                        *reinterpret_cast<float*>(pM + 0x124) = 0.0f; // EliteRes
+                        *reinterpret_cast<uint8_t*>(pM + 0x12C) = 0; // EliteIgnoreNormalDmg
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -707,6 +740,7 @@ struct ItemOptionsConfig {
     int legendOption;  // -1 = none, 0..7 = Legend Opt
     int specialOption; // -1 = none, 0..7 = Special Opt
     std::vector<int> subOptions; // 0..7 (Ex Options)
+    bool dropAtPlayer; // If true, drop on ground at player feet instead of inventory
 };
 
 static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
@@ -722,7 +756,7 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         if (val == 0) freeSlots.push_back(i);
     }
     
-    if (freeSlots.size() < (size_t)cfg.quantity) {
+    if (!cfg.dropAtPlayer && freeSlots.size() < (size_t)cfg.quantity) {
         Fail([NSString stringWithFormat:@"Không đủ ô trống trong túi đồ (Cần %d, Còn %lu).", cfg.quantity, freeSlots.size()]);
     }
     
@@ -815,14 +849,47 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
             rawItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetAmount", 2, amtArgs));
         }
         
-        // Inject to slot
-        int slot = freeSlots[q];
-        void* setArgs[] = { &slot, &rawItem };
-        Invoke(bucket, "set_Item", 2, setArgs);
-        
         // Register in GameConfig
         void* regArgs[] = { &rawItem };
         Invoke(gameConfig, nullptr, "RegisterItem", 1, regArgs);
+        
+        // Drop on ground or inject into inventory slot
+        if (cfg.dropAtPlayer) {
+            Object* ch = GetMainCharacter();
+            if (ch) {
+                float posX = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ch) + 0x15C);
+                float posY = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(ch) + 0x160);
+                
+                @try {
+                    Object* poolMgr = GetSingleton("PoolManager", "instance");
+                    if (poolMgr) {
+                        Method* mSpawn = class_get_method_from_name(object_get_class(poolMgr), "Spawn", 2);
+                        if (mSpawn) {
+                            void* args[] = { &rawItem };
+                            Object* dropObj = Invoke(poolMgr, "Spawn", 2, args);
+                            if (dropObj) {
+                                void* setPosArgs[] = { &posX, &posY };
+                                Invoke(dropObj, "SetPosition", 2, setPosArgs);
+                                void* setItemArgs[] = { &rawItem };
+                                Invoke(dropObj, "SetItem", 1, setItemArgs);
+                            }
+                        }
+                    }
+                } @catch (id) {
+                    // Fallback to free slot if ground spawn is unavailable
+                    if (!freeSlots.empty()) {
+                        int slot = freeSlots.back();
+                        freeSlots.pop_back();
+                        void* setArgs[] = { &slot, &rawItem };
+                        Invoke(bucket, "set_Item", 2, setArgs);
+                    }
+                }
+            }
+        } else {
+            int slot = freeSlots[q];
+            void* setArgs[] = { &slot, &rawItem };
+            Invoke(bucket, "set_Item", 2, setArgs);
+        }
     }
     
     // Refresh Inventory safely
@@ -840,6 +907,57 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
 }
 
 } // namespace HA
+
+// -------------------------------------------------------------
+// Continuous Frame Loop Engine (Prevents Resets & Drives AutoKill)
+// -------------------------------------------------------------
+
+@interface HAEngineLoop : NSObject
+@property (nonatomic, strong) CADisplayLink* displayLink;
++ (instancetype)shared;
+- (void)start;
+- (void)stop;
+@end
+
+@implementation HAEngineLoop
+
++ (instancetype)shared {
+    static HAEngineLoop* s = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        s = [[HAEngineLoop alloc] init];
+    });
+    return s;
+}
+
+- (void)start {
+    if (self.displayLink) return;
+    self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onTick:)];
+    [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)stop {
+    [self.displayLink invalidate];
+    self.displayLink = nil;
+}
+
+- (void)onTick:(CADisplayLink*)link {
+    static int tickCount = 0;
+    tickCount++;
+    
+    @try {
+        HA::ThreadScope scope;
+        // Continuously maintain combat parameters so game Update/CalculateValues cannot reset them!
+        HA::ApplyCombatModifiers();
+        
+        // Auto-kill loop: runs every ~10 frames (~6 times per second)
+        if (HA::g_AutoKill && (tickCount % 10 == 0)) {
+            HA::KillAllMonsters();
+        }
+    } @catch (id) {}
+}
+
+@end
 
 // -------------------------------------------------------------
 // UI: Premium Mod Menu (iOS Dark Native Design)
@@ -885,7 +1003,6 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     
     int cat = [self.itemData[@"category"] intValue];
     self.availableOptions = HA::GetOptionListForCategory(cat);
-    // Pre-select all available sub-options for maximum god item
     for (NSDictionary* opt in self.availableOptions) {
         [self.selectedOptions addObject:opt[@"index"]];
     }
@@ -903,6 +1020,10 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
 }
 
 - (void)onAddTapped {
+    [self executeCreateItem:NO];
+}
+
+- (void)executeCreateItem:(BOOL)dropOnGround {
     HA::ItemOptionsConfig cfg;
     cfg.category = [self.itemData[@"category"] intValue];
     cfg.itemId = [self.itemData[@"id"] intValue];
@@ -915,6 +1036,7 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     cfg.godType = (int)self.godType;
     cfg.legendOption = 0;
     cfg.specialOption = 0;
+    cfg.dropAtPlayer = dropOnGround;
     
     for (NSNumber* n in self.selectedOptions) {
         cfg.subOptions.push_back([n intValue]);
@@ -924,8 +1046,12 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         HA::ThreadScope scope;
         HA::CreateAndInjectItem(cfg);
         
+        NSString* msg = dropOnGround ? 
+            [NSString stringWithFormat:@"Đã rớt %ldx %@ Full Dòng ngay chân bạn!", (long)self.quantity, self.itemData[@"name"]] :
+            [NSString stringWithFormat:@"Đã thêm %ldx %@ Full Dòng vào túi đồ!", (long)self.quantity, self.itemData[@"name"]];
+            
         UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Thành công"
-                                                                   message:[NSString stringWithFormat:@"Đã tạo và thêm %ldx %@ Full Dòng vào túi đồ!", (long)self.quantity, self.itemData[@"name"]]
+                                                                   message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             [self.navigationController popViewControllerAnimated:YES];
@@ -941,20 +1067,22 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return self.availableOptions.count > 0 ? 4 : 3;
+    return self.availableOptions.count > 0 ? 5 : 4;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if (section == 0) return @"Thông tin Vật phẩm";
     if (section == 1) return @"Cài đặt Cấp độ & Số lượng";
     if (section == 2) return @"Dòng Đặc Biệt (Tím / Vàng / Super / Chip)";
+    if (section == 3) return @"Hành động Nhanh";
     return @"Dòng phụ thường (Option dòng)";
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 3;
     if (section == 1) return 2;
-    if (section == 2) return 5; // Super, Harmony, Chip, God Set, Primitive
+    if (section == 2) return 5;
+    if (section == 3) return 2; // Rớt ngay chân, Bật Full Tất Cả Dòng
     return self.availableOptions.count;
 }
 
@@ -981,7 +1109,7 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         }
     } else if (indexPath.section == 1) {
         if (indexPath.row == 0) {
-            cell.textLabel.text = @"Số lượng thêm";
+            cell.textLabel.text = @"Số lượng tạo";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld", (long)self.quantity];
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         } else {
@@ -1023,6 +1151,14 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
             cell.accessoryView = sw;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
         }
+    } else if (indexPath.section == 3) {
+        if (indexPath.row == 0) {
+            cell.textLabel.text = @"Rớt đồ ngay chân người chơi (Spawn on Ground)";
+            cell.detailTextLabel.text = @"Rớt xuống đất";
+        } else {
+            cell.textLabel.text = @"Tối Thượng: Bật Hết Dòng (Max All)";
+            cell.detailTextLabel.text = @"+15, Tím, Vàng, Chip, Super, Full Dòng";
+        }
     } else {
         NSDictionary* opt = self.availableOptions[indexPath.row];
         cell.textLabel.text = opt[@"label"];
@@ -1043,7 +1179,7 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == 1) {
         if (indexPath.row == 0) {
-            UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Số lượng" message:@"Nhập số lượng muốn thêm (1 - 50)" preferredStyle:UIAlertControllerStyleAlert];
+            UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Số lượng" message:@"Nhập số lượng muốn tạo (1 - 50)" preferredStyle:UIAlertControllerStyleAlert];
             [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
                 textField.keyboardType = UIKeyboardTypeNumberPad;
                 textField.text = [NSString stringWithFormat:@"%ld", (long)self.quantity];
@@ -1083,6 +1219,22 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         [a addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:a animated:YES completion:nil];
     } else if (indexPath.section == 3) {
+        if (indexPath.row == 0) {
+            [self executeCreateItem:YES];
+        } else {
+            // Max God Item All Options
+            self.itemLevel = 15;
+            self.isSuper = YES;
+            self.isHarmony = YES;
+            self.isChip = YES;
+            self.isPrimitive = YES;
+            self.godType = 1;
+            for (NSDictionary* opt in self.availableOptions) {
+                [self.selectedOptions addObject:opt[@"index"]];
+            }
+            [self.tableView reloadData];
+        }
+    } else if (indexPath.section == 4) {
         NSDictionary* opt = self.availableOptions[indexPath.row];
         NSNumber* idx = opt[@"index"];
         if ([self.selectedOptions containsObject:idx]) {
@@ -1212,7 +1364,7 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         return 2; // No Cooldown, Attack AoE
     }
     if (tab == 3) {
-        if (section == 0) return 2; // Kill All, Convert All to Boss Drop
+        if (section == 0) return 3; // Auto Kill Switch, Kill All Now, Convert All to Boss Drop
         return 6; // Spawn Map Boss, Global, Narkan, Shadow, Dark Mona, Exp Rate
     }
     return section == 0 ? 4 : 2;
@@ -1312,11 +1464,20 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
     } else if (tab == 3) {
         if (indexPath.section == 0) {
             if (indexPath.row == 0) {
-                cell.textLabel.text = @"Tiêu diệt toàn bộ quái (Kill All Monsters)";
+                cell.textLabel.text = @"Tự Động Diệt Quái Liên Tục (Auto-Kill Loop)";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_AutoKill;
+                [sw addTarget:self action:@selector(onAutoKillToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            } else if (indexPath.row == 1) {
+                cell.textLabel.text = @"Tiêu diệt toàn bộ quái ngay lập tức (Kill All Now)";
                 cell.detailTextLabel.text = @"Hạ quái hợp lệ, kích hoạt rơi đồ, exp và nhiệm vụ";
             } else {
                 cell.textLabel.text = @"Chuyển drop quái thành Boss (Super & God Drop)";
-                cell.detailTextLabel.text = @"Toàn bộ quái trên map thành cấp 350 + Super/God Effect";
+                UISwitch* sw = [[UISwitch alloc] init];
+                sw.on = HA::g_BossDropEnabled;
+                [sw addTarget:self action:@selector(onBossDropToggled:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
             }
         } else {
             NSArray* bossList = @[
@@ -1364,32 +1525,40 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
 
 - (void)onGodModeToggled:(UISwitch*)sw {
     HA::g_GodMode = sw.on;
-    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
 }
 
 - (void)onInfiniteManaToggled:(UISwitch*)sw {
     HA::g_InfiniteMana = sw.on;
-    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
 }
 
 - (void)onZeroManaToggled:(UISwitch*)sw {
     HA::g_ZeroMana = sw.on;
-    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
 }
 
 - (void)onOneHitToggled:(UISwitch*)sw {
     HA::g_OneHitKill = sw.on;
-    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
 }
 
 - (void)onNoCooldownToggled:(UISwitch*)sw {
     HA::g_NoCooldown = sw.on;
-    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
 }
 
 - (void)onAttackAoEToggled:(UISwitch*)sw {
     HA::g_AttackAoE = sw.on;
-    @try { HA::ThreadScope sc; HA::ApplyCombatModifiers(); } @catch (id) {}
+}
+
+- (void)onAutoKillToggled:(UISwitch*)sw {
+    HA::g_AutoKill = sw.on;
+}
+
+- (void)onBossDropToggled:(UISwitch*)sw {
+    HA::g_BossDropEnabled = sw.on;
+    if (sw.on) {
+        @try {
+            HA::ThreadScope scope;
+            HA::ConvertAllMonstersToBossDrop();
+        } @catch (id) {}
+    }
 }
 
 - (void)onAutoSaveToggled:(UISwitch*)sw {
@@ -1431,10 +1600,6 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
                     float val = [a.textFields.firstObject.text floatValue];
                     if (val >= 1.0f && val <= 50.0f) {
                         HA::g_MoveSpeedMultiplier = val;
-                        @try {
-                            HA::ThreadScope scope;
-                            HA::ApplyCombatModifiers();
-                        } @catch (id) {}
                     }
                     [self.tableView reloadData];
                 }]];
@@ -1450,10 +1615,6 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
                     int val = [a.textFields.firstObject.text intValue];
                     if (val >= 0 && val <= 10000) {
                         HA::g_AttackSpeedBonus = val;
-                        @try {
-                            HA::ThreadScope scope;
-                            HA::ApplyCombatModifiers();
-                        } @catch (id) {}
                     }
                     [self.tableView reloadData];
                 }]];
@@ -1469,10 +1630,6 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
                     float val = [a.textFields.firstObject.text floatValue];
                     if (val >= 1.0f && val <= 10000.0f) {
                         HA::g_DamageMultiplier = val;
-                        @try {
-                            HA::ThreadScope scope;
-                            HA::ApplyCombatModifiers();
-                        } @catch (id) {}
                     }
                     [self.tableView reloadData];
                 }]];
@@ -1482,17 +1639,14 @@ static void CreateAndInjectItem(const ItemOptionsConfig& cfg) {
         }
     } else if (tab == 3) {
         if (indexPath.section == 0) {
-            @try {
-                HA::ThreadScope scope;
-                if (indexPath.row == 0) {
+            if (indexPath.row == 1) {
+                @try {
+                    HA::ThreadScope scope;
                     int killed = HA::KillAllMonsters();
                     [self showSuccessAlert:[NSString stringWithFormat:@"Đã tiêu diệt %d quái vật trên map và kích hoạt rơi đồ!", killed]];
-                } else {
-                    int conv = HA::ConvertAllMonstersToBossDrop();
-                    [self showSuccessAlert:[NSString stringWithFormat:@"Đã chuyển %d quái vật trên map thành cấp Boss (Cấp 350 + Super/God Effect)!", conv]];
+                } @catch (NSException* e) {
+                    [self showErrorAlert:e.reason];
                 }
-            } @catch (NSException* e) {
-                [self showErrorAlert:e.reason];
             }
         } else {
             @try {
@@ -1680,11 +1834,16 @@ __attribute__((constructor)) static void Entry() {
         static HAButtonLauncher* launcher;
         launcher = [[HAButtonLauncher alloc] init];
         [launcher attach];
+        
+        // Start persistent frame loop
+        [HAEngineLoop.shared start];
+        
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification * _Nonnull note) {
             [launcher attach];
+            [HAEngineLoop.shared start];
         }];
     });
 }
