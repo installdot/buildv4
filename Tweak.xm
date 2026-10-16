@@ -15,6 +15,10 @@
 
 namespace HA {
 
+[[noreturn]] static void Fail(NSString* message) {
+    @throw [NSException exceptionWithName:@"HeroAgeException" reason:message userInfo:nil];
+}
+
 struct Object;
 struct Class;
 struct Method;
