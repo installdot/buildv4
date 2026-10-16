@@ -149,7 +149,7 @@ struct ThreadScope {
     }
 };
 
-static Class* FindClass(const char* name) {
+static Class* FindClass(const char* name, const char* namespaze = "") {
     Init();
     if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
     void* domain = domain_get();
@@ -163,7 +163,7 @@ static Class* FindClass(const char* name) {
     for (size_t i = 0; i < count; ++i) {
         void* img = assembly_get_image(assemblies[i]);
         if (!img) continue;
-        Class* c = class_from_name(img, "", name);
+        Class* c = class_from_name(img, namespaze, name);
         if (c) {
             res = c;
             break;
@@ -1012,7 +1012,6 @@ static int UpgradeAllEquippedToMax() {
             int64_t newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetLevel", 2, lvlArgs));
             
             void* itemArgs[] = { &newItem };
-            newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetSuper", 1, itemArgs));
             newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetHarmony", 1, itemArgs));
             newItem = Unbox<int64_t>(Invoke(itemUtils, nullptr, "SetChipAttribute", 1, itemArgs));
             
@@ -1043,7 +1042,7 @@ static bool AutoFillCraftMachine() {
         if (!craftDiag || !object_get_class) return false;
         
         // Check if CraftDialog is active using Component.get_gameObject and GameObject.get_activeInHierarchy
-        Class* compClass = FindClass("Component");
+        Class* compClass = FindClass("Component", "UnityEngine");
         if (!compClass) return false;
         Object* go = Invoke(compClass, craftDiag, "get_gameObject");
         if (!go || !object_get_class) return false;
