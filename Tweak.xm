@@ -144,18 +144,6 @@ static T GetFieldValue(Class* klass, Object* obj, const char* name) {
     return val;
 }
 
-template<typename T>
-static void SetFieldValue(Class* klass, Object* obj, const char* name, T val) {
-    Field* f = class_get_field_from_name(klass, name);
-    if (!f) Fail([NSString stringWithFormat:@"Không tìm thấy field: %s", name]);
-    // write to instance field
-    if (!(field_get_flags(f) & 0x10)) {
-        if (!obj) Fail(@"Field instance cần object.");
-        // Offset calculation or direct write
-        uint8_t* ptr = reinterpret_cast<uint8_t*>(obj);
-        // We can use field accessor or direct pointer if known
-    }
-}
 
 static Object* GetSingleton(const char* klassName, const char* fieldName) {
     return GetFieldValue<Object*>(FindClass(klassName), nullptr, fieldName);
@@ -281,7 +269,6 @@ static void UnlockAllSkills(bool maxPoints) {
     
     int total = ArrayLength(skillModelsArr);
     int playerClass = Unbox<int>(Invoke(p, "get_ClassType"));
-    Class* itemUtilsClass = FindClass("ItemUtils");
     
     int maxPts = 20;
     Field* fMaxPts = class_get_field_from_name(object_get_class(gc), "MaxSkillPoint");
