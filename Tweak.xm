@@ -38,6 +38,7 @@ static const Type* (*field_get_type)(Field*);
 static Class* (*class_from_type)(const Type*);
 static const char* (*class_get_name)(Class*);
 static void (*field_get_value)(Object*, Field*, void*);
+static void (*field_set_value)(Object*, Field*, void*);
 static void (*field_static_get_value)(Field*, void*);
 static uint32_t (*field_get_flags)(Field*);
 static Method* (*class_get_method_from_name)(Class*, const char*, int);
@@ -131,6 +132,7 @@ static void Init() {
     LOAD(type_get_type); LOAD(runtime_invoke); LOAD(object_unbox);
     LOAD(string_length); LOAD(string_chars); LOAD(thread_current); LOAD(thread_attach);
     LOAD(runtime_class_init);
+    LOAD(field_set_value);
 #undef LOAD
     if (!domain_get || !domain_get()) return;
     ready = true;
@@ -310,6 +312,8 @@ static void CheckAutoSave() {
 static int GetPlayerStat(NSString* name) {
     Object* p = GetPlayer();
     if (!p || !object_get_class) return 0;
+    if ([name isEqualToString:@"UpgradeLuck"])
+        return GetFieldValue<uint8_t>(object_get_class(p), p, "UpgradeLuck");
     std::string methodName = "get_" + std::string([name UTF8String]);
     Method* m = class_get_method_from_name(object_get_class(p), methodName.c_str(), 0);
     if (!m) return 0;
@@ -321,6 +325,20 @@ static int GetPlayerStat(NSString* name) {
 
 static void SetPlayerStat(NSString* name, int value) {
     Object* p = GetPlayer();
+    if ([name isEqualToString:@"UpgradeLuck"]) {
+        if (!p || !object_get_class || !field_set_value) Fail(@"Chưa có nhân vật hoặc API ghi field.");
+        if (value < 0 || value > UINT8_MAX) Fail(@"UpgradeLuck chỉ nhận 0–255.");
+        Field* field = class_get_field_from_name(object_get_class(p), "UpgradeLuck");
+        if (!field || type_get_type(field_get_type(field)) != 0x05)
+            Fail(@"UpgradeLuck không tồn tại hoặc không phải Byte.");
+        uint8_t luck = static_cast<uint8_t>(value);
+        field_set_value(p, field, &luck);
+        uint8_t actual = 0;
+        field_get_value(p, field, &actual);
+        if (actual != luck) Fail(@"Giá trị UpgradeLuck đọc lại không khớp.");
+        CheckAutoSave();
+        return;
+    }
     if (!p || !object_get_class) return;
     std::string methodName = "set_" + std::string([name UTF8String]);
     void* args[] = { &value };
@@ -1649,7 +1667,7 @@ static bool AutoFillCraftMachine() {
     NSInteger tab = self.tabControl.selectedSegmentIndex;
     if (tab == 0) return self.filteredItems.count;
     if (tab == 1) {
-        if (section == 0) return 5;
+        if (section == 0) return 6;
         if (section == 1) return 7;
         return 3;
     }
@@ -1684,7 +1702,7 @@ static bool AutoFillCraftMachine() {
         }
     } else if (tab == 1) {
         if (indexPath.section == 0) {
-            NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
+            NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount", @"UpgradeLuck"];
             NSString* statName = s0[indexPath.row];
             cell.textLabel.text = statName;
             @try {
@@ -1872,7 +1890,7 @@ static bool AutoFillCraftMachine() {
         }
     } else if (tab == 1) {
         if (indexPath.section == 0) {
-            NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount"];
+            NSArray* s0 = @[@"Level", @"Experience", @"Point", @"SkillPoint", @"ResetCount", @"UpgradeLuck"];
             NSString* statName = s0[indexPath.row];
             [self promptInputForStat:statName];
         } else if (indexPath.section == 1) {
@@ -2017,6 +2035,38 @@ static bool AutoFillCraftMachine() {
 }
 
 - (void)promptInputForStat:(NSString*)statName {
+    if ([statName isEqualToString:@"UpgradeLuck"]) {
+        int current;
+        @try {
+            HA::ThreadScope scope;
+            if (!HA::GetPlayer()) HA::Fail(@"Vào nhân vật trước khi chỉnh luck.");
+            current = HA::GetPlayerStat(statName);
+        } @catch (NSException* error) { [self showErrorAlert:error.reason]; return; }
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"UpgradeLuck"
+            message:@"Nhập 0–255. Từ 26 có thể bị game tính thành luck 0; không đảm bảo craft 100%."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addTextFieldWithConfigurationHandler:^(UITextField* field) {
+            field.text = [NSString stringWithFormat:@"%d", current];
+            field.keyboardType = UIKeyboardTypeNumberPad;
+            field.accessibilityLabel = @"UpgradeLuck từ 0 đến 255";
+        }];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Áp dụng" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+            @try {
+                NSString* text = alert.textFields.firstObject.text ?: @"";
+                NSCharacterSet* invalid = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
+                if (!text.length || text.length > 3 || [text rangeOfCharacterFromSet:invalid].location != NSNotFound)
+                    HA::Fail(@"Nhập số nguyên 0–255, không dùng ký tự khác.");
+                HA::ThreadScope scope;
+                HA::SetPlayerStat(@"UpgradeLuck", text.intValue);
+                [self.tableView reloadData];
+            } @catch (NSException* error) {
+                dispatch_async(dispatch_get_main_queue(), ^{ [self showErrorAlert:error.reason]; });
+            }
+        }]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
     UIAlertController* a = [UIAlertController alertControllerWithTitle:statName message:@"Nhập giá trị mới" preferredStyle:UIAlertControllerStyleAlert];
     [a addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
         textField.keyboardType = UIKeyboardTypeNumberPad;
@@ -2077,22 +2127,45 @@ static bool AutoFillCraftMachine() {
 @implementation HAButtonLauncher
 
 - (void)attach {
-    if (self.floatBtn.superview) return;
+    UIApplication* app = UIApplication.sharedApplication;
+    if (app.applicationState != UIApplicationStateActive) return;
     
     UIWindow* win = nil;
-    for (UIScene* s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]] && s.activationState == UISceneActivationStateForegroundActive) {
-            UIWindowScene* ws = (UIWindowScene*)s;
-            for (UIWindow* w in ws.windows) {
-                if (w.isKeyWindow) { win = w; break; }
-            }
-            if (win) break;
+    for (UIScene* s in app.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]] ||
+            s.activationState != UISceneActivationStateForegroundActive) continue;
+        for (UIWindow* w in ((UIWindowScene*)s).windows) {
+            if (w.hidden || w.alpha <= 0 || !w.rootViewController ||
+                w.windowLevel != UIWindowLevelNormal) continue;
+            if (!win || w.isKeyWindow) win = w;
+            if (w.isKeyWindow) break;
+        }
+        if (win.isKeyWindow) break;
+    }
+    // Unity builds without a scene manifest still use application windows on iOS 17.
+    if (!win) {
+        for (UIWindow* w in app.windows) {
+            if (w.hidden || w.alpha <= 0 || !w.rootViewController ||
+                w.windowLevel != UIWindowLevelNormal) continue;
+            if (!win || w.isKeyWindow) win = w;
+            if (w.isKeyWindow) break;
         }
     }
     if (!win) return;
+    if (self.floatBtn.superview == win) {
+        [win bringSubviewToFront:self.floatBtn];
+        return;
+    }
+    if (self.floatBtn) {
+        [self.floatBtn removeFromSuperview];
+        self.floatBtn.frame = CGRectMake(win.bounds.size.width - 65, 120, 50, 50);
+        [win addSubview:self.floatBtn];
+        return;
+    }
     
     self.floatBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatBtn.frame = CGRectMake(win.bounds.size.width - 65, 120, 50, 50);
+    self.floatBtn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
     self.floatBtn.layer.cornerRadius = 25;
     self.floatBtn.backgroundColor = [UIColor colorWithRed:0.15 green:0.15 blue:0.18 alpha:0.85];
     self.floatBtn.layer.borderColor = [UIColor colorWithRed:0.84 green:0.65 blue:0.25 alpha:0.9].CGColor;
@@ -2136,10 +2209,14 @@ static bool AutoFillCraftMachine() {
 @end
 
 __attribute__((constructor)) static void Entry() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_async(dispatch_get_main_queue(), ^{
         static HAButtonLauncher* launcher;
         launcher = [[HAButtonLauncher alloc] init];
         [launcher attach];
+        // Recheck late Unity roots, replacement windows and views covering the launcher.
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer* timer) {
+            [launcher attach];
+        }];
         
         [HAEngineLoop.shared start];
         
