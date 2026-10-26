@@ -3,10 +3,8 @@
 // Logs to  <app Documents>/racetoolkit.log   (O_APPEND + fsync on every line,
 // so the file survives a hard crash; no NSLog / os_log dependency).
 //
-// Every hook target is verified against its expected 8-byte prologue taken from
-// the Il2Cpp dump BEFORE patching. A mismatch means the on-device UnityFramework
-// does not match the dump -> the hook is skipped and logged instead of writing a
-// 16-byte patch into unrelated code (that was the "crash on entering game" bug).
+// The 8-byte prologue check is a limited mismatch check, not build identity.
+// NULL trampoline and SIGBUS do not establish whether the backend wrote a patch.
 //
 //   RVA          function                                          size
 //   0x53D8430    void GameGoState::ImpEnter()                      1408
@@ -22,10 +20,9 @@
 //   0x7C6E664    void NssVehicleDriftCtrl::ForceEndDrifting()       208
 //   0x7AF996C    void NssPhyVehicleECU::SetNormalTopMPS(float)      220
 //
-// NOT hooked (8-byte leaf functions — a 16-byte MSHookFunction patch would
-// overwrite the next function):
-//   0x9CF2340  get_NitrogenValue        (overwrote get_CollisionPickLossPowerNum)
-//   0x7AF9964  ReadNormalTopMPS         (overwrote SetNormalTopMPS)
+// These 8-byte leaf getters remain excluded; patch size depends on the backend.
+//   0x9CF2340  get_NitrogenValue
+//   0x7AF9964  ReadNormalTopMPS
 
 // Feature-test macros MUST come before the first system header, otherwise
 // iPhoneOS26.sdk's <ucontext.h> errors out with
@@ -51,13 +48,11 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
-#include <execinfo.h>
+#include <dlfcn.h>
 // arm64 Darwin: ucontext_t + mcontext64 live here; avoids the deprecated
 // <ucontext.h> wrapper entirely.
 #include <sys/ucontext.h>
 #include <mach/mach.h>
-#include <mach/vm_map.h>
-#include <libkern/OSCacheControl.h>
 #include <pthread.h>
 #include <time.h>
 #include <sys/time.h>
@@ -126,49 +121,6 @@ static int rtAppendHex(char *dst, int off, uintptr_t v) {
     return off;
 }
 
-// Precomputed at init (not in the handler) so the handler only reads memory.
-#define RT_MAX_IMG 96
-static uintptr_t gImgBase[RT_MAX_IMG];
-static char      gImgName[RT_MAX_IMG][64];
-static int       gImgCount = 0;
-
-static void rtSnapshotImages(void) {
-    int n = 0;
-    for (uint32_t i = 0; i < _dyld_image_count() && n < RT_MAX_IMG; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (!nm) continue;
-        gImgBase[n] = (uintptr_t)_dyld_get_image_header(i);
-        const char *slash = strrchr(nm, '/');
-        strncpy(gImgName[n], slash ? slash + 1 : nm, sizeof(gImgName[n]) - 1);
-        n++;
-    }
-    // insertion sort by base -> lets the handler locate an address by range
-    for (int i = 1; i < n; i++) {
-        uintptr_t b = gImgBase[i]; char tmp[64];
-        strncpy(tmp, gImgName[i], sizeof(tmp));
-        int j = i - 1;
-        while (j >= 0 && gImgBase[j] > b) {
-            gImgBase[j + 1] = gImgBase[j];
-            strncpy(gImgName[j + 1], gImgName[j], sizeof(gImgName[j + 1]) - 1);
-            j--;
-        }
-        gImgBase[j + 1] = b;
-        strncpy(gImgName[j + 1], tmp, sizeof(gImgName[j + 1]) - 1);
-    }
-    gImgCount = n;
-}
-
-// Signal-safe: returns "Img+0xoff" into dst, or just the hex address.
-static int rtDescribeAddr(char *dst, int off, uintptr_t a) {
-    for (int i = gImgCount - 1; i >= 0; i--) {
-        if (a < gImgBase[i]) continue;
-        const char *nm = gImgName[i];
-        while (*nm) dst[off++] = *nm++;
-        dst[off++] = '+';
-        return rtAppendHex(dst, off, a - gImgBase[i]);
-    }
-    return rtAppendHex(dst, off, a);
-}
 
 static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
     ucontext_t *uc = (ucontext_t *)uap;
@@ -187,21 +139,19 @@ static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
     ssize_t w = write(gLogFd, hdr, (size_t)n);
     (void)w;
 
-    // Where it actually died: PC/LR from ucontext beats backtrace_symbols_fd,
-    // which returns 0 frames when the crash is outside a valid frame chain.
+    // Preserve absolute addresses; symbolicate against actual segment ranges.
+    // Do not unwind here: unwinding is not guaranteed async-signal-safe.
     char loc[320];
     int k = 0;
     const char *p1 = "  PC="; while (*p1) loc[k++] = *p1++;
-    k = rtDescribeAddr(loc, k, uc && uc->uc_mcontext ? (uintptr_t)uc->uc_mcontext->__ss.__pc : 0);
+    k = rtAppendHex(loc, k, uc && uc->uc_mcontext ? (uintptr_t)uc->uc_mcontext->__ss.__pc : 0);
     const char *p2 = "  LR="; while (*p2) loc[k++] = *p2++;
-    k = rtDescribeAddr(loc, k, uc && uc->uc_mcontext ? (uintptr_t)uc->uc_mcontext->__ss.__lr : 0);
+    k = rtAppendHex(loc, k, uc && uc->uc_mcontext ? (uintptr_t)uc->uc_mcontext->__ss.__lr : 0);
     const char *p3 = "\n"; loc[k++] = *p3++;
     ssize_t w2 = write(gLogFd, loc, (size_t)k);
     (void)w2;
 
-    void *frames[64];
-    int c = backtrace(frames, 64);
-    if (c > 0) backtrace_symbols_fd(frames, c, gLogFd);
+    // No unwinding or symbol allocation in a fatal signal handler.
     fsync(gLogFd);
 
     signal(sig, SIG_DFL);
@@ -365,8 +315,8 @@ static int hook_EvtN2OTrigger(void *self) {
 // ExtraVelocityTriggerMgr::mVehicle @ 0x68
 static BOOL hook_IsCanTriggerExVel(void *self, int type) {
     RT_TRACE(6, "hook IsCanTriggerExtraVelocity self=%p type=%d", self, type);
-    BOOL mine = self && vehicleIsMainPlayer(*(void **)((char *)self + 0x68));
-    if (mine && type == kTypeMini && gFullMiniBoost) return YES;
+    if (gFullMiniBoost && type == kTypeMini && self &&
+        vehicleIsMainPlayer(*(void **)((char *)self + 0x68))) return YES;
     return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type) : NO;
 }
 
@@ -417,28 +367,17 @@ static uintptr_t unityFrameworkBase(void) {
     return 0;
 }
 
-// MSHookFunction returns void: on failure it leaves *orig == NULL and may have
-// already written part of its 16-byte patch into the target. That is exactly
-// what the log showed (6/12 orig=0x0, then SIGBUS). So: snapshot the bytes
-// first, and restore them if the trampoline came back NULL.
-#define RT_PATCH_LEN 32
-
-static BOOL rtMakeWritable(void *addr, size_t len) {
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)addr, len,
-                                  false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    return kr == KERN_SUCCESS;
-}
-
-static void rtRestoreBytes(void *addr, const uint8_t *saved, size_t len) {
-    if (!rtMakeWritable(addr, len)) {
-        rtLog("restore: vm_protect FAILED for %p", addr);
-        return;
-    }
-    memcpy(addr, saved, len);
-    sys_icache_invalidate(addr, len);
-}
+// Never restore an assumed patch length. The backend may have changed mappings
+// or multiple instructions; a NULL trampoline is not proof of a partial patch.
 
 static void installHooks(void) {
+    Dl_info backend = {};
+    if (dladdr((const void *)&MSHookFunction, &backend)) {
+        rtLog("backend MSHookFunction=%p image=%s base=%p",
+              (void *)&MSHookFunction, backend.dli_fname ?: "unknown", backend.dli_fbase);
+    } else {
+        rtLog("backend MSHookFunction=%p image=unknown", (void *)&MSHookFunction);
+    }
     uintptr_t b = unityFrameworkBase();
     if (!b) { rtLog("install: UnityFramework base not found"); return; }
     rtLog("install: UnityFramework base = %p", (void *)b);
@@ -503,20 +442,13 @@ static void installHooks(void) {
             continue;   // wrong build/version -> do not patch
         }
 
-        uint8_t saved[RT_PATCH_LEN];
-        memcpy(saved, addr, sizeof(saved));
 
+        rtLog("HOOK BEGIN name=%s target=%p replacement=%p", s->name, addr, s->replacement);
         MSHookFunction(addr, s->replacement, s->trampoline);
 
         if (*(s->trampoline) == NULL) {
-            // Trampoline creation failed. Undo whatever the patcher wrote.
-            rtRestoreBytes(addr, saved, sizeof(saved));
-            uint8_t after[8];
-            memcpy(after, addr, sizeof(after));
-            BOOL restored = memcmp(after, s->expect, sizeof(after)) == 0;
-            rtLog("FAIL %-40s @%p orig=NULL -> bytes %s",
-                  s->name, addr, restored ? "RESTORED" : "STILL CORRUPT");
-            continue;
+            rtLog("INSTALL STOP: %s returned NULL trampoline; no manual code writes; backend state unknown", s->name);
+            return;
         }
 
         rtLog("HOOK %-40s @%p orig=%p", s->name, addr, *(s->trampoline));
@@ -708,9 +640,13 @@ static void startToolkit(void) {
 
 __attribute__((constructor)) static void RCInit(void) {
     rtLogOpen();
-    rtSnapshotImages();
     rtInstallCrashHandler();
     rtLog("=== RaceToolkit session start ===\nlog: %s\npid=%d", gLogPath, getpid());
+    rtLog("diagnostic revision=no-rollback-raw-pc-1");
+    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+        rtLog("IMAGE base=%p slide=%lld path=%s", (void *)_dyld_get_image_header(i),
+              (long long)_dyld_get_image_vmaddr_slide(i), _dyld_get_image_name(i));
+    }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ startToolkit(); });
