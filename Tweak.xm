@@ -1,10 +1,12 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
-// Zero-Crash Architecture:
-// - Does NOT touch __TEXT (no vm_protect, no code-patching, no AMFI violation, no SIGBUS).
-// - Replaces methodPointer in MethodInfo and slot in Il2CppClass::vtable (__DATA, natively RW).
-// - Resolves runtime exports from UnityFramework (il2cpp_domain_get, il2cpp_class_from_name, etc.).
-// - Fully compatible with jailed / rootless / TrollStore / modern iOS environments.
+// Root Cause Fix for Log (5):
+// 1. Removed fragile vehicleIsMainPlayer / evtIsMainPlayer checks which returned false
+//    and silently dropped all 4 features.
+// 2. Switched Speed adjustment from ECU (which was overwritten every frame) to
+//    NssPhyVehiclePowerChain::Update (directly sets mExtraKMPH, mExtraTorque, mMPSScaleCoef).
+// 3. Added support for ExtraVelocityType Air (3), FallingGround (11), PassiveMini (16), Overlap (8).
+// 4. Removed gGoTime 5-second gate so Speed applies immediately when the slider is moved.
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -126,55 +128,36 @@ static void rtInstallCrashHandler(void) {
 
 #pragma mark - Toolkit state & field offsets
 
-static BOOL   gFullNitro     = NO;
-static BOOL   gFullMiniBoost = NO;
-static BOOL   gAutoDriftEnd  = NO;
-static float  gSpeedKmh      = 0.f;
-static double gGoTime        = 0.0;
+static BOOL   gFullNitro      = NO;
+static BOOL   gFullMiniBoost  = NO;
+static BOOL   gAutoDriftEnd   = NO;
+static float  gSpeedKmh       = 0.f;
 static BOOL   gHooksInstalled = NO;
-
-static const float    kSpeedDelaySeconds = 5.0f;
-static const uint32_t kNitroMaxPower     = 1000;
-static const int      kTypeMini          = 2;
 
 // Il2cpp field offsets verified against dump.cs:
 enum {
-    kOffNitroCurPower   = 208,  // 0xD0 SingleNitrogenCollect::mCurPower (uint)
-    kOffTopMps          = 264,  // 0x108 NssPhyVehicleECUBase::mNormalTopMPS (float)
-    kOffEvtVdAngleMax   = 116,  // 0x74 EvtMini::mDriftingMaxAbsVDAngle (float)
-    kOffEvtDriftingTime = 124,  // 0x7C EvtMini::mDriftingTime (float)
-    kOffEvtInCanTrigger = 133,  // 0x85 EvtMini::mInCanTriggerTime (bool)
-    kOffEvtMiniVdMax    = 136,  // 0x88 EvtMini::mMiniBoostDriftingMaxAbsVDAngle (float)
-    kOffEvtInChecking   = 140,  // 0x8C EvtMini::mIsInCheckingCanTrigger (bool)
-    kOffEvtCheckTime    = 144,  // 0x90 EvtMini::mNewCheckMiniBoostTime (float)
-    kOffEvtLastDrift    = 160,  // 0xA0 EvtMini::mLastIsDrifting (bool)
+    // SingleNitrogenCollect
+    kOffNitroCurPower     = 208, // 0xD0 mCurPower (uint)
+    kOffNitroCurColPower  = 212, // 0xD4 mCurCollectPower (uint)
+    kOffNitroShowPower    = 224, // 0xE0 mCurShowPower (uint)
+    kOffNitroIsFull       = 240, // 0xF0 mIsCollectFull (bool)
+
+    // EvtMini
+    kOffEvtVdAngleMax     = 116, // 0x74 EvtMini::mDriftingMaxAbsVDAngle (float)
+    kOffEvtDriftingTime   = 124, // 0x7C EvtMini::mDriftingTime (float)
+    kOffEvtInCanTrigger   = 133, // 0x85 EvtMini::mInCanTriggerTime (bool)
+    kOffEvtMiniVdMax      = 136, // 0x88 EvtMini::mMiniBoostDriftingMaxAbsVDAngle (float)
+    kOffEvtInChecking     = 140, // 0x8C EvtMini::mIsInCheckingCanTrigger (bool)
+    kOffEvtCheckTime      = 144, // 0x90 EvtMini::mNewCheckMiniBoostTime (float)
+    kOffEvtLastDrift      = 160, // 0xA0 EvtMini::mLastIsDrifting (bool)
+
+    // NssPhyVehiclePowerChain (Physics Power Chain, NOT ECU)
+    kOffPowerForceTopMPS  = 52,  // 0x34 mForceTopMPS (float)
+    kOffPowerMPSScaleCoef = 56,  // 0x38 mMPSScaleCoef (float)
+    kOffPowerTorqueScale  = 64,  // 0x40 mTorqueScaleCoef (float)
+    kOffPowerExtraKMPH    = 68,  // 0x44 mExtraKMPH (float)
+    kOffPowerExtraTorque  = 72,  // 0x48 mExtraTorque (float)
 };
-
-static inline double nowSeconds(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
-static inline BOOL speedWindowOpen(void) {
-    if (gSpeedKmh <= 0.f) return NO;
-    if (gGoTime > 0.0) {
-        return (nowSeconds() - gGoTime) >= (double)kSpeedDelaySeconds;
-    }
-    return YES;
-}
-
-// NssVehicle::mIsMainPlayer @ 0xF8
-static inline BOOL vehicleIsMainPlayer(void *vehicle) {
-    if (!vehicle) return NO;
-    return *(uint8_t *)((char *)vehicle + 0xF8) != 0;
-}
-
-// ExtraVelocityTriggerBase::mVehicle @ 0x18
-static inline BOOL evtIsMainPlayer(void *evt) {
-    if (!evt) return NO;
-    return vehicleIsMainPlayer(*(void **)((char *)evt + 0x18));
-}
 
 #pragma mark - IL2CPP Runtime API & Structures
 
@@ -190,13 +173,11 @@ typedef struct {
     const MethodInfo *method;
 } VirtualInvokeData;
 
-// Function pointers resolved from UnityFramework
 static Il2CppDomain *(*il2cpp_domain_get)(void) = NULL;
 static const Il2CppAssembly **(*il2cpp_domain_get_assemblies)(const Il2CppDomain *domain, size_t *size) = NULL;
 static const Il2CppImage *(*il2cpp_assembly_get_image)(const Il2CppAssembly *assembly) = NULL;
 static Il2CppClass *(*il2cpp_class_from_name)(const Il2CppImage *image, const char *namespaze, const char *name) = NULL;
 static const MethodInfo *(*il2cpp_class_get_method_from_name)(Il2CppClass *klass, const char *name, int argsCount) = NULL;
-static const char *(*il2cpp_image_get_name)(const Il2CppImage *image) = NULL;
 
 static uintptr_t unityFrameworkBase(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -223,7 +204,6 @@ static BOOL rtInitIl2CppApi(void) {
     *(void **)&il2cpp_assembly_get_image = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_assembly_get_image");
     *(void **)&il2cpp_class_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_from_name");
     *(void **)&il2cpp_class_get_method_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
-    *(void **)&il2cpp_image_get_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_image_get_name");
 
     if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_class_get_method_from_name) {
         return NO;
@@ -250,8 +230,7 @@ static Il2CppClass *rtFindClass(const char *namespaze, const char *name) {
     return NULL;
 }
 
-// Hooks a method via Il2CppClass vtable + MethodInfo.
-// Zero code patching. Zero memory protection change. 100% safe on iOS.
+// Hooks a method via Il2CppClass vtable + MethodInfo (__DATA / heap, natively RW).
 static void *rtHookMethod(const char *namespaze, const char *className,
                           const char *methodName, int argsCount,
                           void *replacement) {
@@ -261,28 +240,21 @@ static void *rtHookMethod(const char *namespaze, const char *className,
         return NULL;
     }
 
-    // il2cpp_class_get_method_from_name automatically calls Class::Init(klass)
     const MethodInfo *method = il2cpp_class_get_method_from_name(klass, methodName, argsCount);
     if (!method) {
         rtLog("il2cpp: %s::%s(args=%d) NOT FOUND", className, methodName, argsCount);
         return NULL;
     }
 
-    // Offset 0 of MethodInfo is methodPointer
     void *orig = *(void **)((char *)method + 0);
-
-    // Replace in MethodInfo (for direct reflection / runtime_invoke)
     *(void **)((char *)method + 0) = replacement;
 
-    // Offset 88 is slot (uint16_t)
     uint16_t slot = *(uint16_t *)((char *)method + 88);
-    // Offset 306 is vtable_count (uint16_t)
     uint16_t vtable_count = *(uint16_t *)((char *)klass + 306);
 
     uintptr_t base = unityFrameworkBase();
     uintptr_t rva = base && orig ? ((uintptr_t)orig - base) : 0;
 
-    // Offset 336 (0x150) is vtable array of VirtualInvokeData
     if (slot < vtable_count) {
         VirtualInvokeData *vtable = (VirtualInvokeData *)((char *)klass + 336);
         vtable[slot].methodPtr = replacement;
@@ -298,43 +270,41 @@ static void *rtHookMethod(const char *namespaze, const char *className,
 
 #pragma mark - Original function pointers & Replacements
 
-static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
 static void  (*orig_Nitro_Update)(void *, float, const void *) = NULL;
 static float (*orig_Nitro_GetProgress)(void *, const void *) = NULL;
 static void  (*orig_EvtMini_Update)(void *, float, const void *) = NULL;
 static BOOL  (*orig_EvtMini_CanTrigger)(void *, const void *) = NULL;
-static int   (*orig_EvtMini_Trigger)(void *, const void *) = NULL;
 static BOOL  (*orig_EvtN2O_CanTrigger)(void *, const void *) = NULL;
-static int   (*orig_EvtN2O_Trigger)(void *, const void *) = NULL;
 static BOOL  (*orig_IsCanTriggerExVel)(void *, int, const void *) = NULL;
 static void  (*orig_Drift_Release)(void *, const void *) = NULL;
 static void  (*orig_Drift_ForceEnd)(void *, const void *) = NULL;
-static void  (*orig_ECU_SetNormalTopMPS)(void *, float, const void *) = NULL;
+static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
 
-static void hook_GoImpEnter(void *self, const void *method) {
-    RT_TRACE(4, "hook GameGoState::ImpEnter self=%p", self);
-    if (orig_GameGo_ImpEnter) orig_GameGo_ImpEnter(self, method);
-    gGoTime = nowSeconds();
-    rtLog("race started -> speed gate armed (%.1fs delay)", kSpeedDelaySeconds);
-}
-
+// 1. Full Nitro
 static void hook_NitroUpdate(void *self, float dt, const void *method) {
-    RT_TRACE(3, "hook Nitro::Update self=%p dt=%.3f", self, dt);
     if (orig_Nitro_Update) orig_Nitro_Update(self, dt, method);
     if (!gFullNitro || !self) return;
-    void *veh = *(void **)((char *)self + 0x60);
-    if (!vehicleIsMainPlayer(veh)) return;
-    *(uint32_t *)((char *)self + kOffNitroCurPower) = kNitroMaxPower;
+
+    // Fill current power, show power, and mark full
+    *(uint32_t *)((char *)self + kOffNitroCurPower)    = 1000;
+    *(uint32_t *)((char *)self + kOffNitroCurColPower) = 1000;
+    *(uint32_t *)((char *)self + kOffNitroShowPower)   = 1000;
+    *(uint8_t *) ((char *)self + kOffNitroIsFull)      = 1;
 }
 
 static float hook_NitroGetProgress(void *self, const void *method) {
-    RT_TRACE(3, "hook Nitro::get_ProgressBarPowerValue self=%p", self);
-    if (gFullNitro && self &&
-        vehicleIsMainPlayer(*(void **)((char *)self + 0x60))) return 1.0f;
+    if (gFullNitro && self) return 1.0f;
     return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self, method) : 0.0f;
 }
 
+static BOOL hook_EvtN2OCanTrigger(void *self, const void *method) {
+    if (gFullNitro) return YES;
+    return orig_EvtN2O_CanTrigger ? orig_EvtN2O_CanTrigger(self, method) : NO;
+}
+
+// 2. Full Mini Boost
 static inline void armMiniWindow(void *self) {
+    if (!self) return;
     *(float *)   ((char *)self + kOffEvtVdAngleMax)   = 999.0f;
     *(float *)   ((char *)self + kOffEvtMiniVdMax)    = 999.0f;
     *(float *)   ((char *)self + kOffEvtDriftingTime) = 999.0f;
@@ -345,71 +315,54 @@ static inline void armMiniWindow(void *self) {
 }
 
 static void hook_EvtMiniUpdate(void *self, float dt, const void *method) {
-    RT_TRACE(3, "hook EvtMini::Update self=%p", self);
     if (orig_EvtMini_Update) orig_EvtMini_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
-    if (!evtIsMainPlayer(self)) return;
     armMiniWindow(self);
 }
 
 static BOOL hook_EvtMiniCanTrigger(void *self, const void *method) {
-    RT_TRACE(5, "hook EvtMini::IsCanTrigger self=%p", self);
-    if (gFullMiniBoost && evtIsMainPlayer(self)) {
+    if (gFullMiniBoost && self) {
         armMiniWindow(self);
         return YES;
     }
     return orig_EvtMini_CanTrigger ? orig_EvtMini_CanTrigger(self, method) : NO;
 }
 
-static int hook_EvtMiniTrigger(void *self, const void *method) {
-    RT_TRACE(5, "hook EvtMini::Trigger self=%p", self);
-    return orig_EvtMini_Trigger ? orig_EvtMini_Trigger(self, method) : -1;
-}
-
-static BOOL hook_EvtN2OCanTrigger(void *self, const void *method) {
-    RT_TRACE(5, "hook EvtN2O::IsCanTrigger self=%p", self);
-    if (gFullNitro && evtIsMainPlayer(self)) return YES;
-    return orig_EvtN2O_CanTrigger ? orig_EvtN2O_CanTrigger(self, method) : NO;
-}
-
-static int hook_EvtN2OTrigger(void *self, const void *method) {
-    RT_TRACE(5, "hook EvtN2O::Trigger self=%p", self);
-    return orig_EvtN2O_Trigger ? orig_EvtN2O_Trigger(self, method) : -1;
-}
-
 static BOOL hook_IsCanTriggerExVel(void *self, int type, const void *method) {
-    RT_TRACE(6, "hook IsCanTriggerExtraVelocity self=%p type=%d", self, type);
-    if (gFullMiniBoost && type == kTypeMini && self &&
-        vehicleIsMainPlayer(*(void **)((char *)self + 0x68))) return YES;
+    if (gFullMiniBoost && self) {
+        // ExtraVelocityType: Mini=2, Air=3, Overlap=8, FallingGround=11, PassiveMini=16
+        if (type == 2 || type == 3 || type == 8 || type == 11 || type == 16) {
+            return YES;
+        }
+    }
     return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type, method) : NO;
 }
 
+// 3. Auto End Drift
 static void hook_DriftForceEnd(void *self, const void *method) {
-    RT_TRACE(4, "hook DriftCtrl::ForceEndDrifting self=%p", self);
     if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self, method);
 }
 
 static void hook_DriftRelease(void *self, const void *method) {
-    RT_TRACE(4, "hook DriftCtrl::ReleaseDrifting self=%p", self);
     if (orig_Drift_Release) orig_Drift_Release(self, method);
     if (!gAutoDriftEnd || !self) return;
-
-    void *dyn = *(void **)((char *)self + 0x10);   // NssVehicleDriftCtrl.mVehicle : IDynamicVehicle
-    if (!dyn) return;
-    void *veh = *(void **)((char *)dyn + 0x10);    // DynamicVehicle.mVehicle : IVehicle
-    if (!vehicleIsMainPlayer(veh)) return;
-
     if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self, nullptr);
 }
 
-static void hook_SetNormalTopMPS(void *self, float topMps, const void *method) {
-    RT_TRACE(3, "hook ECU::SetNormalTopMPS self=%p mps=%.3f", self, topMps);
-    if (orig_ECU_SetNormalTopMPS) orig_ECU_SetNormalTopMPS(self, topMps, method);
+// 4. Vehicle Physics PowerChain Speed Boost (Direct Physics, NO ECU)
+static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
+    if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
+    if (!self || gSpeedKmh <= 0.f) return;
 
-    if (!self || !speedWindowOpen()) return;
-    void *veh = *(void **)((char *)self + 0x18);   // NssPhyVehicleECUBase.mVehicle
-    if (!vehicleIsMainPlayer(veh)) return;
-    *(float *)((char *)self + kOffTopMps) += gSpeedKmh / 3.6f;
+    // Apply directly to vehicle physical power chain:
+    // 0x44: mExtraKMPH
+    // 0x48: mExtraTorque
+    // 0x38: mMPSScaleCoef (speed scaling)
+    // 0x40: mTorqueScaleCoef (acceleration scaling)
+    *(float *)((char *)self + kOffPowerExtraKMPH)    = gSpeedKmh;
+    *(float *)((char *)self + kOffPowerExtraTorque)  = gSpeedKmh * 10.0f;
+    *(float *)((char *)self + kOffPowerMPSScaleCoef) = 1.0f + (gSpeedKmh / 120.0f);
+    *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
 #pragma mark - Hook installation
@@ -442,16 +395,12 @@ static void installHooks(void) {
         rtHookMethod("", "SingleNitrogenCollect", "get_ProgressBarPowerValue", 0, (void *)hook_NitroGetProgress);
     orig_EvtN2O_CanTrigger = (BOOL (*)(void *, const void *))
         rtHookMethod("", "EvtN2O", "IsCanTrigger", 0, (void *)hook_EvtN2OCanTrigger);
-    orig_EvtN2O_Trigger = (int (*)(void *, const void *))
-        rtHookMethod("", "EvtN2O", "Trigger", 0, (void *)hook_EvtN2OTrigger);
 
     // 2. Full Mini Boost
     orig_EvtMini_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "EvtMini", "Update", 1, (void *)hook_EvtMiniUpdate);
     orig_EvtMini_CanTrigger = (BOOL (*)(void *, const void *))
         rtHookMethod("", "EvtMini", "IsCanTrigger", 0, (void *)hook_EvtMiniCanTrigger);
-    orig_EvtMini_Trigger = (int (*)(void *, const void *))
-        rtHookMethod("", "EvtMini", "Trigger", 0, (void *)hook_EvtMiniTrigger);
     orig_IsCanTriggerExVel = (BOOL (*)(void *, int, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "IsCanTriggerExtraVelocity", 1, (void *)hook_IsCanTriggerExVel);
 
@@ -461,24 +410,15 @@ static void installHooks(void) {
     orig_Drift_ForceEnd = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ForceEndDrifting", 0, (void *)hook_DriftForceEnd);
 
-    // 4. Speed Slider (ECU)
-    orig_ECU_SetNormalTopMPS = (void (*)(void *, float, const void *))
-        rtHookMethod("", "NssPhyVehicleECU", "SetNormalTopMPS", 1, (void *)hook_SetNormalTopMPS);
-    rtHookMethod("", "NssPhyVehicleECUBase", "SetNormalTopMPS", 1, (void *)hook_SetNormalTopMPS);
+    // 4. Vehicle Physics PowerChain Speed Boost (Direct Physics, NO ECU)
+    orig_PowerChain_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    // 5. Race start marker
-    orig_GameGo_ImpEnter = (void (*)(void *, const void *))
-        rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
-    rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
-    rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
-    rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
-
-    rtLog("install: done (IL2CPP metadata hooks active)");
+    rtLog("install: done (all hooks active)");
 }
 
 #pragma mark - UI
 
-// Window that only takes touches landing on our own controls.
 @interface RCPassThroughWindow : UIWindow
 @end
 
@@ -540,7 +480,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     self.window.rootViewController = [[UIViewController alloc] init];
     self.window.rootViewController.view.backgroundColor = UIColor.clearColor;
     self.window.rootViewController.view.opaque = NO;
-    self.window.hidden = NO;   // never makeKeyAndVisible: keep the game key
+    self.window.hidden = NO;
 
     self.host = self.window.rootViewController.view;
 
@@ -594,16 +534,16 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 3;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:11];
-    note.text = @"Speed applies only after race start + 5s.\nAuto End Drift ends the drift when the drift key is released.";
+    note.text = @"PowerChain Speed: Direct physics torque & km/h boost.\nAuto End Drift: Releases drift immediately on key up.";
     [self.panel addSubview:note];
 }
 
 - (NSString *)speedText {
-    return [NSString stringWithFormat:@"Boost speed: %d km/h (+5s)", (int)gSpeedKmh];
+    return [NSString stringWithFormat:@"Boost speed: %d km/h", (int)gSpeedKmh];
 }
 
 - (void)togglePanel {
-    self.panel.hidden = !self.panel.hidden;
+    self.panel.hidden = __omp_shell("self.panel.hidden;")
     self.window.windowLevel = UIWindowLevelAlert + 1;
     self.window.hidden = NO;
 }
