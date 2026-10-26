@@ -241,8 +241,29 @@ static void installHooks(void) {
 
 #pragma mark - UI
 
+// Window that only takes touches landing on our own controls; everything else
+// passes through to the game underneath (Unity/UnityFramework view).
+@interface RCPassThroughWindow : UIWindow
+@end
+
+@implementation RCPassThroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (!hit) return nil;
+    // Finger landed on empty overlay space -> pass through to the game window.
+    if (hit == self) return nil;
+    if (hit == self.rootViewController.view) return nil;
+    return hit;
+}
+
+// Never become key: the game must keep key-window status for input to keep working.
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeFocused  { return NO; }
+@end
+
 @interface RCRaceToolkitMenu : NSObject
-@property (nonatomic, strong) UIWindow *window;
+@property (nonatomic, strong) RCPassThroughWindow *window;
+@property (nonatomic, strong) UIView *host;
 @property (nonatomic, strong) UIButton *fab;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UILabel *speedLabel;
@@ -270,14 +291,28 @@ static RCRaceToolkitMenu *gMenu = nil;
 - (void)build {
     CGRect screen = UIScreen.mainScreen.bounds;
 
-    self.window = [[UIWindow alloc] initWithFrame:screen];
-    self.window.windowLevel = UIWindowLevelAlert + 100;
+    self.window = [[RCPassThroughWindow alloc] initWithFrame:screen];
+
+    // iOS 13+: a window created off-scene never gets displayed.
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            if (sc.activationState != UISceneActivationStateForegroundActive) continue;
+            self.window.windowScene = (UIWindowScene *)sc;
+            break;
+        }
+    }
+    self.window.windowLevel = UIWindowLevelAlert + 1;
     self.window.backgroundColor = UIColor.clearColor;
+    self.window.opaque = NO;
     self.window.rootViewController = [[UIViewController alloc] init];
     self.window.rootViewController.view.backgroundColor = UIColor.clearColor;
-    [self.window makeKeyAndVisible];
+    self.window.rootViewController.view.opaque = NO;
+    // Do NOT makeKeyAndVisible: that steals the key window from the game.
+    self.window.hidden = NO;
 
     UIView *host = self.window.rootViewController.view;
+    self.host = host;
 
     self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
     self.fab.frame = CGRectMake(screen.size.width - 68, 96, 56, 56);
@@ -289,7 +324,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:24];
     [self.fab addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
-    [host addSubview:self.fab];
+    [self.host addSubview:self.fab];
 
     CGFloat w = 300, h = 300;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - w) / 2, (screen.size.height - h) / 2, w, h)];
@@ -298,7 +333,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     self.panel.layer.borderWidth = 1;
     self.panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
     self.panel.hidden = YES;
-    [host addSubview:self.panel];
+    [self.host addSubview:self.panel];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 240, 26)];
     title.text = @"Race Toolkit";
@@ -336,7 +371,12 @@ static RCRaceToolkitMenu *gMenu = nil;
     return [NSString stringWithFormat:@"Boost speed: %d km/h (+5s)", (int)gSpeedKmh];
 }
 
-- (void)togglePanel { self.panel.hidden = !self.panel.hidden; }
+- (void)togglePanel {
+    self.panel.hidden = !self.panel.hidden;
+    // The game may add its own high-level windows; stay above them.
+    self.window.windowLevel = UIWindowLevelAlert + 1;
+    self.window.hidden = NO;
+}
 
 - (void)dragFab:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.fab.superview];
