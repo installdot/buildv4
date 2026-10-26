@@ -1,10 +1,12 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
 // Features & Fixes:
-// 1. Nitro: Instant Full Nitro on gentle drift (mCurIsCollect == true), not automatic idle feeding.
-// 2. Mini Boost: Continuously feeds ReserveSmallBoostMgr::AddReserveSmallBoost so miniboost is always available.
-// 3. Auto End Drift: Calls NssVehicleDriftCtrl::ExitCurDriftState on drift key release. Removed corrupting drift fields.
-// 4. Speed Boost: Direct physics power chain boost (mExtraKMPH, mExtraTorque, mMPSScaleCoef) - NO ECU!
+// 1. Nitro: Drift nhe full nitro (mCurIsCollect == 1). KHONG hook CanTrigger.
+// 2. Miniboost: Auto nhan tieu phun tu ReserveSmallBoostMgr lien tuc. KHONG hook CanTrigger.
+// 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
+// 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
+// 5. Report Speed: Luon gioi han van toc bao cao o muc 300 trong SdcVehicleVel.
+// 6. Top Overlay: Hien thi MinMapTime & Can Finish: TRUE/FALSE check dieu kien ve dich.
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -56,13 +58,6 @@ static void rtLog(const char *fmt, ...) {
     ssize_t w = write(gLogFd, buf, total);
     (void)w;
 }
-
-#define RT_TRACE(rate, fmt, ...) do {                           \
-    static unsigned _rc_##__LINE__ = 0;                         \
-    if ((_rc_##__LINE__++ % (rate)) == 0) {                     \
-        rtLog(fmt, ##__VA_ARGS__);                              \
-    }                                                           \
-} while (0)
 
 #pragma mark - Crash diagnostic (read-only signal reporter)
 
@@ -130,7 +125,16 @@ static BOOL   gFullNitro      = NO;
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
 static float  gSpeedKmh       = 0.f;
+static double gGoTime         = 0.0;
 static BOOL   gHooksInstalled = NO;
+
+// Race status & metrics
+static float  gCurrentMatchTime  = 0.f;
+static float  gMainCurveLength   = 0.f;
+static int    gMapTotalLaps      = 2;
+static float  gMinMapTimeSeconds = 0.f;
+static BOOL   gCanFinish         = NO;
+static int    gLastCheckPointId  = 0;
 
 enum {
     // SingleNitrogenCollect
@@ -140,24 +144,32 @@ enum {
     kOffNitroShowPower    = 224, // 0xE0 mCurShowPower (uint)
     kOffNitroIsFull       = 240, // 0xF0 mIsCollectFull (bool)
 
-    // EvtMini (Only benign flags from OnForceCanTriggerOnce)
-    kOffEvtInCanTrigger   = 133, // 0x85 mInCanTriggerTime (bool)
-    kOffEvtInChecking     = 140, // 0x8C mIsInCheckingCanTrigger (bool)
-    kOffEvtCheckTime      = 144, // 0x90 mNewCheckMiniBoostTime (float)
-
     // ExtraVelocityTriggerMgr
     kOffExVelReserveMgr   = 144, // 0x90 mReserveSmallBoostMgr
 
     // ReserveSmallBoostMgr
     kOffReserveNum        = 24,  // 0x18 mReserveNum (int)
 
-    // NssPhyVehiclePowerChain (Physics Power Chain, NOT ECU)
-    kOffPowerForceTopMPS  = 52,  // 0x34 mForceTopMPS (float)
-    kOffPowerMPSScaleCoef = 56,  // 0x38 mMPSScaleCoef (float)
-    kOffPowerTorqueScale  = 64,  // 0x40 mTorqueScaleCoef (float)
+    // NssPhyVehiclePowerChain
     kOffPowerExtraKMPH    = 68,  // 0x44 mExtraKMPH (float)
     kOffPowerExtraTorque  = 72,  // 0x48 mExtraTorque (float)
+    kOffPowerMPSScaleCoef = 56,  // 0x38 mMPSScaleCoef (float)
+    kOffPowerTorqueScale  = 64,  // 0x40 mTorqueScaleCoef (float)
+
+    // SdcVehicleVel (Security Data Collect)
+    kOffSdcVelEndData     = 88,  // 0x58 mEndData
+    kOffSdcVelProcData    = 96,  // 0x60 mProcessData
+
+    // ActorCpReporter
+    kOffActorCpLastCp     = 104, // 0x68 mLastCheckPoint
+    kOffActorCpLaps       = 120, // 0x78 mMapTotalRoundNum
 };
+
+static inline double nowSeconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 #pragma mark - IL2CPP Runtime API & Structures
 
@@ -269,27 +281,37 @@ static void *rtHookMethod(const char *namespaze, const char *className,
 
 #pragma mark - Original function pointers & Replacements
 
+static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
 static void  (*orig_Nitro_Update)(void *, float, const void *) = NULL;
 static float (*orig_Nitro_GetProgress)(void *, const void *) = NULL;
-static BOOL  (*orig_EvtN2O_CanTrigger)(void *, const void *) = NULL;
 
 static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
 static void  (*orig_Reserve_AddSmallBoost)(void *, int, const void *) = NULL;
-static void  (*orig_EvtMini_Update)(void *, float, const void *) = NULL;
-static BOOL  (*orig_EvtMini_CanTrigger)(void *, const void *) = NULL;
-static BOOL  (*orig_IsCanTriggerExVel)(void *, int, const void *) = NULL;
 
 static void  (*orig_Drift_Release)(void *, const void *) = NULL;
 static void  (*orig_Drift_ExitCurDriftState)(void *, const void *) = NULL;
+static void  (*orig_Drift_ForceClearDriftParams)(void *, const void *) = NULL;
 
 static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
+static void  (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
+static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
+static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
 
-// 1. Full Nitro: Drift nhẹ full nitro (chỉ kích hoạt khi drift, không tự động cộng khi chạy thẳng)
+// 1. Race Start: Bắt đầu bấm giờ
+static void hook_GoImpEnter(void *self, const void *method) {
+    if (orig_GameGo_ImpEnter) orig_GameGo_ImpEnter(self, method);
+    gGoTime = nowSeconds();
+    gCurrentMatchTime = 0.f;
+    gCanFinish = NO;
+    rtLog("race started -> gGoTime=%.3f, minMapTime=%.1fs", gGoTime, gMinMapTimeSeconds);
+}
+
+// 2. Full Nitro: CHỈ drift nhẹ là full nitro, KHÔNG can thiệp CanTrigger
 static void hook_NitroUpdate(void *self, float dt, const void *method) {
     if (orig_Nitro_Update) orig_Nitro_Update(self, dt, method);
     if (!gFullNitro || !self) return;
 
-    // Check mCurIsCollect (0xC4): chỉ khi xe đang drift (dù nhẹ) mới nạp đầy nitro tức thì
+    // 0xC4 là mCurIsCollect: chỉ khi xe đang drift (dù nhẹ) mới nạp đầy
     uint8_t isDrifting = *(uint8_t *)((char *)self + kOffNitroCurIsCollect);
     if (!isDrifting) return;
 
@@ -307,25 +329,12 @@ static float hook_NitroGetProgress(void *self, const void *method) {
     return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self, method) : 0.0f;
 }
 
-static BOOL hook_EvtN2OCanTrigger(void *self, const void *method) {
-    if (gFullNitro && self) return YES;
-    return orig_EvtN2O_CanTrigger ? orig_EvtN2O_CanTrigger(self, method) : NO;
-}
-
-// 2. Mini Boost: Call nhận liên tục qua ReserveSmallBoostMgr::AddReserveSmallBoost
-static inline void armMiniWindow(void *self) {
-    if (!self) return;
-    // Chỉ kích hoạt cờ trigger, KHÔNG chạm vào mLastIsDrifting hay mDriftingTime để tránh kẹt drift
-    *(uint8_t *) ((char *)self + kOffEvtInCanTrigger) = 1;
-    *(uint8_t *) ((char *)self + kOffEvtInChecking)   = 1;
-    *(float *)   ((char *)self + kOffEvtCheckTime)    = 0.0f;
-}
-
+// 3. Mini Boost: Tự động nhận tiểu phun dự trữ (ReserveSmallBoost) liên tục, KHÔNG hook CanTrigger
 static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
     if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
 
-    // Liên tục cấp tiểu phun dự trữ (ReserveSmallBoost)
+    // Nạp liên tục tiểu phun dự trữ
     void *reserveMgr = *(void **)((char *)self + kOffExVelReserveMgr);
     if (reserveMgr) {
         int curNum = *(int *)((char *)reserveMgr + kOffReserveNum);
@@ -343,52 +352,90 @@ static void hook_ReserveAddSmallBoost(void *self, int addNum, const void *method
     if (orig_Reserve_AddSmallBoost) orig_Reserve_AddSmallBoost(self, addNum, method);
 }
 
-static void hook_EvtMiniUpdate(void *self, float dt, const void *method) {
-    if (orig_EvtMini_Update) orig_EvtMini_Update(self, dt, method);
-    if (!gFullMiniBoost || !self) return;
-    armMiniWindow(self);
-}
-
-static BOOL hook_EvtMiniCanTrigger(void *self, const void *method) {
-    if (gFullMiniBoost && self) {
-        armMiniWindow(self);
-        return YES;
-    }
-    return orig_EvtMini_CanTrigger ? orig_EvtMini_CanTrigger(self, method) : NO;
-}
-
-static BOOL hook_IsCanTriggerExVel(void *self, int type, const void *method) {
-    if (gFullMiniBoost && self) {
-        // Cho phép toàn bộ các kiểu phun: Mini=2, Air=3, Overlap=8, FallingGround=11, PassiveMini=16
-        return YES;
-    }
-    return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type, method) : NO;
-}
-
-// 3. Auto End Drift: Gọi chuẩn ExitCurDriftState để thoát trạng thái drift ngay khi nhả nút
+// 4. Auto End Drift: Tránh dính drift bằng cách gọi cả ExitCurDriftState và ForceClearDriftParams
 static void hook_DriftExitCurState(void *self, const void *method) {
     if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(self, method);
+}
+
+static void hook_DriftForceClear(void *self, const void *method) {
+    if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(self, method);
 }
 
 static void hook_DriftRelease(void *self, const void *method) {
     if (orig_Drift_Release) orig_Drift_Release(self, method);
     if (!gAutoDriftEnd || !self) return;
 
-    // Thoát triệt để khỏi DriftStateMachine và trả lái thẳng
+    // 1. Thoát ngay khỏi DriftStateMachine
     if (orig_Drift_ExitCurDriftState) {
         orig_Drift_ExitCurDriftState(self, nullptr);
     }
+    // 2. Xóa triệt để thông số ma sát và góc bẻ lái drift -> Không còn bị dính drift
+    if (orig_Drift_ForceClearDriftParams) {
+        orig_Drift_ForceClearDriftParams(self, nullptr);
+    }
 }
 
-// 4. Vehicle Physics PowerChain Speed Boost (Trực tiếp trục truyền động vật lý, KHÔNG ECU)
+// 5. Tốc độ PowerChain: Chỉ kích hoạt sau 5s xuất phát
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
     if (!self || gSpeedKmh <= 0.f) return;
+
+    // Phải sau 5 giây xuất phát mới bắt đầu boost tốc độ
+    if (gGoTime <= 0.0 || (nowSeconds() - gGoTime) < 5.0) return;
 
     *(float *)((char *)self + kOffPowerExtraKMPH)    = gSpeedKmh;
     *(float *)((char *)self + kOffPowerExtraTorque)  = gSpeedKmh * 10.0f;
     *(float *)((char *)self + kOffPowerMPSScaleCoef) = 1.0f + (gSpeedKmh / 120.0f);
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
+}
+
+// 6. Anti-Cheat Report Speed: Luôn giới hạn tốc độ báo cáo ở mức 300
+static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
+    if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, method);
+    if (!self) return;
+
+    void *endData = *(void **)((char *)self + kOffSdcVelEndData);
+    if (endData) {
+        *(int *)((char *)endData + 0x10) = 300; // CarSpeedMax = 300
+        *(int *)((char *)endData + 0x14) = 0;   // CarSpeedOverBase = 0
+    }
+    void *procData = *(void **)((char *)self + kOffSdcVelProcData);
+    if (procData) {
+        *(int *)((char *)procData + 0x10) = 300; // ProcessVehicleMaxVel = 300
+        *(int *)((char *)procData + 0x28) = 300; // ProcessVehicleMaxBaseVel = 300
+    }
+}
+
+// 7. CheckPointMgr & ActorCpReporter: Lấy độ dài map & tính MinMapTime và Can Finish
+static void hook_CheckPointMgrInit(void *self, void *config, bool checkCrc, bool enableReset, const void *method) {
+    if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, checkCrc, enableReset, method);
+    if (config) {
+        gMainCurveLength = *(float *)((char *)config + 0x4C); // MainCurveLength
+        int laps = gMapTotalLaps > 0 ? gMapTotalLaps : 2;
+        float totalDist = (gMainCurveLength > 100.f ? gMainCurveLength : 4000.f) * (float)laps;
+        // Tốc độ tối đa lý thuyết 300 km/h (≈ 83.33 m/s) -> MinMapTime an toàn
+        gMinMapTimeSeconds = totalDist / (300.0f / 3.6f);
+        rtLog("map loaded: length=%.1fm, laps=%d -> MinMapTime=%.2fs", gMainCurveLength, laps, gMinMapTimeSeconds);
+    }
+}
+
+static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, const void *method) {
+    if (orig_ActorCpReporter_Update) orig_ActorCpReporter_Update(self, dt, matchTime, method);
+    if (!self) return;
+
+    gCurrentMatchTime = matchTime;
+    int laps = *(int *)((char *)self + kOffActorCpLaps);
+    if (laps > 0) gMapTotalLaps = laps;
+    gLastCheckPointId = *(int *)((char *)self + kOffActorCpLastCp);
+
+    // Kiểm tra điều kiện về đích: Thời gian đua >= MinMapTime
+    if (gMinMapTimeSeconds > 0.f && gCurrentMatchTime >= gMinMapTimeSeconds) {
+        gCanFinish = YES;
+    } else if (gGoTime > 0.0 && (nowSeconds() - gGoTime) >= (double)gMinMapTimeSeconds && gMinMapTimeSeconds > 0.f) {
+        gCanFinish = YES;
+    } else {
+        gCanFinish = NO;
+    }
 }
 
 #pragma mark - Hook installation
@@ -414,35 +461,46 @@ static void installHooks(void) {
 
     rtLog("install: installing IL2CPP metadata hooks (zero text-patching)");
 
-    // 1. Full Nitro (Drift nhẹ full nitro)
+    // 1. Race start marker (đếm 5s xuất phát)
+    orig_GameGo_ImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+
+    // 2. Full Nitro (Chỉ drift nhẹ full nitro, KHÔNG hook CanTrigger)
     orig_Nitro_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SingleNitrogenCollect", "Update", 1, (void *)hook_NitroUpdate);
     orig_Nitro_GetProgress = (float (*)(void *, const void *))
         rtHookMethod("", "SingleNitrogenCollect", "get_ProgressBarPowerValue", 0, (void *)hook_NitroGetProgress);
-    orig_EvtN2O_CanTrigger = (BOOL (*)(void *, const void *))
-        rtHookMethod("", "EvtN2O", "IsCanTrigger", 0, (void *)hook_EvtN2OCanTrigger);
 
-    // 2. Mini Boost (Cấp nhận liên tục từ ReserveSmallBoostMgr)
+    // 3. Mini Boost (Auto nhận tiểu phun liên tục qua ReserveSmallBoost, KHÔNG hook CanTrigger)
     orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
     orig_Reserve_AddSmallBoost = (void (*)(void *, int, const void *))
         rtHookMethod("", "ReserveSmallBoostMgr", "AddReserveSmallBoost", 1, (void *)hook_ReserveAddSmallBoost);
-    orig_EvtMini_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "EvtMini", "Update", 1, (void *)hook_EvtMiniUpdate);
-    orig_EvtMini_CanTrigger = (BOOL (*)(void *, const void *))
-        rtHookMethod("", "EvtMini", "IsCanTrigger", 0, (void *)hook_EvtMiniCanTrigger);
-    orig_IsCanTriggerExVel = (BOOL (*)(void *, int, const void *))
-        rtHookMethod("", "ExtraVelocityTriggerMgr", "IsCanTriggerExtraVelocity", 1, (void *)hook_IsCanTriggerExVel);
 
-    // 3. Auto End Drift (Thoát drift sạch sẽ qua ExitCurDriftState)
+    // 4. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
     orig_Drift_Release = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
     orig_Drift_ExitCurDriftState = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ExitCurDriftState", 0, (void *)hook_DriftExitCurState);
+    orig_Drift_ForceClearDriftParams = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftForceClear);
 
-    // 4. Vehicle Physics PowerChain Speed Boost (Trực tiếp trục truyền động vật lý, KHÔNG ECU)
+    // 5. Tốc độ trục truyền động vật lý (PowerChain - sau 5s xuất phát)
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
+
+    // 6. Anti-Cheat Report Speed (luôn là 300)
+    orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVelUpdate);
+
+    // 7. CheckPointMgr & ActorCpReporter (Tính MinMapTime và Can Finish)
+    orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
+        rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgrInit);
+    orig_ActorCpReporter_Update = (void (*)(void *, float, float, const void *))
+        rtHookMethod("", "ActorCpReporter", "Update", 2, (void *)hook_ActorCpReporterUpdate);
 
     rtLog("install: done (all hooks active)");
 }
@@ -470,6 +528,12 @@ static void installHooks(void) {
 @property (nonatomic, strong) UIButton *fab;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UILabel *speedLabel;
+
+// Top HUD Overlay
+@property (nonatomic, strong) UIView *topHud;
+@property (nonatomic, strong) UILabel *topTimeLabel;
+@property (nonatomic, strong) UILabel *topFinishLabel;
+@property (nonatomic, strong) NSTimer *hudTimer;
 @end
 
 static RCRaceToolkitMenu *gMenu = nil;
@@ -514,6 +578,39 @@ static RCRaceToolkitMenu *gMenu = nil;
 
     self.host = self.window.rootViewController.view;
 
+    // === TOP HUD OVERLAY (MinMapTime & Can Finish) ===
+    CGFloat hudW = 320, hudH = 44;
+    self.topHud = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - hudW) / 2, 10, hudW, hudH)];
+    self.topHud.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.88];
+    self.topHud.layer.cornerRadius = 14;
+    self.topHud.layer.borderWidth = 1.0;
+    self.topHud.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.18].CGColor;
+    self.topHud.userInteractionEnabled = NO;
+
+    self.topTimeLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, hudW - 16, 18)];
+    self.topTimeLabel.textColor = UIColor.whiteColor;
+    self.topTimeLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
+    self.topTimeLabel.textAlignment = NSTextAlignmentCenter;
+    self.topTimeLabel.text = @"MinMapTime: --:-- | Time: 00:00.0";
+    [self.topHud addSubview:self.topTimeLabel];
+
+    self.topFinishLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 22, hudW - 16, 18)];
+    self.topFinishLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightHeavy];
+    self.topFinishLabel.textAlignment = NSTextAlignmentCenter;
+    self.topFinishLabel.textColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:1.0];
+    self.topFinishLabel.text = @"Can Finish: FALSE";
+    [self.topHud addSubview:self.topFinishLabel];
+
+    [self.host addSubview:self.topHud];
+
+    // Timer cập nhật HUD 10 lần mỗi giây
+    self.hudTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
+                                                     target:self
+                                                   selector:@selector(updateTopHud)
+                                                   userInfo:nil
+                                                    repeats:YES];
+
+    // === FLOATING BUTTON (FAB) ===
     self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
     self.fab.frame = CGRectMake(screen.size.width - 68, 96, 56, 56);
     self.fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.45 blue:0.90 alpha:0.92];
@@ -526,6 +623,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
     [self.host addSubview:self.fab];
 
+    // === MENU PANEL ===
     CGFloat w = 300, h = 300;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - w) / 2,
                                                         (screen.size.height - h) / 2, w, h)];
@@ -564,12 +662,43 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 3;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:11];
-    note.text = @"Nitro: Drift nhe la full.\nMiniboost: Nhan lien tuc khong gioi han.\nAuto End Drift: Nha nut drift la dut khoat thang lai.";
+    note.text = @"Speed applies only after race start + 5s.\nReport speed is locked to 300.\nTop HUD displays real-time MinMapTime & Finish safety.";
     [self.panel addSubview:note];
 }
 
+- (void)updateTopHud {
+    float curTime = gCurrentMatchTime;
+    if (curTime <= 0.f && gGoTime > 0.0) {
+        curTime = (float)(nowSeconds() - gGoTime);
+    }
+
+    int minM = (int)(gMinMapTimeSeconds / 60.0f);
+    float minS = gMinMapTimeSeconds - (float)(minM * 60);
+
+    int curM = (int)(curTime / 60.0f);
+    float curS = curTime - (float)(curM * 60);
+
+    self.topTimeLabel.text = [NSString stringWithFormat:@"Min: %02d:%04.1f | Time: %02d:%04.1f",
+                              minM, minS, curM, curS];
+
+    if (gCanFinish) {
+        self.topFinishLabel.textColor = [UIColor colorWithRed:0.25 green:0.95 blue:0.45 alpha:1.0];
+        self.topFinishLabel.text = @"Can Finish: TRUE (Safe to Finish)";
+        self.topHud.layer.borderColor = [UIColor colorWithRed:0.25 green:0.95 blue:0.45 alpha:0.6].CGColor;
+    } else {
+        float remaining = gMinMapTimeSeconds > curTime ? (gMinMapTimeSeconds - curTime) : 0.f;
+        self.topFinishLabel.textColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:1.0];
+        if (remaining > 0.f) {
+            self.topFinishLabel.text = [NSString stringWithFormat:@"Can Finish: FALSE (Wait %.1fs)", remaining];
+        } else {
+            self.topFinishLabel.text = @"Can Finish: FALSE (Not in final lap)";
+        }
+        self.topHud.layer.borderColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:0.4].CGColor;
+    }
+}
+
 - (NSString *)speedText {
-    return [NSString stringWithFormat:@"Boost speed: %d km/h", (int)gSpeedKmh];
+    return [NSString stringWithFormat:@"Boost speed: %d km/h (+5s gate)", (int)gSpeedKmh];
 }
 
 - (void)togglePanel {
