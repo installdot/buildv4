@@ -53,6 +53,7 @@
 // <ucontext.h> wrapper entirely.
 #include <sys/ucontext.h>
 #include <mach/mach.h>
+#include <mach/vm_region.h>   // vm_region_64 + VM_REGION_BASIC_INFO_64
 #include <pthread.h>
 #include <time.h>
 #include <sys/time.h>
@@ -370,7 +371,26 @@ static uintptr_t unityFrameworkBase(void) {
 // Never restore an assumed patch length. The backend may have changed mappings
 // or multiple instructions; a NULL trampoline is not proof of a partial patch.
 
+// Kill switch so one build can prove whether the crash comes from the hook
+// layer at all: create "<Documents>/no_hooks" and restart the app.
+static BOOL rtHooksDisabled(void) {
+    char path[1200];
+    const char *dir = strrchr(gLogPath, '/');
+    if (!dir) return NO;
+    size_t n = (size_t)(dir - gLogPath);
+    if (n + 10 >= sizeof(path)) return NO;
+    memcpy(path, gLogPath, n);
+    memcpy(path + n, "/no_hooks", 10);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) { close(fd); return YES; }
+    return NO;
+}
+
 static void installHooks(void) {
+    if (rtHooksDisabled()) {
+        rtLog("install: SKIPPED (no_hooks flag present) - hooks disabled, menu only");
+        return;
+    }
     using HookFunction = void (*)(void *, void *, void **);
     const HookFunction hookFunction = static_cast<HookFunction>(&MSHookFunction);
     const void *hookAddress = reinterpret_cast<const void *>(hookFunction);
@@ -445,6 +465,29 @@ static void installHooks(void) {
             continue;   // wrong build/version -> do not patch
         }
 
+
+        // Ask the kernel first. The previous run called the patcher on a
+        // read-only __TEXT page; it failed and the app died immediately in a
+        // neighbouring function on that same page. Skip instead of trying.
+        vm_address_t region = (vm_address_t)addr;
+        vm_size_t regionSize = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t objectName = MACH_PORT_NULL;
+        kern_return_t kr = vm_region_64(mach_task_self(), &region, &regionSize,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &infoCount, &objectName);
+        if (objectName != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), objectName);
+
+        if (kr != KERN_SUCCESS) {
+            rtLog("SKIP %-40s @%p  vm_region failed (kr=%d) page=%p", s->name, addr, (int)kr, (void *)((uintptr_t)addr & ~0x3fffULL));
+            continue;
+        }
+        if ((info.protection & VM_PROT_WRITE) == 0) {
+            rtLog("SKIP %-40s @%p  page=%p not writable (prot=0x%x) - leaving code untouched",
+                  s->name, addr, (void *)region, (unsigned)info.protection);
+            continue;
+        }
 
         rtLog("HOOK BEGIN name=%s target=%p replacement=%p", s->name, addr, s->replacement);
         hookFunction(addr, s->replacement, s->trampoline);
