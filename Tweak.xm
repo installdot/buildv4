@@ -36,7 +36,6 @@ static double gGoTime        = 0.0;
 
 static const float    kSpeedDelaySeconds = 5.0f;
 static const uint32_t kNitroMaxPower     = 1000;
-static const int      kTypeN2O           = 1;
 static const int      kTypeMini          = 2;
 
 // Il2cpp field offsets, DECIMAL (as printed by Hex-Rays).
