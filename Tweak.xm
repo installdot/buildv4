@@ -27,6 +27,17 @@
 //   0x9CF2340  get_NitrogenValue        (overwrote get_CollisionPickLossPowerNum)
 //   0x7AF9964  ReadNormalTopMPS         (overwrote SetNormalTopMPS)
 
+// Feature-test macros MUST come before the first system header, otherwise
+// iPhoneOS26.sdk's <ucontext.h> errors out with
+//   "The deprecated ucontext routines require _XOPEN_SOURCE to be defined".
+// _DARWIN_C_SOURCE keeps the Darwin-specific extensions available.
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #import <UIKit/UIKit.h>
 #import <substrate.h>
 #import <Foundation/Foundation.h>
@@ -41,7 +52,9 @@
 #include <errno.h>
 #include <signal.h>
 #include <execinfo.h>
-#include <ucontext.h>
+// arm64 Darwin: ucontext_t + mcontext64 live here; avoids the deprecated
+// <ucontext.h> wrapper entirely.
+#include <sys/ucontext.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
 #include <libkern/OSCacheControl.h>
@@ -179,9 +192,9 @@ static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
     char loc[320];
     int k = 0;
     const char *p1 = "  PC="; while (*p1) loc[k++] = *p1++;
-    k = rtDescribeAddr(loc, k, (uintptr_t)uc->uc_mcontext->__ss.__pc);
+    k = rtDescribeAddr(loc, k, uc && uc->uc_mcontext ? (uintptr_t)uc->uc_mcontext->__ss.__pc : 0);
     const char *p2 = "  LR="; while (*p2) loc[k++] = *p2++;
-    k = rtDescribeAddr(loc, k, (uintptr_t)uc->uc_mcontext->__ss.__lr);
+    k = rtDescribeAddr(loc, k, uc && uc->uc_mcontext ? (uintptr_t)uc->uc_mcontext->__ss.__lr : 0);
     const char *p3 = "\n"; loc[k++] = *p3++;
     ssize_t w2 = write(gLogFd, loc, (size_t)k);
     (void)w2;
@@ -196,7 +209,7 @@ static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
 }
 
 static void rtInstallCrashHandler(void) {
-    static char altStack[64 * 1024];   // fixed: SIGSTKSZ is not a constant on modern SDKs
+    static char altStack[64 * 1024];   // fixed size: constant on every SDK
     stack_t ss;
     ss.ss_sp = altStack;
     ss.ss_size = sizeof(altStack);
