@@ -6,8 +6,8 @@
 // 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
 // 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
 // 5. Anti-Cheat CheckPointPathError (210054) & ReportCheckPointPosError (210046):
-//    Tu dong khoa van toc trung binh giua cac checkpoint o muc 200 km/h (dwAvgSpeed = 200).
-// 6. SdcVehicleVel: Khoa van toc toi da bao cao o muc 200 km/h (chong Err 210033 & 210044).
+//    Tu dong khoa van toc trung binh giua cac checkpoint o muc 320 km/h (dwAvgSpeed = 320).
+// 6. SdcVehicleVel: Khoa van toc toi da bao cao o muc 320 km/h (chong Err 210033 & 210044).
 // 7. SdcBoostAction / SdcExtraVelocity: Khoa tong thoi gian & so lan nitro = 20, miniboost = 80
 //    (chong Err_AntiCheck_BigBoostTotalTimeError 210025 & MiniBoostTotalTimeError 210022).
 // 8. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
@@ -399,13 +399,13 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
-// 6. Anti-Cheat CheckPoint Average Speed: Khóa vận tốc trung bình giữa các checkpoint ở mức 200 km/h
+// 6. Anti-Cheat CheckPoint Average Speed: Khóa vận tốc trung bình giữa các checkpoint ở mức 320 km/h
 //    (Chống triệt để Err 210054 CheckPointPathError & Err 210046 ReportCheckPointPosError)
 static void hook_CPR_ReportData(void *self, void *collectData, void **cpInfo, const void *method) {
     if (orig_CPR_ReportData) orig_CPR_ReportData(self, collectData, cpInfo, method);
     if (cpInfo && *cpInfo) {
         void *cp = *cpInfo;
-        *(uint32_t *)((char *)cp + 0x18) = 200; // dwAvgSpeed = 200 km/h
+        *(uint32_t *)((char *)cp + 0x18) = 320; // dwAvgSpeed = 320 km/h
     }
 }
 
@@ -419,7 +419,7 @@ static int hook_ActorCpReporter_FillCheckPointData(void *self, int startPos, voi
             for (uint32_t i = 0; i < len; i++) {
                 void *cp = *(void **)((char *)list + 0x20 + i * 8);
                 if (cp) {
-                    *(uint32_t *)((char *)cp + 0x18) = 200; // dwAvgSpeed = 200 km/h
+                    *(uint32_t *)((char *)cp + 0x18) = 320; // dwAvgSpeed = 320 km/h
                 }
             }
         }
@@ -427,22 +427,22 @@ static int hook_ActorCpReporter_FillCheckPointData(void *self, int startPos, voi
     return ret;
 }
 
-// 7. SdcVehicleVel: Khóa vận tốc tối đa tức thời ở mức 200 km/h (chống Err 210033 & 210044)
+// 7. SdcVehicleVel: Khóa vận tốc tối đa tức thời ở mức 320 km/h (chống Err 210033 & 210044)
 static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
     if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, method);
     if (!self) return;
 
     void *endData = *(void **)((char *)self + kOffSdcVelEndData);
     if (endData) {
-        *(int *)((char *)endData + 0x10) = 200; // CarSpeedMax = 200 km/h
+        *(int *)((char *)endData + 0x10) = 320; // CarSpeedMax = 320 km/h
         *(int *)((char *)endData + 0x14) = 0;   // CarSpeedOverBase = 0
     }
     void *procData = *(void **)((char *)self + kOffSdcVelProcData);
     if (procData) {
-        *(int *)((char *)procData + 0x10) = 200; // ProcessVehicleMaxVel = 200 km/h
-        *(int *)((char *)procData + 0x28) = 200; // ProcessVehicleMaxBaseVel = 200 km/h
+        *(int *)((char *)procData + 0x10) = 320; // ProcessVehicleMaxVel = 320 km/h
+        *(int *)((char *)procData + 0x28) = 320; // ProcessVehicleMaxBaseVel = 320 km/h
     }
-    *(float *)((char *)self + 0x94) = 200.0f; // mMaxVehicleKMPH = 200.0f
+    *(float *)((char *)self + 0x94) = 320.0f; // mMaxVehicleKMPH = 320.0f
 }
 
 // 8. SdcBoostAction: Khóa tổng thời gian và số lần nitro = 20, miniboost = 80
@@ -478,9 +478,9 @@ static void hook_CheckPointMgrInit(void *self, void *config, bool checkCrc, bool
         float lapDist = gMainCurveLength > 100.f ? gMainCurveLength : 2500.f;
         float totalDist = lapDist * (float)laps;
 
-        // Vận tốc chuẩn an toàn 200 km/h (≈ 55.56 m/s)
-        gLapTimeLimit = lapDist / (200.0f / 3.6f);
-        gMinMapTimeSeconds = totalDist / (200.0f / 3.6f);
+        // Vận tốc chuẩn an toàn 320 km/h (≈ 88.89 m/s)
+        gLapTimeLimit = lapDist / (320.0f / 3.6f);
+        gMinMapTimeSeconds = totalDist / (320.0f / 3.6f);
 
         rtLog("map loaded: length=%.1fm, laps=%d -> LapLimit=%.2fs, MinMapTime=%.2fs",
               lapDist, laps, gLapTimeLimit, gMinMapTimeSeconds);
@@ -560,13 +560,13 @@ static void installHooks(void) {
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    // 6. Anti-Cheat CheckPoint Average Speed (khóa 200 km/h)
+    // 6. Anti-Cheat CheckPoint Average Speed (khóa 320 km/h)
     orig_CPR_ReportData = (void (*)(void *, void *, void **, const void *))
         rtHookMethod("", "CPR_STPVPProcessGame", "ReportData", 2, (void *)hook_CPR_ReportData);
     orig_ActorCpReporter_FillCheckPointData = (int (*)(void *, int, void *, int, void *, uint8_t *, const void *))
         rtHookMethod("", "ActorCpReporter", "FillCheckPointData", 5, (void *)hook_ActorCpReporter_FillCheckPointData);
 
-    // 7. SdcVehicleVel (khóa tốc độ tối đa tức thời 200 km/h)
+    // 7. SdcVehicleVel (khóa tốc độ tối đa tức thời 320 km/h)
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVelUpdate);
 
@@ -730,7 +730,7 @@ static RCRaceToolkitMenu *gMenu = nil;
 
     UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 196, 268, 32)];
     slider.minimumValue = 0.f;
-    slider.maximumValue = 200.f;
+    slider.maximumValue = 320.f;
     slider.value = gSpeedKmh;
     slider.tintColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.55 alpha:1.0];
     [slider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
@@ -740,7 +740,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 3;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:11];
-    note.text = @"Speed applies +5s after start.\nAvg speed = 200, Max speed = 200.\nNitro = 20, MiniBoost = 80.";
+    note.text = @"Speed applies +5s after start.\nAvg speed = 320, Max speed = 320.\nNitro = 20, MiniBoost = 80.";
     [self.panel addSubview:note];
 }
 
