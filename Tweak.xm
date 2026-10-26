@@ -5,8 +5,12 @@
 // 2. Miniboost: Auto nhan tieu phun tu ReserveSmallBoostMgr lien tuc. KHONG hook CanTrigger.
 // 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
 // 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
-// 5. Report Speed: Luon gioi han van toc bao cao o muc 300 trong SdcVehicleVel.
-// 6. Top Overlay: Hien thi MinMapTime & Can Finish: TRUE/FALSE check dieu kien ve dich.
+// 5. Anti-Cheat CheckPointPathError (210054) & ReportCheckPointPosError (210046):
+//    Tu dong khoa van toc trung binh giua cac checkpoint o muc 200 km/h (dwAvgSpeed = 200).
+// 6. SdcVehicleVel: Khoa van toc toi da bao cao o muc 200 km/h (chong Err 210033 & 210044).
+// 7. SdcBoostAction / SdcExtraVelocity: Khoa tong thoi gian & so lan nitro = 20, miniboost = 80
+//    (chong Err_AntiCheck_BigBoostTotalTimeError 210025 & MiniBoostTotalTimeError 210022).
+// 8. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -133,6 +137,7 @@ static float  gCurrentMatchTime  = 0.f;
 static float  gMainCurveLength   = 0.f;
 static int    gMapTotalLaps      = 2;
 static float  gMinMapTimeSeconds = 0.f;
+static float  gLapTimeLimit      = 0.f;
 static BOOL   gCanFinish         = NO;
 static int    gLastCheckPointId  = 0;
 
@@ -159,6 +164,10 @@ enum {
     // SdcVehicleVel (Security Data Collect)
     kOffSdcVelEndData     = 88,  // 0x58 mEndData
     kOffSdcVelProcData    = 96,  // 0x60 mProcessData
+
+    // SdcBoostAction
+    kOffSdcBoostEndData   = 88,  // 0x58 mEndData
+    kOffSdcBoostProcData  = 96,  // 0x60 mProcessData
 
     // ActorCpReporter
     kOffActorCpLastCp     = 104, // 0x68 mLastCheckPoint
@@ -295,7 +304,10 @@ static void  (*orig_Drift_ForceClearDriftParams)(void *, const void *) = NULL;
 static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
 static void  (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
 static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
+static int   (*orig_ActorCpReporter_FillCheckPointData)(void *, int, void *, int, void *, uint8_t *, const void *) = NULL;
+static void  (*orig_CPR_ReportData)(void *, void *, void **, const void *) = NULL;
 static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
+static void  (*orig_SdcBoostAction_Update)(void *, float, const void *) = NULL;
 
 // 1. Race Start: Bắt đầu bấm giờ
 static void hook_GoImpEnter(void *self, const void *method) {
@@ -303,7 +315,8 @@ static void hook_GoImpEnter(void *self, const void *method) {
     gGoTime = nowSeconds();
     gCurrentMatchTime = 0.f;
     gCanFinish = NO;
-    rtLog("race started -> gGoTime=%.3f, minMapTime=%.1fs", gGoTime, gMinMapTimeSeconds);
+    rtLog("race started -> gGoTime=%.3f, MinMapTime=%.1fs, LapTimeLimit=%.1fs",
+          gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
 
 // 2. Full Nitro: CHỈ drift nhẹ là full nitro, KHÔNG can thiệp CanTrigger
@@ -334,7 +347,6 @@ static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
     if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
 
-    // Nạp liên tục tiểu phun dự trữ
     void *reserveMgr = *(void **)((char *)self + kOffExVelReserveMgr);
     if (reserveMgr) {
         int curNum = *(int *)((char *)reserveMgr + kOffReserveNum);
@@ -365,11 +377,9 @@ static void hook_DriftRelease(void *self, const void *method) {
     if (orig_Drift_Release) orig_Drift_Release(self, method);
     if (!gAutoDriftEnd || !self) return;
 
-    // 1. Thoát ngay khỏi DriftStateMachine
     if (orig_Drift_ExitCurDriftState) {
         orig_Drift_ExitCurDriftState(self, nullptr);
     }
-    // 2. Xóa triệt để thông số ma sát và góc bẻ lái drift -> Không còn bị dính drift
     if (orig_Drift_ForceClearDriftParams) {
         orig_Drift_ForceClearDriftParams(self, nullptr);
     }
@@ -389,33 +399,91 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
-// 6. Anti-Cheat Report Speed: Luôn giới hạn tốc độ báo cáo ở mức 300
+// 6. Anti-Cheat CheckPoint Average Speed: Khóa vận tốc trung bình giữa các checkpoint ở mức 200 km/h
+//    (Chống triệt để Err 210054 CheckPointPathError & Err 210046 ReportCheckPointPosError)
+static void hook_CPR_ReportData(void *self, void *collectData, void **cpInfo, const void *method) {
+    if (orig_CPR_ReportData) orig_CPR_ReportData(self, collectData, cpInfo, method);
+    if (cpInfo && *cpInfo) {
+        void *cp = *cpInfo;
+        *(uint32_t *)((char *)cp + 0x18) = 200; // dwAvgSpeed = 200 km/h
+    }
+}
+
+static int hook_ActorCpReporter_FillCheckPointData(void *self, int startPos, void *a3, int count, void *cpPara, uint8_t *isAddLap, const void *method) {
+    int ret = orig_ActorCpReporter_FillCheckPointData ?
+        orig_ActorCpReporter_FillCheckPointData(self, startPos, a3, count, cpPara, isAddLap, method) : 0;
+    if (cpPara) {
+        void *list = *(void **)((char *)cpPara + 0x28); // astCheckPointList
+        if (list) {
+            uint32_t len = *(uint32_t *)((char *)list + 0x18);
+            for (uint32_t i = 0; i < len; i++) {
+                void *cp = *(void **)((char *)list + 0x20 + i * 8);
+                if (cp) {
+                    *(uint32_t *)((char *)cp + 0x18) = 200; // dwAvgSpeed = 200 km/h
+                }
+            }
+        }
+    }
+    return ret;
+}
+
+// 7. SdcVehicleVel: Khóa vận tốc tối đa tức thời ở mức 200 km/h (chống Err 210033 & 210044)
 static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
     if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, method);
     if (!self) return;
 
     void *endData = *(void **)((char *)self + kOffSdcVelEndData);
     if (endData) {
-        *(int *)((char *)endData + 0x10) = 300; // CarSpeedMax = 300
+        *(int *)((char *)endData + 0x10) = 200; // CarSpeedMax = 200 km/h
         *(int *)((char *)endData + 0x14) = 0;   // CarSpeedOverBase = 0
     }
     void *procData = *(void **)((char *)self + kOffSdcVelProcData);
     if (procData) {
-        *(int *)((char *)procData + 0x10) = 300; // ProcessVehicleMaxVel = 300
-        *(int *)((char *)procData + 0x28) = 300; // ProcessVehicleMaxBaseVel = 300
+        *(int *)((char *)procData + 0x10) = 200; // ProcessVehicleMaxVel = 200 km/h
+        *(int *)((char *)procData + 0x28) = 200; // ProcessVehicleMaxBaseVel = 200 km/h
+    }
+    *(float *)((char *)self + 0x94) = 200.0f; // mMaxVehicleKMPH = 200.0f
+}
+
+// 8. SdcBoostAction: Khóa tổng thời gian và số lần nitro = 20, miniboost = 80
+//    (Chống Err 210025 BigBoostTotalTimeError & Err 210022 MiniBoostTotalTimeError)
+static void hook_SdcBoostActionUpdate(void *self, float dt, const void *method) {
+    if (orig_SdcBoostAction_Update) orig_SdcBoostAction_Update(self, dt, method);
+    if (!self) return;
+
+    // Giới hạn bộ đếm float bên trong SdcBoostAction
+    *(float *)((char *)self + 0x124) = 20.0f; // mBigBoostTotalExecuteTime (Nitro)
+    *(float *)((char *)self + 0xA8)  = 80.0f; // mMiniBoostTotalExecuteTime (MiniBoost)
+
+    void *endData = *(void **)((char *)self + kOffSdcBoostEndData);
+    if (endData) {
+        *(int *)((char *)endData + 0xB4) = 20;    // CarBigJetCount = 20
+        *(int *)((char *)endData + 0xC8) = 20000; // CarBigJetTimeTotal = 20s (20000ms)
+        *(int *)((char *)endData + 0x18) = 80;    // CarMiniJetCount = 80
+        *(int *)((char *)endData + 0x28) = 80000; // CarMiniJetTimeTotal = 80s (80000ms)
+    }
+    void *procData = *(void **)((char *)self + kOffSdcBoostProcData);
+    if (procData) {
+        *(int *)((char *)procData + 0x28) = 20;   // ProcessBigJetCount = 20
+        *(int *)((char *)procData + 0x1C) = 80;   // ProcessMIniJetCount = 80
     }
 }
 
-// 7. CheckPointMgr & ActorCpReporter: Lấy độ dài map & tính MinMapTime và Can Finish
+// 9. CheckPointMgr & ActorCpReporter: Tính MinMapTime, LapTimeLimit & Can Finish
 static void hook_CheckPointMgrInit(void *self, void *config, bool checkCrc, bool enableReset, const void *method) {
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, checkCrc, enableReset, method);
     if (config) {
-        gMainCurveLength = *(float *)((char *)config + 0x4C); // MainCurveLength
+        gMainCurveLength = *(float *)((char *)config + 0x4C); // MainCurveLength (mét)
         int laps = gMapTotalLaps > 0 ? gMapTotalLaps : 2;
-        float totalDist = (gMainCurveLength > 100.f ? gMainCurveLength : 4000.f) * (float)laps;
-        // Tốc độ tối đa lý thuyết 300 km/h (≈ 83.33 m/s) -> MinMapTime an toàn
-        gMinMapTimeSeconds = totalDist / (300.0f / 3.6f);
-        rtLog("map loaded: length=%.1fm, laps=%d -> MinMapTime=%.2fs", gMainCurveLength, laps, gMinMapTimeSeconds);
+        float lapDist = gMainCurveLength > 100.f ? gMainCurveLength : 2500.f;
+        float totalDist = lapDist * (float)laps;
+
+        // Vận tốc chuẩn an toàn 200 km/h (≈ 55.56 m/s)
+        gLapTimeLimit = lapDist / (200.0f / 3.6f);
+        gMinMapTimeSeconds = totalDist / (200.0f / 3.6f);
+
+        rtLog("map loaded: length=%.1fm, laps=%d -> LapLimit=%.2fs, MinMapTime=%.2fs",
+              lapDist, laps, gLapTimeLimit, gMinMapTimeSeconds);
     }
 }
 
@@ -428,10 +496,10 @@ static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, co
     if (laps > 0) gMapTotalLaps = laps;
     gLastCheckPointId = *(int *)((char *)self + kOffActorCpLastCp);
 
-    // Kiểm tra điều kiện về đích: Thời gian đua >= MinMapTime
-    if (gMinMapTimeSeconds > 0.f && gCurrentMatchTime >= gMinMapTimeSeconds) {
-        gCanFinish = YES;
-    } else if (gGoTime > 0.0 && (nowSeconds() - gGoTime) >= (double)gMinMapTimeSeconds && gMinMapTimeSeconds > 0.f) {
+    // Kiểm tra điều kiện về đích an toàn
+    float curTime = gCurrentMatchTime > 0.f ? gCurrentMatchTime :
+                    (gGoTime > 0.0 ? (float)(nowSeconds() - gGoTime) : 0.f);
+    if (gMinMapTimeSeconds > 0.f && curTime >= gMinMapTimeSeconds) {
         gCanFinish = YES;
     } else {
         gCanFinish = NO;
@@ -492,17 +560,27 @@ static void installHooks(void) {
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    // 6. Anti-Cheat Report Speed (luôn là 300)
+    // 6. Anti-Cheat CheckPoint Average Speed (khóa 200 km/h)
+    orig_CPR_ReportData = (void (*)(void *, void *, void **, const void *))
+        rtHookMethod("", "CPR_STPVPProcessGame", "ReportData", 2, (void *)hook_CPR_ReportData);
+    orig_ActorCpReporter_FillCheckPointData = (int (*)(void *, int, void *, int, void *, uint8_t *, const void *))
+        rtHookMethod("", "ActorCpReporter", "FillCheckPointData", 5, (void *)hook_ActorCpReporter_FillCheckPointData);
+
+    // 7. SdcVehicleVel (khóa tốc độ tối đa tức thời 200 km/h)
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVelUpdate);
 
-    // 7. CheckPointMgr & ActorCpReporter (Tính MinMapTime và Can Finish)
+    // 8. SdcBoostAction (khóa tổng thời gian & số lần nitro = 20, miniboost = 80)
+    orig_SdcBoostAction_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "SdcBoostAction", "Update", 1, (void *)hook_SdcBoostActionUpdate);
+
+    // 9. CheckPointMgr & ActorCpReporter (Tính MinMapTime, LapTimeLimit và Can Finish)
     orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
         rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgrInit);
     orig_ActorCpReporter_Update = (void (*)(void *, float, float, const void *))
         rtHookMethod("", "ActorCpReporter", "Update", 2, (void *)hook_ActorCpReporterUpdate);
 
-    rtLog("install: done (all hooks active)");
+    rtLog("install: done (all anti-cheat and toolkit hooks active)");
 }
 
 #pragma mark - UI
@@ -578,9 +656,9 @@ static RCRaceToolkitMenu *gMenu = nil;
 
     self.host = self.window.rootViewController.view;
 
-    // === TOP HUD OVERLAY (MinMapTime & Can Finish) ===
-    CGFloat hudW = 320, hudH = 44;
-    self.topHud = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - hudW) / 2, 10, hudW, hudH)];
+    // === TOP HUD OVERLAY (MinMapTime, LapTimeLimit & Can Finish) ===
+    CGFloat hudW = 340, hudH = 46;
+    self.topHud = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - hudW) / 2, 8, hudW, hudH)];
     self.topHud.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.88];
     self.topHud.layer.cornerRadius = 14;
     self.topHud.layer.borderWidth = 1.0;
@@ -589,12 +667,12 @@ static RCRaceToolkitMenu *gMenu = nil;
 
     self.topTimeLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 4, hudW - 16, 18)];
     self.topTimeLabel.textColor = UIColor.whiteColor;
-    self.topTimeLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightBold];
+    self.topTimeLabel.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightBold];
     self.topTimeLabel.textAlignment = NSTextAlignmentCenter;
-    self.topTimeLabel.text = @"MinMapTime: --:-- | Time: 00:00.0";
+    self.topTimeLabel.text = @"MinMap: --:-- | LapMin: --:-- | Time: 00:00.0";
     [self.topHud addSubview:self.topTimeLabel];
 
-    self.topFinishLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 22, hudW - 16, 18)];
+    self.topFinishLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 24, hudW - 16, 18)];
     self.topFinishLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightHeavy];
     self.topFinishLabel.textAlignment = NSTextAlignmentCenter;
     self.topFinishLabel.textColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:1.0];
@@ -662,7 +740,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 3;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:11];
-    note.text = @"Speed applies only after race start + 5s.\nReport speed is locked to 300.\nTop HUD displays real-time MinMapTime & Finish safety.";
+    note.text = @"Speed applies +5s after start.\nAvg speed = 200, Max speed = 200.\nNitro = 20, MiniBoost = 80.";
     [self.panel addSubview:note];
 }
 
@@ -672,14 +750,17 @@ static RCRaceToolkitMenu *gMenu = nil;
         curTime = (float)(nowSeconds() - gGoTime);
     }
 
-    int minM = (int)(gMinMapTimeSeconds / 60.0f);
-    float minS = gMinMapTimeSeconds - (float)(minM * 60);
+    int mapM = (int)(gMinMapTimeSeconds / 60.0f);
+    float mapS = gMinMapTimeSeconds - (float)(mapM * 60);
+
+    int lapM = (int)(gLapTimeLimit / 60.0f);
+    float lapS = gLapTimeLimit - (float)(lapM * 60);
 
     int curM = (int)(curTime / 60.0f);
     float curS = curTime - (float)(curM * 60);
 
-    self.topTimeLabel.text = [NSString stringWithFormat:@"Min: %02d:%04.1f | Time: %02d:%04.1f",
-                              minM, minS, curM, curS];
+    self.topTimeLabel.text = [NSString stringWithFormat:@"MinMap: %02d:%04.1f | LapMin: %02d:%04.1f | Time: %02d:%04.1f",
+                              mapM, mapS, lapM, lapS, curM, curS];
 
     if (gCanFinish) {
         self.topFinishLabel.textColor = [UIColor colorWithRed:0.25 green:0.95 blue:0.45 alpha:1.0];
@@ -691,7 +772,7 @@ static RCRaceToolkitMenu *gMenu = nil;
         if (remaining > 0.f) {
             self.topFinishLabel.text = [NSString stringWithFormat:@"Can Finish: FALSE (Wait %.1fs)", remaining];
         } else {
-            self.topFinishLabel.text = @"Can Finish: FALSE (Not in final lap)";
+            self.topFinishLabel.text = @"Can Finish: FALSE (Time not reached)";
         }
         self.topHud.layer.borderColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:0.4].CGColor;
     }
