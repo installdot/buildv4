@@ -53,7 +53,7 @@
 // <ucontext.h> wrapper entirely.
 #include <sys/ucontext.h>
 #include <mach/mach.h>
-#include <mach/vm_region.h>   // vm_region_64 + VM_REGION_BASIC_INFO_64
+#include <mach/vm_map.h>   // vm_protect
 #include <pthread.h>
 #include <time.h>
 #include <sys/time.h>
@@ -394,9 +394,8 @@ static BOOL rtMakePatchable(void *addr, size_t len,
                          & ~(vm_address_t)(page - 1);
     vm_size_t size = (vm_size_t)(end - start);
 
-    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)start,
-                                       (mach_vm_size_t)size, FALSE,
-                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    kern_return_t kr = vm_protect(mach_task_self(), start, size, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
         rtLog("vm_protect(CW) failed kr=%d base=%p size=%zu", (int)kr, (void *)start, (size_t)size);
         return NO;
@@ -407,9 +406,8 @@ static BOOL rtMakePatchable(void *addr, size_t len,
 }
 
 static void rtRestorePage(vm_address_t pageBase, vm_size_t pageSize) {
-    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)pageBase,
-                                       (mach_vm_size_t)pageSize, FALSE,
-                                       VM_PROT_READ | VM_PROT_EXECUTE);
+    kern_return_t kr = vm_protect(mach_task_self(), pageBase, pageSize, FALSE,
+                                  VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS)
         rtLog("restore R-X failed kr=%d base=%p", (int)kr, (void *)pageBase);
 }
