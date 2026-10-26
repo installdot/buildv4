@@ -368,9 +368,6 @@ static uintptr_t unityFrameworkBase(void) {
     return 0;
 }
 
-// Never restore an assumed patch length. The backend may have changed mappings
-// or multiple instructions; a NULL trampoline is not proof of a partial patch.
-
 // Kill switch so one build can prove whether the crash comes from the hook
 // layer at all: create "<Documents>/no_hooks" and restart the app.
 static BOOL rtHooksDisabled(void) {
@@ -384,6 +381,37 @@ static BOOL rtHooksDisabled(void) {
     int fd = open(path, O_RDONLY);
     if (fd >= 0) { close(fd); return YES; }
     return NO;
+}
+
+// Page-align the range and take a private writable copy of it. iOS keeps the
+// dyld shared cache mapped read-only, so VM_PROT_COPY is required; afterwards
+// the page is restored to R-X.
+static BOOL rtMakePatchable(void *addr, size_t len,
+                            vm_address_t *pageBase, vm_size_t *pageSize) {
+    const vm_size_t page = (vm_size_t)vm_page_size ? (vm_size_t)vm_page_size : 0x4000;
+    vm_address_t start = (vm_address_t)addr & ~(vm_address_t)(page - 1);
+    vm_address_t end   = ((vm_address_t)addr + (vm_address_t)len + page - 1)
+                         & ~(vm_address_t)(page - 1);
+    vm_size_t size = (vm_size_t)(end - start);
+
+    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)start,
+                                       (mach_vm_size_t)size, FALSE,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        rtLog("vm_protect(CW) failed kr=%d base=%p size=%zu", (int)kr, (void *)start, (size_t)size);
+        return NO;
+    }
+    *pageBase = start;
+    *pageSize = size;
+    return YES;
+}
+
+static void rtRestorePage(vm_address_t pageBase, vm_size_t pageSize) {
+    kern_return_t kr = mach_vm_protect(mach_task_self(), (mach_vm_address_t)pageBase,
+                                       (mach_vm_size_t)pageSize, FALSE,
+                                       VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS)
+        rtLog("restore R-X failed kr=%d base=%p", (int)kr, (void *)pageBase);
 }
 
 static void installHooks(void) {
@@ -466,31 +494,21 @@ static void installHooks(void) {
         }
 
 
-        // Ask the kernel first. The previous run called the patcher on a
-        // read-only __TEXT page; it failed and the app died immediately in a
-        // neighbouring function on that same page. Skip instead of trying.
-        vm_address_t region = (vm_address_t)addr;
-        vm_size_t regionSize = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t objectName = MACH_PORT_NULL;
-        kern_return_t kr = vm_region_64(mach_task_self(), &region, &regionSize,
-                                        VM_REGION_BASIC_INFO_64,
-                                        (vm_region_info_t)&info, &infoCount, &objectName);
-        if (objectName != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), objectName);
-
-        if (kr != KERN_SUCCESS) {
-            rtLog("SKIP %-40s @%p  vm_region failed (kr=%d) page=%p", s->name, addr, (int)kr, (void *)((uintptr_t)addr & ~0x3fffULL));
-            continue;
-        }
-        if ((info.protection & VM_PROT_WRITE) == 0) {
-            rtLog("SKIP %-40s @%p  page=%p not writable (prot=0x%x) - leaving code untouched",
-                  s->name, addr, (void *)region, (unsigned)info.protection);
+        // __TEXT of UnityFramework is R-X (prot=0x5). Patching it needs
+        // VM_PROT_COPY on a PAGE-ALIGNED range: passing a mid-page address is
+        // exactly what made the earlier vm_protect fail and MSHookFunction
+        // return a NULL trampoline.
+        vm_address_t pageBase = 0;
+        vm_size_t pageSize = 0;
+        if (!rtMakePatchable(addr, 16, &pageBase, &pageSize)) {
+            rtLog("SKIP %-40s @%p  cannot make page writable errno=%d", s->name, addr, errno);
             continue;
         }
 
         rtLog("HOOK BEGIN name=%s target=%p replacement=%p", s->name, addr, s->replacement);
         hookFunction(addr, s->replacement, s->trampoline);
+
+        rtRestorePage(pageBase, pageSize);
 
         if (*(s->trampoline) == NULL) {
             rtLog("INSTALL STOP: %s returned NULL trampoline; no manual code writes; backend state unknown", s->name);
