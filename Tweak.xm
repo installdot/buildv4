@@ -1,12 +1,10 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
-// Root Cause Fix for Log (5):
-// 1. Removed fragile vehicleIsMainPlayer / evtIsMainPlayer checks which returned false
-//    and silently dropped all 4 features.
-// 2. Switched Speed adjustment from ECU (which was overwritten every frame) to
-//    NssPhyVehiclePowerChain::Update (directly sets mExtraKMPH, mExtraTorque, mMPSScaleCoef).
-// 3. Added support for ExtraVelocityType Air (3), FallingGround (11), PassiveMini (16), Overlap (8).
-// 4. Removed gGoTime 5-second gate so Speed applies immediately when the slider is moved.
+// Features & Fixes:
+// 1. Nitro: Instant Full Nitro on gentle drift (mCurIsCollect == true), not automatic idle feeding.
+// 2. Mini Boost: Continuously feeds ReserveSmallBoostMgr::AddReserveSmallBoost so miniboost is always available.
+// 3. Auto End Drift: Calls NssVehicleDriftCtrl::ExitCurDriftState on drift key release. Removed corrupting drift fields.
+// 4. Speed Boost: Direct physics power chain boost (mExtraKMPH, mExtraTorque, mMPSScaleCoef) - NO ECU!
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -134,22 +132,24 @@ static BOOL   gAutoDriftEnd   = NO;
 static float  gSpeedKmh       = 0.f;
 static BOOL   gHooksInstalled = NO;
 
-// Il2cpp field offsets verified against dump.cs:
 enum {
     // SingleNitrogenCollect
+    kOffNitroCurIsCollect = 196, // 0xC4 mCurIsCollect (bool)
     kOffNitroCurPower     = 208, // 0xD0 mCurPower (uint)
     kOffNitroCurColPower  = 212, // 0xD4 mCurCollectPower (uint)
     kOffNitroShowPower    = 224, // 0xE0 mCurShowPower (uint)
     kOffNitroIsFull       = 240, // 0xF0 mIsCollectFull (bool)
 
-    // EvtMini
-    kOffEvtVdAngleMax     = 116, // 0x74 EvtMini::mDriftingMaxAbsVDAngle (float)
-    kOffEvtDriftingTime   = 124, // 0x7C EvtMini::mDriftingTime (float)
-    kOffEvtInCanTrigger   = 133, // 0x85 EvtMini::mInCanTriggerTime (bool)
-    kOffEvtMiniVdMax      = 136, // 0x88 EvtMini::mMiniBoostDriftingMaxAbsVDAngle (float)
-    kOffEvtInChecking     = 140, // 0x8C EvtMini::mIsInCheckingCanTrigger (bool)
-    kOffEvtCheckTime      = 144, // 0x90 EvtMini::mNewCheckMiniBoostTime (float)
-    kOffEvtLastDrift      = 160, // 0xA0 EvtMini::mLastIsDrifting (bool)
+    // EvtMini (Only benign flags from OnForceCanTriggerOnce)
+    kOffEvtInCanTrigger   = 133, // 0x85 mInCanTriggerTime (bool)
+    kOffEvtInChecking     = 140, // 0x8C mIsInCheckingCanTrigger (bool)
+    kOffEvtCheckTime      = 144, // 0x90 mNewCheckMiniBoostTime (float)
+
+    // ExtraVelocityTriggerMgr
+    kOffExVelReserveMgr   = 144, // 0x90 mReserveSmallBoostMgr
+
+    // ReserveSmallBoostMgr
+    kOffReserveNum        = 24,  // 0x18 mReserveNum (int)
 
     // NssPhyVehiclePowerChain (Physics Power Chain, NOT ECU)
     kOffPowerForceTopMPS  = 52,  // 0x34 mForceTopMPS (float)
@@ -230,7 +230,6 @@ static Il2CppClass *rtFindClass(const char *namespaze, const char *name) {
     return NULL;
 }
 
-// Hooks a method via Il2CppClass vtable + MethodInfo (__DATA / heap, natively RW).
 static void *rtHookMethod(const char *namespaze, const char *className,
                           const char *methodName, int argsCount,
                           void *replacement) {
@@ -272,20 +271,28 @@ static void *rtHookMethod(const char *namespaze, const char *className,
 
 static void  (*orig_Nitro_Update)(void *, float, const void *) = NULL;
 static float (*orig_Nitro_GetProgress)(void *, const void *) = NULL;
+static BOOL  (*orig_EvtN2O_CanTrigger)(void *, const void *) = NULL;
+
+static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
+static void  (*orig_Reserve_AddSmallBoost)(void *, int, const void *) = NULL;
 static void  (*orig_EvtMini_Update)(void *, float, const void *) = NULL;
 static BOOL  (*orig_EvtMini_CanTrigger)(void *, const void *) = NULL;
-static BOOL  (*orig_EvtN2O_CanTrigger)(void *, const void *) = NULL;
 static BOOL  (*orig_IsCanTriggerExVel)(void *, int, const void *) = NULL;
+
 static void  (*orig_Drift_Release)(void *, const void *) = NULL;
-static void  (*orig_Drift_ForceEnd)(void *, const void *) = NULL;
+static void  (*orig_Drift_ExitCurDriftState)(void *, const void *) = NULL;
+
 static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
 
-// 1. Full Nitro
+// 1. Full Nitro: Drift nhẹ full nitro (chỉ kích hoạt khi drift, không tự động cộng khi chạy thẳng)
 static void hook_NitroUpdate(void *self, float dt, const void *method) {
     if (orig_Nitro_Update) orig_Nitro_Update(self, dt, method);
     if (!gFullNitro || !self) return;
 
-    // Fill current power, show power, and mark full
+    // Check mCurIsCollect (0xC4): chỉ khi xe đang drift (dù nhẹ) mới nạp đầy nitro tức thì
+    uint8_t isDrifting = *(uint8_t *)((char *)self + kOffNitroCurIsCollect);
+    if (!isDrifting) return;
+
     *(uint32_t *)((char *)self + kOffNitroCurPower)    = 1000;
     *(uint32_t *)((char *)self + kOffNitroCurColPower) = 1000;
     *(uint32_t *)((char *)self + kOffNitroShowPower)   = 1000;
@@ -293,25 +300,47 @@ static void hook_NitroUpdate(void *self, float dt, const void *method) {
 }
 
 static float hook_NitroGetProgress(void *self, const void *method) {
-    if (gFullNitro && self) return 1.0f;
+    if (gFullNitro && self) {
+        uint8_t isDrifting = *(uint8_t *)((char *)self + kOffNitroCurIsCollect);
+        if (isDrifting) return 1.0f;
+    }
     return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self, method) : 0.0f;
 }
 
 static BOOL hook_EvtN2OCanTrigger(void *self, const void *method) {
-    if (gFullNitro) return YES;
+    if (gFullNitro && self) return YES;
     return orig_EvtN2O_CanTrigger ? orig_EvtN2O_CanTrigger(self, method) : NO;
 }
 
-// 2. Full Mini Boost
+// 2. Mini Boost: Call nhận liên tục qua ReserveSmallBoostMgr::AddReserveSmallBoost
 static inline void armMiniWindow(void *self) {
     if (!self) return;
-    *(float *)   ((char *)self + kOffEvtVdAngleMax)   = 999.0f;
-    *(float *)   ((char *)self + kOffEvtMiniVdMax)    = 999.0f;
-    *(float *)   ((char *)self + kOffEvtDriftingTime) = 999.0f;
-    *(float *)   ((char *)self + kOffEvtCheckTime)    = 0.0f;
+    // Chỉ kích hoạt cờ trigger, KHÔNG chạm vào mLastIsDrifting hay mDriftingTime để tránh kẹt drift
     *(uint8_t *) ((char *)self + kOffEvtInCanTrigger) = 1;
     *(uint8_t *) ((char *)self + kOffEvtInChecking)   = 1;
-    *(uint8_t *) ((char *)self + kOffEvtLastDrift)    = 1;
+    *(float *)   ((char *)self + kOffEvtCheckTime)    = 0.0f;
+}
+
+static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
+    if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
+    if (!gFullMiniBoost || !self) return;
+
+    // Liên tục cấp tiểu phun dự trữ (ReserveSmallBoost)
+    void *reserveMgr = *(void **)((char *)self + kOffExVelReserveMgr);
+    if (reserveMgr) {
+        int curNum = *(int *)((char *)reserveMgr + kOffReserveNum);
+        if (curNum < 2) {
+            if (orig_Reserve_AddSmallBoost) {
+                orig_Reserve_AddSmallBoost(reserveMgr, 2 - curNum, nullptr);
+            } else {
+                *(int *)((char *)reserveMgr + kOffReserveNum) = 2;
+            }
+        }
+    }
+}
+
+static void hook_ReserveAddSmallBoost(void *self, int addNum, const void *method) {
+    if (orig_Reserve_AddSmallBoost) orig_Reserve_AddSmallBoost(self, addNum, method);
 }
 
 static void hook_EvtMiniUpdate(void *self, float dt, const void *method) {
@@ -330,35 +359,32 @@ static BOOL hook_EvtMiniCanTrigger(void *self, const void *method) {
 
 static BOOL hook_IsCanTriggerExVel(void *self, int type, const void *method) {
     if (gFullMiniBoost && self) {
-        // ExtraVelocityType: Mini=2, Air=3, Overlap=8, FallingGround=11, PassiveMini=16
-        if (type == 2 || type == 3 || type == 8 || type == 11 || type == 16) {
-            return YES;
-        }
+        // Cho phép toàn bộ các kiểu phun: Mini=2, Air=3, Overlap=8, FallingGround=11, PassiveMini=16
+        return YES;
     }
     return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type, method) : NO;
 }
 
-// 3. Auto End Drift
-static void hook_DriftForceEnd(void *self, const void *method) {
-    if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self, method);
+// 3. Auto End Drift: Gọi chuẩn ExitCurDriftState để thoát trạng thái drift ngay khi nhả nút
+static void hook_DriftExitCurState(void *self, const void *method) {
+    if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(self, method);
 }
 
 static void hook_DriftRelease(void *self, const void *method) {
     if (orig_Drift_Release) orig_Drift_Release(self, method);
     if (!gAutoDriftEnd || !self) return;
-    if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self, nullptr);
+
+    // Thoát triệt để khỏi DriftStateMachine và trả lái thẳng
+    if (orig_Drift_ExitCurDriftState) {
+        orig_Drift_ExitCurDriftState(self, nullptr);
+    }
 }
 
-// 4. Vehicle Physics PowerChain Speed Boost (Direct Physics, NO ECU)
+// 4. Vehicle Physics PowerChain Speed Boost (Trực tiếp trục truyền động vật lý, KHÔNG ECU)
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
     if (!self || gSpeedKmh <= 0.f) return;
 
-    // Apply directly to vehicle physical power chain:
-    // 0x44: mExtraKMPH
-    // 0x48: mExtraTorque
-    // 0x38: mMPSScaleCoef (speed scaling)
-    // 0x40: mTorqueScaleCoef (acceleration scaling)
     *(float *)((char *)self + kOffPowerExtraKMPH)    = gSpeedKmh;
     *(float *)((char *)self + kOffPowerExtraTorque)  = gSpeedKmh * 10.0f;
     *(float *)((char *)self + kOffPowerMPSScaleCoef) = 1.0f + (gSpeedKmh / 120.0f);
@@ -388,7 +414,7 @@ static void installHooks(void) {
 
     rtLog("install: installing IL2CPP metadata hooks (zero text-patching)");
 
-    // 1. Full Nitro
+    // 1. Full Nitro (Drift nhẹ full nitro)
     orig_Nitro_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SingleNitrogenCollect", "Update", 1, (void *)hook_NitroUpdate);
     orig_Nitro_GetProgress = (float (*)(void *, const void *))
@@ -396,7 +422,11 @@ static void installHooks(void) {
     orig_EvtN2O_CanTrigger = (BOOL (*)(void *, const void *))
         rtHookMethod("", "EvtN2O", "IsCanTrigger", 0, (void *)hook_EvtN2OCanTrigger);
 
-    // 2. Full Mini Boost
+    // 2. Mini Boost (Cấp nhận liên tục từ ReserveSmallBoostMgr)
+    orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
+    orig_Reserve_AddSmallBoost = (void (*)(void *, int, const void *))
+        rtHookMethod("", "ReserveSmallBoostMgr", "AddReserveSmallBoost", 1, (void *)hook_ReserveAddSmallBoost);
     orig_EvtMini_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "EvtMini", "Update", 1, (void *)hook_EvtMiniUpdate);
     orig_EvtMini_CanTrigger = (BOOL (*)(void *, const void *))
@@ -404,13 +434,13 @@ static void installHooks(void) {
     orig_IsCanTriggerExVel = (BOOL (*)(void *, int, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "IsCanTriggerExtraVelocity", 1, (void *)hook_IsCanTriggerExVel);
 
-    // 3. Auto End Drift
+    // 3. Auto End Drift (Thoát drift sạch sẽ qua ExitCurDriftState)
     orig_Drift_Release = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
-    orig_Drift_ForceEnd = (void (*)(void *, const void *))
-        rtHookMethod("", "NssVehicleDriftCtrl", "ForceEndDrifting", 0, (void *)hook_DriftForceEnd);
+    orig_Drift_ExitCurDriftState = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ExitCurDriftState", 0, (void *)hook_DriftExitCurState);
 
-    // 4. Vehicle Physics PowerChain Speed Boost (Direct Physics, NO ECU)
+    // 4. Vehicle Physics PowerChain Speed Boost (Trực tiếp trục truyền động vật lý, KHÔNG ECU)
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
@@ -512,9 +542,9 @@ static RCRaceToolkitMenu *gMenu = nil;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:44  title:@"Full Nitro"      on:gFullNitro     action:@selector(onNitro:)];
-    [self switchAtY:84  title:@"Full Mini Boost" on:gFullMiniBoost action:@selector(onMini:)];
-    [self switchAtY:124 title:@"Auto End Drift"  on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
+    [self switchAtY:44  title:@"Drift Full Nitro"  on:gFullNitro     action:@selector(onNitro:)];
+    [self switchAtY:84  title:@"Inf Mini Boost"   on:gFullMiniBoost action:@selector(onMini:)];
+    [self switchAtY:124 title:@"Auto End Drift"   on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
 
     self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 168, 268, 22)];
     self.speedLabel.textColor = UIColor.whiteColor;
@@ -534,7 +564,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 3;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:11];
-    note.text = @"PowerChain Speed: Direct physics torque & km/h boost.\nAuto End Drift: Releases drift immediately on key up.";
+    note.text = @"Nitro: Drift nhe la full.\nMiniboost: Nhan lien tuc khong gioi han.\nAuto End Drift: Nha nut drift la dut khoat thang lai.";
     [self.panel addSubview:note];
 }
 
