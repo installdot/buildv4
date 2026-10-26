@@ -5,7 +5,7 @@
 //
 //   0x53D8430  void  GameGoState::ImpEnter()                        race start marker
 //   0x9CF33DC  void  SingleNitrogenCollect::Update(float)           nitro tick
-//   0x9CF2340  uint  SingleNitrogenCollect::get_NitrogenValue()     *(uint*)(this+208)
+//   (removed)  SingleNitrogenCollect::get_NitrogenValue            8-byte leaf, see below
 //   0x9CF229C  float SingleNitrogenCollect::get_ProgressBarPowerValue()
 //   0x50A40C4  void  EvtMini::Update(float)
 //   0x50A5468  bool  EvtMini::UpdateIsCanTrigger()
@@ -15,7 +15,7 @@
 //   0x50DE3D8  bool  ExtraVelocityTriggerMgr::IsCanTriggerExtraVelocity(int type)
 //   0x7C6E51C  void  NssVehicleDriftCtrl::ReleaseDrifting()
 //   0x7C6E664  void  NssVehicleDriftCtrl::ForceEndDrifting()
-//   0x7AF9964  float NssPhyVehicleECU::ReadNormalTopMPS()          *(float*)(this+264)
+//   (removed)  NssPhyVehicleECU::ReadNormalTopMPS                  8-byte leaf, see below
 //
 // Build: Theos (`make package`).
 
@@ -41,6 +41,7 @@ static const int      kTypeMini          = 2;
 // Il2cpp field offsets, DECIMAL (as printed by Hex-Rays).
 enum {
     kOffNitroCurPower   = 208,  // 0xD0 mCurPower (uint)
+    kOffTopMps          = 264,  // 0x108 NssPhyVehicleECUBase::mNormalTopMPS (float)
     kOffEvtVdAngleMax   = 116,  // 0x74 mDriftingMaxAbsVDAngle
     kOffEvtDriftingTime = 124,  // 0x7C mDriftingTime
     kOffEvtInCanTrigger = 133,  // 0x85 mInCanTriggerTime (bool)
@@ -54,7 +55,6 @@ enum {
 
 static void  (*orig_GameGo_ImpEnter)(void *);
 static void  (*orig_Nitro_Update)(void *, float);
-static uint32_t (*orig_Nitro_GetValue)(void *);
 static float (*orig_Nitro_GetProgress)(void *);
 static void  (*orig_EvtMini_Update)(void *, float);
 static BOOL  (*orig_EvtMini_CanTrigger)(void *);
@@ -64,7 +64,10 @@ static int   (*orig_EvtN2O_Trigger)(void *);
 static BOOL  (*orig_IsCanTriggerExVel)(void *, int);
 static void  (*orig_Drift_Release)(void *);
 static void  (*orig_Drift_ForceEnd)(void *);
-static float (*orig_ECU_ReadTopMPS)(void *);
+static void  (*orig_ECU_SetNormalTopMPS)(void *, float);
+// NssPhyVehicleECU::ReadNormalTopMPS (0x7AF9964) is an 8-byte leaf getter
+// (`LDR S0,[X0,#0x108]; RET`). MSHookFunction writes a 16-byte patch, which
+// would overwrite SetNormalTopMPS at 0x7AF996C -> instant corruption. Not hooked.
 
 // No cached il2cpp object pointers: EvtMini/EvtN2O instances are pooled and
 // recycled with the vehicle, so keeping them here is a use-after-free waiting
@@ -103,12 +106,6 @@ static void hook_NitroUpdate(void *self, float dt) {
     void *veh = *(void **)((char *)self + 0x60);        // SingleNitrogenCollect.mVehicle
     if (!vehicleIsMainPlayer(veh)) return;
     *(uint32_t *)((char *)self + kOffNitroCurPower) = kNitroMaxPower;
-}
-
-static uint32_t hook_NitroGetValue(void *self) {
-    if (gFullNitro && self &&
-        vehicleIsMainPlayer(*(void **)((char *)self + 0x60))) return kNitroMaxPower;
-    return orig_Nitro_GetValue ? orig_Nitro_GetValue(self) : 0;
 }
 
 static float hook_NitroGetProgress(void *self) {
@@ -179,6 +176,19 @@ static BOOL hook_IsCanTriggerExVel(void *self, int type) {
     return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type) : NO;
 }
 
+// Speed boost without touching the 8-byte ReadNormalTopMPS getter:
+// NssPhyVehicleECU::SetNormalTopMPS (0x7AF996C, 220 bytes) writes
+// mNormalTopMPS @ +0x108, which ReadNormalTopMPS returns. The game refreshes
+// this value every frame from car params, so we re-apply it after it runs.
+static void hook_SetNormalTopMPS(void *self, float topMps) {
+    if (orig_ECU_SetNormalTopMPS) orig_ECU_SetNormalTopMPS(self, topMps);
+
+    if (!self || !speedWindowOpen()) return;
+    void *veh = *(void **)((char *)self + 0x18);        // NssPhyVehicleECUBase.mVehicle
+    if (!vehicleIsMainPlayer(veh)) return;
+    *(float *)((char *)self + kOffTopMps) += gSpeedKmh / 3.6f;
+}
+
 // Exposed so Auto End Drift can hard-stop the drift state machine.
 static void hook_DriftForceEnd(void *self) {
     if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self);
@@ -201,17 +211,6 @@ static void hook_DriftRelease(void *self) {
     if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self);
 }
 
-static float hook_ReadTopMPS(void *self) {
-    if (!orig_ECU_ReadTopMPS) return 0.0f;
-    float base = orig_ECU_ReadTopMPS(self);
-    if (!speedWindowOpen()) return base;
-
-    void *veh = *(void **)((char *)self + 0x18);        // NssPhyVehicleECUBase.mVehicle
-    if (!vehicleIsMainPlayer(veh)) return base;
-
-    return base + gSpeedKmh / 3.6f;                     // km/h -> m/s
-}
-
 #pragma mark - Install
 
 static uintptr_t unityFrameworkBase(void) {
@@ -229,7 +228,6 @@ static void installHooks(void) {
 #define H(rva, repl, origp) MSHookFunction((void *)(b + (rva)), (void *)(repl), (void **)&(origp))
     H(0x53D8430, hook_GoImpEnter,       orig_GameGo_ImpEnter);
     H(0x9CF33DC, hook_NitroUpdate,      orig_Nitro_Update);
-    H(0x9CF2340, hook_NitroGetValue,    orig_Nitro_GetValue);
     H(0x9CF229C, hook_NitroGetProgress, orig_Nitro_GetProgress);
     H(0x50A40C4, hook_EvtMiniUpdate,    orig_EvtMini_Update);
     H(0x50A5468, hook_EvtMiniCanTrigger, orig_EvtMini_CanTrigger);
@@ -239,7 +237,7 @@ static void installHooks(void) {
     H(0x50DE3D8, hook_IsCanTriggerExVel, orig_IsCanTriggerExVel);
     H(0x7C6E51C, hook_DriftRelease,     orig_Drift_Release);
     H(0x7C6E664, hook_DriftForceEnd,    orig_Drift_ForceEnd);
-    H(0x7AF9964, hook_ReadTopMPS,       orig_ECU_ReadTopMPS);
+    H(0x7AF996C, hook_SetNormalTopMPS,  orig_ECU_SetNormalTopMPS);
 #undef H
 }
 
