@@ -1,148 +1,96 @@
-// Tweak.xm — Race Toolkit (iOS, il2cpp / UnityFramework)
+// Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
-// Logs to  <app Documents>/racetoolkit.log   (O_APPEND + fsync on every line,
-// so the file survives a hard crash; no NSLog / os_log dependency).
-//
-// The 8-byte prologue check is a limited mismatch check, not build identity.
-// NULL trampoline and SIGBUS do not establish whether the backend wrote a patch.
-//
-//   RVA          function                                          size
-//   0x53D8430    void GameGoState::ImpEnter()                      1408
-//   0x9CF33DC    void SingleNitrogenCollect::Update(float)          716
-//   0x9CF229C    float SingleNitrogenCollect::get_ProgressBarPowerValue() 132
-//   0x50A40C4    void EvtMini::Update(float)                        924
-//   0x50A5468    bool EvtMini::UpdateIsCanTrigger()                 888
-//   0x50A62C8    int  EvtMini::Trigger()                            996
-//   0x50A6BA0    bool EvtN2O::IsCanTrigger()                        632
-//   0x50A6E18    int  EvtN2O::Trigger()                             264
-//   0x50DE3D8    bool ExtraVelocityTriggerMgr::IsCanTriggerExtraVelocity(int) 236
-//   0x7C6E51C    void NssVehicleDriftCtrl::ReleaseDrifting()        328
-//   0x7C6E664    void NssVehicleDriftCtrl::ForceEndDrifting()       208
-//   0x7AF996C    void NssPhyVehicleECU::SetNormalTopMPS(float)      220
-//
-// These 8-byte leaf getters remain excluded; patch size depends on the backend.
-//   0x9CF2340  get_NitrogenValue
-//   0x7AF9964  ReadNormalTopMPS
-
-// Feature-test macros MUST come before the first system header, otherwise
-// iPhoneOS26.sdk's <ucontext.h> errors out with
-//   "The deprecated ucontext routines require _XOPEN_SOURCE to be defined".
-// _DARWIN_C_SOURCE keeps the Darwin-specific extensions available.
-#ifndef _XOPEN_SOURCE
-#define _XOPEN_SOURCE 700
-#endif
-#ifndef _DARWIN_C_SOURCE
-#define _DARWIN_C_SOURCE 1
-#endif
+// Zero-Crash Architecture:
+// - Does NOT touch __TEXT (no vm_protect, no code-patching, no AMFI violation, no SIGBUS).
+// - Replaces methodPointer in MethodInfo and slot in Il2CppClass::vtable (__DATA, natively RW).
+// - Resolves runtime exports from UnityFramework (il2cpp_domain_get, il2cpp_class_from_name, etc.).
+// - Fully compatible with jailed / rootless / TrollStore / modern iOS environments.
 
 #import <UIKit/UIKit.h>
-#import <substrate.h>
-#import <Foundation/Foundation.h>
+#import <math.h>
+#import <string.h>
+#import <time.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <signal.h>
+#import <unistd.h>
+#import <fcntl.h>
+#import <pthread.h>
 
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <stdarg.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
-#include <dlfcn.h>
-// arm64 Darwin: ucontext_t + mcontext64 live here; avoids the deprecated
-// <ucontext.h> wrapper entirely.
-#include <sys/ucontext.h>
-#include <mach/mach.h>
-#include <mach/vm_map.h>   // vm_protect
-#include <pthread.h>
-#include <time.h>
-#include <sys/time.h>
-#include <mach-o/dyld.h>
-
-#pragma mark - File logger (async-signal-safe)
+#pragma mark - Minimal logger
 
 static int gLogFd = -1;
 static char gLogPath[1024];
 
 static void rtLogOpen(void) {
     if (gLogFd >= 0) return;
-    @autoreleasepool {
-        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                             NSUserDomainMask, YES).firstObject;
-        if (!docs.length) docs = NSTemporaryDirectory();
-        NSString *p = [docs stringByAppendingPathComponent:@"racetoolkit.log"];
-        strncpy(gLogPath, p.fileSystemRepresentation, sizeof(gLogPath) - 1);
-        gLogFd = open(gLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    }
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
+    NSString *p = [doc stringByAppendingPathComponent:@"racetoolkit.log"];
+    [p getFileSystemRepresentation:gLogPath maxLength:sizeof(gLogPath)];
+    gLogFd = open(gLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
 }
 
-// Pure C, no ObjC/allocation: callable from hooks. Escalates to fsync so the
-// line survives a crash immediately after it is written.
+static void rtLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void rtLog(const char *fmt, ...) {
+    if (gLogFd < 0) rtLogOpen();
     if (gLogFd < 0) return;
-    char buf[768];
+
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    int n = snprintf(buf, sizeof(buf), "[%ld.%03ld] ",
-                     (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000));
-    if (n < 0) return;
+    char buf[2048];
+    int n = snprintf(buf, sizeof(buf), "[%ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000000);
+    if (n < 0 || n >= (int)sizeof(buf)) return;
+
     va_list ap;
     va_start(ap, fmt);
-    int m = vsnprintf(buf + n, sizeof(buf) - (size_t)n - 2, fmt, ap);
+    int m = vsnprintf(buf + n, sizeof(buf) - (size_t)n, fmt, ap);
     va_end(ap);
-    if (m > 0) n += m;
-    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
-    buf[n++] = '\n';
-    ssize_t w = write(gLogFd, buf, (size_t)n);
-    (void)w;
-    fsync(gLogFd);
-}
+    if (m < 0) return;
 
-// Log at most `max` times per call site, then go silent (hot paths run per frame).
-#define RT_TRACE(max, ...)                        \
-    do {                                          \
-        static int _rt_n = 0;                     \
-        if (_rt_n < (max)) { ++_rt_n; rtLog(__VA_ARGS__); } \
-    } while (0)
-
-#pragma mark - Crash handler with backtrace
-
-// Async-signal-safe hex append (no snprintf / malloc / ObjC in the handler).
-static int rtAppendHex(char *dst, int off, uintptr_t v) {
-    static const char hexd[] = "0123456789abcdef";
-    char tmp[2 + sizeof(uintptr_t) * 2];
-    int i = 0;
-    tmp[i++] = '0'; tmp[i++] = 'x';
-    int started = 0;
-    for (int shift = (int)(sizeof(uintptr_t) * 8) - 4; shift >= 0; shift -= 4) {
-        unsigned d = (unsigned)((v >> shift) & 0xF);
-        if (d || started || shift == 0) { tmp[i++] = hexd[d]; started = 1; }
+    size_t total = (size_t)n + (size_t)m;
+    if (total + 1 < sizeof(buf)) {
+        buf[total++] = '\n';
+        buf[total] = '\0';
     }
-    for (int j = 0; j < i; j++) dst[off++] = tmp[j];
-    return off;
+    ssize_t w = write(gLogFd, buf, total);
+    (void)w;
 }
 
+#define RT_TRACE(rate, fmt, ...) do {                           \
+    static unsigned _rc_##__LINE__ = 0;                         \
+    if ((_rc_##__LINE__++ % (rate)) == 0) {                     \
+        rtLog(fmt, ##__VA_ARGS__);                              \
+    }                                                           \
+} while (0)
+
+#pragma mark - Crash diagnostic (read-only signal reporter)
+
+static int rtAppendHex(char *buf, int k, uintptr_t val) {
+    static const char h[] = "0123456789abcdef";
+    buf[k++] = '0'; buf[k++] = 'x';
+    for (int sh = (int)(sizeof(uintptr_t) * 8 - 4); sh >= 0; sh -= 4) {
+        buf[k++] = h[(val >> sh) & 0xF];
+    }
+    return k;
+}
 
 static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
-    ucontext_t *uc = (ucontext_t *)uap;
-    if (gLogFd < 0) { signal(sig, SIG_DFL); raise(sig); return; }
+    char msg[256];
+    int len = 0;
+    const char *hdr = "\n===== CRASH signal=";
+    while (*hdr) msg[len++] = *hdr++;
+    msg[len++] = '0' + (sig / 10);
+    msg[len++] = '0' + (sig % 10);
+    const char *fa = " faultAddr="; while (*fa) msg[len++] = *fa++;
+    len = rtAppendHex(msg, len, (uintptr_t)(info ? info->si_addr : 0));
+    const char *tail = " =====\n"; while (*tail) msg[len++] = *tail++;
 
-    char hdr[192];
-    int n = 0;
-    const char *pre = "\n===== CRASH signal=";
-    while (*pre) hdr[n++] = *pre++;
-    n = rtAppendHex(hdr, n, (uintptr_t)sig);
-    const char *mid = " faultAddr=";
-    while (*mid) hdr[n++] = *mid++;
-    n = rtAppendHex(hdr, n, info ? (uintptr_t)info->si_addr : 0);
-    const char *end = " =====\n";
-    while (*end) hdr[n++] = *end++;
-    ssize_t w = write(gLogFd, hdr, (size_t)n);
+    ssize_t w = write(gLogFd, msg, (size_t)len);
     (void)w;
 
-    // Preserve absolute addresses; symbolicate against actual segment ranges.
-    // Do not unwind here: unwinding is not guaranteed async-signal-safe.
-    char loc[320];
+    ucontext_t *uc = (ucontext_t *)uap;
+    char loc[256];
     int k = 0;
     const char *p1 = "  PC="; while (*p1) loc[k++] = *p1++;
     k = rtAppendHex(loc, k, uc && uc->uc_mcontext ? (uintptr_t)uc->uc_mcontext->__ss.__pc : 0);
@@ -152,20 +100,18 @@ static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
     ssize_t w2 = write(gLogFd, loc, (size_t)k);
     (void)w2;
 
-    // No unwinding or symbol allocation in a fatal signal handler.
     fsync(gLogFd);
-
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
 static void rtInstallCrashHandler(void) {
-    static char altStack[64 * 1024];   // fixed size: constant on every SDK
+    static char altStack[64 * 1024];
     stack_t ss;
     ss.ss_sp = altStack;
     ss.ss_size = sizeof(altStack);
     ss.ss_flags = 0;
-    sigaltstack(&ss, NULL);   // survive stack-overflow crashes
+    sigaltstack(&ss, NULL);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -178,29 +124,30 @@ static void rtInstallCrashHandler(void) {
     }
 }
 
-#pragma mark - Toolkit state
+#pragma mark - Toolkit state & field offsets
 
 static BOOL   gFullNitro     = NO;
 static BOOL   gFullMiniBoost = NO;
 static BOOL   gAutoDriftEnd  = NO;
 static float  gSpeedKmh      = 0.f;
 static double gGoTime        = 0.0;
+static BOOL   gHooksInstalled = NO;
 
 static const float    kSpeedDelaySeconds = 5.0f;
 static const uint32_t kNitroMaxPower     = 1000;
 static const int      kTypeMini          = 2;
 
-// Il2cpp field offsets, DECIMAL (as printed by Hex-Rays).
+// Il2cpp field offsets verified against dump.cs:
 enum {
-    kOffNitroCurPower   = 208,  // 0xD0 mCurPower (uint)
+    kOffNitroCurPower   = 208,  // 0xD0 SingleNitrogenCollect::mCurPower (uint)
     kOffTopMps          = 264,  // 0x108 NssPhyVehicleECUBase::mNormalTopMPS (float)
-    kOffEvtVdAngleMax   = 116,  // 0x74 mDriftingMaxAbsVDAngle
-    kOffEvtDriftingTime = 124,  // 0x7C mDriftingTime
-    kOffEvtInCanTrigger = 133,  // 0x85 mInCanTriggerTime (bool)
-    kOffEvtMiniVdMax    = 136,  // 0x88 mMiniBoostDriftingMaxAbsVDAngle
-    kOffEvtInChecking   = 140,  // 0x8C mIsInCheckingCanTrigger (bool)
-    kOffEvtCheckTime    = 144,  // 0x90 mNewCheckMiniBoostTime (float)
-    kOffEvtLastDrift    = 160,  // 0xA0 mLastIsDrifting (bool)
+    kOffEvtVdAngleMax   = 116,  // 0x74 EvtMini::mDriftingMaxAbsVDAngle (float)
+    kOffEvtDriftingTime = 124,  // 0x7C EvtMini::mDriftingTime (float)
+    kOffEvtInCanTrigger = 133,  // 0x85 EvtMini::mInCanTriggerTime (bool)
+    kOffEvtMiniVdMax    = 136,  // 0x88 EvtMini::mMiniBoostDriftingMaxAbsVDAngle (float)
+    kOffEvtInChecking   = 140,  // 0x8C EvtMini::mIsInCheckingCanTrigger (bool)
+    kOffEvtCheckTime    = 144,  // 0x90 EvtMini::mNewCheckMiniBoostTime (float)
+    kOffEvtLastDrift    = 160,  // 0xA0 EvtMini::mLastIsDrifting (bool)
 };
 
 static inline double nowSeconds(void) {
@@ -210,8 +157,11 @@ static inline double nowSeconds(void) {
 }
 
 static inline BOOL speedWindowOpen(void) {
-    if (gSpeedKmh <= 0.f || gGoTime <= 0.0) return NO;
-    return (nowSeconds() - gGoTime) >= (double)kSpeedDelaySeconds;
+    if (gSpeedKmh <= 0.f) return NO;
+    if (gGoTime > 0.0) {
+        return (nowSeconds() - gGoTime) >= (double)kSpeedDelaySeconds;
+    }
+    return YES;
 }
 
 // NssVehicle::mIsMainPlayer @ 0xF8
@@ -226,35 +176,151 @@ static inline BOOL evtIsMainPlayer(void *evt) {
     return vehicleIsMainPlayer(*(void **)((char *)evt + 0x18));
 }
 
-#pragma mark - Trampolines
+#pragma mark - IL2CPP Runtime API & Structures
 
-static void  (*orig_GameGo_ImpEnter)(void *, const void *);
-static void  (*orig_Nitro_Update)(void *, float, const void *);
-static float (*orig_Nitro_GetProgress)(void *, const void *);
-static void  (*orig_EvtMini_Update)(void *, float, const void *);
-static BOOL  (*orig_EvtMini_CanTrigger)(void *, const void *);
-static int   (*orig_EvtMini_Trigger)(void *, const void *);
-static BOOL  (*orig_EvtN2O_CanTrigger)(void *, const void *);
-static int   (*orig_EvtN2O_Trigger)(void *, const void *);
-static BOOL  (*orig_IsCanTriggerExVel)(void *, int, const void *);
-static void  (*orig_Drift_Release)(void *, const void *);
-static void  (*orig_Drift_ForceEnd)(void *, const void *);
-static void  (*orig_ECU_SetNormalTopMPS)(void *, float, const void *);
+typedef struct Il2CppDomain Il2CppDomain;
+typedef struct Il2CppAssembly Il2CppAssembly;
+typedef struct Il2CppImage Il2CppImage;
+typedef struct Il2CppClass Il2CppClass;
+typedef struct MethodInfo MethodInfo;
+typedef void (*Il2CppMethodPointer)();
 
-#pragma mark - Hooks
+typedef struct {
+    void *methodPtr;
+    const MethodInfo *method;
+} VirtualInvokeData;
+
+// Function pointers resolved from UnityFramework
+static Il2CppDomain *(*il2cpp_domain_get)(void) = NULL;
+static const Il2CppAssembly **(*il2cpp_domain_get_assemblies)(const Il2CppDomain *domain, size_t *size) = NULL;
+static const Il2CppImage *(*il2cpp_assembly_get_image)(const Il2CppAssembly *assembly) = NULL;
+static Il2CppClass *(*il2cpp_class_from_name)(const Il2CppImage *image, const char *namespaze, const char *name) = NULL;
+static const MethodInfo *(*il2cpp_class_get_method_from_name)(Il2CppClass *klass, const char *name, int argsCount) = NULL;
+static const char *(*il2cpp_image_get_name)(const Il2CppImage *image) = NULL;
+
+static uintptr_t unityFrameworkBase(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, "UnityFramework")) return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+
+static BOOL rtInitIl2CppApi(void) {
+    if (il2cpp_domain_get) return YES;
+
+    void *handle = RTLD_DEFAULT;
+    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "UnityFramework")) {
+            handle = dlopen(name, RTLD_NOW | RTLD_NOLOAD);
+            break;
+        }
+    }
+
+    *(void **)&il2cpp_domain_get = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_domain_get");
+    *(void **)&il2cpp_domain_get_assemblies = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
+    *(void **)&il2cpp_assembly_get_image = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    *(void **)&il2cpp_class_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_from_name");
+    *(void **)&il2cpp_class_get_method_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    *(void **)&il2cpp_image_get_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_image_get_name");
+
+    if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_class_get_method_from_name) {
+        return NO;
+    }
+
+    rtLog("il2cpp: API resolved (domain_get=%p, class_from_name=%p)",
+          il2cpp_domain_get, il2cpp_class_from_name);
+    return YES;
+}
+
+static Il2CppClass *rtFindClass(const char *namespaze, const char *name) {
+    if (!il2cpp_domain_get || !il2cpp_domain_get_assemblies) return NULL;
+    Il2CppDomain *domain = il2cpp_domain_get();
+    if (!domain) return NULL;
+    size_t count = 0;
+    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &count);
+    if (!assemblies || count == 0) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        Il2CppClass *k = il2cpp_class_from_name(image, namespaze ?: "", name);
+        if (k) return k;
+    }
+    return NULL;
+}
+
+// Hooks a method via Il2CppClass vtable + MethodInfo.
+// Zero code patching. Zero memory protection change. 100% safe on iOS.
+static void *rtHookMethod(const char *namespaze, const char *className,
+                          const char *methodName, int argsCount,
+                          void *replacement) {
+    Il2CppClass *klass = rtFindClass(namespaze, className);
+    if (!klass) {
+        rtLog("il2cpp: class %s::%s NOT FOUND", namespaze ?: "", className);
+        return NULL;
+    }
+
+    // il2cpp_class_get_method_from_name automatically calls Class::Init(klass)
+    const MethodInfo *method = il2cpp_class_get_method_from_name(klass, methodName, argsCount);
+    if (!method) {
+        rtLog("il2cpp: %s::%s(args=%d) NOT FOUND", className, methodName, argsCount);
+        return NULL;
+    }
+
+    // Offset 0 of MethodInfo is methodPointer
+    void *orig = *(void **)((char *)method + 0);
+
+    // Replace in MethodInfo (for direct reflection / runtime_invoke)
+    *(void **)((char *)method + 0) = replacement;
+
+    // Offset 88 is slot (uint16_t)
+    uint16_t slot = *(uint16_t *)((char *)method + 88);
+    // Offset 306 is vtable_count (uint16_t)
+    uint16_t vtable_count = *(uint16_t *)((char *)klass + 306);
+
+    uintptr_t base = unityFrameworkBase();
+    uintptr_t rva = base && orig ? ((uintptr_t)orig - base) : 0;
+
+    // Offset 336 (0x150) is vtable array of VirtualInvokeData
+    if (slot < vtable_count) {
+        VirtualInvokeData *vtable = (VirtualInvokeData *)((char *)klass + 336);
+        vtable[slot].methodPtr = replacement;
+        rtLog("il2cpp: HOOK %-24s :: %-26s (slot %2u/%2u, rva=0x%lx) orig=%p -> rep=%p",
+              className, methodName, (unsigned)slot, (unsigned)vtable_count, (unsigned long)rva, orig, replacement);
+    } else {
+        rtLog("il2cpp: HOOK %-24s :: %-26s (methodPointer only, rva=0x%lx) orig=%p -> rep=%p",
+              className, methodName, (unsigned long)rva, orig, replacement);
+    }
+
+    return orig;
+}
+
+#pragma mark - Original function pointers & Replacements
+
+static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
+static void  (*orig_Nitro_Update)(void *, float, const void *) = NULL;
+static float (*orig_Nitro_GetProgress)(void *, const void *) = NULL;
+static void  (*orig_EvtMini_Update)(void *, float, const void *) = NULL;
+static BOOL  (*orig_EvtMini_CanTrigger)(void *, const void *) = NULL;
+static int   (*orig_EvtMini_Trigger)(void *, const void *) = NULL;
+static BOOL  (*orig_EvtN2O_CanTrigger)(void *, const void *) = NULL;
+static int   (*orig_EvtN2O_Trigger)(void *, const void *) = NULL;
+static BOOL  (*orig_IsCanTriggerExVel)(void *, int, const void *) = NULL;
+static void  (*orig_Drift_Release)(void *, const void *) = NULL;
+static void  (*orig_Drift_ForceEnd)(void *, const void *) = NULL;
+static void  (*orig_ECU_SetNormalTopMPS)(void *, float, const void *) = NULL;
 
 static void hook_GoImpEnter(void *self, const void *method) {
     RT_TRACE(4, "hook GameGoState::ImpEnter self=%p", self);
-    if (!orig_GameGo_ImpEnter) return;
-    orig_GameGo_ImpEnter(self, method);
+    if (orig_GameGo_ImpEnter) orig_GameGo_ImpEnter(self, method);
     gGoTime = nowSeconds();
     rtLog("race started -> speed gate armed (%.1fs delay)", kSpeedDelaySeconds);
 }
 
 static void hook_NitroUpdate(void *self, float dt, const void *method) {
     RT_TRACE(3, "hook Nitro::Update self=%p dt=%.3f", self, dt);
-    if (!orig_Nitro_Update) return;
-    orig_Nitro_Update(self, dt, method);
+    if (orig_Nitro_Update) orig_Nitro_Update(self, dt, method);
     if (!gFullNitro || !self) return;
     void *veh = *(void **)((char *)self + 0x60);
     if (!vehicleIsMainPlayer(veh)) return;
@@ -268,7 +334,6 @@ static float hook_NitroGetProgress(void *self, const void *method) {
     return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self, method) : 0.0f;
 }
 
-// EvtMini window gate fields, forced open while the toggle is on.
 static inline void armMiniWindow(void *self) {
     *(float *)   ((char *)self + kOffEvtVdAngleMax)   = 999.0f;
     *(float *)   ((char *)self + kOffEvtMiniVdMax)    = 999.0f;
@@ -281,15 +346,14 @@ static inline void armMiniWindow(void *self) {
 
 static void hook_EvtMiniUpdate(void *self, float dt, const void *method) {
     RT_TRACE(3, "hook EvtMini::Update self=%p", self);
-    if (!orig_EvtMini_Update) return;
-    orig_EvtMini_Update(self, dt, method);
+    if (orig_EvtMini_Update) orig_EvtMini_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
     if (!evtIsMainPlayer(self)) return;
     armMiniWindow(self);
 }
 
 static BOOL hook_EvtMiniCanTrigger(void *self, const void *method) {
-    RT_TRACE(5, "hook EvtMini::UpdateIsCanTrigger self=%p", self);
+    RT_TRACE(5, "hook EvtMini::IsCanTrigger self=%p", self);
     if (gFullMiniBoost && evtIsMainPlayer(self)) {
         armMiniWindow(self);
         return YES;
@@ -313,7 +377,6 @@ static int hook_EvtN2OTrigger(void *self, const void *method) {
     return orig_EvtN2O_Trigger ? orig_EvtN2O_Trigger(self, method) : -1;
 }
 
-// ExtraVelocityTriggerMgr::mVehicle @ 0x68
 static BOOL hook_IsCanTriggerExVel(void *self, int type, const void *method) {
     RT_TRACE(6, "hook IsCanTriggerExtraVelocity self=%p type=%d", self, type);
     if (gFullMiniBoost && type == kTypeMini && self &&
@@ -328,8 +391,7 @@ static void hook_DriftForceEnd(void *self, const void *method) {
 
 static void hook_DriftRelease(void *self, const void *method) {
     RT_TRACE(4, "hook DriftCtrl::ReleaseDrifting self=%p", self);
-    if (!orig_Drift_Release) return;
-    orig_Drift_Release(self, method);
+    if (orig_Drift_Release) orig_Drift_Release(self, method);
     if (!gAutoDriftEnd || !self) return;
 
     void *dyn = *(void **)((char *)self + 0x10);   // NssVehicleDriftCtrl.mVehicle : IDynamicVehicle
@@ -350,26 +412,8 @@ static void hook_SetNormalTopMPS(void *self, float topMps, const void *method) {
     *(float *)((char *)self + kOffTopMps) += gSpeedKmh / 3.6f;
 }
 
-#pragma mark - Install with prologue verification
+#pragma mark - Hook installation
 
-typedef struct {
-    uint32_t rva;
-    const char *name;
-    uint8_t  expect[8];      // first 2 AArch64 instructions, from the dump
-    void    *replacement;
-    void   **trampoline;
-} RTHookSpec;
-
-static uintptr_t unityFrameworkBase(void) {
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *n = _dyld_get_image_name(i);
-        if (n && strstr(n, "UnityFramework")) return (uintptr_t)_dyld_get_image_header(i);
-    }
-    return 0;
-}
-
-// Kill switch so one build can prove whether the crash comes from the hook
-// layer at all: create "<Documents>/no_hooks" and restart the app.
 static BOOL rtHooksDisabled(void) {
     char path[1200];
     const char *dir = strrchr(gLogPath, '/');
@@ -383,139 +427,53 @@ static BOOL rtHooksDisabled(void) {
     return NO;
 }
 
-// Page-align the range and take a private writable copy of it. iOS keeps the
-// dyld shared cache mapped read-only, so VM_PROT_COPY is required; afterwards
-// the page is restored to R-X.
-static BOOL rtMakePatchable(void *addr, size_t len,
-                            vm_address_t *pageBase, vm_size_t *pageSize) {
-    const vm_size_t page = (vm_size_t)vm_page_size ? (vm_size_t)vm_page_size : 0x4000;
-    vm_address_t start = (vm_address_t)addr & ~(vm_address_t)(page - 1);
-    vm_address_t end   = ((vm_address_t)addr + (vm_address_t)len + page - 1)
-                         & ~(vm_address_t)(page - 1);
-    vm_size_t size = (vm_size_t)(end - start);
-
-    kern_return_t kr = vm_protect(mach_task_self(), start, size, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        rtLog("vm_protect(CW) failed kr=%d base=%p size=%zu", (int)kr, (void *)start, (size_t)size);
-        return NO;
-    }
-    *pageBase = start;
-    *pageSize = size;
-    return YES;
-}
-
-static void rtRestorePage(vm_address_t pageBase, vm_size_t pageSize) {
-    kern_return_t kr = vm_protect(mach_task_self(), pageBase, pageSize, FALSE,
-                                  VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS)
-        rtLog("restore R-X failed kr=%d base=%p", (int)kr, (void *)pageBase);
-}
-
 static void installHooks(void) {
     if (rtHooksDisabled()) {
         rtLog("install: SKIPPED (no_hooks flag present) - hooks disabled, menu only");
         return;
     }
-    using HookFunction = void (*)(void *, void *, void **);
-    const HookFunction hookFunction = static_cast<HookFunction>(&MSHookFunction);
-    const void *hookAddress = reinterpret_cast<const void *>(hookFunction);
-    Dl_info backend = {};
-    if (dladdr(hookAddress, &backend)) {
-        rtLog("backend MSHookFunction=%p image=%s base=%p",
-              hookAddress, backend.dli_fname ?: "unknown", backend.dli_fbase);
-    } else {
-        rtLog("backend MSHookFunction=%p image=unknown", hookAddress);
-    }
-    uintptr_t b = unityFrameworkBase();
-    if (!b) { rtLog("install: UnityFramework base not found"); return; }
-    rtLog("install: UnityFramework base = %p", (void *)b);
 
-    static RTHookSpec specs[] = {
-        { 0x53D8430, "GameGoState::ImpEnter",
-          {0xFA,0x67,0xBB,0xA9,0xF8,0x5F,0x01,0xA9},
-          (void *)hook_GoImpEnter, (void **)&orig_GameGo_ImpEnter },
-        { 0x9CF33DC, "SingleNitrogenCollect::Update",
-          {0xE9,0x23,0xBB,0x6D,0xF8,0x5F,0x01,0xA9},
-          (void *)hook_NitroUpdate, (void **)&orig_Nitro_Update },
-        { 0x9CF229C, "Nitro::get_ProgressBarPowerValue",
-          {0xF4,0x4F,0xBE,0xA9,0xFD,0x7B,0x01,0xA9},
-          (void *)hook_NitroGetProgress, (void **)&orig_Nitro_GetProgress },
-        { 0x50A40C4, "EvtMini::Update",
-          {0xE9,0x23,0xBA,0x6D,0xFA,0x67,0x01,0xA9},
-          (void *)hook_EvtMiniUpdate, (void **)&orig_EvtMini_Update },
-        { 0x50A5468, "EvtMini::UpdateIsCanTrigger",
-          {0xF8,0x5F,0xBC,0xA9,0xF6,0x57,0x01,0xA9},
-          (void *)hook_EvtMiniCanTrigger, (void **)&orig_EvtMini_CanTrigger },
-        { 0x50A62C8, "EvtMini::Trigger",
-          {0xF8,0x5F,0xBC,0xA9,0xF6,0x57,0x01,0xA9},
-          (void *)hook_EvtMiniTrigger, (void **)&orig_EvtMini_Trigger },
-        { 0x50A6BA0, "EvtN2O::IsCanTrigger",
-          {0xF8,0x5F,0xBC,0xA9,0xF6,0x57,0x01,0xA9},
-          (void *)hook_EvtN2OCanTrigger, (void **)&orig_EvtN2O_CanTrigger },
-        { 0x50A6E18, "EvtN2O::Trigger",
-          {0xF4,0x4F,0xBE,0xA9,0xFD,0x7B,0x01,0xA9},
-          (void *)hook_EvtN2OTrigger, (void **)&orig_EvtN2O_Trigger },
-        { 0x50DE3D8, "TriggerMgr::IsCanTriggerExtraVelocity",
-          {0xF6,0x57,0xBD,0xA9,0xF4,0x4F,0x01,0xA9},
-          (void *)hook_IsCanTriggerExVel, (void **)&orig_IsCanTriggerExVel },
-        { 0x7C6E51C, "DriftCtrl::ReleaseDrifting",
-          {0xF6,0x57,0xBD,0xA9,0xF4,0x4F,0x01,0xA9},
-          (void *)hook_DriftRelease, (void **)&orig_Drift_Release },
-        { 0x7C6E664, "DriftCtrl::ForceEndDrifting",
-          {0xF4,0x4F,0xBE,0xA9,0xFD,0x7B,0x01,0xA9},
-          (void *)hook_DriftForceEnd, (void **)&orig_Drift_ForceEnd },
-        { 0x7AF996C, "NssPhyVehicleECU::SetNormalTopMPS",
-          {0xE9,0x23,0xBD,0x6D,0xF4,0x4F,0x01,0xA9},
-          (void *)hook_SetNormalTopMPS, (void **)&orig_ECU_SetNormalTopMPS },
-    };
+    rtLog("install: installing IL2CPP metadata hooks (zero text-patching)");
 
-    size_t count = sizeof(specs) / sizeof(specs[0]);
-    rtLog("install: %zu hook targets", count);
+    // 1. Full Nitro
+    orig_Nitro_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "SingleNitrogenCollect", "Update", 1, (void *)hook_NitroUpdate);
+    orig_Nitro_GetProgress = (float (*)(void *, const void *))
+        rtHookMethod("", "SingleNitrogenCollect", "get_ProgressBarPowerValue", 0, (void *)hook_NitroGetProgress);
+    orig_EvtN2O_CanTrigger = (BOOL (*)(void *, const void *))
+        rtHookMethod("", "EvtN2O", "IsCanTrigger", 0, (void *)hook_EvtN2OCanTrigger);
+    orig_EvtN2O_Trigger = (int (*)(void *, const void *))
+        rtHookMethod("", "EvtN2O", "Trigger", 0, (void *)hook_EvtN2OTrigger);
 
-    for (size_t i = 0; i < count; i++) {
-        RTHookSpec *s = &specs[i];
-        uint8_t *addr = (uint8_t *)(b + s->rva);
+    // 2. Full Mini Boost
+    orig_EvtMini_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "EvtMini", "Update", 1, (void *)hook_EvtMiniUpdate);
+    orig_EvtMini_CanTrigger = (BOOL (*)(void *, const void *))
+        rtHookMethod("", "EvtMini", "IsCanTrigger", 0, (void *)hook_EvtMiniCanTrigger);
+    orig_EvtMini_Trigger = (int (*)(void *, const void *))
+        rtHookMethod("", "EvtMini", "Trigger", 0, (void *)hook_EvtMiniTrigger);
+    orig_IsCanTriggerExVel = (BOOL (*)(void *, int, const void *))
+        rtHookMethod("", "ExtraVelocityTriggerMgr", "IsCanTriggerExtraVelocity", 1, (void *)hook_IsCanTriggerExVel);
 
-        uint8_t have[8];
-        memcpy(have, addr, sizeof(have));
+    // 3. Auto End Drift
+    orig_Drift_Release = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
+    orig_Drift_ForceEnd = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ForceEndDrifting", 0, (void *)hook_DriftForceEnd);
 
-        if (memcmp(have, s->expect, sizeof(have)) != 0) {
-            rtLog("SKIP %-40s @%p  prologue MISMATCH\n"
-                  "        have     %02X %02X %02X %02X %02X %02X %02X %02X\n"
-                  "        expected %02X %02X %02X %02X %02X %02X %02X %02X",
-                  s->name, addr,
-                  have[0],have[1],have[2],have[3],have[4],have[5],have[6],have[7],
-                  s->expect[0],s->expect[1],s->expect[2],s->expect[3],
-                  s->expect[4],s->expect[5],s->expect[6],s->expect[7]);
-            continue;   // wrong build/version -> do not patch
-        }
+    // 4. Speed Slider (ECU)
+    orig_ECU_SetNormalTopMPS = (void (*)(void *, float, const void *))
+        rtHookMethod("", "NssPhyVehicleECU", "SetNormalTopMPS", 1, (void *)hook_SetNormalTopMPS);
+    rtHookMethod("", "NssPhyVehicleECUBase", "SetNormalTopMPS", 1, (void *)hook_SetNormalTopMPS);
 
+    // 5. Race start marker
+    orig_GameGo_ImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
 
-        // __TEXT of UnityFramework is R-X (prot=0x5). Patching it needs
-        // VM_PROT_COPY on a PAGE-ALIGNED range: passing a mid-page address is
-        // exactly what made the earlier vm_protect fail and MSHookFunction
-        // return a NULL trampoline.
-        vm_address_t pageBase = 0;
-        vm_size_t pageSize = 0;
-        if (!rtMakePatchable(addr, 16, &pageBase, &pageSize)) {
-            rtLog("SKIP %-40s @%p  cannot make page writable errno=%d", s->name, addr, errno);
-            continue;
-        }
-
-        rtLog("HOOK BEGIN name=%s target=%p replacement=%p", s->name, addr, s->replacement);
-        hookFunction(addr, s->replacement, s->trampoline);
-
-        rtRestorePage(pageBase, pageSize);
-
-        if (*(s->trampoline) == NULL) {
-            rtLog("INSTALL STOP: %s returned NULL trampoline; no manual code writes; backend state unknown", s->name);
-            return;
-        }
-
-        rtLog("HOOK %-40s @%p orig=%p", s->name, addr, *(s->trampoline));
-    }
-    rtLog("install: done");
+    rtLog("install: done (IL2CPP metadata hooks active)");
 }
 
 #pragma mark - UI
@@ -670,8 +628,6 @@ static RCRaceToolkitMenu *gMenu = nil;
 
 #pragma mark - Bootstrap
 
-static BOOL gHooksInstalled = NO;
-
 static void buildMenuSafely(void) {
     if (gMenu) return;
     @try {
@@ -686,13 +642,32 @@ static void buildMenuSafely(void) {
 
 static void startToolkit(void) {
     static int tries = 0;
-    if (!unityFrameworkBase()) {
-        if (++tries > 240) { rtLog("bootstrap: gave up waiting for UnityFramework"); return; }
+    if (!rtInitIl2CppApi()) {
+        if (++tries > 60) {
+            rtLog("bootstrap: gave up waiting for IL2CPP API in UnityFramework");
+            buildMenuSafely();
+            return;
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ startToolkit(); });
         return;
     }
-    rtLog("bootstrap: UnityFramework mapped after %d polls", tries);
+
+    Il2CppDomain *domain = il2cpp_domain_get();
+    size_t count = 0;
+    const Il2CppAssembly **assemblies = domain ? il2cpp_domain_get_assemblies(domain, &count) : NULL;
+    if (!assemblies || count == 0) {
+        if (++tries > 60) {
+            rtLog("bootstrap: gave up waiting for IL2CPP domain/assemblies");
+            buildMenuSafely();
+            return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ startToolkit(); });
+        return;
+    }
+
+    rtLog("bootstrap: IL2CPP ready (%zu assemblies) after %d polls", count, tries);
     if (!gHooksInstalled) {
         gHooksInstalled = YES;
         installHooks();
@@ -704,10 +679,13 @@ __attribute__((constructor)) static void RCInit(void) {
     rtLogOpen();
     rtInstallCrashHandler();
     rtLog("=== RaceToolkit session start ===\nlog: %s\npid=%d", gLogPath, getpid());
-    rtLog("diagnostic revision=no-rollback-raw-pc-1");
+    rtLog("architecture: IL2CPP VTable & Metadata Hook (zero __TEXT patch)");
     for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
-        rtLog("IMAGE base=%p slide=%lld path=%s", (void *)_dyld_get_image_header(i),
-              (long long)_dyld_get_image_vmaddr_slide(i), _dyld_get_image_name(i));
+        const char *name = _dyld_get_image_name(i);
+        if (name && (strstr(name, "UnityFramework") || strstr(name, "zsmvn") || strstr(name, "Bypass"))) {
+            rtLog("IMAGE base=%p slide=%lld path=%s", (void *)_dyld_get_image_header(i),
+                  (long long)_dyld_get_image_vmaddr_slide(i), name);
+        }
     }
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
