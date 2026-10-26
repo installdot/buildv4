@@ -543,7 +543,7 @@ static RCRaceToolkitMenu *gMenu = nil;
 }
 
 - (void)togglePanel {
-    self.panel.hidden = __omp_shell("self.panel.hidden;")
+    self.panel.hidden = (self.panel.hidden ? NO : YES);
     self.window.windowLevel = UIWindowLevelAlert + 1;
     self.window.hidden = NO;
 }
