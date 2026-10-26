@@ -227,44 +227,44 @@ static inline BOOL evtIsMainPlayer(void *evt) {
 
 #pragma mark - Trampolines
 
-static void  (*orig_GameGo_ImpEnter)(void *);
-static void  (*orig_Nitro_Update)(void *, float);
-static float (*orig_Nitro_GetProgress)(void *);
-static void  (*orig_EvtMini_Update)(void *, float);
-static BOOL  (*orig_EvtMini_CanTrigger)(void *);
-static int   (*orig_EvtMini_Trigger)(void *);
-static BOOL  (*orig_EvtN2O_CanTrigger)(void *);
-static int   (*orig_EvtN2O_Trigger)(void *);
-static BOOL  (*orig_IsCanTriggerExVel)(void *, int);
-static void  (*orig_Drift_Release)(void *);
-static void  (*orig_Drift_ForceEnd)(void *);
-static void  (*orig_ECU_SetNormalTopMPS)(void *, float);
+static void  (*orig_GameGo_ImpEnter)(void *, const void *);
+static void  (*orig_Nitro_Update)(void *, float, const void *);
+static float (*orig_Nitro_GetProgress)(void *, const void *);
+static void  (*orig_EvtMini_Update)(void *, float, const void *);
+static BOOL  (*orig_EvtMini_CanTrigger)(void *, const void *);
+static int   (*orig_EvtMini_Trigger)(void *, const void *);
+static BOOL  (*orig_EvtN2O_CanTrigger)(void *, const void *);
+static int   (*orig_EvtN2O_Trigger)(void *, const void *);
+static BOOL  (*orig_IsCanTriggerExVel)(void *, int, const void *);
+static void  (*orig_Drift_Release)(void *, const void *);
+static void  (*orig_Drift_ForceEnd)(void *, const void *);
+static void  (*orig_ECU_SetNormalTopMPS)(void *, float, const void *);
 
 #pragma mark - Hooks
 
-static void hook_GoImpEnter(void *self) {
+static void hook_GoImpEnter(void *self, const void *method) {
     RT_TRACE(4, "hook GameGoState::ImpEnter self=%p", self);
     if (!orig_GameGo_ImpEnter) return;
-    orig_GameGo_ImpEnter(self);
+    orig_GameGo_ImpEnter(self, method);
     gGoTime = nowSeconds();
     rtLog("race started -> speed gate armed (%.1fs delay)", kSpeedDelaySeconds);
 }
 
-static void hook_NitroUpdate(void *self, float dt) {
+static void hook_NitroUpdate(void *self, float dt, const void *method) {
     RT_TRACE(3, "hook Nitro::Update self=%p dt=%.3f", self, dt);
     if (!orig_Nitro_Update) return;
-    orig_Nitro_Update(self, dt);
+    orig_Nitro_Update(self, dt, method);
     if (!gFullNitro || !self) return;
     void *veh = *(void **)((char *)self + 0x60);
     if (!vehicleIsMainPlayer(veh)) return;
     *(uint32_t *)((char *)self + kOffNitroCurPower) = kNitroMaxPower;
 }
 
-static float hook_NitroGetProgress(void *self) {
+static float hook_NitroGetProgress(void *self, const void *method) {
     RT_TRACE(3, "hook Nitro::get_ProgressBarPowerValue self=%p", self);
     if (gFullNitro && self &&
         vehicleIsMainPlayer(*(void **)((char *)self + 0x60))) return 1.0f;
-    return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self) : 0.0f;
+    return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self, method) : 0.0f;
 }
 
 // EvtMini window gate fields, forced open while the toggle is on.
@@ -278,57 +278,57 @@ static inline void armMiniWindow(void *self) {
     *(uint8_t *) ((char *)self + kOffEvtLastDrift)    = 1;
 }
 
-static void hook_EvtMiniUpdate(void *self, float dt) {
+static void hook_EvtMiniUpdate(void *self, float dt, const void *method) {
     RT_TRACE(3, "hook EvtMini::Update self=%p", self);
     if (!orig_EvtMini_Update) return;
-    orig_EvtMini_Update(self, dt);
+    orig_EvtMini_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
     if (!evtIsMainPlayer(self)) return;
     armMiniWindow(self);
 }
 
-static BOOL hook_EvtMiniCanTrigger(void *self) {
+static BOOL hook_EvtMiniCanTrigger(void *self, const void *method) {
     RT_TRACE(5, "hook EvtMini::UpdateIsCanTrigger self=%p", self);
     if (gFullMiniBoost && evtIsMainPlayer(self)) {
         armMiniWindow(self);
         return YES;
     }
-    return orig_EvtMini_CanTrigger ? orig_EvtMini_CanTrigger(self) : NO;
+    return orig_EvtMini_CanTrigger ? orig_EvtMini_CanTrigger(self, method) : NO;
 }
 
-static int hook_EvtMiniTrigger(void *self) {
+static int hook_EvtMiniTrigger(void *self, const void *method) {
     RT_TRACE(5, "hook EvtMini::Trigger self=%p", self);
-    return orig_EvtMini_Trigger ? orig_EvtMini_Trigger(self) : -1;
+    return orig_EvtMini_Trigger ? orig_EvtMini_Trigger(self, method) : -1;
 }
 
-static BOOL hook_EvtN2OCanTrigger(void *self) {
+static BOOL hook_EvtN2OCanTrigger(void *self, const void *method) {
     RT_TRACE(5, "hook EvtN2O::IsCanTrigger self=%p", self);
     if (gFullNitro && evtIsMainPlayer(self)) return YES;
-    return orig_EvtN2O_CanTrigger ? orig_EvtN2O_CanTrigger(self) : NO;
+    return orig_EvtN2O_CanTrigger ? orig_EvtN2O_CanTrigger(self, method) : NO;
 }
 
-static int hook_EvtN2OTrigger(void *self) {
+static int hook_EvtN2OTrigger(void *self, const void *method) {
     RT_TRACE(5, "hook EvtN2O::Trigger self=%p", self);
-    return orig_EvtN2O_Trigger ? orig_EvtN2O_Trigger(self) : -1;
+    return orig_EvtN2O_Trigger ? orig_EvtN2O_Trigger(self, method) : -1;
 }
 
 // ExtraVelocityTriggerMgr::mVehicle @ 0x68
-static BOOL hook_IsCanTriggerExVel(void *self, int type) {
+static BOOL hook_IsCanTriggerExVel(void *self, int type, const void *method) {
     RT_TRACE(6, "hook IsCanTriggerExtraVelocity self=%p type=%d", self, type);
     if (gFullMiniBoost && type == kTypeMini && self &&
         vehicleIsMainPlayer(*(void **)((char *)self + 0x68))) return YES;
-    return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type) : NO;
+    return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type, method) : NO;
 }
 
-static void hook_DriftForceEnd(void *self) {
+static void hook_DriftForceEnd(void *self, const void *method) {
     RT_TRACE(4, "hook DriftCtrl::ForceEndDrifting self=%p", self);
-    if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self);
+    if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self, method);
 }
 
-static void hook_DriftRelease(void *self) {
+static void hook_DriftRelease(void *self, const void *method) {
     RT_TRACE(4, "hook DriftCtrl::ReleaseDrifting self=%p", self);
     if (!orig_Drift_Release) return;
-    orig_Drift_Release(self);
+    orig_Drift_Release(self, method);
     if (!gAutoDriftEnd || !self) return;
 
     void *dyn = *(void **)((char *)self + 0x10);   // NssVehicleDriftCtrl.mVehicle : IDynamicVehicle
@@ -336,12 +336,12 @@ static void hook_DriftRelease(void *self) {
     void *veh = *(void **)((char *)dyn + 0x10);    // DynamicVehicle.mVehicle : IVehicle
     if (!vehicleIsMainPlayer(veh)) return;
 
-    if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self);
+    if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self, nullptr);
 }
 
-static void hook_SetNormalTopMPS(void *self, float topMps) {
+static void hook_SetNormalTopMPS(void *self, float topMps, const void *method) {
     RT_TRACE(3, "hook ECU::SetNormalTopMPS self=%p mps=%.3f", self, topMps);
-    if (orig_ECU_SetNormalTopMPS) orig_ECU_SetNormalTopMPS(self, topMps);
+    if (orig_ECU_SetNormalTopMPS) orig_ECU_SetNormalTopMPS(self, topMps, method);
 
     if (!self || !speedWindowOpen()) return;
     void *veh = *(void **)((char *)self + 0x18);   // NssPhyVehicleECUBase.mVehicle
@@ -371,12 +371,15 @@ static uintptr_t unityFrameworkBase(void) {
 // or multiple instructions; a NULL trampoline is not proof of a partial patch.
 
 static void installHooks(void) {
+    using HookFunction = void (*)(void *, void *, void **);
+    const HookFunction hookFunction = static_cast<HookFunction>(&MSHookFunction);
+    const void *hookAddress = reinterpret_cast<const void *>(hookFunction);
     Dl_info backend = {};
-    if (dladdr((const void *)&MSHookFunction, &backend)) {
+    if (dladdr(hookAddress, &backend)) {
         rtLog("backend MSHookFunction=%p image=%s base=%p",
-              (void *)&MSHookFunction, backend.dli_fname ?: "unknown", backend.dli_fbase);
+              hookAddress, backend.dli_fname ?: "unknown", backend.dli_fbase);
     } else {
-        rtLog("backend MSHookFunction=%p image=unknown", (void *)&MSHookFunction);
+        rtLog("backend MSHookFunction=%p image=unknown", hookAddress);
     }
     uintptr_t b = unityFrameworkBase();
     if (!b) { rtLog("install: UnityFramework base not found"); return; }
@@ -444,7 +447,7 @@ static void installHooks(void) {
 
 
         rtLog("HOOK BEGIN name=%s target=%p replacement=%p", s->name, addr, s->replacement);
-        MSHookFunction(addr, s->replacement, s->trampoline);
+        hookFunction(addr, s->replacement, s->trampoline);
 
         if (*(s->trampoline) == NULL) {
             rtLog("INSTALL STOP: %s returned NULL trampoline; no manual code writes; backend state unknown", s->name);
