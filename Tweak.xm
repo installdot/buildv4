@@ -67,8 +67,9 @@ static void  (*orig_Drift_Release)(void *);
 static void  (*orig_Drift_ForceEnd)(void *);
 static float (*orig_ECU_ReadTopMPS)(void *);
 
-static void *g_evtMini = NULL;
-static void *g_evtN2O  = NULL;
+// No cached il2cpp object pointers: EvtMini/EvtN2O instances are pooled and
+// recycled with the vehicle, so keeping them here is a use-after-free waiting
+// to happen (crash on lobby/game transition).
 
 // NssVehicle layout: mIsMainPlayer @ 0xF8 (bool).
 // NssVehicleDriftCtrl.mVehicle @ 0x10. NssPhyVehicleECUBase.mVehicle @ 0x18.
@@ -91,11 +92,13 @@ static inline BOOL speedWindowOpen(void) {
 #pragma mark - Hooks
 
 static void hook_GoImpEnter(void *self) {
+    if (!orig_GameGo_ImpEnter) return;
     orig_GameGo_ImpEnter(self);
     gGoTime = nowSeconds();
 }
 
 static void hook_NitroUpdate(void *self, float dt) {
+    if (!orig_Nitro_Update) return;
     orig_Nitro_Update(self, dt);
     if (!gFullNitro || !self) return;
     void *veh = *(void **)((char *)self + 0x60);        // SingleNitrogenCollect.mVehicle
@@ -106,13 +109,13 @@ static void hook_NitroUpdate(void *self, float dt) {
 static uint32_t hook_NitroGetValue(void *self) {
     if (gFullNitro && self &&
         vehicleIsMainPlayer(*(void **)((char *)self + 0x60))) return kNitroMaxPower;
-    return orig_Nitro_GetValue(self);
+    return orig_Nitro_GetValue ? orig_Nitro_GetValue(self) : 0;
 }
 
 static float hook_NitroGetProgress(void *self) {
     if (gFullNitro && self &&
         vehicleIsMainPlayer(*(void **)((char *)self + 0x60))) return 1.0f;
-    return orig_Nitro_GetProgress(self);
+    return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self) : 0.0f;
 }
 
 // EvtMini window gate fields, forced open while the toggle is on.
@@ -127,10 +130,10 @@ static inline void armMiniWindow(void *self) {
 }
 
 static void hook_EvtMiniUpdate(void *self, float dt) {
+    if (!orig_EvtMini_Update) return;
     orig_EvtMini_Update(self, dt);
     if (!gFullMiniBoost || !self) return;
     if (!vehicleIsMainPlayer(*(void **)((char *)self + 0x18))) return;
-    g_evtMini = self;
     armMiniWindow(self);
 }
 
@@ -142,49 +145,49 @@ static inline BOOL evtIsMainPlayer(void *evt) {
 
 static BOOL hook_EvtMiniCanTrigger(void *self) {
     if (gFullMiniBoost && evtIsMainPlayer(self)) {
-        g_evtMini = self;
         armMiniWindow(self);
         return YES;
     }
-    return orig_EvtMini_CanTrigger(self);
+    return orig_EvtMini_CanTrigger ? orig_EvtMini_CanTrigger(self) : NO;
 }
 
 static int hook_EvtMiniTrigger(void *self) {
-    if (gFullMiniBoost && evtIsMainPlayer(self)) g_evtMini = self;
-    return orig_EvtMini_Trigger(self);
+    return orig_EvtMini_Trigger ? orig_EvtMini_Trigger(self) : -1;
 }
 
 static BOOL hook_EvtN2OCanTrigger(void *self) {
     if (gFullNitro && evtIsMainPlayer(self)) {
-        g_evtN2O = self;
-        return YES;
+        return YES;   // bottle is force-filled by the nitro hooks
     }
-    BOOL r = orig_EvtN2O_CanTrigger(self);
-    if (r) g_evtN2O = self;
-    return r;
+    return orig_EvtN2O_CanTrigger ? orig_EvtN2O_CanTrigger(self) : NO;
 }
 
 static int hook_EvtN2OTrigger(void *self) {
-    if (gFullNitro && evtIsMainPlayer(self)) g_evtN2O = self;
-    return orig_EvtN2O_Trigger(self);
+    return orig_EvtN2O_Trigger ? orig_EvtN2O_Trigger(self) : -1;
 }
 
 // Single gate every boost request funnels through.
 // ExtraVelocityTriggerMgr.mVehicle @ 0x68.
 static BOOL hook_IsCanTriggerExVel(void *self, int type) {
     BOOL mine = self && vehicleIsMainPlayer(*(void **)((char *)self + 0x68));
+
+    // Mini boost is purely kinematic -> safe to force.
     if (mine && type == kTypeMini && gFullMiniBoost) return YES;
-    if (mine && type == kTypeN2O  && gFullNitro)     return YES;
-    return orig_IsCanTriggerExVel(self, type);
+
+    // N2O consumes a bottle slot: let the game's own check run (it passes
+    // because the bottle is force-filled). Forcing it here without a slot
+    // desyncs the prop/slot bookkeeping and crashes on the next transition.
+    return orig_IsCanTriggerExVel ? orig_IsCanTriggerExVel(self, type) : NO;
 }
 
 // Exposed so Auto End Drift can hard-stop the drift state machine.
 static void hook_DriftForceEnd(void *self) {
-    orig_Drift_ForceEnd(self);
+    if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self);
 }
 
 // Drift key released -> hard-end the drift, then fire N2O / mini boost.
 static void hook_DriftRelease(void *self) {
+    if (!orig_Drift_Release) return;
     orig_Drift_Release(self);
     if (!gAutoDriftEnd || !self) return;
 
@@ -193,12 +196,14 @@ static void hook_DriftRelease(void *self) {
     void *veh = *(void **)((char *)dyn + 0x10);         // DynamicVehicle.mVehicle : IVehicle -> NssVehicle
     if (!vehicleIsMainPlayer(veh)) return;              // never touch other cars
 
+    // Only act on `self`, which is guaranteed live. The mini boost / N2O are
+    // re-armed through IsCanTriggerExtraVelocity and fire on their own path,
+    // so no stale trigger objects are dereferenced here.
     if (orig_Drift_ForceEnd) orig_Drift_ForceEnd(self);
-    if (gFullMiniBoost && g_evtMini && orig_EvtMini_Trigger) orig_EvtMini_Trigger(g_evtMini);
-    if (gFullNitro     && g_evtN2O  && orig_EvtN2O_Trigger)  orig_EvtN2O_Trigger(g_evtN2O);
 }
 
 static float hook_ReadTopMPS(void *self) {
+    if (!orig_ECU_ReadTopMPS) return 0.0f;
     float base = orig_ECU_ReadTopMPS(self);
     if (!speedWindowOpen()) return base;
 
@@ -397,16 +402,35 @@ static RCRaceToolkitMenu *gMenu = nil;
 
 #pragma mark - Bootstrap
 
-static void startToolkit(void) {
-    if (!unityFrameworkBase()) return;
-    installHooks();
-    dispatch_async(dispatch_get_main_queue(), ^{
+static BOOL gHooksInstalled = NO;
+
+static void buildMenuSafely(void) {
+    if (gMenu) return;
+    @try {
         gMenu = [RCRaceToolkitMenu new];
         [gMenu build];
-    });
+    } @catch (NSException *e) {
+        gMenu = nil;   // never let the overlay take the app down
+    }
+}
+
+// UnityFramework may be mapped late; poll instead of guessing a delay.
+static void startToolkit(void) {
+    static int tries = 0;
+    if (!unityFrameworkBase()) {
+        if (++tries > 240) return;      // give up after ~2 minutes
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ startToolkit(); });
+        return;
+    }
+    if (!gHooksInstalled) {
+        gHooksInstalled = YES;
+        installHooks();
+    }
+    buildMenuSafely();
 }
 
 __attribute__((constructor)) static void RCInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ startToolkit(); });
 }
