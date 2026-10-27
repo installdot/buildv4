@@ -1,8 +1,8 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
 // Features & Fixes:
-// 1. Auto Racing (Full Bot): Tu dong danh lai, di chuyen, vao cua drift, thoat cua kich hoat CWW Boost & MiniBoost.
-// 2. Guide Line & Arrows: Ve duong chi dan to ro rang tren mat duong + mui ten om cua tu xa.
+// 1. Local vehicle ghost-state toggle.
+// 2. Drift slip slider: reduce drift deceleration; zero preserves baseline.
 // 3. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
 // 4. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
 // 5. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
@@ -122,8 +122,8 @@ static void rtInstallCrashHandler(void) {
 
 #pragma mark - Toolkit state & field offsets
 
-static BOOL   gAutoRacing     = NO;  // Tu dong dua (Auto Racing Bot)
-static BOOL   gGuideLine      = YES; // Bat duong chi dan ro net
+static BOOL   gGhostCars = NO;
+static float  gDriftSlip = 0.f;
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
 static float  gSpeedKmh       = 0.f;
@@ -138,30 +138,6 @@ static float  gMinMapTimeSeconds = 0.f;
 static float  gLapTimeLimit      = 0.f;
 static BOOL   gCanFinish         = NO;
 static int    gLastCheckPointId  = 0;
-
-// Cached TraceLine Component pointer
-
-// Autopilot state variables (declared early for hook_GoImpEnter)
-typedef struct { float x, y, z; }    rtV3;
-typedef struct { float x, y, z, w; } rtQ;
-typedef enum { ST_GREEN = 0, ST_YELLOW, ST_BOOST } rtBotState;
-
-static int   s_BotClosestIdx     = -1;
-static int      s_BotDriftExitCount = 0;
-static float    s_BotDesiredSteer   = 0.f;
-static uint32_t s_BotKeyFlags       = 0;
-static rtBotState s_BotState        = ST_GREEN;
-static int      s_BotYellowEndIdx   = -1;   // index cuối đoạn vàng đang khoá
-static rtV3     s_BotYellowEndPos;          // vị trí cuối đoạn vàng
-static float s_BotEntryHeading = 0.f;
-static int s_BotPreviousYellowEnd = -1;
-static int      s_BotYellowTurnDir  = 0;    // 1=Left, 2=Right
-static int      s_BotTraceFrames    = 0;   // breadcrumb: 5 frame đầu mỗi trận
-// Snapshot trace-line do TraceLineComponent::Update làm mới mỗi frame.
-// Autopilot KHÔNG gọi GetTraceLinePoints() trên con trỏ cache (có thể đã bị hủy).
-static void   **s_TlItems = NULL;
-static int      s_TlSize  = 0;
-static int      s_TlAge   = 999;
 
 enum {
     // ExtraVelocityTriggerMgr
@@ -268,37 +244,6 @@ static void *rtGetMethodPointer(const char *namespaze, const char *className,
     return *(void **)((char *)method + 0);
 }
 
-// Resolve a method pointer by exact RVA. Needed for overloaded names where
-// arg-count alone is ambiguous (e.g. BeginSteering(float) vs BeginSteering(NssSteerDir)).
-static void *rtGetMethodPointerByRva(const char *namespaze, const char *className, uint32_t rva) {
-    Il2CppClass *klass = rtFindClass(namespaze, className);
-    uintptr_t base = unityFrameworkBase();
-    if (!klass || !base) return NULL;
-
-    // Class::Init phải chạy trước thì klass->methods (0x98) mới được build.
-    // Gọi get_method_from_name với 1 method bất kỳ để ép init.
-    if (il2cpp_class_get_method_from_name) {
-        il2cpp_class_get_method_from_name(klass, ".ctor", -1);
-        il2cpp_class_get_method_from_name(klass, "Update", -1);
-        il2cpp_class_get_method_from_name(klass, "ToggleDrifting", -1);
-    }
-
-    uint16_t n = *(uint16_t *)((char *)klass + 296);   // method_count
-    void *methods = *(void **)((char *)klass + 152);   // methods
-    if (n && methods) {
-        for (uint16_t i = 0; i < n; i++) {
-            void *m = *(void **)((char *)methods + i * 8);
-            if (!m) continue;
-            void *ptr = *(void **)((char *)m + 0);
-            if (ptr && (uintptr_t)ptr - base == (uintptr_t)rva) return ptr;
-        }
-    }
-
-    // Fallback: quét toàn bộ method của class bằng get_methods iterator
-    // (dùng khi method_count == 0 vì chưa Init)
-    return NULL;
-}
-
 static void *rtHookMethod(const char *namespaze, const char *className,
                           const char *methodName, int argsCount,
                           void *replacement) {
@@ -350,35 +295,19 @@ static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
 static void  (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
 static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
 
-// Guide Line & TraceLine
-static void  (*orig_TraceLineConfig_Init)(void *, int, const void *) = NULL;
-static BOOL  (*orig_TraceLineComponent_GameModeForceOpen)(void *, const void *) = NULL;
-static BOOL  (*orig_TraceLineComponent_EnableUpdate)(void *, const void *) = NULL;
-static void  (*orig_TraceLineComponent_Update)(void *, float, const void *) = NULL;
+static void (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
+static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
+static void (*orig_ExtraSideFriction)(void *, float, float, const void *) = NULL;
 
-// Native methods invoked directly
-static void  (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
-static void  (*ExtraVelocityFast_DoPerfectCWWBoost)(void *, const void *) = NULL;
-static void *(*TraceLineComponent_GetTraceLinePoints)(void *, const void *) = NULL;
-
-static void  (*NssPhyVehicleCab_ThrottleDown)(void *, float, const void *) = NULL;
-static void  (*NssPhyVehicleCab_BeginSteeringAnalog)(void *, float, const void *) = NULL;
-static BOOL  (*NssPhyVehicleCab_BeginDrifting)(void *, int, const void *) = NULL;
-static BOOL  (*NssPhyVehicleCab_EndDrifting)(void *, int, const void *) = NULL;
-
-// Drift state machine entry points. Cab::BeginDrifting chỉ push button vào queue,
-// KHÔNG chuyển DriftStateMachine. Chỉ DriftCtrl::ToggleDrifting mới thật sự vào drift.
-static void  (*NssVehicleDriftCtrl_ToggleDrifting_)(void *, float, const void *) = NULL;
-static void  (*NssVehicleDriftCtrl_ReleaseDrifting_)(void *, const void *) = NULL;
-
-static void  (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
-static void  (*orig_VehicleInputCtrl_Update)(void *, float, const void *) = NULL;
-
-// Native drift processors trên VehicleInputHelper — chính là đường người chơi thật đi.
-// ProcessLeftDrift  : đọc mKeyFlags bit1(Left)+bit8(Drift)  -> ActionMgr.DoAction(mActionDriftLeft)
-// ProcessRightDrift : đọc mKeyFlags bit2(Right)+bit8(Drift) -> ActionMgr.DoAction(mActionDriftRight)
-static void  (*rt_ProcessLeftDrift)(void *, const void *)  = NULL;
-static void  (*rt_ProcessRightDrift)(void *, const void *) = NULL;
+// Inherited virtuals keep a stale copy in each derived vtable; replace them all.
+static void rtPatchVtable(Il2CppClass *klass, void *orig, void *replacement) {
+    if (!klass || !orig) return;
+    uint16_t n = *(uint16_t *)((char *)klass + 306);
+    VirtualInvokeData *v = (VirtualInvokeData *)((char *)klass + 336);
+    for (uint16_t i = 0; i < n; i++) {
+        if (v[i].methodPtr == orig) v[i].methodPtr = (Il2CppMethodPointer)replacement;
+    }
+}
 
 // 1. Race Start
 static void hook_GoImpEnter(void *self, const void *method) {
@@ -386,18 +315,6 @@ static void hook_GoImpEnter(void *self, const void *method) {
     gGoTime = nowSeconds();
     gCurrentMatchTime = 0.f;
     gCanFinish = NO;
-    s_BotClosestIdx = -1;
-    s_BotState = ST_GREEN;
-    s_BotYellowEndIdx = -1;
-    s_BotPreviousYellowEnd = -1;
-    s_BotYellowTurnDir = 0;
-    s_BotDriftExitCount = 0;
-    s_BotKeyFlags = 0;
-    s_BotDesiredSteer = 0.f;
-    s_BotTraceFrames = 0;
-    s_TlItems = NULL;
-    s_TlSize  = 0;
-    s_TlAge   = 999;
     rtLog("race started -> gGoTime=%.3f, MinMapTime=%.1fs, LapTimeLimit=%.1fs",
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
@@ -448,280 +365,47 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
-// ---------------------------------------------------------------------------
-// AUTOPILOT — GUIDE LOCK / YELLOW DRIFT / CLEAR-CORRIDOR BOOST
-// ---------------------------------------------------------------------------
-// Transform calls resolve concrete methods with MethodInfo, never raw interface slots.
-// Preserve guide elevation. Clearance samples three lanes at one-metre intervals;
-// narrow holes and dynamic obstacles still require device validation.
-
-#define kSdForward      0x10
-#define kSdBrakingState 0x14
-#define kSdHandbrake    0x18
-#define kSdSteering     0x1C
-
-#define kInpCtrlVehicle 0x58
-#define kInpCtrlHelper  0x60
-#define kInpFlagsInvoke 0xD8
-#define kInpFlagsDown   0xDC
-#define kInpFlagsKeys   0xE0
-
-#define kVehicleToDyn    0x20
-#define kDynPhyCtrl      0x40
-#define kDynMotionCtrl   0x38
-#define kMotionDriftCtrl 0x60
-
-#define kPhySimOutput    0x28
-#define kSimPos          0x64
-#define kSimRot          0x70
-#define kSimKmph         0x10
-
-#define kTlpPos          0x10
-#define kTlpDriftFlag    0x37
-#define kTlpDriftPct     0x60
-
-// Alignment is only a cheap rejection filter, not a memory-validity guarantee.
 static inline BOOL rtPtrOk(const void *p) {
     uintptr_t v = (uintptr_t)p;
-    if (v < 0x10000ULL) return NO;   // null page / rác thấp
-    if (v & 7) return NO;            // IL2CPP object luôn 8-byte aligned
+    if (v < 0x10000ULL) return NO;
+    if (v & 7) return NO;
     return YES;
 }
 
-#define RT_STAGE(n) do { if (s_BotTraceFrames < 5) rtLog("BOT stage=%d idx=%d", (n), s_BotClosestIdx); } while (0)
-
-// Lái: da (rad) * gain, clamp ±1.0
-#define kSteerGain       2.4f
-// Lệch ngang (mét) -> cộng thêm lái để bám vạch (m/2.0 -> 0..1 rad)
-#define kLateralGain     0.55f
-#define kCurvDriftEnter  0.017f
-#define kCurvDriftExit   0.008f
-
-static BOOL rtPointXZ(void **items, int size, int idx, float *ox, float *oz) {
-    if (!items || size <= 0) return NO;
-    int i = ((idx % size) + size) % size;
-    void *p = items[i];
-    if (!p) return NO;
-    *ox = *(float *)((char *)p + kTlpPos);
-    *oz = *(float *)((char *)p + kTlpPos + 8);
-    return YES;
-}
-
-static BOOL rtPointIsYellow(void *p) {
-    if (!p) return NO;
-    uint8_t df = *(uint8_t *)((char *)p + kTlpDriftFlag);
-    float dp   = *(float *)((char *)p + kTlpDriftPct);
-    return (df || dp > 0.01f) ? YES : NO;
-}
-
-// Resolve on the concrete object; interface declaration slots are not class slots.
-static const MethodInfo *rtObjectMethod(void *obj, const char *name, int argc) {
-    if (!obj || !il2cpp_class_get_method_from_name) return NULL;
-    return il2cpp_class_get_method_from_name(*(Il2CppClass **)obj, name, argc);
-}
-
-static BOOL rtSetPose(void *motion, rtV3 p, float yaw) {
-    const MethodInfo *pos = rtObjectMethod(motion, "SetPosition", 2);
-    const MethodInfo *rot = rtObjectMethod(motion, "SetRotation", 1);
-    if (!pos || !rot || !*(void **)pos || !*(void **)rot) return NO;
-    rtQ q = {0.f, sinf(yaw * .5f), 0.f, cosf(yaw * .5f)};
-    ((void (*)(void *, rtQ, const MethodInfo *))*(void **)rot)(motion, q, rot);
-    ((void (*)(void *, rtV3, bool, const MethodInfo *))*(void **)pos)(motion, p, false, pos);
-    return YES;
-}
-
-// No-hit is NULL; HitDistance is in world units (verified in 0x8471F6C).
-static BOOL rtCorridorClear(void *phy, rtV3 from, rtV3 to) {
-    void *engine = *(void **)((char *)phy + 0xF8);
-    const MethodInfo *method = rtObjectMethod(engine, "RayCast", 3);
-    if (!method || !*(void **)method) return NO;
-    typedef void *(*Cast)(void *, rtV3, rtV3, int, const MethodInfo *);
-    Cast cast = (Cast)*(void **)method;
-    float dx = to.x-from.x, dz = to.z-from.z;
-    float length = hypotf(dx, dz);
-    if (!isfinite(length) || length < .01f || length > 200.f) return NO;
-    float sideX = dz/length * .8f, sideZ = -dx/length * .8f;
-    int steps = (int)ceilf(length / 1.f);
-    for (int lane = -1; lane <= 1; ++lane) {
-        rtV3 a = {from.x + lane*sideX, from.y + .5f, from.z + lane*sideZ};
-        rtV3 b = {to.x + lane*sideX, to.y + .5f, to.z + lane*sideZ};
-        if (cast(engine, a, b, 9, method)) return NO;
-        for (int i = 0; i <= steps; ++i) {
-            float t = (float)i / steps;
-            rtV3 top = {a.x + (b.x-a.x)*t, a.y + (b.y-a.y)*t + 1.f, a.z + (b.z-a.z)*t};
-            rtV3 bottom = {top.x, top.y - 3.f, top.z};
-            if (!cast(engine, top, bottom, 11, method)) return NO;
-        }
-    }
-    return YES;
-}
-
-
-static void rtComputeAutoDrive(void *vehicle) {
-    if (!rtPtrOk(vehicle)) return;
-    if (!*(bool *)((char *)vehicle + 0xF8)) return;
-    s_BotKeyFlags = 0;
-    s_BotDesiredSteer = 0.f;
-    RT_STAGE(1);
-
-    void *dyn = *(void **)((char *)vehicle + kVehicleToDyn);
-    if (!rtPtrOk(dyn)) return;
-    void *phyCtrl = *(void **)((char *)dyn + kDynPhyCtrl);
-    void *motionCtrl = *(void **)((char *)dyn + kDynMotionCtrl);
-    if (!rtPtrOk(phyCtrl) || !rtPtrOk(motionCtrl)) return;
-    void *sim = *(void **)((char *)phyCtrl + kPhySimOutput);
-    if (!rtPtrOk(sim)) return;
-    void *driftCtrl = *(void **)((char *)motionCtrl + kMotionDriftCtrl);
-    RT_STAGE(2);
-
-    // Chỉ dùng snapshot mới (TraceLineComponent::Update refresh trong vài frame gần đây).
-    if (!s_TlItems || s_TlSize < 20 || s_TlAge > 10) return;
-    RT_STAGE(3);
-    void **items = s_TlItems;
-    int size = s_TlSize;
-
-    float px = *(float *)((char *)sim + kSimPos);
-    float pz = *(float *)((char *)sim + kSimPos + 8);
-
-    float qx = *(float *)((char *)sim + kSimRot);
-    float qy = *(float *)((char *)sim + kSimRot + 4);
-    float qz = *(float *)((char *)sim + kSimRot + 8);
-    float qw = *(float *)((char *)sim + kSimRot + 12);
-    float fwdX = 2.0f * (qx*qz + qw*qy);
-    float fwdZ = 1.0f - 2.0f * (qx*qx + qy*qy);
-    float fl = sqrtf(fwdX*fwdX + fwdZ*fwdZ);
-    if (fl < 1e-4f) return;
-    fwdX /= fl; fwdZ /= fl;
-    float heading = atan2f(fwdX, fwdZ);
-
-    // --- 1. Điểm gần nhất ---
-    if (s_BotClosestIdx < 0 || s_BotClosestIdx >= size) {
-        float best = 1e30f; int bi = 0;
-        for (int i = 0; i < size; i++) {
-            float ox, oz;
-            if (!rtPointXZ(items, size, i, &ox, &oz)) continue;
-            float dx = ox - px, dz = oz - pz;
-            float d = dx*dx + dz*dz;
-            if (d < best) { best = d; bi = i; }
-        }
-        s_BotClosestIdx = bi;
-    } else {
-        float best = 1e30f; int bi = s_BotClosestIdx;
-        for (int step = -2; step <= 20; step++) {
-            float ox, oz;
-            if (!rtPointXZ(items, size, s_BotClosestIdx + step, &ox, &oz)) continue;
-            float dx = ox - px, dz = oz - pz;
-            float d = dx*dx + dz*dz;
-            if (d < best) { best = d; bi = ((s_BotClosestIdx + step) % size + size) % size; }
-        }
-        if (best > 900.0f) {
-            best = 1e30f;
-            for (int i = 0; i < size; i++) {
-                float ox, oz;
-                if (!rtPointXZ(items, size, i, &ox, &oz)) continue;
-                float dx = ox - px, dz = oz - pz;
-                float d = dx*dx + dz*dz;
-                if (d < best) { best = d; bi = i; }
-            }
-        }
-        s_BotClosestIdx = bi;
-    }
-    int i0 = s_BotClosestIdx;
-
-    if (!items[i0] || !items[(i0+1)%size]) return;
-    rtV3 a = *(rtV3 *)((char *)items[i0] + kTlpPos);
-    rtV3 b = *(rtV3 *)((char *)items[(i0+1)%size] + kTlpPos);
-    float dx=b.x-a.x, dz=b.z-a.z, d2=dx*dx+dz*dz;
-    if (!isfinite(d2) || d2<1e-6f || !isfinite(px) || !isfinite(pz)) return;
-    float t=fmaxf(0.f,fminf(1.f,((px-a.x)*dx+(pz-a.z)*dz)/d2));
-    rtV3 lock={a.x+t*dx,a.y+t*(b.y-a.y),a.z+t*dz};
-    float yaw=atan2f(dx,dz);
-    if (!isfinite(lock.y)) return;
-    if (!rtPointIsYellow(items[i0])) s_BotPreviousYellowEnd=-1;
-    if (s_BotState==ST_GREEN && rtPointIsYellow(items[i0])) {
-        int end=i0;
-        for (int k=1;k<size;++k) {
-            int next=(i0+k)%size;
-            if (!rtPointIsYellow(items[next])) break;
-            end=next;
-        }
-        if (end!=s_BotPreviousYellowEnd) {
-            s_BotYellowEndIdx=end;
-            s_BotYellowEndPos=*(rtV3 *)((char *)items[end]+kTlpPos);
-            s_BotEntryHeading=heading;
-            float target=atan2f(s_BotYellowEndPos.x-lock.x,s_BotYellowEndPos.z-lock.z);
-            float delta=atan2f(sinf(target-s_BotEntryHeading),cosf(target-s_BotEntryHeading));
-            s_BotYellowTurnDir=delta<0.f?1:2;
-            s_BotState=ST_YELLOW;
-            s_BotDriftExitCount=0;
-        }
-    }
-    static rtV3 launch;
-    if (s_BotState==ST_YELLOW) {
-        if (s_BotDriftExitCount>0 && driftCtrl && orig_Drift_ExitCurDriftState &&
-            orig_Drift_ForceClearDriftParams && ExtraVelocityFast_DoPerfectCWWBoost &&
-            rtCorridorClear(phyCtrl,lock,s_BotYellowEndPos)) {
-            orig_Drift_ExitCurDriftState(driftCtrl,nullptr);
-            orig_Drift_ForceClearDriftParams(driftCtrl,nullptr);
-            ExtraVelocityFast_DoPerfectCWWBoost(vehicle,nullptr);
-            launch=lock;
-            s_BotState=ST_BOOST;
-        } else s_BotDriftExitCount=1;
-    }
-    if (s_BotState==ST_BOOST) {
-        float ux=s_BotYellowEndPos.x-launch.x, uz=s_BotYellowEndPos.z-launch.z;
-        float len2=ux*ux+uz*uz;
-        float u=len2>1e-6f?fmaxf(0.f,fminf(1.f,((px-launch.x)*ux+(pz-launch.z)*uz)/len2)):1.f;
-        lock=(rtV3){launch.x+u*ux,launch.y+u*(s_BotYellowEndPos.y-launch.y),launch.z+u*uz};
-        if (hypotf(s_BotYellowEndPos.x-lock.x,s_BotYellowEndPos.z-lock.z)<=1.f) {
-            s_BotPreviousYellowEnd=s_BotYellowEndIdx;
-            s_BotClosestIdx=s_BotYellowEndIdx;
-            s_BotState=ST_GREEN;
-        }
-    }
-    if (s_BotState!=ST_GREEN)
-        yaw=atan2f(s_BotYellowEndPos.x-lock.x,s_BotYellowEndPos.z-lock.z);
-    if (!rtSetPose(motionCtrl,lock,yaw)) return;
-    if (s_BotState==ST_YELLOW) {
-        s_BotDesiredSteer=s_BotYellowTurnDir==1?1.f:-1.f;
-        s_BotKeyFlags=(s_BotYellowTurnDir==1?2u:4u)|256u;
-    } else s_BotKeyFlags=32u;
-}
-
-static void hook_VehicleInputCtrlUpdate(void *self, float dt, const void *method) {
-    if (orig_VehicleInputCtrl_Update) orig_VehicleInputCtrl_Update(self, dt, method);
-    if (!gAutoRacing || !self) return;
-
-    void *vehicle     = *(void **)((char *)self + kInpCtrlVehicle);
-    void *inputHelper = *(void **)((char *)self + kInpCtrlHelper);
-    if (!rtPtrOk(vehicle) || !rtPtrOk(inputHelper)) return;
-    if (!*(bool *)((char *)vehicle + 0xF8)) return;
-    if (s_TlAge < 999) ++s_TlAge;
-    if (s_BotTraceFrames < 5) ++s_BotTraceFrames;
-
-    rtComputeAutoDrive(vehicle);
-
-    *(uint32_t *)((char *)inputHelper + kInpFlagsInvoke) = s_BotKeyFlags;
-    *(uint32_t *)((char *)inputHelper + kInpFlagsDown)   = s_BotKeyFlags;
-    *(uint32_t *)((char *)inputHelper + kInpFlagsKeys)   = s_BotKeyFlags;
-
-    if (s_BotKeyFlags & 256u) {
-        if (s_BotYellowTurnDir == 1) { if (rt_ProcessLeftDrift)  rt_ProcessLeftDrift(inputHelper, nullptr); }
-        else                          { if (rt_ProcessRightDrift) rt_ProcessRightDrift(inputHelper, nullptr); }
-    }
-}
-
+// Ghost override targets the local player's ESP only. SetGhostState lives on the
+// base ESP class; the call is idempotent, so we only re-apply on change.
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
+    static const MethodInfo *ghostMi = NULL;
+    static void *owner = NULL;
+    static int applied = -1;
+    if (!ghostMi) {
+        Il2CppClass *base = rtFindClass("", "NssPhyVehicleESPBase");
+        if (base) ghostMi = il2cpp_class_get_method_from_name(base, "SetGhostState", 1);
+    }
     void *vehicle = self ? *(void **)((char *)self + 0x18) : NULL;
-    if (gAutoRacing && vehicle && *(bool *)((char *)vehicle + 0xF8)) {
-        void *sd = *(void **)((char *)self + 0x10);
-        if (rtPtrOk(sd)) {
-            *(float *)((char *)sd + kSdForward)      = 1.0f;
-            *(int   *)((char *)sd + kSdBrakingState) = 0;
-            *(float *)((char *)sd + kSdSteering)     = s_BotDesiredSteer;
+    if (ghostMi && *(void **)ghostMi && rtPtrOk(vehicle) && *(bool *)((char *)vehicle + 0xF8)) {
+        void *dyn = *(void **)((char *)vehicle + 0x20);
+        void *esp = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x20) : NULL;
+        if (rtPtrOk(esp)) {
+            // Re-assert every frame: _UpdateNoCollision resets this flag.
+            if (gGhostCars || owner != esp || applied) {
+                typedef void (*SetGhost)(void *, bool, const MethodInfo *);
+                ((SetGhost)*(void **)ghostMi)(esp, gGhostCars, ghostMi);
+                owner = esp;
+                applied = gGhostCars ? 1 : 0;
+            }
         }
     }
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
+}
+
+// Reduce lateral grip per call only; the argument is not persisting state.
+static void hook_ExtraSideFriction(void *self, float steering, float dt, const void *method) {
+    void *dyn = self ? *(void **)((char *)self + 0x28) : NULL;
+    void *vehicle = dyn ? *(void **)((char *)dyn + 0x10) : NULL;
+    if (vehicle && rtPtrOk(vehicle) && *(bool *)((char *)vehicle + 0xF8) && gDriftSlip > 0.f)
+        dt *= 1.f - 0.9f * gDriftSlip;
+    if (orig_ExtraSideFriction) orig_ExtraSideFriction(self, steering, dt, method);
 }
 
 // 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
@@ -740,61 +424,6 @@ static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
         *(int *)((char *)procData + 0x28) = 300; // ProcessVehicleMaxBaseVel = 300 km/h
     }
     *(float *)((char *)self + 0x94) = 300.0f; // mMaxVehicleKMPH = 300.0f
-}
-
-// 6. Guide Line & Racing Line: Đường chỉ dẫn to rõ + mũi tên ôm cua từ xa
-static void hook_TraceLineConfig_Init(void *self, int mapID, const void *method) {
-    if (orig_TraceLineConfig_Init) orig_TraceLineConfig_Init(self, mapID, method);
-    if (!self || !gGuideLine) return;
-
-    // Vạch đường chỉ dẫn:
-    *(int *)  ((char *)self + 0x24) = 1000;   // VisibleMeshMaxDistance: hiển thị vạch xa tới 1000m
-    *(float *)((char *)self + 0x3C) = 3.6f;   // LineWidth: to gấp đôi bình thường, cực kỳ rõ nét
-    *(float *)((char *)self + 0x40) = 0.25f;  // LineUpOffset: nâng cao 25cm so với mặt đường, không bị lún
-
-    // Mũi tên hướng dẫn góc ôm cua/drift:
-    *(float *)((char *)self + 0x54) = 4.5f;   // DriftFXWidth: mũi tên to rõ ràng
-    *(float *)((char *)self + 0x5C) = 600.0f; // DriftFXVisibleDistance: nhìn thấy mũi tên trước 600m
-    rtLog("guideline: enhanced LineWidth=3.6, UpOffset=0.25, VisibleDist=1000m, DriftFXWidth=4.5");
-}
-
-static BOOL hook_TraceLineComponent_GameModeForceOpen(void *self, const void *method) {
-    if (gGuideLine) return YES;
-    return orig_TraceLineComponent_GameModeForceOpen ? orig_TraceLineComponent_GameModeForceOpen(self, method) : NO;
-}
-
-static BOOL hook_TraceLineComponent_EnableUpdate(void *self, const void *method) {
-    if (gGuideLine) return YES;
-    return orig_TraceLineComponent_EnableUpdate ? orig_TraceLineComponent_EnableUpdate(self, method) : NO;
-}
-
-static void hook_TraceLineComponent_Update(void *self, float dt, const void *method) {
-    if (gGuideLine && self) {
-        *(uint8_t *)((char *)self + 0xB0) = 1; // mIsEnable = true
-        *(uint8_t *)((char *)self + 0xB1) = 1; // mIsClassicMode = true
-        *(uint8_t *)((char *)self + 0xB2) = 1; // mIsLadderMode = true
-    }
-    if (orig_TraceLineComponent_Update) orig_TraceLineComponent_Update(self, dt, method);
-
-    // Refresh snapshot SAU Update: self ở đây chắc chắn còn sống.
-    if (self && TraceLineComponent_GetTraceLinePoints) {
-        void *lv = TraceLineComponent_GetTraceLinePoints(self, nullptr);
-        if (rtPtrOk(lv)) {
-            void *ctx = *(void **)((char *)lv + 0x10);
-            int sz  = *(int  *)((char *)lv + 0x18);
-            if (rtPtrOk(ctx) && sz >= 20 && sz <= 200000) {
-                s_TlItems = (void **)((char *)ctx + 0x20);
-                s_TlSize  = sz;
-                s_TlAge   = 0;
-            } else {
-                s_TlAge++;
-            }
-        } else {
-            s_TlAge++;
-        }
-    } else {
-        s_TlAge++;
-    }
 }
 
 // 7. CheckPointMgr & ActorCpReporter: Tính MinMapTime, LapTimeLimit & Can Finish
@@ -867,42 +496,8 @@ static void installHooks(void) {
     orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
 
-    // Resolve native functions for Autopilot & Boosts
     ExtraVelocityTriggerMgr_ForceCanTriggerOnce = (void (*)(void *, int, const void *))
         rtGetMethodPointer("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
-    ExtraVelocityFast_DoPerfectCWWBoost = (void (*)(void *, const void *))
-        rtGetMethodPointer("", "ExtraVelocityFast", "DoPerfectCWWBoost", 1);
-    TraceLineComponent_GetTraceLinePoints = (void *(*)(void *, const void *))
-        rtGetMethodPointerByRva("", "TraceLineComponent", 0xA47FF6C);  // GetTraceLinePoints()
-
-    NssPhyVehicleCab_ThrottleDown = (void (*)(void *, float, const void *))
-        rtGetMethodPointer("", "NssPhyVehicleCab", "ThrottleDown", 1);
-    NssPhyVehicleCab_BeginSteeringAnalog = (void (*)(void *, float, const void *))
-        rtGetMethodPointerByRva("", "NssPhyVehicleCab", 0x7AEC854); // BeginSteering(float)
-    NssPhyVehicleCab_BeginDrifting = (BOOL (*)(void *, int, const void *))
-        rtGetMethodPointer("", "NssPhyVehicleCab", "BeginDrifting", 1);
-    NssPhyVehicleCab_EndDrifting = (BOOL (*)(void *, int, const void *))
-        rtGetMethodPointer("", "NssPhyVehicleCab", "EndDrifting", 1);
-
-    NssVehicleDriftCtrl_ToggleDrifting_ = (void (*)(void *, float, const void *))
-        rtGetMethodPointerByRva("", "NssVehicleDriftCtrl", 0x7C6E368);   // ToggleDrifting(float)
-    NssVehicleDriftCtrl_ReleaseDrifting_ = (void (*)(void *, const void *))
-        rtGetMethodPointerByRva("", "NssVehicleDriftCtrl", 0x7C6E51C);   // ReleaseDrifting()
-
-    rt_ProcessLeftDrift  = (void (*)(void *, const void *))
-        rtGetMethodPointerByRva("", "VehicleInputHelper", 0xACB6C54);   // ProcessLeftDrift()
-    rt_ProcessRightDrift = (void (*)(void *, const void *))
-        rtGetMethodPointerByRva("", "VehicleInputHelper", 0xACB7000);   // ProcessRightDrift()
-
-    rtLog("il2cpp: drift procs Left=%p Right=%p", rt_ProcessLeftDrift, rt_ProcessRightDrift);
-
-    rtLog("il2cpp: drift toggle=%p release=%p", NssVehicleDriftCtrl_ToggleDrifting_,
-          NssVehicleDriftCtrl_ReleaseDrifting_);
-
-    rtLog("il2cpp: Autopilot resolved (CWW=%p, SteerAnalog=%p, Throttle=%p, Drift=%p, TL=%p)",
-          ExtraVelocityFast_DoPerfectCWWBoost, NssPhyVehicleCab_BeginSteeringAnalog,
-          NssPhyVehicleCab_ThrottleDown, NssPhyVehicleCab_BeginDrifting,
-          TraceLineComponent_GetTraceLinePoints);
 
     // 3. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
     orig_Drift_Release = (void (*)(void *, const void *))
@@ -916,27 +511,16 @@ static void installHooks(void) {
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    // 4b. Autopilot: bọc MotionCtrl::Update (slot 96) — ghi NssSteeringData (ga + lái analog)
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
-
-    // 4c. Autopilot Native Input: bơm phím Left/Right/Drift vào VehicleInputCtrl (slot 48)
-    orig_VehicleInputCtrl_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "VehicleInputCtrl", "Update", 1, (void *)hook_VehicleInputCtrlUpdate);
+    orig_ExtraSideFriction = (void (*)(void *, float, float, const void *))
+        rtHookMethod("", "NssPhyVehicleMotionCtrlHelper", "ApplyExtraSideFriction", 2, (void *)hook_ExtraSideFriction);
+    rtPatchVtable(rtFindClass("", "NssPhyVehicleMotionCtrl"), (void *)orig_ExtraSideFriction,
+                  (void *)hook_ExtraSideFriction);
 
     // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVelUpdate);
-
-    // 6. Guide Line & Racing Line
-    orig_TraceLineConfig_Init = (void (*)(void *, int, const void *))
-        rtHookMethod("", "TraceLineConfig", "Init", 1, (void *)hook_TraceLineConfig_Init);
-    orig_TraceLineComponent_GameModeForceOpen = (BOOL (*)(void *, const void *))
-        rtHookMethod("", "TraceLineComponent", "GameModeForceOpen", 0, (void *)hook_TraceLineComponent_GameModeForceOpen);
-    orig_TraceLineComponent_EnableUpdate = (BOOL (*)(void *, const void *))
-        rtHookMethod("", "TraceLineComponent", "EnableUpdate", 0, (void *)hook_TraceLineComponent_EnableUpdate);
-    orig_TraceLineComponent_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "TraceLineComponent", "Update", 1, (void *)hook_TraceLineComponent_Update);
 
     // 7. CheckPointMgr & ActorCpReporter (Tính MinMapTime, LapTimeLimit và Can Finish)
     orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
@@ -970,6 +554,7 @@ static void installHooks(void) {
 @property (nonatomic, strong) UIButton *fab;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UILabel *speedLabel;
+@property (nonatomic, strong) UILabel *slipLabel;
 
 // Top HUD Overlay
 @property (nonatomic, strong) UIView *topHud;
@@ -1077,23 +662,37 @@ static RCRaceToolkitMenu *gMenu = nil;
     [self.host addSubview:self.panel];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 240, 26)];
-    title.text = @"Race Toolkit (Auto Racer)";
+    title.text = @"Race Toolkit";
     title.textColor = UIColor.whiteColor;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:40  title:@"Auto Racing (Bot)"    on:gAutoRacing    action:@selector(onAutoRacing:)];
-    [self switchAtY:76  title:@"Guide Line & Arrows"  on:gGuideLine     action:@selector(onGuideLine:)];
-    [self switchAtY:112 title:@"Inf Mini Boost"       on:gFullMiniBoost action:@selector(onMini:)];
-    [self switchAtY:148 title:@"Auto End Drift"       on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
+    [self switchAtY:40 title:@"Xuyên xe" on:gGhostCars action:@selector(onGhostCars:)];
 
-    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 190, 268, 22)];
+    self.slipLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 78, 268, 20)];
+    self.slipLabel.textColor = UIColor.whiteColor;
+    self.slipLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.slipLabel.text = [self slipText];
+    [self.panel addSubview:self.slipLabel];
+
+    UISlider *slip = [[UISlider alloc] initWithFrame:CGRectMake(16, 100, 268, 32)];
+    slip.minimumValue = 0.f;
+    slip.maximumValue = 1.f;
+    slip.value = gDriftSlip;
+    slip.tintColor = [UIColor colorWithRed:0.95 green:0.65 blue:0.20 alpha:1.0];
+    [slip addTarget:self action:@selector(onSlipChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:slip];
+
+    [self switchAtY:140 title:@"Inf Mini Boost"       on:gFullMiniBoost action:@selector(onMini:)];
+    [self switchAtY:176 title:@"Auto End Drift"       on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
+
+    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 210, 268, 20)];
     self.speedLabel.textColor = UIColor.whiteColor;
-    self.speedLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    self.speedLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     self.speedLabel.text = [self speedText];
     [self.panel addSubview:self.speedLabel];
 
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 216, 268, 32)];
+    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 232, 268, 32)];
     slider.minimumValue = 0.f;
     slider.maximumValue = 300.f;
     slider.value = gSpeedKmh;
@@ -1101,11 +700,11 @@ static RCRaceToolkitMenu *gMenu = nil;
     [slider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:slider];
 
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 256, 278, 62)];
-    note.numberOfLines = 4;
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 270, 278, 50)];
+    note.numberOfLines = 3;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:10.5];
-    note.text = @"Auto Racing: Tự động lái theo TraceLine, ôm cua drift, thoát cua bắn CWW Boost & MiniBoost hoàn hảo.\nGuide Line: Đường dẫn & mũi tên cực nét.";
+    note.text = @"Xuyên xe: ghost-state của game, vẫn va chạm tường/đường.\nTrượt drift: trái = mặc định, phải = giảm hãm tới 80%.";
     [self.panel addSubview:note];
 }
 
@@ -1143,6 +742,10 @@ static RCRaceToolkitMenu *gMenu = nil;
     }
 }
 
+- (NSString *)slipText {
+    return [NSString stringWithFormat:@"Độ trượt drift: %.0f%%", gDriftSlip * 100.f];
+}
+
 - (NSString *)speedText {
     return [NSString stringWithFormat:@"Boost speed: %d km/h (+5s gate)", (int)gSpeedKmh];
 }
@@ -1159,8 +762,12 @@ static RCRaceToolkitMenu *gMenu = nil;
     [g setTranslation:CGPointZero inView:self.fab.superview];
 }
 
-- (void)onAutoRacing:(UISwitch *)s { gAutoRacing = s.isOn;     rtLog("toggle AutoRacing=%d", s.isOn); }
-- (void)onGuideLine:(UISwitch *)s  { gGuideLine = s.isOn;      rtLog("toggle GuideLine=%d", s.isOn); }
+- (void)onGhostCars:(UISwitch *)s { gGhostCars = s.isOn; rtLog("ghost cars=%d", s.isOn); }
+- (void)onSlipChanged:(UISlider *)s {
+    gDriftSlip = isfinite(s.value) ? fmaxf(0.f, fminf(1.f, s.value)) : 0.f;
+    self.slipLabel.text = [self slipText];
+    rtLog("drift slip=%.2f", gDriftSlip);
+}
 - (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn;  rtLog("toggle FullMiniBoost=%d", s.isOn); }
 - (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn;   rtLog("toggle AutoEndDrift=%d", s.isOn); }
 
