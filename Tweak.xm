@@ -143,7 +143,21 @@ static int    gLastCheckPointId  = 0;
 static void  *gTraceLineComp     = NULL;
 
 // Autopilot state variables (declared early for hook_GoImpEnter)
+typedef struct { float x, y, z; }    rtV3;
+typedef struct { float x, y, z, w; } rtQ;
+typedef enum { ST_GREEN = 0, ST_YELLOW, ST_BOOST } rtBotState;
+
 static int   s_BotClosestIdx     = -1;
+static int      s_BotDriftExitCount = 0;
+static float    s_BotDesiredSteer   = 0.f;
+static uint32_t s_BotKeyFlags       = 0;
+static float    s_BotLastKappa      = 0.f;
+static rtBotState s_BotState        = ST_GREEN;
+static int      s_BotYellowEndIdx   = -1;   // index cuối đoạn vàng đang khoá
+static rtV3     s_BotYellowEndPos;          // vị trí cuối đoạn vàng
+static rtV3     s_BotYellowEntryDir;        // hướng nhìn lúc bắt đầu khoá
+static int      s_BotYellowTurnDir  = 0;    // 1=Left, 2=Right
+static int      s_BotBoostTicks     = 0;
 
 enum {
     // ExtraVelocityTriggerMgr
@@ -441,9 +455,6 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 //   BOOST  : nhả drift, bắn CWW, phóng thẳng tới điểm cuối đã khoá
 //   Reached: tắt khoá, quay lại GREEN
 
-typedef struct { float x, y, z; } rtV3;
-typedef struct { float x, y, z, w; } rtQ;
-
 // Gọi hàm theo slot vtable của Il2CppClass
 static inline void *rtVSlot(void *obj, int slot) {
     if (!obj) return NULL;
@@ -493,18 +504,7 @@ static inline void *rtVSlot(void *obj, int slot) {
 #define kSnapDist        2.5f
 #define kSnapDistMax     6.0f
 
-typedef enum { ST_GREEN = 0, ST_YELLOW, ST_BOOST } rtBotState;
-
-static int      s_BotDriftExitCount = 0;
-static float    s_BotDesiredSteer   = 0.f;
-static uint32_t s_BotKeyFlags       = 0;
-static float    s_BotLastKappa      = 0.f;
-static rtBotState s_BotState        = ST_GREEN;
-static int      s_BotYellowEndIdx   = -1;   // index cuối đoạn vàng đang khoá
-static rtV3     s_BotYellowEndPos;          // vị trí cuối đoạn vàng
-static rtV3     s_BotYellowEntryDir;        // hướng nhìn lúc bắt đầu khoá
-static int      s_BotYellowTurnDir  = 0;    // 1=Left, 2=Right
-static int      s_BotBoostTicks     = 0;
+// (autopilot state declared at top of file)
 
 static inline BOOL rtPointXZ(void **items, int size, int idx, float *ox, float *oz) {
     if (!items || size <= 0) return NO;
