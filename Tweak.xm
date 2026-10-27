@@ -142,6 +142,11 @@ static int    gLastCheckPointId  = 0;
 // Cached TraceLine Component pointer
 static void  *gTraceLineComp     = NULL;
 
+// Autopilot state variables (declared early for hook_GoImpEnter)
+static int   s_BotClosestIdx     = -1;
+static BOOL  s_BotDrifting       = NO;
+static int   s_BotDriftDir       = 0;
+
 enum {
     // ExtraVelocityTriggerMgr
     kOffExVelReserveMgr   = 144, // 0x90 mReserveSmallBoostMgr
@@ -430,9 +435,7 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 #define kTlpPos          0x10
 #define kTlpDriftFlag    0x37
 
-static int  s_BotClosestIdx = -1;
-static BOOL s_BotDrifting   = NO;
-static int  s_BotDriftDir   = 0;
+// (Autopilot state variables declared above)
 
 static void rtAutoDrive(void *drivingCtrl, void *steeringData) {
     if (!drivingCtrl) return;
