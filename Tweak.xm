@@ -1,11 +1,11 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
 // Features & Fixes:
-// 1. Nitro: Nap day va goi GenOneNitrogenProp lien tuc. Bypass SingleNitrogenCollectCheatProcess.
+// 1. Guide Line & Arrows: Ve duong chi dan to ro rang tren mat duong + mui ten om cua tu xa.
 // 2. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
 // 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
 // 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
-// 5. Anti-Cheat Report: Chi giu lai SdcVehicleVel::Update, khoa van toc toi da bao cao o muc 300 km/h.
+// 5. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
 // 6. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
 
 #import <UIKit/UIKit.h>
@@ -121,7 +121,7 @@ static void rtInstallCrashHandler(void) {
 
 #pragma mark - Toolkit state & field offsets
 
-static BOOL   gFullNitro      = NO;
+static BOOL   gGuideLine      = YES; // Bat mac dinh duong chi dan ro net
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
 static float  gSpeedKmh       = 0.f;
@@ -138,11 +138,8 @@ static BOOL   gCanFinish         = NO;
 static int    gLastCheckPointId  = 0;
 
 enum {
-    // SingleNitrogenCollect
-    kOffNitroCurPower     = 208, // 0xD0 mCurPower (uint)
-    kOffNitroCurColPower  = 212, // 0xD4 mCurCollectPower (uint)
-    kOffNitroShowPower    = 224, // 0xE0 mCurShowPower (uint)
-    kOffNitroIsFull       = 240, // 0xF0 mIsCollectFull (bool)
+    // ExtraVelocityTriggerMgr
+    kOffExVelReserveMgr   = 144, // 0x90 mReserveSmallBoostMgr
 
     // NssPhyVehiclePowerChain
     kOffPowerExtraKMPH    = 68,  // 0x44 mExtraKMPH (float)
@@ -285,8 +282,6 @@ static void *rtHookMethod(const char *namespaze, const char *className,
 #pragma mark - Original function pointers & Replacements
 
 static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
-static void  (*orig_Nitro_Update)(void *, float, const void *) = NULL;
-static float (*orig_Nitro_GetProgress)(void *, const void *) = NULL;
 
 static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
 static void  (*orig_Drift_Release)(void *, const void *) = NULL;
@@ -294,12 +289,17 @@ static void  (*orig_Drift_ExitCurDriftState)(void *, const void *) = NULL;
 static void  (*orig_Drift_ForceClearDriftParams)(void *, const void *) = NULL;
 
 static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
+static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
 static void  (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
 static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
-static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
 
-// Method pointers called directly
-static int   (*SingleNitrogenCollect_GenOneNitrogenProp)(void *, const void *) = NULL;
+// Guide Line & TraceLine
+static void  (*orig_TraceLineConfig_Init)(void *, int, const void *) = NULL;
+static BOOL  (*orig_TraceLineComponent_GameModeForceOpen)(void *, const void *) = NULL;
+static BOOL  (*orig_TraceLineComponent_EnableUpdate)(void *, const void *) = NULL;
+static void  (*orig_TraceLineComponent_Update)(void *, float, const void *) = NULL;
+
+// Direct method pointers
 static void  (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
 
 // 1. Race Start: Bắt đầu bấm giờ
@@ -312,43 +312,11 @@ static void hook_GoImpEnter(void *self, const void *method) {
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
 
-// 2. Full Nitro: Nạp đầy và gọi GenOneNitrogenProp liên tục
-static void hook_NitroUpdate(void *self, float dt, const void *method) {
-    if (orig_Nitro_Update) orig_Nitro_Update(self, dt, method);
-    if (!gFullNitro || !self) return;
-
-    // 1. Luôn nạp đầy bình Nitro
-    *(uint32_t *)((char *)self + kOffNitroCurPower)    = 1000;
-    *(uint32_t *)((char *)self + kOffNitroCurColPower) = 1000;
-    *(uint32_t *)((char *)self + kOffNitroShowPower)   = 1000;
-    *(uint8_t *) ((char *)self + kOffNitroIsFull)      = 1;
-
-    // 2. Gọi GenOneNitrogenProp để liên tục cấp bình Nitro vào túi
-    if (SingleNitrogenCollect_GenOneNitrogenProp) {
-        SingleNitrogenCollect_GenOneNitrogenProp(self, nullptr);
-    }
-}
-
-static float hook_NitroGetProgress(void *self, const void *method) {
-    if (gFullNitro && self) return 1.0f;
-    return orig_Nitro_GetProgress ? orig_Nitro_GetProgress(self, method) : 0.0f;
-}
-
-// Bypass cheat detector bên trong SingleNitrogenCollectCheatProcess
-static void hook_CheatProcess_CheckCheat(void *self, const void *method) {
-    // No-op: chặn hoàn toàn việc kiểm tra/báo cáo cheat nitro
-}
-
-static void hook_CheatProcess_CheckShieldMethodCheat(void *self, const void *method) {
-    // No-op
-}
-
-// 3. Mini Boost: Gọi ForceCanTriggerOnce(Mini/Air/FallingGround) liên tục để nhận và dùng không giới hạn
+// 2. Mini Boost: Gọi ForceCanTriggerOnce(Mini/Air/FallingGround) liên tục
 static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
     if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
 
-    // Kích hoạt nhận miniboost ngay lập tức (Mini=2, Air=3, FallingGround=11)
     if (ExtraVelocityTriggerMgr_ForceCanTriggerOnce) {
         ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 2, nullptr);  // Mini
         ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 3, nullptr);  // Air
@@ -356,7 +324,7 @@ static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
     }
 }
 
-// 4. Auto End Drift: Tránh dính drift bằng cách gọi cả ExitCurDriftState và ForceClearDriftParams
+// 3. Auto End Drift: Tránh dính drift
 static void hook_DriftExitCurState(void *self, const void *method) {
     if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(self, method);
 }
@@ -377,12 +345,11 @@ static void hook_DriftRelease(void *self, const void *method) {
     }
 }
 
-// 5. Tốc độ PowerChain: Chỉ kích hoạt sau 5s xuất phát
+// 4. Tốc độ PowerChain: Chỉ kích hoạt sau 5s xuất phát
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
     if (!self || gSpeedKmh <= 0.f) return;
 
-    // Phải sau 5 giây xuất phát mới bắt đầu boost tốc độ
     if (gGoTime <= 0.0 || (nowSeconds() - gGoTime) < 5.0) return;
 
     *(float *)((char *)self + kOffPowerExtraKMPH)    = gSpeedKmh;
@@ -391,7 +358,7 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
-// 6. Anti-Cheat Report: Duy nhất giữ lại SdcVehicleVel, khóa vận tốc tối đa tức thời ở mức 300 km/h
+// 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
 static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
     if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, method);
     if (!self) return;
@@ -409,11 +376,46 @@ static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + 0x94) = 300.0f; // mMaxVehicleKMPH = 300.0f
 }
 
+// 6. Guide Line & Racing Line: Đường chỉ dẫn to rõ + mũi tên ôm cua từ xa
+static void hook_TraceLineConfig_Init(void *self, int mapID, const void *method) {
+    if (orig_TraceLineConfig_Init) orig_TraceLineConfig_Init(self, mapID, method);
+    if (!self || !gGuideLine) return;
+
+    // Vạch đường chỉ dẫn:
+    *(int *)  ((char *)self + 0x24) = 1000;   // VisibleMeshMaxDistance: hiển thị vạch xa tới 1000m
+    *(float *)((char *)self + 0x3C) = 3.6f;   // LineWidth: to gấp đôi bình thường, cực kỳ rõ nét
+    *(float *)((char *)self + 0x40) = 0.25f;  // LineUpOffset: nâng cao 25cm so với mặt đường, không bị lún
+
+    // Mũi tên hướng dẫn góc ôm cua/drift:
+    *(float *)((char *)self + 0x54) = 4.5f;   // DriftFXWidth: mũi tên to rõ ràng
+    *(float *)((char *)self + 0x5C) = 600.0f; // DriftFXVisibleDistance: nhìn thấy mũi tên trước 600m
+    rtLog("guideline: enhanced LineWidth=3.6, UpOffset=0.25, VisibleDist=1000m, DriftFXWidth=4.5");
+}
+
+static BOOL hook_TraceLineComponent_GameModeForceOpen(void *self, const void *method) {
+    if (gGuideLine) return YES;
+    return orig_TraceLineComponent_GameModeForceOpen ? orig_TraceLineComponent_GameModeForceOpen(self, method) : NO;
+}
+
+static BOOL hook_TraceLineComponent_EnableUpdate(void *self, const void *method) {
+    if (gGuideLine) return YES;
+    return orig_TraceLineComponent_EnableUpdate ? orig_TraceLineComponent_EnableUpdate(self, method) : NO;
+}
+
+static void hook_TraceLineComponent_Update(void *self, float dt, const void *method) {
+    if (gGuideLine && self) {
+        *(uint8_t *)((char *)self + 0xB0) = 1; // mIsEnable = true
+        *(uint8_t *)((char *)self + 0xB1) = 1; // mIsClassicMode = true
+        *(uint8_t *)((char *)self + 0xB2) = 1; // mIsLadderMode = true
+    }
+    if (orig_TraceLineComponent_Update) orig_TraceLineComponent_Update(self, dt, method);
+}
+
 // 7. CheckPointMgr & ActorCpReporter: Tính MinMapTime, LapTimeLimit & Can Finish
 static void hook_CheckPointMgrInit(void *self, void *config, bool checkCrc, bool enableReset, const void *method) {
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, checkCrc, enableReset, method);
     if (config) {
-        gMainCurveLength = *(float *)((char *)config + 0x4C); // MainCurveLength (mét)
+        gMainCurveLength = *(float *)((char *)config + 0x4C);
         int laps = gMapTotalLaps > 0 ? gMapTotalLaps : 2;
         float lapDist = gMainCurveLength > 100.f ? gMainCurveLength : 2500.f;
         float totalDist = lapDist * (float)laps;
@@ -436,7 +438,6 @@ static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, co
     if (laps > 0) gMapTotalLaps = laps;
     gLastCheckPointId = *(int *)((char *)self + kOffActorCpLastCp);
 
-    // Kiểm tra điều kiện về đích an toàn
     float curTime = gCurrentMatchTime > 0.f ? gCurrentMatchTime :
                     (gGoTime > 0.0 ? (float)(nowSeconds() - gGoTime) : 0.f);
     if (gMinMapTimeSeconds > 0.f && curTime >= gMinMapTimeSeconds) {
@@ -476,22 +477,7 @@ static void installHooks(void) {
     rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
 
-    // 2. Full Nitro: Cấp đầy và gọi GenOneNitrogenProp
-    orig_Nitro_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "SingleNitrogenCollect", "Update", 1, (void *)hook_NitroUpdate);
-    orig_Nitro_GetProgress = (float (*)(void *, const void *))
-        rtHookMethod("", "SingleNitrogenCollect", "get_ProgressBarPowerValue", 0, (void *)hook_NitroGetProgress);
-
-    // Resolve GenOneNitrogenProp
-    SingleNitrogenCollect_GenOneNitrogenProp = (int (*)(void *, const void *))
-        rtGetMethodPointer("", "SingleNitrogenCollect", "GenOneNitrogenProp", 0);
-    rtLog("il2cpp: GenOneNitrogenProp resolved = %p", SingleNitrogenCollect_GenOneNitrogenProp);
-
-    // Bypass cheat detector bên trong SingleNitrogenCollectCheatProcess
-    rtHookMethod("", "SingleNitrogenCollectCheatProcess", "CheckCheat", 0, (void *)hook_CheatProcess_CheckCheat);
-    rtHookMethod("", "SingleNitrogenCollectCheatProcess", "CheckShieldMethodCheat", 0, (void *)hook_CheatProcess_CheckShieldMethodCheat);
-
-    // 3. Mini Boost: Gọi ForceCanTriggerOnce liên tục
+    // 2. Mini Boost: Gọi ForceCanTriggerOnce liên tục
     orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
 
@@ -500,7 +486,7 @@ static void installHooks(void) {
         rtGetMethodPointer("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
     rtLog("il2cpp: ForceCanTriggerOnce resolved = %p", ExtraVelocityTriggerMgr_ForceCanTriggerOnce);
 
-    // 4. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
+    // 3. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
     orig_Drift_Release = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
     orig_Drift_ExitCurDriftState = (void (*)(void *, const void *))
@@ -508,13 +494,23 @@ static void installHooks(void) {
     orig_Drift_ForceClearDriftParams = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftForceClear);
 
-    // 5. Tốc độ trục truyền động vật lý (PowerChain - sau 5s xuất phát)
+    // 4. Tốc độ trục truyền động vật lý (PowerChain - sau 5s xuất phát)
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    // 6. Anti-Cheat Report: Duy nhất giữ lại SdcVehicleVel, khóa 300 km/h
+    // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVelUpdate);
+
+    // 6. Guide Line & Racing Line
+    orig_TraceLineConfig_Init = (void (*)(void *, int, const void *))
+        rtHookMethod("", "TraceLineConfig", "Init", 1, (void *)hook_TraceLineConfig_Init);
+    orig_TraceLineComponent_GameModeForceOpen = (BOOL (*)(void *, const void *))
+        rtHookMethod("", "TraceLineComponent", "GameModeForceOpen", 0, (void *)hook_TraceLineComponent_GameModeForceOpen);
+    orig_TraceLineComponent_EnableUpdate = (BOOL (*)(void *, const void *))
+        rtHookMethod("", "TraceLineComponent", "EnableUpdate", 0, (void *)hook_TraceLineComponent_EnableUpdate);
+    orig_TraceLineComponent_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "TraceLineComponent", "Update", 1, (void *)hook_TraceLineComponent_Update);
 
     // 7. CheckPointMgr & ActorCpReporter (Tính MinMapTime, LapTimeLimit và Can Finish)
     orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
@@ -660,9 +656,9 @@ static RCRaceToolkitMenu *gMenu = nil;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:44  title:@"Inf Full Nitro"    on:gFullNitro     action:@selector(onNitro:)];
-    [self switchAtY:84  title:@"Inf Mini Boost"    on:gFullMiniBoost action:@selector(onMini:)];
-    [self switchAtY:124 title:@"Auto End Drift"    on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
+    [self switchAtY:44  title:@"Guide Line & Arrows" on:gGuideLine     action:@selector(onGuideLine:)];
+    [self switchAtY:84  title:@"Inf Mini Boost"       on:gFullMiniBoost action:@selector(onMini:)];
+    [self switchAtY:124 title:@"Auto End Drift"       on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
 
     self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 168, 268, 22)];
     self.speedLabel.textColor = UIColor.whiteColor;
@@ -682,7 +678,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 3;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:11];
-    note.text = @"Speed applies +5s after start.\nReport max speed = 300 km/h.\nContinuous Nitro & MiniBoost active.";
+    note.text = @"Speed applies +5s after start.\nGuide Line: Wide line & drift arrows.\nMiniBoost: Continuous ForceCanTrigger.";
     [self.panel addSubview:note];
 }
 
@@ -736,9 +732,9 @@ static RCRaceToolkitMenu *gMenu = nil;
     [g setTranslation:CGPointZero inView:self.fab.superview];
 }
 
-- (void)onNitro:(UISwitch *)s     { gFullNitro = s.isOn;     rtLog("toggle FullNitro=%d", s.isOn); }
-- (void)onMini:(UISwitch *)s      { gFullMiniBoost = s.isOn; rtLog("toggle FullMiniBoost=%d", s.isOn); }
-- (void)onAutoDrift:(UISwitch *)s { gAutoDriftEnd = s.isOn;  rtLog("toggle AutoEndDrift=%d", s.isOn); }
+- (void)onGuideLine:(UISwitch *)s  { gGuideLine = s.isOn;      rtLog("toggle GuideLine=%d", s.isOn); }
+- (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn;  rtLog("toggle FullMiniBoost=%d", s.isOn); }
+- (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn;   rtLog("toggle AutoEndDrift=%d", s.isOn); }
 
 - (void)onSpeedChanged:(UISlider *)s {
     gSpeedKmh = s.value;
