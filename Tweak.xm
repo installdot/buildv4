@@ -146,7 +146,6 @@ static void  *gTraceLineComp     = NULL;
 static int   s_BotClosestIdx     = -1;
 static BOOL  s_BotDrifting       = NO;
 static int   s_BotDriftDir       = 0;
-static int   s_BotDriftExit      = 0;
 
 enum {
     // ExtraVelocityTriggerMgr
@@ -841,9 +840,13 @@ static void installHooks(void) {
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    // 4b. Autopilot: bọc MotionCtrl::Update (slot 96) — nơi gọi UpdateDrivingData bằng BL
+    // 4b. Autopilot: bọc MotionCtrl::Update (slot 96) — ghi NssSteeringData (ga + lái analog)
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
+
+    // 4c. Autopilot Native Input: bơm phím Left/Right/Drift vào VehicleInputCtrl (slot 48)
+    orig_VehicleInputCtrl_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "VehicleInputCtrl", "Update", 1, (void *)hook_VehicleInputCtrlUpdate);
 
     // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
