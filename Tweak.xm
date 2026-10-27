@@ -1,12 +1,13 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
 // Features & Fixes:
-// 1. Guide Line & Arrows: Ve duong chi dan to ro rang tren mat duong + mui ten om cua tu xa.
-// 2. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
-// 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
-// 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
-// 5. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
-// 6. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
+// 1. Auto Racing (Full Bot): Tu dong danh lai, di chuyen, vao cua drift, thoat cua kich hoat CWW Boost & MiniBoost.
+// 2. Guide Line & Arrows: Ve duong chi dan to ro rang tren mat duong + mui ten om cua tu xa.
+// 3. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
+// 4. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
+// 5. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
+// 6. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
+// 7. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -121,7 +122,8 @@ static void rtInstallCrashHandler(void) {
 
 #pragma mark - Toolkit state & field offsets
 
-static BOOL   gGuideLine      = YES; // Bat mac dinh duong chi dan ro net
+static BOOL   gAutoRacing     = NO;  // Tu dong dua (Auto Racing Bot)
+static BOOL   gGuideLine      = YES; // Bat duong chi dan ro net
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
 static float  gSpeedKmh       = 0.f;
@@ -136,6 +138,9 @@ static float  gMinMapTimeSeconds = 0.f;
 static float  gLapTimeLimit      = 0.f;
 static BOOL   gCanFinish         = NO;
 static int    gLastCheckPointId  = 0;
+
+// Cached TraceLine Component pointer
+static void  *gTraceLineComp     = NULL;
 
 enum {
     // ExtraVelocityTriggerMgr
@@ -299,10 +304,18 @@ static BOOL  (*orig_TraceLineComponent_GameModeForceOpen)(void *, const void *) 
 static BOOL  (*orig_TraceLineComponent_EnableUpdate)(void *, const void *) = NULL;
 static void  (*orig_TraceLineComponent_Update)(void *, float, const void *) = NULL;
 
-// Direct method pointers
+// Native methods invoked directly
 static void  (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
+static void  (*ExtraVelocityFast_DoPerfectCWWBoost)(void *, const void *) = NULL;
+static void *(*TraceLineComponent_GetTraceLinePoints)(void *, const void *) = NULL;
 
-// 1. Race Start: Bắt đầu bấm giờ
+static void  (*NssPhyVehicleCab_ThrottleDown)(void *, float, const void *) = NULL;
+static void  (*NssPhyVehicleCab_OnWheelSteering)(void *, float, const void *) = NULL;
+static void  (*NssPhyVehicleCab_ReleaseWheelSteering)(void *, const void *) = NULL;
+static BOOL  (*NssPhyVehicleCab_BeginDrifting)(void *, int, const void *) = NULL;
+static BOOL  (*NssPhyVehicleCab_EndDrifting)(void *, int, const void *) = NULL;
+
+// 1. Race Start
 static void hook_GoImpEnter(void *self, const void *method) {
     if (orig_GameGo_ImpEnter) orig_GameGo_ImpEnter(self, method);
     gGoTime = nowSeconds();
@@ -345,17 +358,139 @@ static void hook_DriftRelease(void *self, const void *method) {
     }
 }
 
-// 4. Tốc độ PowerChain: Chỉ kích hoạt sau 5s xuất phát
+// 4. Autonomous Racing Bot & PowerChain Speed Boost
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
-    if (!self || gSpeedKmh <= 0.f) return;
+    if (!self) return;
 
-    if (gGoTime <= 0.0 || (nowSeconds() - gGoTime) < 5.0) return;
+    void *dynVhc = *(void **)((char *)self + 0x10); // DynamicVehicle
+    if (!dynVhc) return;
 
-    *(float *)((char *)self + kOffPowerExtraKMPH)    = gSpeedKmh;
-    *(float *)((char *)self + kOffPowerExtraTorque)  = gSpeedKmh * 10.0f;
-    *(float *)((char *)self + kOffPowerMPSScaleCoef) = 1.0f + (gSpeedKmh / 120.0f);
-    *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
+    void *vehicle    = *(void **)((char *)dynVhc + 0x10); // IVehicle
+    void *cab        = *(void **)((char *)dynVhc + 0x30); // NssPhyVehicleCab
+    void *motionCtrl = *(void **)((char *)dynVhc + 0x38); // NssPhyVehicleMotionCtrl
+    void *driftCtrl  = motionCtrl ? *(void **)((char *)motionCtrl + 0x60) : NULL; // IVehicleDriftCtrl
+    void *simOutput  = motionCtrl ? *(void **)((char *)motionCtrl + 0xD0) : NULL; // NssVehicleSimOutput
+
+    // A. BOOST TỐC ĐỘ (Sau 5s xuất phát)
+    if (gSpeedKmh > 0.f && gGoTime > 0.0 && (nowSeconds() - gGoTime) >= 5.0) {
+        *(float *)((char *)self + kOffPowerExtraKMPH)    = gSpeedKmh;
+        *(float *)((char *)self + kOffPowerExtraTorque)  = gSpeedKmh * 10.0f;
+        *(float *)((char *)self + kOffPowerMPSScaleCoef) = 1.0f + (gSpeedKmh / 120.0f);
+        *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
+    }
+
+    // B. AUTOPILOT - TỰ ĐỘNG ĐUA (Cua, Di chuyển, Drift, CWW Boost, MiniBoost)
+    if (!gAutoRacing || !cab || !simOutput || !gTraceLineComp || !TraceLineComponent_GetTraceLinePoints) {
+        return;
+    }
+
+    void *listView = TraceLineComponent_GetTraceLinePoints(gTraceLineComp, nullptr);
+    if (!listView) return;
+
+    void *context = *(void **)((char *)listView + 0x10);
+    int size = *(int *)((char *)listView + 0x18);
+    if (!context || size <= 0) return;
+
+    void **items = (void **)((char *)context + 0x20);
+
+    // Tọa độ và hướng xe hiện tại
+    float posX = *(float *)((char *)simOutput + 0x64);
+    float posZ = *(float *)((char *)simOutput + 0x6C);
+
+    float fwdX = *(float *)((char *)simOutput + 0x44);
+    float fwdZ = *(float *)((char *)simOutput + 0x4C);
+    float fwdLen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
+    if (fwdLen < 0.001f) return;
+    fwdX /= fwdLen; fwdZ /= fwdLen;
+    float heading = atan2f(fwdX, fwdZ);
+
+    // Tìm điểm gần xe nhất trên TraceLine
+    static int s_LastClosest = 0;
+    int bestIdx = s_LastClosest;
+    float bestDistSq = 1e9f;
+    int searchStart = (s_LastClosest > 40) ? (s_LastClosest - 30) : 0;
+    int searchEnd   = (s_LastClosest + 50 < size) ? (s_LastClosest + 50) : size;
+
+    for (int i = searchStart; i < searchEnd; i++) {
+        void *pt = items[i];
+        if (!pt) continue;
+        float px = *(float *)((char *)pt + 0x10);
+        float pz = *(float *)((char *)pt + 0x18);
+        float dx = px - posX;
+        float dz = pz - posZ;
+        float dSq = dx * dx + dz * dz;
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            bestIdx = i;
+        }
+    }
+    s_LastClosest = bestIdx;
+
+    // Khoảng cách nhìn trước (Lookahead)
+    float curKmph = *(float *)((char *)simOutput + 0x10);
+    int lookahead = (curKmph > 220.0f) ? 16 : ((curKmph > 140.0f) ? 12 : 8);
+    int targetIdx = (bestIdx + lookahead) % size;
+    void *targetPt = items[targetIdx];
+    if (!targetPt) return;
+
+    float tx = *(float *)((char *)targetPt + 0x10);
+    float tz = *(float *)((char *)targetPt + 0x18);
+    uint8_t targetDrift = *(uint8_t *)((char *)targetPt + 0x37);
+
+    // Tính góc lệch giữa hướng xe và điểm mục tiêu
+    float toTargetX = tx - posX;
+    float toTargetZ = tz - posZ;
+    float targetAngle = atan2f(toTargetX, toTargetZ);
+    float deltaAngle = targetAngle - heading;
+    while (deltaAngle > M_PI)  deltaAngle -= 2.0f * M_PI;
+    while (deltaAngle < -M_PI) deltaAngle += 2.0f * M_PI;
+
+    // Tính lực đánh lái (-1.0 đến +1.0)
+    float steer = deltaAngle * 1.9f;
+    if (steer > 1.0f)  steer = 1.0f;
+    if (steer < -1.0f) steer = -1.0f;
+
+    // 1. Luôn đạp ga tự động di chuyển
+    if (NssPhyVehicleCab_ThrottleDown) {
+        NssPhyVehicleCab_ThrottleDown(cab, 1.0f, nullptr);
+    }
+
+    // 2. Tự động đánh lái
+    if (NssPhyVehicleCab_OnWheelSteering) {
+        NssPhyVehicleCab_OnWheelSteering(cab, steer, nullptr);
+    }
+
+    // 3. Tự động Drift ôm cua
+    static BOOL s_BotDrifting = NO;
+    static int  s_BotDriftDir = 0;
+
+    if (targetDrift || (fabsf(deltaAngle) > 0.40f && curKmph > 85.0f)) {
+        if (!s_BotDrifting) {
+            s_BotDrifting = YES;
+            s_BotDriftDir = (deltaAngle < 0.0f) ? 1 : 2; // 1 = Left, 2 = Right
+            if (NssPhyVehicleCab_BeginDrifting) {
+                NssPhyVehicleCab_BeginDrifting(cab, s_BotDriftDir, nullptr);
+            }
+        }
+    } else {
+        if (s_BotDrifting && fabsf(deltaAngle) < 0.16f) {
+            // Hết cua -> Thoát drift dứt khoát
+            if (NssPhyVehicleCab_EndDrifting) {
+                NssPhyVehicleCab_EndDrifting(cab, s_BotDriftDir, nullptr);
+            }
+            if (driftCtrl) {
+                if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(driftCtrl, nullptr);
+                if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(driftCtrl, nullptr);
+            }
+            s_BotDrifting = NO;
+
+            // KÍCH HOẠT CWW BOOST HOÀN HẢO NGAY KHI RA KHỎI CUA!
+            if (ExtraVelocityFast_DoPerfectCWWBoost && vehicle) {
+                ExtraVelocityFast_DoPerfectCWWBoost(vehicle, nullptr);
+            }
+        }
+    }
 }
 
 // 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
@@ -403,6 +538,7 @@ static BOOL hook_TraceLineComponent_EnableUpdate(void *self, const void *method)
 }
 
 static void hook_TraceLineComponent_Update(void *self, float dt, const void *method) {
+    gTraceLineComp = self; // Lưu con trỏ TraceLineComponent cho Autopilot
     if (gGuideLine && self) {
         *(uint8_t *)((char *)self + 0xB0) = 1; // mIsEnable = true
         *(uint8_t *)((char *)self + 0xB1) = 1; // mIsClassicMode = true
@@ -481,10 +617,28 @@ static void installHooks(void) {
     orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
 
-    // Resolve ForceCanTriggerOnce
+    // Resolve native functions for Autopilot & Boosts
     ExtraVelocityTriggerMgr_ForceCanTriggerOnce = (void (*)(void *, int, const void *))
         rtGetMethodPointer("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
-    rtLog("il2cpp: ForceCanTriggerOnce resolved = %p", ExtraVelocityTriggerMgr_ForceCanTriggerOnce);
+    ExtraVelocityFast_DoPerfectCWWBoost = (void (*)(void *, const void *))
+        rtGetMethodPointer("", "ExtraVelocityFast", "DoPerfectCWWBoost", 1);
+    TraceLineComponent_GetTraceLinePoints = (void *(*)(void *, const void *))
+        rtGetMethodPointer("", "TraceLineComponent", "GetTraceLinePoints", 0);
+
+    NssPhyVehicleCab_ThrottleDown = (void (*)(void *, float, const void *))
+        rtGetMethodPointer("", "NssPhyVehicleCab", "ThrottleDown", 1);
+    NssPhyVehicleCab_OnWheelSteering = (void (*)(void *, float, const void *))
+        rtGetMethodPointer("", "NssPhyVehicleCab", "OnWheelSteering", 1);
+    NssPhyVehicleCab_ReleaseWheelSteering = (void (*)(void *, const void *))
+        rtGetMethodPointer("", "NssPhyVehicleCab", "ReleaseWheelSteering", 0);
+    NssPhyVehicleCab_BeginDrifting = (BOOL (*)(void *, int, const void *))
+        rtGetMethodPointer("", "NssPhyVehicleCab", "BeginDrifting", 1);
+    NssPhyVehicleCab_EndDrifting = (BOOL (*)(void *, int, const void *))
+        rtGetMethodPointer("", "NssPhyVehicleCab", "EndDrifting", 1);
+
+    rtLog("il2cpp: Autopilot methods resolved (CWW=%p, Steer=%p, Throttle=%p, Drift=%p)",
+          ExtraVelocityFast_DoPerfectCWWBoost, NssPhyVehicleCab_OnWheelSteering,
+          NssPhyVehicleCab_ThrottleDown, NssPhyVehicleCab_BeginDrifting);
 
     // 3. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
     orig_Drift_Release = (void (*)(void *, const void *))
@@ -494,7 +648,7 @@ static void installHooks(void) {
     orig_Drift_ForceClearDriftParams = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftForceClear);
 
-    // 4. Tốc độ trục truyền động vật lý (PowerChain - sau 5s xuất phát)
+    // 4. Tốc độ trục truyền động vật lý & Autopilot (PowerChain)
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
@@ -640,7 +794,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     [self.host addSubview:self.fab];
 
     // === MENU PANEL ===
-    CGFloat w = 300, h = 300;
+    CGFloat w = 310, h = 330;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - w) / 2,
                                                         (screen.size.height - h) / 2, w, h)];
     self.panel.backgroundColor = [UIColor colorWithWhite:0.09 alpha:0.96];
@@ -651,22 +805,23 @@ static RCRaceToolkitMenu *gMenu = nil;
     [self.host addSubview:self.panel];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 240, 26)];
-    title.text = @"Race Toolkit";
+    title.text = @"Race Toolkit (Auto Racer)";
     title.textColor = UIColor.whiteColor;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:44  title:@"Guide Line & Arrows" on:gGuideLine     action:@selector(onGuideLine:)];
-    [self switchAtY:84  title:@"Inf Mini Boost"       on:gFullMiniBoost action:@selector(onMini:)];
-    [self switchAtY:124 title:@"Auto End Drift"       on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
+    [self switchAtY:40  title:@"Auto Racing (Bot)"    on:gAutoRacing    action:@selector(onAutoRacing:)];
+    [self switchAtY:76  title:@"Guide Line & Arrows"  on:gGuideLine     action:@selector(onGuideLine:)];
+    [self switchAtY:112 title:@"Inf Mini Boost"       on:gFullMiniBoost action:@selector(onMini:)];
+    [self switchAtY:148 title:@"Auto End Drift"       on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
 
-    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 168, 268, 22)];
+    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 190, 268, 22)];
     self.speedLabel.textColor = UIColor.whiteColor;
     self.speedLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
     self.speedLabel.text = [self speedText];
     [self.panel addSubview:self.speedLabel];
 
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 196, 268, 32)];
+    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 216, 268, 32)];
     slider.minimumValue = 0.f;
     slider.maximumValue = 300.f;
     slider.value = gSpeedKmh;
@@ -674,11 +829,11 @@ static RCRaceToolkitMenu *gMenu = nil;
     [slider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:slider];
 
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 236, 268, 50)];
-    note.numberOfLines = 3;
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 256, 278, 62)];
+    note.numberOfLines = 4;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
-    note.font = [UIFont systemFontOfSize:11];
-    note.text = @"Speed applies +5s after start.\nGuide Line: Wide line & drift arrows.\nMiniBoost: Continuous ForceCanTrigger.";
+    note.font = [UIFont systemFontOfSize:10.5];
+    note.text = @"Auto Racing: Tự động lái theo TraceLine, ôm cua drift, thoát cua bắn CWW Boost & MiniBoost hoàn hảo.\nGuide Line: Đường dẫn & mũi tên cực nét.";
     [self.panel addSubview:note];
 }
 
@@ -732,6 +887,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     [g setTranslation:CGPointZero inView:self.fab.superview];
 }
 
+- (void)onAutoRacing:(UISwitch *)s { gAutoRacing = s.isOn;     rtLog("toggle AutoRacing=%d", s.isOn); }
 - (void)onGuideLine:(UISwitch *)s  { gGuideLine = s.isOn;      rtLog("toggle GuideLine=%d", s.isOn); }
 - (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn;  rtLog("toggle FullMiniBoost=%d", s.isOn); }
 - (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn;   rtLog("toggle AutoEndDrift=%d", s.isOn); }
