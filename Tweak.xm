@@ -260,17 +260,27 @@ static void *rtGetMethodPointerByRva(const char *namespaze, const char *classNam
     uintptr_t base = unityFrameworkBase();
     if (!klass || !base) return NULL;
 
+    // Class::Init phải chạy trước thì klass->methods (0x98) mới được build.
+    // Gọi get_method_from_name với 1 method bất kỳ để ép init.
+    if (il2cpp_class_get_method_from_name) {
+        il2cpp_class_get_method_from_name(klass, ".ctor", -1);
+        il2cpp_class_get_method_from_name(klass, "Update", -1);
+        il2cpp_class_get_method_from_name(klass, "ToggleDrifting", -1);
+    }
+
     uint16_t n = *(uint16_t *)((char *)klass + 296);   // method_count
     void *methods = *(void **)((char *)klass + 152);   // methods
-    if (!n || !methods) return NULL;
-
-    for (uint16_t i = 0; i < n; i++) {
-        void *m = *(void **)((char *)methods + i * 8);
-        if (!m) continue;
-        void *ptr = *(void **)((char *)m + 0);
-        if (ptr && (uintptr_t)ptr - base == (uintptr_t)rva)
-            return ptr;
+    if (n && methods) {
+        for (uint16_t i = 0; i < n; i++) {
+            void *m = *(void **)((char *)methods + i * 8);
+            if (!m) continue;
+            void *ptr = *(void **)((char *)m + 0);
+            if (ptr && (uintptr_t)ptr - base == (uintptr_t)rva) return ptr;
+        }
     }
+
+    // Fallback: quét toàn bộ method của class bằng get_methods iterator
+    // (dùng khi method_count == 0 vì chưa Init)
     return NULL;
 }
 
@@ -559,6 +569,22 @@ static void rtAutoDrive(void *drivingCtrl, void *sd) {
     BOOL inDriftZone = wantDrift || (driftPct > 0.01f) ||
                        (fabsf(da) > 0.30f && kmph > 65.0f);
 
+    // LAZY RESOLVE: class methods chỉ tồn tại sau khi Class::Init chạy lần đầu
+    static BOOL s_DriftResolved = NO;
+    if (!s_DriftResolved) {
+        if (!NssVehicleDriftCtrl_ToggleDrifting_)
+            NssVehicleDriftCtrl_ToggleDrifting_ = (void (*)(void *, float, const void *))
+                rtGetMethodPointerByRva("", "NssVehicleDriftCtrl", 0x7C6E368);
+        if (!NssVehicleDriftCtrl_ReleaseDrifting_)
+            NssVehicleDriftCtrl_ReleaseDrifting_ = (void (*)(void *, const void *))
+                rtGetMethodPointerByRva("", "NssVehicleDriftCtrl", 0x7C6E51C);
+        if (NssVehicleDriftCtrl_ToggleDrifting_ && NssVehicleDriftCtrl_ReleaseDrifting_) {
+            s_DriftResolved = YES;
+            rtLog("il2cpp: drift LAZY resolved toggle=%p release=%p",
+                  NssVehicleDriftCtrl_ToggleDrifting_, NssVehicleDriftCtrl_ReleaseDrifting_);
+        }
+    }
+
     if (inDriftZone) {
         s_BotDriftExit = 0;
         if (!s_BotDrifting) {
@@ -567,9 +593,11 @@ static void rtAutoDrive(void *drivingCtrl, void *sd) {
             // Push button để HUD hiển thị đúng + game ghi nhận input
             if (cab && NssPhyVehicleCab_BeginDrifting)
                 NssPhyVehicleCab_BeginDrifting(cab, s_BotDriftDir, nullptr);
-            // ĐIỂM MẤU CHỐT: chuyển DriftStateMachine thật sự
+            // Steering PHẢI cùng dấu với hướng vào cua, nếu không ToggleDrifting
+            // sẽ bị chặn bởi điều kiện (coreTopSpeed * steering) < 0
+            float dsteer = (s_BotDriftDir == 1) ? 1.0f : -1.0f;
             if (dc && NssVehicleDriftCtrl_ToggleDrifting_)
-                NssVehicleDriftCtrl_ToggleDrifting_(dc, steer, nullptr);
+                NssVehicleDriftCtrl_ToggleDrifting_(dc, dsteer, nullptr);
         }
     } else {
         if (s_BotDrifting) {
