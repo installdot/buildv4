@@ -146,6 +146,7 @@ static void  *gTraceLineComp     = NULL;
 static int   s_BotClosestIdx     = -1;
 static BOOL  s_BotDrifting       = NO;
 static int   s_BotDriftDir       = 0;
+static int   s_BotDriftExit      = 0;
 
 enum {
     // ExtraVelocityTriggerMgr
@@ -339,6 +340,11 @@ static void  (*NssPhyVehicleCab_ThrottleDown)(void *, float, const void *) = NUL
 static void  (*NssPhyVehicleCab_BeginSteeringAnalog)(void *, float, const void *) = NULL;
 static BOOL  (*NssPhyVehicleCab_BeginDrifting)(void *, int, const void *) = NULL;
 static BOOL  (*NssPhyVehicleCab_EndDrifting)(void *, int, const void *) = NULL;
+
+// Drift state machine entry points. Cab::BeginDrifting chỉ push button vào queue,
+// KHÔNG chuyển DriftStateMachine. Chỉ DriftCtrl::ToggleDrifting mới thật sự vào drift.
+static void  (*NssVehicleDriftCtrl_ToggleDrifting_)(void *, float, const void *) = NULL;
+static void  (*NssVehicleDriftCtrl_ReleaseDrifting_)(void *, const void *) = NULL;
 
 static void  (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
 
@@ -548,23 +554,47 @@ static void rtAutoDrive(void *drivingCtrl, void *sd) {
 
     float kmph = *(float *)((char *)sim + kSimKmph);
 
-    if (wantDrift || (fabsf(da) > 0.36f && kmph > 70.0f)) {
-        if (!s_BotDrifting && cab) {
-            s_BotDrifting  = YES;
-            s_BotDriftDir  = (da > 0.0f) ? 2 : 1;   // phải = 2, trái = 1
-            if (NssPhyVehicleCab_BeginDrifting)
+    // Vùng vàng drift: Drift flag HOẶC DriftingPercent > 0 HOẶC góc cua lớn
+    float driftPct = *(float *)((char *)tgt + 0x60);   // TraceLinePoint.DriftingPercent
+    BOOL inDriftZone = wantDrift || (driftPct > 0.01f) ||
+                       (fabsf(da) > 0.30f && kmph > 65.0f);
+
+    if (inDriftZone) {
+        s_BotDriftExit = 0;
+        if (!s_BotDrifting) {
+            s_BotDrifting = YES;
+            s_BotDriftDir = (da > 0.0f) ? 2 : 1;   // 2 = Right, 1 = Left
+            // Push button để HUD hiển thị đúng + game ghi nhận input
+            if (cab && NssPhyVehicleCab_BeginDrifting)
                 NssPhyVehicleCab_BeginDrifting(cab, s_BotDriftDir, nullptr);
+            // ĐIỂM MẤU CHỐT: chuyển DriftStateMachine thật sự
+            if (dc && NssVehicleDriftCtrl_ToggleDrifting_)
+                NssVehicleDriftCtrl_ToggleDrifting_(dc, steer, nullptr);
         }
-    } else if (s_BotDrifting && fabsf(da) < 0.13f) {
-        if (cab && NssPhyVehicleCab_EndDrifting)
-            NssPhyVehicleCab_EndDrifting(cab, s_BotDriftDir, nullptr);
-        if (dc) {
-            if (orig_Drift_ExitCurDriftState)     orig_Drift_ExitCurDriftState(dc, nullptr);
-            if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(dc, nullptr);
+    } else {
+        if (s_BotDrifting) {
+            // Cần 3 frame liên tiếp hết vùng vàng mới nhả, tránh nhấp nháy
+            if (fabsf(da) < 0.13f && driftPct <= 0.01f && !wantDrift) {
+                if (++s_BotDriftExit >= 3) {
+                    if (cab && NssPhyVehicleCab_EndDrifting)
+                        NssPhyVehicleCab_EndDrifting(cab, s_BotDriftDir, nullptr);
+                    if (dc) {
+                        if (NssVehicleDriftCtrl_ReleaseDrifting_)
+                            NssVehicleDriftCtrl_ReleaseDrifting_(dc, nullptr);
+                        if (orig_Drift_ExitCurDriftState)
+                            orig_Drift_ExitCurDriftState(dc, nullptr);
+                        if (orig_Drift_ForceClearDriftParams)
+                            orig_Drift_ForceClearDriftParams(dc, nullptr);
+                    }
+                    s_BotDrifting  = NO;
+                    s_BotDriftExit = 0;
+                    if (ExtraVelocityFast_DoPerfectCWWBoost && veh)
+                        ExtraVelocityFast_DoPerfectCWWBoost(veh, nullptr);
+                }
+            } else {
+                s_BotDriftExit = 0;
+            }
         }
-        s_BotDrifting = NO;
-        if (ExtraVelocityFast_DoPerfectCWWBoost && veh)
-            ExtraVelocityFast_DoPerfectCWWBoost(veh, nullptr);
     }
 }
 
@@ -727,6 +757,14 @@ static void installHooks(void) {
         rtGetMethodPointer("", "NssPhyVehicleCab", "BeginDrifting", 1);
     NssPhyVehicleCab_EndDrifting = (BOOL (*)(void *, int, const void *))
         rtGetMethodPointer("", "NssPhyVehicleCab", "EndDrifting", 1);
+
+    NssVehicleDriftCtrl_ToggleDrifting_ = (void (*)(void *, float, const void *))
+        rtGetMethodPointerByRva("", "NssVehicleDriftCtrl", 0x7C6E368);   // ToggleDrifting(float)
+    NssVehicleDriftCtrl_ReleaseDrifting_ = (void (*)(void *, const void *))
+        rtGetMethodPointerByRva("", "NssVehicleDriftCtrl", 0x7C6E51C);   // ReleaseDrifting()
+
+    rtLog("il2cpp: drift toggle=%p release=%p", NssVehicleDriftCtrl_ToggleDrifting_,
+          NssVehicleDriftCtrl_ReleaseDrifting_);
 
     rtLog("il2cpp: Autopilot resolved (CWW=%p, SteerAnalog=%p, Throttle=%p, Drift=%p, TL=%p)",
           ExtraVelocityFast_DoPerfectCWWBoost, NssPhyVehicleCab_BeginSteeringAnalog,
