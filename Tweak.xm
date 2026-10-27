@@ -335,7 +335,7 @@ static void  (*NssPhyVehicleCab_BeginSteeringAnalog)(void *, float, const void *
 static BOOL  (*NssPhyVehicleCab_BeginDrifting)(void *, int, const void *) = NULL;
 static BOOL  (*NssPhyVehicleCab_EndDrifting)(void *, int, const void *) = NULL;
 
-static void  (*orig_Cab_Update)(void *, bool, float, const void *) = NULL;
+static void  (*orig_DrivingCtrl_UpdateDrivingData)(void *, void *, float, const void *) = NULL;
 
 // 1. Race Start
 static void hook_GoImpEnter(void *self, const void *method) {
@@ -343,6 +343,8 @@ static void hook_GoImpEnter(void *self, const void *method) {
     gGoTime = nowSeconds();
     gCurrentMatchTime = 0.f;
     gCanFinish = NO;
+    s_BotClosestIdx = -1;
+    s_BotDrifting = NO;
     rtLog("race started -> gGoTime=%.3f, MinMapTime=%.1fs, LapTimeLimit=%.1fs",
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
@@ -394,153 +396,192 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 }
 
 // ---------------------------------------------------------------------------
-// AUTOPILOT CORE
+// AUTOPILOT CORE — DRIVING CTRL DIRECT INJECTION
 // ---------------------------------------------------------------------------
-// Cab field map (dump.cs NssPhyVehicleCab):
-//   0x38 mIsSteerIntensityMode (bool)  0x3C mSteerIntensity (float)
-//   0x40 mEnableSteerKeys     (bool)   0x41 mThrottleUp     (bool)
-//   0x42 IsPressDrift         (bool)   0x43 isBrake
-//   0x44 mLastSteerDir        (int)    0x48 mLastDriftDir   (int)
-//   0x4C mDriftInputs         (ButtonInputData*) 0x54 mSteerInputs
-// NssPhyVehicleCab::Update reads: +56 (0x38) steerIntensityMode, +60 (0x3C)
-// steerIntensity, +64 (0x40) enableSteerKeys, then writes NssSteeringData.
-#define kCabSteerIntensityMode 0x38
-#define kCabSteerIntensity     0x3C
-#define kCabEnableSteerKeys    0x40
-#define kCabThrottleUp         0x41
-#define kCabIsPressDrift       0x42
+// NssPhyVehicleDrivingCtrl fields:
+//   0x10 mVehicle        (IDynamicVehicle)
+//   0x18 mVehiclePhyCtrl (NssPhyVehicleCtrl)
+//   0x20 mVehicleECU     (NssPhyVehicleECUBase)
+//   0x3C mThrottle       (float) -> Luôn gán 1.0f để xe luôn chạy, không đứng im
+//   0x40 mSteering       (float) -> Left = +1.0, Right = -1.0
+//
+// NssPhyVehicleCtrl + 0x28 = mSimulateOutput (NssVehicleSimOutput)
+// NssVehicleSimOutput:
+//   0x10 mKmph
+//   0x64 mChassisPosition (x=0x64, y=0x68, z=0x6C)
+//   0x70 mChassisRotation (qx=0x70, qy=0x74, qz=0x78, qw=0x7C)
 
-#define kCabToVehicle          0x10   // NssPhyVehicleCab.mVehicle (IVehicle)
-#define kVehicleToDyn          0x20   // NssVehicle.mDynamicVehicle
-#define kDynToCab              0x30   // DynamicVehicle.mCab
-#define kDynToPhyCtrl          0x40   // DynamicVehicle.mPhyVehicleCtrl
-#define kPhyCtrlToSimOutput    0x28   // NssPhyVehicleCtrl.mSimulateOutput
+#define kDriveVehicle    0x10
+#define kDrivePhyCtrl    0x18
+#define kDriveThrottle   0x3C
+#define kDriveSteering   0x40
 
-// NssVehicleSimOutput offsets
-#define kSimKmph     0x10
-#define kSimLinear   0x38
-#define kSimMoving   0x44
-#define kSimChassis  0x64
+#define kPhySimOutput    0x28
 
-// TraceLinePoint (subclass) offsets
-#define kTlpPos        0x10
-#define kTlpDriftFlag  0x37
+#define kDynCab          0x30
+#define kDynVehicle      0x10
+#define kDynMotionCtrl   0x38
+#define kMotionDriftCtrl 0x60
 
-// NssSteeringData output offsets written by Cab::Update
-#define kSteerOutThrottle 0x18
-#define kSteerOutHandBrake 0x1C
-#define kSteerOutSteer    0x28
+#define kSimPos          0x64
+#define kSimRot          0x70
+#define kSimKmph         0x10
 
-static int s_LastClosest = 0;
+#define kTlpPos          0x10
+#define kTlpDriftFlag    0x37
 
-// DynamicVehicle.mMotionCtrl (0x38) -> NssPhyVehicleMotionCtrlHelper.mDriftCtrl (0x60)
-static inline void *rtDriftCtrl(void *dyn) {
-    if (!dyn) return NULL;
-    void *motionCtrl = *(void **)((char *)dyn + 0x38);
-    if (!motionCtrl) return NULL;
-    return *(void **)((char *)motionCtrl + 0x60);
-}
+static int  s_BotClosestIdx = -1;
+static BOOL s_BotDrifting   = NO;
+static int  s_BotDriftDir   = 0;
 
-static void rtAutoDrive(void *cab) {
-    if (!cab || !TraceLineComponent_GetTraceLinePoints || !gTraceLineComp) return;
+static void rtAutoDrive(void *drivingCtrl, void *steeringData) {
+    if (!drivingCtrl) return;
 
-    // --- resolve vehicle / sim output via the correct chain ---
-    void *vehicle = *(void **)((char *)cab + kCabToVehicle);
-    if (!vehicle) return;
-    void *dyn = *(void **)((char *)vehicle + kVehicleToDyn);
-    if (!dyn) return;
-    void *phyCtrl = *(void **)((char *)dyn + kDynToPhyCtrl);
-    if (!phyCtrl) return;
-    void *sim = *(void **)((char *)phyCtrl + kPhyCtrlToSimOutput);
-    if (!sim) return;
+    // 1. LUÔN LUÔN DUY TRÌ 100% GA TIẾN (Xe luôn chạy tiến tới, không bao giờ đứng im!)
+    *(float *)((char *)drivingCtrl + kDriveThrottle) = 1.0f;
+    if (steeringData) {
+        *(float *)((char *)steeringData + 16) = 1.0f; // NssSteeringData.throttle = 1.0f
+    }
 
+    if (!gAutoRacing || !gTraceLineComp || !TraceLineComponent_GetTraceLinePoints) {
+        return;
+    }
+
+    // 2. LẤY MẢNG ĐIỂM CỦA VẠCH CHỈ DẪN (TraceLine)
     void *listView = TraceLineComponent_GetTraceLinePoints(gTraceLineComp, nullptr);
     if (!listView) return;
     void *context = *(void **)((char *)listView + 0x10);
     int size = *(int *)((char *)listView + 0x18);
-    if (!context || size < 8) return;
+    if (!context || size < 10) return;
     void **items = (void **)((char *)context + 0x20);
 
-    float px = *(float *)((char *)sim + kSimChassis);
-    float pz = *(float *)((char *)sim + kSimChassis + 8);
+    // 3. TRUY XUẤT TRẠNG THÁI VẬT LÝ XE (NssVehicleSimOutput)
+    void *phyCtrl = *(void **)((char *)drivingCtrl + kDrivePhyCtrl);
+    if (!phyCtrl) return;
+    void *sim = *(void **)((char *)phyCtrl + kPhySimOutput);
+    if (!sim) return;
 
-    float fx = *(float *)((char *)sim + kSimMoving);
-    float fz = *(float *)((char *)sim + kSimMoving + 8);
-    float flen = sqrtf(fx * fx + fz * fz);
-    if (flen < 0.001f) return;
-    fx /= flen; fz /= flen;
-    float heading = atan2f(fx, fz);
+    float px = *(float *)((char *)sim + kSimPos);
+    float pz = *(float *)((char *)sim + kSimPos + 8);
 
-    // --- nearest point (windowed search around last index) ---
-    int lo = s_LastClosest > 40 ? s_LastClosest - 40 : 0;
-    int hi = s_LastClosest + 60 < size ? s_LastClosest + 60 : size;
-    int best = s_LastClosest < size ? s_LastClosest : 0;
-    float bestD = 1e30f;
-    for (int i = lo; i < hi; i++) {
-        void *pt = items[i];
-        if (!pt) continue;
-        float dx = *(float *)((char *)pt + kTlpPos) - px;
-        float dz = *(float *)((char *)pt + kTlpPos + 8) - pz;
-        float d = dx * dx + dz * dz;
-        if (d < bestD) { bestD = d; best = i; }
+    // 4. TÍNH HEADING CHUẨN TỪ QUATERNION GÓC XOAY XE (Luôn chuẩn xác, kể cả khi xe đang đứng im 0 km/h)
+    float qx = *(float *)((char *)sim + kSimRot);
+    float qy = *(float *)((char *)sim + kSimRot + 4);
+    float qz = *(float *)((char *)sim + kSimRot + 8);
+    float qw = *(float *)((char *)sim + kSimRot + 12);
+
+    float fwdX = 2.0f * (qx * qz + qw * qy);
+    float fwdZ = 1.0f - 2.0f * (qx * qx + qy * qy);
+    float fwdLen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
+    if (fwdLen > 0.0001f) { fwdX /= fwdLen; fwdZ /= fwdLen; }
+    float heading = atan2f(fwdX, fwdZ);
+
+    // 5. TÌM ĐIỂM GẦN XE NHẤT TRÊN VẠCH CHỈ DẪN (Chống quay đầu 180 độ)
+    if (s_BotClosestIdx < 0 || s_BotClosestIdx >= size) {
+        // Quét toàn bộ map ở frame đầu để khóa chuẩn vị trí xuất phát của xe
+        float minD = 1e30f;
+        int best = 0;
+        for (int i = 0; i < size; i++) {
+            void *pt = items[i];
+            if (!pt) continue;
+            float dx = *(float *)((char *)pt + kTlpPos) - px;
+            float dz = *(float *)((char *)pt + kTlpPos + 8) - pz;
+            float d = dx * dx + dz * dz;
+            if (d < minD) { minD = d; best = i; }
+        }
+        s_BotClosestIdx = best;
+    } else {
+        // Trong trận: CHỈ tìm về phía trước (-3 đến +20 điểm), tuyệt đối không dò ngược chiều!
+        float minD = 1e30f;
+        int best = s_BotClosestIdx;
+        for (int step = -3; step <= 20; step++) {
+            int idx = (s_BotClosestIdx + step + size) % size;
+            void *pt = items[idx];
+            if (!pt) continue;
+            float dx = *(float *)((char *)pt + kTlpPos) - px;
+            float dz = *(float *)((char *)pt + kTlpPos + 8) - pz;
+            float d = dx * dx + dz * dz;
+            if (d < minD) { minD = d; best = idx; }
+        }
+        s_BotClosestIdx = best;
     }
-    s_LastClosest = best;
 
-    float kmph = *(float *)((char *)sim + kSimKmph);
-    int look = kmph > 200.f ? 18 : (kmph > 130.f ? 13 : 9);
-    void *tgt = items[(best + look) % size];
-    if (!tgt) return;
+    // 6. CHỌN ĐIỂM BÁM ĐƯỜNG PHÍA TRƯỚC (Bám sát từng mét của vạch chỉ dẫn)
+    // Nhìn trước 4 điểm (~5-7m) giúp xe ôm trọn vạch chỉ dẫn, vạch lượn đâu xe lượn theo đó
+    int targetIdx = (s_BotClosestIdx + 4) % size;
+    void *targetPt = items[targetIdx];
+    if (!targetPt) return;
 
-    float tx = *(float *)((char *)tgt + kTlpPos);
-    float tz = *(float *)((char *)tgt + kTlpPos + 8);
-    uint8_t wantDrift = *(uint8_t *)((char *)tgt + kTlpDriftFlag);
+    float tx = *(float *)((char *)targetPt + kTlpPos);
+    float tz = *(float *)((char *)targetPt + kTlpPos + 8);
+    uint8_t wantDrift = *(uint8_t *)((char *)targetPt + kTlpDriftFlag);
 
-    float ang = atan2f(tx - px, tz - pz) - heading;
-    while (ang > (float)M_PI)  ang -= 2.0f * (float)M_PI;
-    while (ang < -(float)M_PI) ang += 2.0f * (float)M_PI;
+    float toTargetX = tx - px;
+    float toTargetZ = tz - pz;
+    float targetAngle = atan2f(toTargetX, toTargetZ);
 
-    float steer = ang * 1.9f;
-    if (steer > 1.0f) steer = 1.0f;
+    float deltaAngle = targetAngle - heading;
+    while (deltaAngle > (float)M_PI)  deltaAngle -= 2.0f * (float)M_PI;
+    while (deltaAngle < -(float)M_PI) deltaAngle += 2.0f * (float)M_PI;
+
+    // 7. BẺ LÁI THEO HƯỚNG VẠCH (Trong game: Left = +1.0f, Right = -1.0f)
+    // Khi vạch ở bên phải -> deltaAngle > 0 -> steer âm (-). Xe rẽ phải theo vạch.
+    // Khi vạch ở bên trái -> deltaAngle < 0 -> steer dương (+). Xe rẽ trái theo vạch.
+    float steer = -deltaAngle * 2.2f;
+    if (steer > 1.0f)  steer = 1.0f;
     if (steer < -1.0f) steer = -1.0f;
 
-    // --- throttle: always on, via physics-facing field ---
-    *(uint8_t *)((char *)cab + kCabThrottleUp) = 1;
-    if (NssPhyVehicleCab_ThrottleDown) NssPhyVehicleCab_ThrottleDown(cab, 1.0f, nullptr);
-
-    // --- analog steering: BeginSteering(float) sets mode+intensity ---
-    if (NssPhyVehicleCab_BeginSteeringAnalog) {
-        NssPhyVehicleCab_BeginSteeringAnalog(cab, steer, nullptr);
+    *(float *)((char *)drivingCtrl + kDriveSteering) = steer;
+    if (steeringData) {
+        *(float *)((char *)steeringData + 28) = steer; // NssSteeringData.steering = steer
     }
-    *(uint8_t *)((char *)cab + kCabEnableSteerKeys) = 1;
 
-    // --- drift state machine ---
-    static BOOL drifting = NO;
-    static int driftDir = 0;
+    // 8. TỰ ĐỘNG ÔM CUA DRIFT & KÍCH HOẠT CWW BOOST KHI RA KHỎI CUA
+    void *dynVhc = *(void **)((char *)drivingCtrl + kDriveVehicle);
+    if (!dynVhc) return;
+    void *cab = *(void **)((char *)dynVhc + kDynCab);
+    void *vehicle = *(void **)((char *)dynVhc + kDynVehicle);
+    void *motionCtrl = *(void **)((char *)dynVhc + kDynMotionCtrl);
+    void *driftCtrl = motionCtrl ? *(void **)((char *)motionCtrl + kMotionDriftCtrl) : NULL;
 
-    if (wantDrift || (fabsf(ang) > 0.40f && kmph > 85.f)) {
-        if (!drifting) {
-            driftDir = (ang < 0.f) ? 1 : 2; // 1 = Left, 2 = Right
-            if (NssPhyVehicleCab_BeginDrifting) NssPhyVehicleCab_BeginDrifting(cab, driftDir, nullptr);
-            drifting = YES;
+    float kmph = *(float *)((char *)sim + kSimKmph);
+
+    if (wantDrift || (fabsf(deltaAngle) > 0.38f && kmph > 80.0f)) {
+        if (!s_BotDrifting && cab) {
+            s_BotDrifting = YES;
+            s_BotDriftDir = (deltaAngle > 0.0f) ? 2 : 1; // deltaAngle > 0 là cua Phải (2), < 0 là cua Trái (1)
+            if (NssPhyVehicleCab_BeginDrifting) {
+                NssPhyVehicleCab_BeginDrifting(cab, s_BotDriftDir, nullptr);
+            }
         }
-    } else if (drifting && fabsf(ang) < 0.16f) {
-        if (NssPhyVehicleCab_EndDrifting) NssPhyVehicleCab_EndDrifting(cab, driftDir, nullptr);
-        void *dc = rtDriftCtrl(dyn);
-        if (dc) {
-            if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(dc, nullptr);
-            if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(dc, nullptr);
+    } else {
+        if (s_BotDrifting && fabsf(deltaAngle) < 0.14f) {
+            // Đã qua khỏi góc cua -> Nhả drift dứt khoát
+            if (cab && NssPhyVehicleCab_EndDrifting) {
+                NssPhyVehicleCab_EndDrifting(cab, s_BotDriftDir, nullptr);
+            }
+            if (driftCtrl) {
+                if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(driftCtrl, nullptr);
+                if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(driftCtrl, nullptr);
+            }
+            s_BotDrifting = NO;
+
+            // KÍCH HOẠT CWW BOOST HOÀN HẢO NGAY KHI VẠCH DUỖI THẲNG!
+            if (ExtraVelocityFast_DoPerfectCWWBoost && vehicle) {
+                ExtraVelocityFast_DoPerfectCWWBoost(vehicle, nullptr);
+            }
         }
-        drifting = NO;
-        if (ExtraVelocityFast_DoPerfectCWWBoost) ExtraVelocityFast_DoPerfectCWWBoost(vehicle, nullptr);
     }
 }
 
-// 5. AUTOPILOT — chèn input TRƯỚC khi cab lấy mẫu, dùng đúng API vật lý
-static void hook_CabUpdate(void *self, bool engineStart, float dt, const void *method) {
-    if (gAutoRacing && self && engineStart) {
-        rtAutoDrive(self);
+// Hook UpdateDrivingData trên NssPhyVehicleDrivingCtrl
+static void hook_DrivingCtrlUpdate(void *self, void *steeringData, float dt, const void *method) {
+    if (orig_DrivingCtrl_UpdateDrivingData) {
+        orig_DrivingCtrl_UpdateDrivingData(self, steeringData, dt, method);
     }
-    if (orig_Cab_Update) orig_Cab_Update(self, engineStart, dt, method);
+    if (gAutoRacing && self) {
+        rtAutoDrive(self, steeringData);
+    }
 }
 
 // 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
@@ -701,9 +742,9 @@ static void installHooks(void) {
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    // 4b. Autopilot: chèn input trước khi cab lấy mẫu
-    orig_Cab_Update = (void (*)(void *, bool, float, const void *))
-        rtHookMethod("", "NssPhyVehicleCab", "Update", 2, (void *)hook_CabUpdate);
+    // 4b. Autopilot: Trực tiếp điều khiển DrivingCtrl (Throttle + Steering)
+    orig_DrivingCtrl_UpdateDrivingData = (void (*)(void *, void *, float, const void *))
+        rtHookMethod("", "NssPhyVehicleDrivingCtrl", "UpdateDrivingData", 2, (void *)hook_DrivingCtrlUpdate);
 
     // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
