@@ -144,8 +144,6 @@ static void  *gTraceLineComp     = NULL;
 
 // Autopilot state variables (declared early for hook_GoImpEnter)
 static int   s_BotClosestIdx     = -1;
-static BOOL  s_BotDrifting       = NO;
-static int   s_BotDriftDir       = 0;
 
 enum {
     // ExtraVelocityTriggerMgr
@@ -371,7 +369,13 @@ static void hook_GoImpEnter(void *self, const void *method) {
     gCurrentMatchTime = 0.f;
     gCanFinish = NO;
     s_BotClosestIdx = -1;
-    s_BotDrifting = NO;
+    s_BotState = ST_GREEN;
+    s_BotYellowEndIdx = -1;
+    s_BotYellowTurnDir = 0;
+    s_BotBoostTicks = 0;
+    s_BotDriftExitCount = 0;
+    s_BotKeyFlags = 0;
+    s_BotDesiredSteer = 0.f;
     rtLog("race started -> gGoTime=%.3f, MinMapTime=%.1fs, LapTimeLimit=%.1fs",
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
@@ -423,24 +427,38 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 }
 
 // ---------------------------------------------------------------------------
-// AUTOPILOT — GEOMETRIC CURVATURE DRIFT CONTROLLER (không phụ thuộc preset)
+// AUTOPILOT — LINE-LOCKED DRIFT CONTROLLER
 // ---------------------------------------------------------------------------
-// Game dùng cờ Drift gán tay + ramp DriftingPercent (xem RefreshDriftingPercent).
-// Bot ở đây TỰ TÍNH curvature từ hình học 3 điểm, không cần cờ preset.
+// Gọi method theo VTABLE SLOT để tránh nhập nhằng overload.
+//   IVehicleMotionCtrl: 17=MoveTo(pos,rot,dt,flag)  18=SetRotation(q)  19=SetPosition(p)
+//   IPhyEngine:          9=RayCast(from,to,layer) -> NssRayCastResult
+//   PhyEntityLayer:      9=RaycastWall   11=RoadOnly
+// NssRayCastResult: 0x10 EntityID, 0x14 HitPosition(Vector3), 0x2C HitDistance
 //
-// Công thức curvature qua 3 điểm (bán kính đường tròn ngoại tiếp):
-//     a = |P1-P0|, b = |P2-P1|, c = |P2-P0|
-//     area2 = |cross(P1-P0, P2-P0)|            (2 * diện tích tam giác)
-//     R = (a*b*c) / (2*area2)
-//     kappa = 1/R = 2*area2 / (a*b*c)
-// kappa càng lớn -> cua càng gắt.
-//
-// Hướng cua từ dấu cross product (hệ Unity: X phải, Z tới, Y lên):
-//     crossY = (P1-P0).x * (P2-P0).z - (P1-P0).z * (P2-P0).x
-//     crossY > 0 -> cua TRÁI  (NssDriftDir.Left  = 1, steer +1.0)
-//     crossY < 0 -> cua PHẢI  (NssDriftDir.Right = 2, steer -1.0)
-//
-// Drift duration tự nhiên = độ dài cung / vận tốc, không cần hằng số.
+// State machine:
+//   GREEN  : bám vạch xanh liên tục (ga + lái + snap nếu lệch)
+//   YELLOW : khoá heading về CUỐI vạch vàng, ép trái/phải + Drift, snap về vạch
+//   BOOST  : nhả drift, bắn CWW, phóng thẳng tới điểm cuối đã khoá
+//   Reached: tắt khoá, quay lại GREEN
+
+typedef struct { float x, y, z; } rtV3;
+typedef struct { float x, y, z, w; } rtQ;
+
+// Gọi hàm theo slot vtable của Il2CppClass
+static inline void *rtVSlot(void *obj, int slot) {
+    if (!obj) return NULL;
+    void *klass = *(void **)obj;
+    if (!klass) return NULL;
+    return *(void **)((char *)klass + 336 + slot * 16);
+}
+
+#define kSlotMoveTo      17
+#define kSlotSetRotation 18
+#define kSlotSetPosition 19
+#define kSlotRayCast      9
+
+#define kPhyLayerWall    9    // PhyEntityLayer.RaycastWall
+#define kPhyLayerRoad   11    // PhyEntityLayer.RoadOnly
 
 #define kSdForward      0x10
 #define kSdBrakingState 0x14
@@ -449,7 +467,6 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 
 #define kInpCtrlVehicle 0x58
 #define kInpCtrlHelper  0x60
-
 #define kInpFlagsInvoke 0xD8
 #define kInpFlagsDown   0xDC
 #define kInpFlagsKeys   0xE0
@@ -460,28 +477,35 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 #define kMotionDriftCtrl 0x60
 
 #define kPhySimOutput    0x28
+#define kPhyEngine       0xF8
 #define kSimPos          0x64
 #define kSimRot          0x70
 #define kSimKmph         0x10
 
 #define kTlpPos          0x10
 #define kTlpDriftFlag    0x37
-#define kTlpDistance     0x5C
 #define kTlpDriftPct     0x60
 
-// Ngưỡng curvature (1/mét). R = 1/kappa.
-// kappa 0.020 -> R = 50m  : cua rất gắt (drift)
-// kappa 0.008 -> R = 125m : cua vừa
-// kappa 0.003 -> R = 333m : gần như thẳng
 #define kCurvDriftEnter  0.017f
 #define kCurvDriftExit   0.008f
 
-static int      s_BotDriftExitCount  = 0;
-static float    s_BotDesiredSteer    = 0.f;
-static uint32_t s_BotKeyFlags        = 0;
-static float    s_BotLastKappa       = 0.f;
+// Ngưỡng snap: lệch > 2.5m thì kéo xe về vạch
+#define kSnapDist        2.5f
+#define kSnapDistMax     6.0f
 
-// Lấy toạ độ XZ của point thứ (base + offset) trên trace line.
+typedef enum { ST_GREEN = 0, ST_YELLOW, ST_BOOST } rtBotState;
+
+static int      s_BotDriftExitCount = 0;
+static float    s_BotDesiredSteer   = 0.f;
+static uint32_t s_BotKeyFlags       = 0;
+static float    s_BotLastKappa      = 0.f;
+static rtBotState s_BotState        = ST_GREEN;
+static int      s_BotYellowEndIdx   = -1;   // index cuối đoạn vàng đang khoá
+static rtV3     s_BotYellowEndPos;          // vị trí cuối đoạn vàng
+static rtV3     s_BotYellowEntryDir;        // hướng nhìn lúc bắt đầu khoá
+static int      s_BotYellowTurnDir  = 0;    // 1=Left, 2=Right
+static int      s_BotBoostTicks     = 0;
+
 static inline BOOL rtPointXZ(void **items, int size, int idx, float *ox, float *oz) {
     if (!items || size <= 0) return NO;
     int i = ((idx % size) + size) % size;
@@ -492,29 +516,81 @@ static inline BOOL rtPointXZ(void **items, int size, int idx, float *ox, float *
     return YES;
 }
 
-// Curvature + hướng cua từ 3 điểm liên tiếp trên đường đua.
+static inline BOOL rtPointIsYellow(void *p) {
+    if (!p) return NO;
+    uint8_t df = *(uint8_t *)((char *)p + kTlpDriftFlag);
+    float dp   = *(float *)((char *)p + kTlpDriftPct);
+    return (df || dp > 0.01f) ? YES : NO;
+}
+
 static float rtCurvatureAt(void **items, int size, int idx, float *outCrossY) {
     float x0, z0, x1, z1, x2, z2;
     if (!rtPointXZ(items, size, idx,     &x0, &z0)) return 0.f;
     if (!rtPointXZ(items, size, idx + 3, &x1, &z1)) return 0.f;
     if (!rtPointXZ(items, size, idx + 6, &x2, &z2)) return 0.f;
-
     float ax = x1 - x0, az = z1 - z0;
     float bx = x2 - x1, bz = z2 - z1;
     float cx = x2 - x0, cz = z2 - z0;
-
-    float la = sqrtf(ax * ax + az * az);
-    float lb = sqrtf(bx * bx + bz * bz);
-    float lc = sqrtf(cx * cx + cz * cz);
+    float la = sqrtf(ax*ax + az*az), lb = sqrtf(bx*bx + bz*bz), lc = sqrtf(cx*cx + cz*cz);
     if (la < 1e-3f || lb < 1e-3f || lc < 1e-3f) return 0.f;
-
-    // 2 * diện tích tam giác = |cross| trong mặt phẳng XZ
-    float crossY = ax * cz - az * cx;
+    float crossY = ax*cz - az*cx;
     if (outCrossY) *outCrossY = crossY;
-
     float area2 = fabsf(crossY);
     if (area2 < 1e-6f) return 0.f;
     return (2.0f * area2) / (la * lb * lc);
+}
+
+// Raycast chắn đường: TRUE nếu bị chặn (tường/vật cản) trong khoảng dist
+static BOOL rtPathBlocked(void *phyCtrl, rtV3 from, rtV3 to) {
+    if (!phyCtrl) return NO;
+    void *eng = *(void **)((char *)phyCtrl + kPhyEngine);
+    if (!eng) return NO;
+    void *fn = rtVSlot(eng, kSlotRayCast);
+    if (!fn) return NO;
+    typedef void *(*RayCastFn)(void *, rtV3, rtV3, int, const void *);
+    void *res = ((RayCastFn)fn)(eng, from, to, kPhyLayerWall, NULL);
+    if (!res) return NO;
+    // NssRayCastResult: EntityID @0x10, HitDistance @0x2C
+    int eid = *(int *)((char *)res + 0x10);
+    float dist = *(float *)((char *)res + 0x2C);
+    if (eid == 0) return NO;
+    float dx = to.x - from.x, dz = to.z - from.z;
+    float seg = sqrtf(dx*dx + dz*dz);
+    return (dist > 0.1f && dist < seg - 0.5f) ? YES : NO;
+}
+
+// Có vực/không có đường phía trước?
+static BOOL rtGroundMissing(void *phyCtrl, rtV3 from) {
+    if (!phyCtrl) return NO;
+    void *eng = *(void **)((char *)phyCtrl + kPhyEngine);
+    if (!eng) return NO;
+    void *fn = rtVSlot(eng, kSlotRayCast);
+    if (!fn) return NO;
+    rtV3 to = from; to.y -= 60.0f;
+    typedef void *(*RayCastFn)(void *, rtV3, rtV3, int, const void *);
+    void *res = ((RayCastFn)fn)(eng, from, to, kPhyLayerRoad, NULL);
+    if (!res) return YES;
+    int eid = *(int *)((char *)res + 0x10);
+    return (eid == 0) ? YES : NO;
+}
+
+static void rtSnapToLine(void *motionCtrl, float tx, float tz, float dirX, float dirZ) {
+    if (!motionCtrl) return;
+    void *setRot = rtVSlot(motionCtrl, kSlotSetRotation);
+    void *setPos = rtVSlot(motionCtrl, kSlotSetPosition);
+    if (setRot && (fabsf(dirX) > 1e-4f || fabsf(dirZ) > 1e-4f)) {
+        // Yaw quay mặt theo hướng vạch (Unity: +Z forward)
+        float yaw = atan2f(dirX, dirZ);
+        rtQ q;
+        q.x = 0.f; q.y = sinf(yaw * 0.5f); q.z = 0.f; q.w = cosf(yaw * 0.5f);
+        ((void (*)(void *, rtQ, const void *))setRot)(motionCtrl, q, NULL);
+    }
+    if (setPos) {
+        rtV3 p; p.x = tx; p.y = 0.f; p.z = tz;
+        // Giữ nguyên Y hiện tại bằng cách đọc lại sau SetRotation không khả thi;
+        // dùng SetPosition(p, false) — game tự bám đường (road phy).
+        ((void (*)(void *, rtV3, uint8_t, const void *))setPos)(motionCtrl, p, 0, NULL);
+    }
 }
 
 static void rtComputeAutoDrive(void *vehicle) {
@@ -523,9 +599,11 @@ static void rtComputeAutoDrive(void *vehicle) {
     void *dyn = *(void **)((char *)vehicle + kVehicleToDyn);
     if (!dyn) return;
     void *phyCtrl = *(void **)((char *)dyn + kDynPhyCtrl);
-    if (!phyCtrl) return;
+    void *motionCtrl = *(void **)((char *)dyn + kDynMotionCtrl);
+    if (!phyCtrl || !motionCtrl) return;
     void *sim = *(void **)((char *)phyCtrl + kPhySimOutput);
     if (!sim) return;
+    void *driftCtrl = *(void **)((char *)motionCtrl + kMotionDriftCtrl);
 
     void *lv = TraceLineComponent_GetTraceLinePoints(gTraceLineComp, nullptr);
     if (!lv) return;
@@ -535,28 +613,28 @@ static void rtComputeAutoDrive(void *vehicle) {
     void **items = (void **)((char *)ctx + 0x20);
 
     float px = *(float *)((char *)sim + kSimPos);
+    float py = *(float *)((char *)sim + kSimPos + 4);
     float pz = *(float *)((char *)sim + kSimPos + 8);
 
     float qx = *(float *)((char *)sim + kSimRot);
     float qy = *(float *)((char *)sim + kSimRot + 4);
     float qz = *(float *)((char *)sim + kSimRot + 8);
     float qw = *(float *)((char *)sim + kSimRot + 12);
-
-    float fwdX = 2.0f * (qx * qz + qw * qy);
-    float fwdZ = 1.0f - 2.0f * (qx * qx + qy * qy);
-    float fl = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
+    float fwdX = 2.0f * (qx*qz + qw*qy);
+    float fwdZ = 1.0f - 2.0f * (qx*qx + qy*qy);
+    float fl = sqrtf(fwdX*fwdX + fwdZ*fwdZ);
     if (fl < 1e-4f) return;
     fwdX /= fl; fwdZ /= fl;
     float heading = atan2f(fwdX, fwdZ);
 
-    // --- 1. Điểm gần nhất (chống quay đầu) ---
+    // --- 1. Điểm gần nhất ---
     if (s_BotClosestIdx < 0 || s_BotClosestIdx >= size) {
         float best = 1e30f; int bi = 0;
         for (int i = 0; i < size; i++) {
             float ox, oz;
             if (!rtPointXZ(items, size, i, &ox, &oz)) continue;
             float dx = ox - px, dz = oz - pz;
-            float d = dx * dx + dz * dz;
+            float d = dx*dx + dz*dz;
             if (d < best) { best = d; bi = i; }
         }
         s_BotClosestIdx = bi;
@@ -566,16 +644,16 @@ static void rtComputeAutoDrive(void *vehicle) {
             float ox, oz;
             if (!rtPointXZ(items, size, s_BotClosestIdx + step, &ox, &oz)) continue;
             float dx = ox - px, dz = oz - pz;
-            float d = dx * dx + dz * dz;
+            float d = dx*dx + dz*dz;
             if (d < best) { best = d; bi = ((s_BotClosestIdx + step) % size + size) % size; }
         }
-        if (best > 900.0f) {   // lệch >30m -> re-acquire toàn map
+        if (best > 900.0f) {
             best = 1e30f;
             for (int i = 0; i < size; i++) {
                 float ox, oz;
                 if (!rtPointXZ(items, size, i, &ox, &oz)) continue;
                 float dx = ox - px, dz = oz - pz;
-                float d = dx * dx + dz * dz;
+                float d = dx*dx + dz*dz;
                 if (d < best) { best = d; bi = i; }
             }
         }
@@ -583,112 +661,162 @@ static void rtComputeAutoDrive(void *vehicle) {
     }
     int i0 = s_BotClosestIdx;
 
-    // --- 2. CURVATURE: lấy max trong cửa sổ 12 điểm để bắt cua sớm ---
-    float kappaMax = 0.f;
-    float crossAtMax = 0.f;
+    // --- 2. Curvature ---
+    float kappaMax = 0.f, crossAtMax = 0.f;
     for (int k = 0; k <= 12; k += 2) {
         float cy = 0.f;
         float kp = rtCurvatureAt(items, size, i0 + k, &cy);
         if (kp > kappaMax) { kappaMax = kp; crossAtMax = cy; }
     }
     s_BotLastKappa = kappaMax;
-
     float kmph = *(float *)((char *)sim + kSimKmph);
 
-    // --- 3. Drift duration: dùng DriftingPercent THẬT của game nếu có,
-    //        fallback sang curvature khi map không bake cờ ---
-    BOOL presetDrift = NO;
-    float presetPctMax = 0.f;
-    for (int k = 1; k <= 10; k++) {
+    // --- 3. Phát hiện đoạn VÀNG liên tục phía trước ---
+    int yStart = -1, yEnd = -1;
+    for (int k = 0; k <= 30; k++) {
         int idx = ((i0 + k) % size + size) % size;
-        void *p = items[idx];
-        if (!p) continue;
-        uint8_t df = *(uint8_t *)((char *)p + kTlpDriftFlag);
-        float dp = *(float *)((char *)p + kTlpDriftPct);
-        if (df || dp > 0.01f) presetDrift = YES;
-        if (dp > presetPctMax) presetPctMax = dp;
+        if (rtPointIsYellow(items[idx])) {
+            if (yStart < 0) yStart = idx;
+            yEnd = idx;
+        } else if (yStart >= 0) {
+            break;   // hết đoạn vàng
+        }
     }
 
-    BOOL driftByCurv = (kappaMax > kCurvDriftEnter && kmph > 55.0f);
-    BOOL shouldDrift = presetDrift || driftByCurv;
-
-    void *motionCtrl = *(void **)((char *)dyn + kDynMotionCtrl);
-    void *driftCtrl  = motionCtrl ? *(void **)((char *)motionCtrl + kMotionDriftCtrl) : NULL;
-
-    // --- 4. State machine vào/ra với hysteresis ---
-    if (shouldDrift) {
-        s_BotDriftExitCount = 0;
-        if (!s_BotDrifting) {
-            s_BotDrifting = YES;
-            // Hướng: ưu tiên dấu cross product hình học
-            s_BotDriftDir = (crossAtMax > 0.f) ? 1 : 2;   // 1 = Left, 2 = Right
+    // --- 4. STATE MACHINE ---
+    if (s_BotState == ST_GREEN && yStart >= 0) {
+        // BẮT ĐẦU KHOÁ VÀNG
+        s_BotState = ST_YELLOW;
+        s_BotYellowEndIdx = yEnd;
+        float ex, ez;
+        if (rtPointXZ(items, size, yEnd, &ex, &ez)) {
+            s_BotYellowEndPos.x = ex; s_BotYellowEndPos.z = ez; s_BotYellowEndPos.y = py;
         }
-    } else if (s_BotDrifting) {
-        // Chỉ ra khi đường thật sự thẳng (hysteresis: exit < enter)
-        if (kappaMax < kCurvDriftExit || !presetDrift) {
-            if (++s_BotDriftExitCount >= 3) {
-                s_BotDrifting = NO;
-                s_BotDriftExitCount = 0;
-                if (driftCtrl) {
-                    if (orig_Drift_ExitCurDriftState)     orig_Drift_ExitCurDriftState(driftCtrl, nullptr);
-                    if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(driftCtrl, nullptr);
-                }
-                if (ExtraVelocityFast_DoPerfectCWWBoost)
-                    ExtraVelocityFast_DoPerfectCWWBoost(vehicle, nullptr);
+        s_BotYellowEntryDir.x = fwdX;
+        s_BotYellowEntryDir.z = fwdZ;
+
+        // Xác định hướng cua: góc từ entry heading tới hướng điểm cuối
+        float daEnd = atan2f(s_BotYellowEndPos.x - px, s_BotYellowEndPos.z - pz) - heading;
+        while (daEnd >  (float)M_PI) daEnd -= 2.0f * (float)M_PI;
+        while (daEnd < -(float)M_PI) daEnd += 2.0f * (float)M_PI;
+        // Left = +1.0, Right = -1.0 (theo _UpdateCabSteering)
+        s_BotYellowTurnDir = (daEnd < 0.f) ? 1 : 2;   // da<0 => cua trai
+
+        // Ép Drift ngay
+        if (driftCtrl) {
+            if (NssVehicleDriftCtrl_ToggleDrifting_)
+                NssVehicleDriftCtrl_ToggleDrifting_(driftCtrl,
+                    (s_BotYellowTurnDir == 1) ? 1.0f : -1.0f, nullptr);
+        }
+        rtLog("BOT -> YELLOW start=%d end=%d turn=%d", yStart, yEnd, s_BotYellowTurnDir);
+    }
+
+    if (s_BotState == ST_YELLOW) {
+        // Kiểm tra trước mặt có tường/vực không
+        rtV3 from; from.x = px; from.y = py + 1.0f; from.z = pz;
+        rtV3 to;   to.x = s_BotYellowEndPos.x; to.y = s_BotYellowEndPos.y + 1.0f; to.z = s_BotYellowEndPos.z;
+
+        BOOL blocked = rtPathBlocked(phyCtrl, from, to);
+        BOOL gap     = rtGroundMissing(phyCtrl, from);
+        BOOL clear   = (!blocked && !gap);
+
+        BOOL stillYellow = (yStart >= 0);
+
+        if (clear && !stillYellow) {
+            // ĐƯỜNG THOÁNG -> nhả drift, bắn CWW, chuyển BOOST
+            s_BotState = ST_BOOST;
+            s_BotBoostTicks = 0;
+            if (driftCtrl) {
+                if (orig_Drift_ExitCurDriftState)     orig_Drift_ExitCurDriftState(driftCtrl, nullptr);
+                if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(driftCtrl, nullptr);
             }
+            if (ExtraVelocityFast_DoPerfectCWWBoost)
+                ExtraVelocityFast_DoPerfectCWWBoost(vehicle, nullptr);
+            rtLog("BOT -> BOOST (clear path, drift ended)");
         } else {
-            s_BotDriftExitCount = 0;
+            // TIẾP TỤC DRIFT: khoá heading về cuối vạch vàng
+            float dxe = s_BotYellowEndPos.x - px;
+            float dze = s_BotYellowEndPos.z - pz;
+            float len = sqrtf(dxe*dxe + dze*dze);
+            if (len > 0.5f) {
+                float nl = 1.0f / len;
+                // Khoá đầu xe nhìn về điểm cuối vạch vàng
+                rtSnapToLine(motionCtrl, px, pz, dxe * nl, dze * nl);
+            }
+            // Giữ phím Left/Right + Drift
+            s_BotKeyFlags = ((s_BotYellowTurnDir == 1) ? (1u << 1) : (1u << 2)) | (1u << 8);
         }
     }
 
-    // --- 5. Lookahead scale theo vận tốc & trạng thái drift ---
+    if (s_BotState == ST_BOOST) {
+        float dxe = s_BotYellowEndPos.x - px;
+        float dze = s_BotYellowEndPos.z - pz;
+        float len = sqrtf(dxe*dxe + dze*dze);
+        s_BotBoostTicks++;
+
+        if (len < 8.0f || s_BotBoostTicks > 240) {
+            // ĐÃ TỚI cuối vạch vàng -> tắt khoá
+            s_BotState = ST_GREEN;
+            s_BotYellowEndIdx = -1;
+            s_BotBoostTicks = 0;
+            rtLog("BOT -> GREEN (reached yellow end)");
+        } else {
+            float nl = 1.0f / len;
+            // Ga thẳng tới điểm cuối + khoá hướng
+            rtSnapToLine(motionCtrl, px, pz, dxe * nl, dze * nl);
+            s_BotKeyFlags = (1u << 5);   // chỉ SmallBoost, không drift
+        }
+    }
+
+    // --- 5. GREEN: bám vạch xanh, snap nếu lệch ---
     int look;
-    if (s_BotDrifting)          look = 3;
-    else if (kmph > 200.f)      look = 9;
-    else if (kmph > 130.f)      look = 6;
-    else                        look = 4;
+    if (s_BotState != ST_GREEN)      look = 3;
+    else if (kmph > 200.f)           look = 9;
+    else if (kmph > 130.f)           look = 6;
+    else                             look = 4;
 
     float tx, tz;
     if (!rtPointXZ(items, size, i0 + look, &tx, &tz)) return;
 
-    float da = atan2f(tx - px, tz - pz) - heading;
+    float tdx = tx - px, tdz = tz - pz;
+    float tlen = sqrtf(tdx*tdx + tdz*tdz);
+
+    // SNAP: giữ xe trên vạch (chống bị tông/hất văng)
+    if (tlen > 0.5f) {
+        float nl = 1.0f / tlen;
+        BOOL offLine = (tlen > kSnapDist);
+        if (offLine || s_BotState == ST_YELLOW || s_BotState == ST_BOOST) {
+            rtSnapToLine(motionCtrl, px, pz, tdx * nl, tdz * nl);
+        }
+    }
+
+    float da = atan2f(tdx, tdz) - heading;
     while (da >  (float)M_PI) da -= 2.0f * (float)M_PI;
     while (da < -(float)M_PI) da += 2.0f * (float)M_PI;
 
-    // Left = +1.0, Right = -1.0  (khớp _UpdateCabSteering)
     float steer = -da * 2.4f;
     if (steer >  1.0f) steer =  1.0f;
     if (steer < -1.0f) steer = -1.0f;
     s_BotDesiredSteer = steer;
 
-    // --- 6. Native key flags ---
-    uint32_t flags = 0;
-    if (s_BotDrifting) {
-        flags |= (s_BotDriftDir == 1) ? (1u << 1) : (1u << 2);  // Left / Right
-        flags |= (1u << 8);                                      // Drift
-    } else {
-        if      (da < -0.05f) flags |= (1u << 1);   // Left
-        else if (da >  0.05f) flags |= (1u << 2);   // Right
-        flags |= (1u << 5);                          // SmallBoost
+    if (s_BotState == ST_GREEN) {
+        uint32_t flags = 0;
+        if      (da < -0.05f) flags |= (1u << 1);
+        else if (da >  0.05f) flags |= (1u << 2);
+        flags |= (1u << 5);
+        s_BotKeyFlags = flags;
     }
-    s_BotKeyFlags = flags;
 
-    // Chẩn đoán: 1 dòng mỗi ~1 giây để xác nhận bot đang chạy đúng
+    // Chẩn đoán
     static int s_DbgTick = 0;
     if ((++s_DbgTick % 60) == 0) {
-        rtLog("BOT idx=%d/%d kappa=%.4f(R=%.0fm) kmph=%.0f drift=%d dir=%d flags=0x%x steer=%.2f",
-              i0, size, kappaMax,
+        rtLog("BOT st=%d idx=%d/%d k=%.4f(R=%.0f) kmph=%.0f yEnd=%d flags=0x%x steer=%.2f",
+              (int)s_BotState, i0, size, kappaMax,
               kappaMax > 1e-5f ? (1.0f / kappaMax) : 99999.0f,
-              kmph, s_BotDrifting ? 1 : 0, s_BotDriftDir, flags, steer);
+              kmph, s_BotYellowEndIdx, s_BotKeyFlags, steer);
     }
 }
 
-// Hook VehicleInputCtrl::Update — bơm phím native
-//
-// THỨ TỰ QUAN TRỌNG: VehicleInputCtrl::Update gọi helper->Update() TRƯỚC (việc này
-// refresh mKeyFlags từ touch input thật của người chơi), rồi mới gọi ProcessDrift/
-// ProcessLeftDrift/ProcessRightDrift. Nếu ta ghi cờ TRƯỚC orig thì bị ghi đè.
-// => Gọi orig() trước, sau đó ghi cờ của bot và tự gọi native drift processor.
 static void hook_VehicleInputCtrlUpdate(void *self, float dt, const void *method) {
     if (orig_VehicleInputCtrl_Update) orig_VehicleInputCtrl_Update(self, dt, method);
     if (!gAutoRacing || !self) return;
@@ -699,22 +827,16 @@ static void hook_VehicleInputCtrlUpdate(void *self, float dt, const void *method
 
     rtComputeAutoDrive(vehicle);
 
-    // Ghi đè cờ input bằng quyết định của bot
     *(uint32_t *)((char *)inputHelper + kInpFlagsInvoke) = s_BotKeyFlags;
     *(uint32_t *)((char *)inputHelper + kInpFlagsDown)   = s_BotKeyFlags;
     *(uint32_t *)((char *)inputHelper + kInpFlagsKeys)   = s_BotKeyFlags;
 
-    // Tự kích hoạt native drift processor (game đã chạy chúng trước đó với cờ rỗng)
-    if (s_BotDrifting) {
-        if (s_BotDriftDir == 1) {
-            if (rt_ProcessLeftDrift)  rt_ProcessLeftDrift(inputHelper, nullptr);
-        } else {
-            if (rt_ProcessRightDrift) rt_ProcessRightDrift(inputHelper, nullptr);
-        }
+    if (s_BotState == ST_YELLOW) {
+        if (s_BotYellowTurnDir == 1) { if (rt_ProcessLeftDrift)  rt_ProcessLeftDrift(inputHelper, nullptr); }
+        else                          { if (rt_ProcessRightDrift) rt_ProcessRightDrift(inputHelper, nullptr); }
     }
 }
 
-// Hook MotionCtrl::Update — ga + lái analog
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
     if (gAutoRacing && self) {
         void *sd = *(void **)((char *)self + 0x10);
