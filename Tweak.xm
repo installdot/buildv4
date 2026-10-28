@@ -171,8 +171,6 @@ typedef struct Il2CppAssembly Il2CppAssembly;
 typedef struct Il2CppImage Il2CppImage;
 typedef struct Il2CppClass Il2CppClass;
 typedef struct MethodInfo MethodInfo;
-typedef void (*Il2CppMethodPointer)();
-
 typedef struct {
     void *methodPtr;
     const MethodInfo *method;
@@ -305,7 +303,7 @@ static void rtPatchVtable(Il2CppClass *klass, void *orig, void *replacement) {
     uint16_t n = *(uint16_t *)((char *)klass + 306);
     VirtualInvokeData *v = (VirtualInvokeData *)((char *)klass + 336);
     for (uint16_t i = 0; i < n; i++) {
-        if (v[i].methodPtr == orig) v[i].methodPtr = (Il2CppMethodPointer)replacement;
+        if (v[i].methodPtr == orig) v[i].methodPtr = replacement;
     }
 }
 
