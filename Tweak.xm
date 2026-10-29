@@ -124,6 +124,7 @@ static void rtInstallCrashHandler(void) {
 
 static BOOL   gGhostCars = NO;
 static float  gDriftSlip = 0.f;
+static void  *gPlayerVehicle = NULL;   // cached from VehicleInputCtrl
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
 static float  gSpeedKmh       = 0.f;
@@ -233,6 +234,27 @@ static Il2CppClass *rtFindClass(const char *namespaze, const char *name) {
     return NULL;
 }
 
+// Resolve by exact RVA; needed where overloads make arg-count ambiguous.
+static void *rtGetMethodPointerByRva(const char *className, uint32_t rva) {
+    Il2CppClass *klass = rtFindClass("", className);
+    uintptr_t base = unityFrameworkBase();
+    if (!klass || !base) return NULL;
+    if (il2cpp_class_get_method_from_name) {
+        il2cpp_class_get_method_from_name(klass, ".ctor", -1);
+        il2cpp_class_get_method_from_name(klass, "Update", -1);
+    }
+    uint16_t n = *(uint16_t *)((char *)klass + 296);
+    void *methods = *(void **)((char *)klass + 152);
+    if (!n || !methods) return NULL;
+    for (uint16_t i = 0; i < n; i++) {
+        void *m = *(void **)((char *)methods + i * 8);
+        if (!m) continue;
+        void *ptr = *(void **)((char *)m + 0);
+        if (ptr && (uintptr_t)ptr - base == (uintptr_t)rva) return ptr;
+    }
+    return NULL;
+}
+
 static void *rtGetMethodPointer(const char *namespaze, const char *className,
                                 const char *methodName, int argsCount) {
     Il2CppClass *klass = rtFindClass(namespaze, className);
@@ -295,16 +317,25 @@ static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) 
 
 static void (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
 static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
-static void (*orig_ExtraSideFriction)(void *, float, float, const void *) = NULL;
+static void (*orig_VehicleInputCtrl_Update)(void *, float, const void *) = NULL;
+static void (*rtSetGhostState)(void *, bool, const void *) = NULL;
+static int  (*rtAddDecCoef)(void *, float, const void *) = NULL;
+static void (*rtRemoveDecCoef)(void *, int, const void *) = NULL;
+static int   s_DecCoefInst = 0;   // active drift-deceleration modifier instance
 
-// Inherited virtuals keep a stale copy in each derived vtable; replace them all.
-static void rtPatchVtable(Il2CppClass *klass, void *orig, void *replacement) {
-    if (!klass || !orig) return;
-    uint16_t n = *(uint16_t *)((char *)klass + 306);
-    VirtualInvokeData *v = (VirtualInvokeData *)((char *)klass + 336);
-    for (uint16_t i = 0; i < n; i++) {
-        if (v[i].methodPtr == orig) v[i].methodPtr = replacement;
-    }
+static inline BOOL rtPtrOk(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    if (v < 0x10000ULL) return NO;
+    if (v & 7) return NO;
+    return YES;
+}
+
+// VehicleInputCtrl exists only for the local player; cache its vehicle.
+static void hook_VehicleInputCtrlUpdate(void *self, float dt, const void *method) {
+    if (orig_VehicleInputCtrl_Update) orig_VehicleInputCtrl_Update(self, dt, method);
+    void *vehicle = self ? *(void **)((char *)self + 0x58) : NULL;   // VehicleInputCtrl.mVehicle
+    // Set unconditionally: a stricter gate here is exactly what made both features inert.
+    if (rtPtrOk(vehicle)) gPlayerVehicle = vehicle;
 }
 
 // 1. Race Start
@@ -363,47 +394,37 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
-static inline BOOL rtPtrOk(const void *p) {
-    uintptr_t v = (uintptr_t)p;
-    if (v < 0x10000ULL) return NO;
-    if (v & 7) return NO;
-    return YES;
+// Player identity comes from the input controller, which only the local player owns.
+static BOOL rtIsPlayerVehicle(void *vehicle) {
+    return gPlayerVehicle && vehicle == gPlayerVehicle;
 }
 
-// Ghost override targets the local player's ESP only. SetGhostState lives on the
-// base ESP class; the call is idempotent, so we only re-apply on change.
+// SetGhostState disables vehicle-to-vehicle contacts only; walls and road still collide.
+// The game re-clears this flag each frame, so it must be re-asserted every tick.
+// Drift lever uses the game's own runtime modifier: coef = 1 + sum(added). The game
+// recomputes it on every Add/Remove, so the slider is applied once per change.
+static void rtApplyDriftSlip(void *motionCtrl) {
+    if (!rtAddDecCoef || !rtRemoveDecCoef) return;
+    void *driftCtrl = rtPtrOk(motionCtrl) ? *(void **)((char *)motionCtrl + 0x60) : NULL;
+    if (!rtPtrOk(driftCtrl)) return;
+    float want = -0.9f * gDriftSlip;          // lower decel -> longer, wider slides
+    static float applied = 0.f;
+    if (want == applied) return;
+    if (s_DecCoefInst) { rtRemoveDecCoef(driftCtrl, s_DecCoefInst, NULL); s_DecCoefInst = 0; }
+    if (want != 0.f) s_DecCoefInst = rtAddDecCoef(driftCtrl, want, NULL);
+    applied = want;
+    rtLog("drift slip=%.2f coef add=%.2f inst=%d", gDriftSlip, want, s_DecCoefInst);
+}
+
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
-    static const MethodInfo *ghostMi = NULL;
-    static void *owner = NULL;
-    static int applied = -1;
-    if (!ghostMi) {
-        Il2CppClass *base = rtFindClass("", "NssPhyVehicleESPBase");
-        if (base) ghostMi = il2cpp_class_get_method_from_name(base, "SetGhostState", 1);
-    }
-    void *vehicle = self ? *(void **)((char *)self + 0x18) : NULL;
-    if (ghostMi && *(void **)ghostMi && rtPtrOk(vehicle) && *(bool *)((char *)vehicle + 0xF8)) {
-        void *dyn = *(void **)((char *)vehicle + 0x20);
+    if (rtPtrOk(self) && rtIsPlayerVehicle(*(void **)((char *)self + 0x18))) {
+        void *dyn = *(void **)((char *)self + 0x28);
         void *esp = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x20) : NULL;
-        if (rtPtrOk(esp)) {
-            // Re-assert every frame: _UpdateNoCollision resets this flag.
-            if (gGhostCars || owner != esp || applied) {
-                typedef void (*SetGhost)(void *, bool, const MethodInfo *);
-                ((SetGhost)*(void **)ghostMi)(esp, gGhostCars, ghostMi);
-                owner = esp;
-                applied = gGhostCars ? 1 : 0;
-            }
-        }
+        if (gGhostCars && rtSetGhostState && rtPtrOk(esp))
+            rtSetGhostState(esp, true, NULL);   // game re-clears this each frame
+        rtApplyDriftSlip(self);
     }
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
-}
-
-// Reduce lateral grip per call only; the argument is not persisting state.
-static void hook_ExtraSideFriction(void *self, float steering, float dt, const void *method) {
-    void *dyn = self ? *(void **)((char *)self + 0x28) : NULL;
-    void *vehicle = dyn ? *(void **)((char *)dyn + 0x10) : NULL;
-    if (vehicle && rtPtrOk(vehicle) && *(bool *)((char *)vehicle + 0xF8) && gDriftSlip > 0.f)
-        dt *= 1.f - 0.9f * gDriftSlip;
-    if (orig_ExtraSideFriction) orig_ExtraSideFriction(self, steering, dt, method);
 }
 
 // 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
@@ -493,6 +514,7 @@ static void installHooks(void) {
     // 2. Mini Boost: Gọi ForceCanTriggerOnce liên tục
     orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
+    rtHookMethod("", "VehicleInputCtrl", "Update", 1, (void *)hook_VehicleInputCtrlUpdate);
 
     ExtraVelocityTriggerMgr_ForceCanTriggerOnce = (void (*)(void *, int, const void *))
         rtGetMethodPointer("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
@@ -511,10 +533,13 @@ static void installHooks(void) {
 
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
-    orig_ExtraSideFriction = (void (*)(void *, float, float, const void *))
-        rtHookMethod("", "NssPhyVehicleMotionCtrlHelper", "ApplyExtraSideFriction", 2, (void *)hook_ExtraSideFriction);
-    rtPatchVtable(rtFindClass("", "NssPhyVehicleMotionCtrl"), (void *)orig_ExtraSideFriction,
-                  (void *)hook_ExtraSideFriction);
+    rtSetGhostState = (void (*)(void *, bool, const void *))
+        rtGetMethodPointerByRva("NssPhyVehicleESPBase", 0x7B04CF0);   // SetGhostState(bool)
+    rtAddDecCoef = (int (*)(void *, float, const void *))
+        rtGetMethodPointerByRva("NssVehicleDriftCtrl", 0x7C6CA48);      // AddDriftingExLinDecScaleCoef
+    rtRemoveDecCoef = (void (*)(void *, int, const void *))
+        rtGetMethodPointerByRva("NssVehicleDriftCtrl", 0x7C6CCF8);      // RemoveDriftingExLinDecScaleCoef
+    rtLog("il2cpp: ghost=%p addCoef=%p rmCoef=%p", rtSetGhostState, rtAddDecCoef, rtRemoveDecCoef);
 
     // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
