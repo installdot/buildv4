@@ -1,13 +1,12 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
 // Features & Fixes:
-// 1. ShadowTrusted: autopilot that follows the track centre line, holds full
-//    throttle and leaves all touch controls to the player.
-// 2. Miniboost: zeroes the game's own post-drift mini-boost delay.
-// 3. Auto End Drift: exits the drift state when the drift key is released.
-// 4. Speed Boost: only after 5s from race start (GameGoState::ImpEnter).
-// 5. Anti-Cheat Report: clamps SdcVehicleVel to 300 km/h.
-// 6. Top Overlay: MinMapTime, LapTimeLimit and Can Finish.
+// 1. Shadow Auto: Tu dong dua theo quy dao tim duong dua (Trackline) + full ga, khong khoa UI control.
+// 2. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
+// 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
+// 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
+// 5. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
+// 6. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -122,10 +121,9 @@ static void rtInstallCrashHandler(void) {
 
 #pragma mark - Toolkit state & field offsets
 
-static BOOL   gShadowTrusted  = NO;
-static void  *gPlayerVehicle = NULL;   // cached from VehicleInputCtrl
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
+static BOOL   gShadowAuto     = NO;
 static float  gSpeedKmh       = 0.f;
 static double gGoTime         = 0.0;
 static BOOL   gHooksInstalled = NO;
@@ -156,6 +154,46 @@ enum {
     // ActorCpReporter
     kOffActorCpLastCp     = 104, // 0x68 mLastCheckPoint
     kOffActorCpLaps       = 120, // 0x78 mMapTotalRoundNum
+
+    // NssVehicle
+    kOffVehicleMotion     = 0x20, // mDynamicVehicle
+    kOffVehicleIsMain     = 0xF8, // mIsMainPlayer
+
+    // IDynamicVehicle (DynamicVehicle)
+    kOffDynVehicle        = 0x10, // mVehicle
+    kOffDynESP            = 0x20, // mESP
+    kOffDynACC            = 0x28, // mACC
+
+    // NssPhyVehicleCtrl
+    kOffPhySimOutput      = 0x28, // mSimulateOutput
+
+    // NssPhyVehicleMotionCtrlHelper
+    kOffMotionVehicle     = 0x18, // mVehicle
+    kOffMotionPhyCtrl     = 0x20, // mVehiclePhyCtrl
+    kOffMotionDynVehicle  = 0x28, // mDynamicVehicle
+    kOffMotionDrivingCtrl = 0x38, // mDrivingCtrl
+
+    // NssPhyVehicleDrivingCtrl
+    kOffDrvDynVehicle     = 0x10, // mVehicle (IDynamicVehicle)
+    kOffDrvPhyCtrl        = 0x18, // mVehiclePhyCtrl
+    kOffDrvThrottle       = 0x3C, // mThrottle (float)
+    kOffDrvSteering       = 0x40, // mSteering (float)
+
+    // NssSteeringData — the per-frame input struct DrivingCtrl consumes
+    kOffSteerForward      = 0x10, // mForward (float)
+    kOffSteerBraking      = 0x14, // mBrakingState (int)
+    kOffSteerHandbrake    = 0x18, // mIsHandbrake (bool)
+    kOffSteerWheel        = 0x1C, // mSteeringLeft (float)
+
+    // NssPhyVehicleACC
+    kOffAccCurTrackPoint  = 0x38, // mCurTrackPoint
+    kOffAccHorizDis       = 0x5C, // mHorizontalDis (float)
+
+    // NssTrackPoint
+    kOffTpDirection       = 0x1C, // mDirection (Vector3)
+
+    // NssVehicleSimOutput
+    kOffSimMovingDir      = 0x44, // mMovingDirection (Vector3)
 };
 
 static inline double nowSeconds(void) {
@@ -233,28 +271,7 @@ static Il2CppClass *rtFindClass(const char *namespaze, const char *name) {
     return NULL;
 }
 
-// Resolve by exact RVA; needed where overloads make arg-count ambiguous.
-__attribute__((unused)) static void *rtGetMethodPointerByRva(const char *className, uint32_t rva) {
-    Il2CppClass *klass = rtFindClass("", className);
-    uintptr_t base = unityFrameworkBase();
-    if (!klass || !base) return NULL;
-    if (il2cpp_class_get_method_from_name) {
-        il2cpp_class_get_method_from_name(klass, ".ctor", -1);
-        il2cpp_class_get_method_from_name(klass, "Update", -1);
-    }
-    uint16_t n = *(uint16_t *)((char *)klass + 296);
-    void *methods = *(void **)((char *)klass + 152);
-    if (!n || !methods) return NULL;
-    for (uint16_t i = 0; i < n; i++) {
-        void *m = *(void **)((char *)methods + i * 8);
-        if (!m) continue;
-        void *ptr = *(void **)((char *)m + 0);
-        if (ptr && (uintptr_t)ptr - base == (uintptr_t)rva) return ptr;
-    }
-    return NULL;
-}
-
-__attribute__((unused)) static void *rtGetMethodPointer(const char *namespaze, const char *className,
+static void *rtGetMethodPointer(const char *namespaze, const char *className,
                                 const char *methodName, int argsCount) {
     Il2CppClass *klass = rtFindClass(namespaze, className);
     if (!klass) return NULL;
@@ -304,33 +321,34 @@ static void *rtHookMethod(const char *namespaze, const char *className,
 
 static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
 
-static void  (*orig_AutoSmallBoostHelper_Update)(void *, float, const void *) = NULL;
+static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
+static void  (*orig_Drift_Release)(void *, const void *) = NULL;
+static void  (*orig_Drift_ExitCurDriftState)(void *, const void *) = NULL;
+static void  (*orig_Drift_ForceClearDriftParams)(void *, const void *) = NULL;
+
 static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
 static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
 static void  (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
 static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
 
+static void (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
 static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
-static void (*orig_VehicleInputCtrl_Update)(void *, float, const void *) = NULL;
+
+// Shadow autopilot
 static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
-static bool (*orig_DriveAssist_IsEnable)(void *, const void *) = NULL;
-static void (*orig_DriveAssist_CopyConfig)(void *, void *, void *, void *, const void *) = NULL;
-static void (*orig_DAVirtualCollision_Update)(void *, float, const void *) = NULL;
-static void (*orig_DrivingCtrl_UpdateDrivingData)(void *, void *, float, const void *) = NULL;
+static void (*orig_Shadow_EnableAutoSpeedUp)(void *, bool, const void *) = NULL;
+static void (*orig_Shadow_IgnoreCollision)(void *, bool, const void *) = NULL;
+static void (*orig_DrivingParams)(void *, void *, float, const void *) = NULL;
+static char  sShadowState[3] = {0, 0, 0};   // last applied [input, speedup, nocoll]
 
-static inline BOOL rtPtrOk(const void *p) {
-    uintptr_t v = (uintptr_t)p;
-    if (v < 0x10000ULL) return NO;
-    if (v & 7) return NO;
-    return YES;
-}
-
-// VehicleInputCtrl exists only for the local player; cache its vehicle.
-static void hook_VehicleInputCtrlUpdate(void *self, float dt, const void *method) {
-    if (orig_VehicleInputCtrl_Update) orig_VehicleInputCtrl_Update(self, dt, method);
-    void *vehicle = self ? *(void **)((char *)self + 0x58) : NULL;   // VehicleInputCtrl.mVehicle
-    // Set unconditionally: a stricter gate here is exactly what made both features inert.
-    if (rtPtrOk(vehicle)) gPlayerVehicle = vehicle;
+// Inherited virtuals keep a stale copy in each derived vtable; replace them all.
+static void rtPatchVtable(Il2CppClass *klass, void *orig, void *replacement) {
+    if (!klass || !orig) return;
+    uint16_t n = *(uint16_t *)((char *)klass + 306);
+    VirtualInvokeData *v = (VirtualInvokeData *)((char *)klass + 336);
+    for (uint16_t i = 0; i < n; i++) {
+        if (v[i].methodPtr == orig) v[i].methodPtr = replacement;
+    }
 }
 
 // 1. Race Start
@@ -343,16 +361,39 @@ static void hook_GoImpEnter(void *self, const void *method) {
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
 
-// 2. Mini Boost: shorten the game's own post-drift auto-boost delay to zero so
-// the existing AutoSmallBoostHelper state machine fires on the first normal
-// frame. The stay timer is left alone: forcing it would break the state
-// accounting and spam the trigger every tick.
-static void hook_AutoSmallBoostHelperUpdate(void *self, float dt, const void *method) {
-    if (gFullMiniBoost && rtPtrOk(self)) {
-        *(float *)((char *)self + 0x28) = 0.0f;  // mAutoMiniBoostDelayTime
+// 2. Mini Boost: Gọi ForceCanTriggerOnce(Mini/Air/FallingGround) liên tục
+static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
+    if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
+    if (!gFullMiniBoost || !self) return;
+
+    if (ExtraVelocityTriggerMgr_ForceCanTriggerOnce) {
+        ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 2, nullptr);  // Mini
+        ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 3, nullptr);  // Air
+        ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 11, nullptr); // FallingGround
     }
-    if (orig_AutoSmallBoostHelper_Update) orig_AutoSmallBoostHelper_Update(self, dt, method);
 }
+
+// 3. Auto End Drift: Tránh dính drift
+static void hook_DriftExitCurState(void *self, const void *method) {
+    if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(self, method);
+}
+
+static void hook_DriftForceClear(void *self, const void *method) {
+    if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(self, method);
+}
+
+static void hook_DriftRelease(void *self, const void *method) {
+    if (orig_Drift_Release) orig_Drift_Release(self, method);
+    if (!gAutoDriftEnd || !self) return;
+
+    if (orig_Drift_ExitCurDriftState) {
+        orig_Drift_ExitCurDriftState(self, nullptr);
+    }
+    if (orig_Drift_ForceClearDriftParams) {
+        orig_Drift_ForceClearDriftParams(self, nullptr);
+    }
+}
+
 // 4. PowerChain Speed Boost (chỉ boost, autopilot tách riêng sang Cab::Update)
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
@@ -366,142 +407,15 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
-// Player identity comes from the input controller, which only the local player owns.
-__attribute__((unused)) static BOOL rtIsPlayerVehicle(void *vehicle) {
-    if (!rtPtrOk(vehicle)) return NO;
-    if (gPlayerVehicle && vehicle == gPlayerVehicle) return YES;
-    return *(bool *)((char *)vehicle + 0xF8); // NssVehicle.mIsMainPlayer
+static inline BOOL rtPtrOk(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    if (v < 0x10000ULL) return NO;
+    if (v & 7) return NO;
+    return YES;
 }
 
-// 5. ShadowTrusted & Max Drive Assist (Tuyet doi KHONG khoa UI control cua nguoi choi)
-static void hook_Shadow_EnableMatchInput(void *self, bool enable, const void *method) {
-    if (gShadowTrusted) {
-        enable = true; // Luon mo khoa UI control / touch input
-    }
-    if (orig_Shadow_EnableMatchInput) orig_Shadow_EnableMatchInput(self, enable, method);
-}
-
-static bool hook_DriveAssist_IsEnable(void *self, const void *method) {
-    if (gShadowTrusted) return true; // Luon kich hoat Drive Assist cho moi map va mode
-    return orig_DriveAssist_IsEnable ? orig_DriveAssist_IsEnable(self, method) : false;
-}
-
-static void hook_DriveAssist_CopyConfig(void *self, void *cfg, void *detectConfig, void *collConfig, const void *method) {
-    if (orig_DriveAssist_CopyConfig) orig_DriveAssist_CopyConfig(self, cfg, detectConfig, collConfig, method);
-    if (!gShadowTrusted) return;
-
-    if (detectConfig) {
-        *(float *)((char *)detectConfig + 0x10) = 0.55f; // mLinvelPredictTime: du doan vua phai
-        *(int *)((char *)detectConfig + 0x14)   = 1;     // mPredictType: Swept AABB
-    }
-    if (collConfig) {
-        *(float *)((char *)collConfig + 0x10) = 8.0f;  // mSlerpSpeed: keo huong nhe nhang
-        *(float *)((char *)collConfig + 0x14) = 1.8f;  // mDriftAccCoef: tang toc drift hop ly
-        *(float *)((char *)collConfig + 0x18) = 0.0f;  // mDriftMaxAngSpeedKMPHThreshold
-        *(float *)((char *)collConfig + 0x1C) = 1.3f;  // mDriftMaxAngelSpeedCoef
-        *(float *)((char *)collConfig + 0x20) = 1.0f;  // mDriftSlidingMaxAngSpeedCoef: GIU DRIFT TU NHIEN, khong clamp 0.01
-        *(float *)((char *)collConfig + 0x24) = 0.12f; // mSteerAngleThreshold: chi ho tro khi chệch huong lon
-        *(float *)((char *)collConfig + 0x28) = 4.0f;  // mSteerAngleSpeed: tro luc vua phai, khong cuop tay lai
-    }
-}
-
-static void hook_DAVirtualCollision_Update(void *self, float dt, const void *method) {
-    if (gShadowTrusted && self) {
-        void *collConfig = *(void **)((char *)self + 0x20); // mConfig
-        if (collConfig) {
-            *(float *)((char *)collConfig + 0x10) = 8.0f;
-            *(float *)((char *)collConfig + 0x14) = 1.8f;
-            *(float *)((char *)collConfig + 0x18) = 0.0f;
-            *(float *)((char *)collConfig + 0x1C) = 1.3f;
-            *(float *)((char *)collConfig + 0x20) = 1.0f;
-            *(float *)((char *)collConfig + 0x24) = 0.12f;
-            *(float *)((char *)collConfig + 0x28) = 4.0f;
-        }
-        void *envInfo = *(void **)((char *)self + 0x18); // mDAEnvInfo
-        if (envInfo) {
-            void *detectConfig = *(void **)((char *)envInfo + 0x70); // mConfig
-            if (detectConfig) {
-                *(float *)((char *)detectConfig + 0x10) = 0.55f;
-                *(int *)((char *)detectConfig + 0x14)   = 1;
-            }
-        }
-    }
-    if (orig_DAVirtualCollision_Update) orig_DAVirtualCollision_Update(self, dt, method);
-}
-
-// Autopilot injects into NssSteeringData, the game's own per-frame input struct
-// consumed by NssPhyVehicleDrivingCtrl._UpdatePhyDrivingParams. Writing
-// mThrottle/mSteering on the ctrl is useless: _UpdatePhyDrivingParams derives
-// them from this struct on the same tick.
-// Hooked on NssPlayerVehicleDrivingCtrl (Slot 25) because the base virtual is
-// overridden there, and only the local player uses that subclass.
-//   NssSteeringData: +0x10 mForward (float), +0x14 mBrakingState (int),
-//                    +0x18 mIsHandbrake (bool), +0x1C mSteeringLeft (float)
-static void hook_DrivingCtrl_UpdatePhyDrivingParams(void *self, void *steerData, float dt, const void *method) {
-    if (rtPtrOk(self) && rtPtrOk(steerData)) {
-        // NssPhyVehicleDrivingCtrl.mVehicle(0x10) is IDynamicVehicle;
-        // DynamicVehicle.mVehicle(0x10) is the owning IVehicle/NssVehicle.
-        void *dyn = *(void **)((char *)self + 0x10);
-        void *vehicle = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x10) : NULL;
-
-        if (gShadowTrusted && rtIsPlayerVehicle(vehicle)) {
-            void *phyCtrl = *(void **)((char *)self + 0x18);                    // NssPhyVehicleCtrl
-            void *acc = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x28) : NULL;   // IVehicleACC
-            void *simOutput = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + 0x28) : NULL;
-            void *curTp = rtPtrOk(acc) ? *(void **)((char *)acc + 0x38) : NULL;  // ITrackPoint
-
-            if (rtPtrOk(simOutput) && rtPtrOk(curTp)) {
-                float fwdX = *(float *)((char *)simOutput + 0x44);  // mMovingDirection.x
-                float fwdZ = *(float *)((char *)simOutput + 0x4C);  // mMovingDirection.z
-                float dirX = *(float *)((char *)curTp + 0x1C);      // NssTrackPoint.mDirection.x
-                float dirZ = *(float *)((char *)curTp + 0x24);      // NssTrackPoint.mDirection.z
-                float hDist = *(float *)((char *)acc + 0x5C);       // mHorizontalDis
-
-                // 2D cross(fwd, dir): sign encodes which side the track bends to.
-                float cross = (fwdX * dirZ) - (fwdZ * dirX);
-                float steer = (cross * 2.2f) - (hDist * 0.10f);
-                if (steer > 1.0f) steer = 1.0f;
-                if (steer < -1.0f) steer = -1.0f;
-
-                // Player override: real thumb input (|mSteeringLeft| > 0.2) always wins.
-                float userSteer = *(float *)((char *)steerData + 0x1C);
-                if (fabsf(userSteer) < 0.2f) {
-                    *(float *)((char *)steerData + 0x1C) = steer;
-                }
-
-                // Full throttle unless the player is braking or on the handbrake.
-                int braking = *(int *)((char *)steerData + 0x14);
-                bool handbrake = *(bool *)((char *)steerData + 0x18);
-                if (braking == 0 && !handbrake) {
-                    *(float *)((char *)steerData + 0x10) = 1.0f;
-                }
-            }
-        }
-    }
-
-    if (orig_DrivingCtrl_UpdateDrivingData) orig_DrivingCtrl_UpdateDrivingData(self, steerData, dt, method);
-}
-
-// Auto End Drift: leave the drift state machine on the tick the player releases
-// the drift key. Edge-triggered, so it never fights an ongoing drift.
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
-    if (!gAutoDriftEnd || !rtPtrOk(self)) return;
-
-    void *vehicle = *(void **)((char *)self + 0x18);
-    if (!rtIsPlayerVehicle(vehicle)) return;
-
-    void *drivingCtrl = *(void **)((char *)self + 0x38);
-    if (!rtPtrOk(drivingCtrl)) return;
-
-    bool pressed = *(bool *)((char *)drivingCtrl + 0x75);  // NssPlayerVehicleDrivingCtrl.mDriftIsPress
-    static bool sWasPressed = false;
-    if (sWasPressed && !pressed) {
-        void (*exitDrift)(void *, const void *) = (void (*)(void *, const void *))
-            rtGetMethodPointerByRva("NssPhyVehicleMotionCtrl", 0x7B10C64);
-        if (exitDrift) exitDrift(self, nullptr);
-    }
-    sWasPressed = pressed;
 }
 
 // 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
@@ -558,6 +472,91 @@ static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, co
     }
 }
 
+#pragma mark - 8. Shadow autopilot
+
+// ShadowTrusteeship drives the car through four side effects. Three of them are
+// fine here, one has to be neutralised:
+//
+//   EnableMatchInput(false)  -> cuts the touch->steer/drift/nitro link  [BLOCK]
+//   EnableAutoSpeedUp(true)  -> Throttle = 1.0 on the cab             [KEEP]
+//   IgnoreCollision(true)    -> VhcActionIgnoreCollision, no wall ping [KEEP]
+//   EnableVehiclePhy(false)  -> kinematic, replay overwrites motion    [KEEP]
+//
+// We keep the player's input alive by forcing enable = true at the source, and
+// then generate the motion ourselves: this codebase has no replay blob
+// (MoveTransInfo2/EventTransInfo), so the ReplayMoveAlgm keyframe sampling is
+// replaced by live ITrackPoint sampling from IVehicleACC. The result is written
+// to NssSteeringData, the same struct ReplayMoveProcess ultimately feeds.
+static void hook_ShadowEnableMatchInput(void *self, bool enable, const void *method) {
+    bool want = gShadowAuto ? true : enable;
+    if (orig_Shadow_EnableMatchInput && want != (bool)sShadowState[0]) {
+        orig_Shadow_EnableMatchInput(self, want, method);
+        sShadowState[0] = want ? 1 : 0;
+    } else if (!orig_Shadow_EnableMatchInput) {
+        rtLog("shadow: EnableMatchInput unavailable, input path untouched");
+    }
+}
+
+static void hook_ShadowEnableAutoSpeedUp(void *self, bool enable, const void *method) {
+    if (orig_Shadow_EnableAutoSpeedUp) orig_Shadow_EnableAutoSpeedUp(self, enable, method);
+}
+
+static void hook_ShadowIgnoreCollision(void *self, bool enable, const void *method) {
+    if (orig_Shadow_IgnoreCollision) orig_Shadow_IgnoreCollision(self, enable, method);
+}
+
+// NssPhyVehicleDrivingCtrl._UpdatePhyDrivingParams(NssSteeringData, float) is the
+// player-only override that turns the input struct into mThrottle/mSteering.
+// It runs before _UpdatePhyDrivingParams derives the forces, so writing here is
+// the earliest point that survives the whole tick.
+//
+//   NssSteeringData: +0x10 mForward, +0x14 mBrakingState, +0x18 mIsHandbrake,
+//                    +0x1C mSteeringLeft
+static void hook_DrivingParams(void *self, void *steerData, float dt, const void *method) {
+    if (gShadowAuto && rtPtrOk(self) && rtPtrOk(steerData)) {
+        void *dyn = *(void **)((char *)self + kOffDrvDynVehicle);          // IDynamicVehicle
+        void *vehicle = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynVehicle) : NULL;
+
+        if (rtPtrOk(vehicle) && *(bool *)((char *)vehicle + kOffVehicleIsMain)) {
+            void *phyCtrl = *(void **)((char *)self + kOffDrvPhyCtrl);
+            void *acc = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynACC) : NULL;
+            void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
+            void *tp = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
+
+            if (rtPtrOk(sim) && rtPtrOk(tp)) {
+                float fwdX = *(float *)((char *)sim + kOffSimMovingDir);
+                float fwdZ = *(float *)((char *)sim + kOffSimMovingDir + 8);
+                float dirX = *(float *)((char *)tp + kOffTpDirection);
+                float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
+                float hDis = *(float *)((char *)acc + kOffAccHorizDis);
+
+                // cross(fwd, dir) sign tells which way the road turns; hDis pulls
+                // the car back toward the centre line.
+                float cross = (fwdX * dirZ) - (fwdZ * dirX);
+                float steer = (cross * 2.2f) - (hDis * 0.10f);
+                if (steer > 1.0f) steer = 1.0f;
+                if (steer < -1.0f) steer = -1.0f;
+
+                // Player override: a real thumb input always wins.
+                float userSteer = *(float *)((char *)steerData + kOffSteerWheel);
+                if (fabsf(userSteer) < 0.2f)
+                    *(float *)((char *)steerData + kOffSteerWheel) = steer;
+
+                // Throttle = 1.0, unless the player brakes or pulls the handbrake.
+                int braking = *(int *)((char *)steerData + kOffSteerBraking);
+                bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
+                if (braking == 0 && !handbrake)
+                    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
+
+                // Mirror onto the ctrl so anything reading it before the flush sees it.
+                *(float *)((char *)self + kOffDrvThrottle) = *(float *)((char *)steerData + kOffSteerForward);
+                *(float *)((char *)self + kOffDrvSteering) = *(float *)((char *)steerData + kOffSteerWheel);
+            }
+        }
+    }
+    if (orig_DrivingParams) orig_DrivingParams(self, steerData, dt, method);
+}
+
 #pragma mark - Hook installation
 
 static BOOL rtHooksDisabled(void) {
@@ -588,31 +587,28 @@ static void installHooks(void) {
     rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
 
-    // 2. Mini Boost: AutoSmallBoostHelper tự động kích hoạt
-    orig_AutoSmallBoostHelper_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "AutoSmallBoostHelper", "Update", 1, (void *)hook_AutoSmallBoostHelperUpdate);
-    rtHookMethod("", "VehicleInputCtrl", "Update", 1, (void *)hook_VehicleInputCtrlUpdate);
+    // 2. Mini Boost: Gọi ForceCanTriggerOnce liên tục
+    orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
+
+    ExtraVelocityTriggerMgr_ForceCanTriggerOnce = (void (*)(void *, int, const void *))
+        rtGetMethodPointer("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
+
+    // 3. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
+    orig_Drift_Release = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
+    orig_Drift_ExitCurDriftState = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ExitCurDriftState", 0, (void *)hook_DriftExitCurState);
+    orig_Drift_ForceClearDriftParams = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftForceClear);
+
     // 4. Tốc độ trục truyền động vật lý (PowerChain)
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
-    // Autopilot input injection: private virtual _UpdatePhyDrivingParams on the
-    // player-only subclass. argsCount 2 -> (NssSteeringData, float).
-    orig_DrivingCtrl_UpdateDrivingData = (void (*)(void *, void *, float, const void *))
-        rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "_UpdatePhyDrivingParams", 2, (void *)hook_DrivingCtrl_UpdatePhyDrivingParams);
-    orig_Shadow_EnableMatchInput = (void (*)(void *, bool, const void *))
-        rtHookMethod("", "ShadowTrusteeship", "EnableMatchInput", 1, (void *)hook_Shadow_EnableMatchInput);
-    orig_DriveAssist_IsEnable = (bool (*)(void *, const void *))
-        rtHookMethod("", "VehicleDriveAssistComp", "IsEnable", 0, (void *)hook_DriveAssist_IsEnable);
-    orig_DriveAssist_CopyConfig = (void (*)(void *, void *, void *, void *, const void *))
-        rtHookMethod("", "VehicleDriveAssistComp", "CopyDataBinConfigToMono", 3, (void *)hook_DriveAssist_CopyConfig);
-    orig_DAVirtualCollision_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "VehicleDAVirtualCollision", "Update", 1, (void *)hook_DAVirtualCollision_Update);
-    rtLog("il2cpp: shadowInput=%p daEnable=%p daCfg=%p daColl=%p drvData=%p",
-          orig_Shadow_EnableMatchInput, orig_DriveAssist_IsEnable, orig_DriveAssist_CopyConfig,
-          orig_DAVirtualCollision_Update, orig_DrivingCtrl_UpdateDrivingData);
+
 
     // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
@@ -623,6 +619,22 @@ static void installHooks(void) {
         rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgrInit);
     orig_ActorCpReporter_Update = (void (*)(void *, float, float, const void *))
         rtHookMethod("", "ActorCpReporter", "Update", 2, (void *)hook_ActorCpReporterUpdate);
+
+    // 8. Shadow autopilot: keep input alive, feed the steering struct
+    orig_Shadow_EnableMatchInput = (void (*)(void *, bool, const void *))
+        rtHookMethod("", "ShadowTrusteeship", "EnableMatchInput", 1, (void *)hook_ShadowEnableMatchInput);
+    orig_Shadow_EnableAutoSpeedUp = (void (*)(void *, bool, const void *))
+        rtHookMethod("", "ShadowTrusteeship", "EnableAutoSpeedUp", 1, (void *)hook_ShadowEnableAutoSpeedUp);
+    orig_Shadow_IgnoreCollision = (void (*)(void *, bool, const void *))
+        rtHookMethod("", "ShadowTrusteeship", "IgnoreCollision", 1, (void *)hook_ShadowIgnoreCollision);
+
+    orig_DrivingParams = (void (*)(void *, void *, float, const void *))
+        rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "_UpdatePhyDrivingParams", 2, (void *)hook_DrivingParams);
+    rtPatchVtable(rtFindClass("", "NssPlayerVehicleDrivingCtrl"), (void *)orig_DrivingParams,
+                  (void *)hook_DrivingParams);
+    rtLog("shadow: inputHook=%p speedUp=%p noColl=%p drvParams=%p",
+          orig_Shadow_EnableMatchInput, orig_Shadow_EnableAutoSpeedUp,
+          orig_Shadow_IgnoreCollision, orig_DrivingParams);
 
     rtLog("install: done (all hooks active)");
 }
@@ -762,9 +774,9 @@ static RCRaceToolkitMenu *gMenu = nil;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:40  title:@"Shadow / Max Assist" on:gShadowTrusted action:@selector(onShadowTrusted:)];
-    [self switchAtY:76  title:@"Inf Mini Boost"       on:gFullMiniBoost  action:@selector(onMini:)];
-    [self switchAtY:112 title:@"Auto End Drift"       on:gAutoDriftEnd   action:@selector(onAutoDrift:)];
+    [self switchAtY:40  title:@"Shadow Auto"     on:gShadowAuto    action:@selector(onShadowAuto:)];
+    [self switchAtY:76  title:@"Inf Mini Boost"   on:gFullMiniBoost action:@selector(onMini:)];
+    [self switchAtY:112 title:@"Auto End Drift"   on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
 
     self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 150, 268, 20)];
     self.speedLabel.textColor = UIColor.whiteColor;
@@ -784,7 +796,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 2;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:10.5];
-    note.text = @"Shadow/Assist: Tu nan goc bam cua & chong va cham tuong toi da ma khong khoa phim dieu khien.";
+    note.text = @"Shadow Auto: tu dong lai bam tim duong + giu full ga.\nNguoi choi van giu toan quyen lai, drift, nitro.";
     [self.panel addSubview:note];
 }
 
@@ -839,7 +851,11 @@ static RCRaceToolkitMenu *gMenu = nil;
     [g setTranslation:CGPointZero inView:self.fab.superview];
 }
 
-- (void)onShadowTrusted:(UISwitch *)s { gShadowTrusted = s.isOn; rtLog("shadow trusted=%d", s.isOn); }
+- (void)onShadowAuto:(UISwitch *)s {
+    gShadowAuto = s.isOn;
+    sShadowState[0] = 0;   // force EnableMatchInput to be re-issued on the next call
+    rtLog("shadow auto=%d", s.isOn);
+}
 - (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn;  rtLog("toggle FullMiniBoost=%d", s.isOn); }
 - (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn;   rtLog("toggle AutoEndDrift=%d", s.isOn); }
 
