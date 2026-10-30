@@ -233,7 +233,7 @@ static Il2CppClass *rtFindClass(const char *namespaze, const char *name) {
 }
 
 // Resolve by exact RVA; needed where overloads make arg-count ambiguous.
-static void *rtGetMethodPointerByRva(const char *className, uint32_t rva) {
+__attribute__((unused)) static void *rtGetMethodPointerByRva(const char *className, uint32_t rva) {
     Il2CppClass *klass = rtFindClass("", className);
     uintptr_t base = unityFrameworkBase();
     if (!klass || !base) return NULL;
@@ -393,7 +393,7 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 }
 
 // Player identity comes from the input controller, which only the local player owns.
-static BOOL rtIsPlayerVehicle(void *vehicle) {
+__attribute__((unused)) static BOOL rtIsPlayerVehicle(void *vehicle) {
     return gPlayerVehicle && vehicle == gPlayerVehicle;
 }
 
