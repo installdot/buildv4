@@ -409,6 +409,20 @@ static inline BOOL rtPtrOk(const void *p) {
     return YES;
 }
 
+// ==== Auto Play state ====================================================
+//
+// Written by hook_MotionCtrlUpdate (once per motion tick) and read by
+// hook_Input_GetKey (polled several times per frame), so it must be declared
+// before both.
+//
+// InputKeyType (dump): Left=1 Right=2 PropOne=3 PropTwo=4 SmallBoost=5
+//                      Brake=6 Reset=7 Drift=8 SidewaysDrift=9 ...
+static int gAPKeyMask    = 0;   // bit N set => key N is "held" this frame
+static int gAPDriftLatch = 0;   // 1 while drift is held
+static int gAPBoostTicks = 0;   // frames left to hold SmallBoost
+
+static BOOL rtAPKey(int t) { return (gAPKeyMask >> t) & 1; }
+
 // Layer A + skill arbitration.
 //
 // Verified order in NssPhyVehicleMotionCtrl.Update (0x7B10770):
@@ -604,11 +618,6 @@ static void hook_ShadowIgnoreCollision(void *self, bool enable, const void *meth
 // Steering is recomputed once per motion tick and cached, because GetKey can be
 // polled several times per frame by different consumers.
 
-static int   gAPKeyMask    = 0;    // bit N set => key N is "held" this frame
-static int   gAPDriftLatch = 0;    // 1 while drift is held
-static int   gAPBoostTicks = 0;    // frames left to hold SmallBoost
-
-static BOOL rtAPKey(int t) { return (gAPKeyMask >> t) & 1; }
 
 // Layer B: pretend the thumb holds these keys. Everything downstream (drift
 // state machine, CWW/WCW boost, nitro) runs the untouched game code path.
