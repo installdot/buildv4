@@ -1,12 +1,15 @@
-// Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
+// Tweak.xm — Race Toolkit Pro (iOS, IL2CPP VTable & Metadata Hook)
 //
-// Features & Fixes:
-// 1. Shadow Auto: Tu dong dua theo quy dao tim duong dua (Trackline) + full ga, khong khoa UI control.
-// 2. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
-// 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
-// 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
-// 5. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
-// 6. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
+// Features:
+// 1. Modern Glassmorphic UI Menu with interactive Vehicle / Skin Dropdown.
+// 2. Mod Xe / Skin Tự Động (Visual RAM): Tự động đổi xe trong Sảnh (Lobby/Garage) và ngay khi Vào Trận / Load Trận.
+// 3. Auto Play (AI Tự Đua): Bám tim đường tức thì qua Quaternion chassis + nắn lái vật lý trực tiếp.
+// 4. Slider Sức Mạnh Đổi Hướng (Steer Strength 0.5x - 3.0x): Nhân trực tiếp mô-men xoắn bẻ lái bánh xe.
+// 5. Inf Mini Boost (ForceCanTriggerOnce liên tục).
+// 6. Gia Tốc / Speed Boost (PowerChain extra KMPH + torque sau 5s xuất phát).
+// 7. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h.
+// 8. Auto End Drift (ExitCurDriftState + ForceClearDriftParams).
+// 9. Top Overlay: MinMapTime, LapTimeLimit & Can Finish status.
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -123,10 +126,19 @@ static void rtInstallCrashHandler(void) {
 
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
-static BOOL   gAutoPlay       = NO; // Kích hoạt AI tự động đua khi mất mạng kể cả khi đang online
+static BOOL   gAutoPlay       = NO;
 static float  gSpeedKmh       = 0.f;
+static float  gSteerStrength  = 1.0f; // Multiplier: 0.5x - 3.0x
+
+// Visual Vehicle Mod state
+static BOOL   gModEnabled     = NO;
+static int    gModVehicleID   = 0;    // Vehicle ID
+static int    gModSkinID      = 0;    // Skin ID
+static int    gSelectedPreset = 0;    // Index in kVehicleCatalog
+
 static double gGoTime         = 0.0;
 static BOOL   gHooksInstalled = NO;
+static void  *gCurrentVehicle = NULL;
 
 // Race status & metrics
 static float  gCurrentMatchTime  = 0.f;
@@ -138,9 +150,6 @@ static BOOL   gCanFinish         = NO;
 static int    gLastCheckPointId  = 0;
 
 enum {
-    // ExtraVelocityTriggerMgr
-    kOffExVelReserveMgr   = 144, // 0x90 mReserveSmallBoostMgr
-
     // NssPhyVehiclePowerChain
     kOffPowerExtraKMPH    = 68,  // 0x44 mExtraKMPH (float)
     kOffPowerExtraTorque  = 72,  // 0x48 mExtraTorque (float)
@@ -156,31 +165,31 @@ enum {
     kOffActorCpLaps       = 120, // 0x78 mMapTotalRoundNum
 
     // NssVehicle
-    kOffVehicleMotion     = 0x20, // mDynamicVehicle
-    kOffVehicleIsMain     = 0xF8, // mIsMainPlayer
+    kOffVehicleID         = 0x10, // mVehicleID (int)
+    kOffVehicleDyn        = 0x20, // mDynamicVehicle
+    kOffVehicleIsMain     = 0xF8, // mIsMainPlayer (bool)
 
     // IDynamicVehicle (DynamicVehicle)
     kOffDynVehicle        = 0x10, // mVehicle
-    kOffDynESP            = 0x20, // mESP
     kOffDynACC            = 0x28, // mACC
 
     // NssPhyVehicleCtrl
     kOffPhySimOutput      = 0x28, // mSimulateOutput
 
     // NssPhyVehicleMotionCtrlHelper
-    kOffMotionSteerData   = 0x10, // mSteeringData (NssSteeringData, by value)
+    kOffMotionSteerData   = 0x10, // mSteeringData
     kOffMotionVehicle     = 0x18, // mVehicle
     kOffMotionPhyCtrl     = 0x20, // mVehiclePhyCtrl
     kOffMotionDynVehicle  = 0x28, // mDynamicVehicle
     kOffMotionDrivingCtrl = 0x38, // mDrivingCtrl
 
-    // NssPhyVehicleDrivingCtrl
-    kOffDrvDynVehicle     = 0x10, // mVehicle (IDynamicVehicle)
-    kOffDrvPhyCtrl        = 0x18, // mVehiclePhyCtrl
+    // NssPlayerVehicleDrivingCtrl
     kOffDrvThrottle       = 0x3C, // mThrottle (float)
     kOffDrvSteering       = 0x40, // mSteering (float)
+    kOffDrvInputXPos      = 0x68, // mInputXPosition (float)
+    kOffDrvDriftPress     = 0x75, // mDriftIsPress (bool)
 
-    // NssSteeringData — the per-frame input struct DrivingCtrl consumes
+    // NssSteeringData
     kOffSteerForward      = 0x10, // mForward (float)
     kOffSteerBraking      = 0x14, // mBrakingState (int)
     kOffSteerHandbrake    = 0x18, // mIsHandbrake (bool)
@@ -195,12 +204,20 @@ enum {
 
     // NssVehicleSimOutput
     kOffSimMovingDir      = 0x44, // mMovingDirection (Vector3)
+    kOffSimChassisRot     = 0x70, // mChassisRotation (Quaternion: x, y, z, w)
 };
 
 static inline double nowSeconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static inline BOOL rtPtrOk(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    if (v < 0x10000ULL) return NO;
+    if (v & 7) return NO;
+    return YES;
 }
 
 #pragma mark - IL2CPP Runtime API & Structures
@@ -261,18 +278,28 @@ static Il2CppClass *rtFindClass(const char *namespaze, const char *name) {
     Il2CppDomain *domain = il2cpp_domain_get();
     if (!domain) return NULL;
     size_t count = 0;
-    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &count);
+    const Il2CppAssembly **assemblies = domain ? il2cpp_domain_get_assemblies(domain, &count) : NULL;
     if (!assemblies || count == 0) return NULL;
     for (size_t i = 0; i < count; i++) {
         const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
         if (!image) continue;
         Il2CppClass *k = il2cpp_class_from_name(image, namespaze ?: "", name);
         if (k) return k;
+        if (strchr(name, '.')) {
+            char nestedName[256];
+            strncpy(nestedName, name, sizeof(nestedName) - 1);
+            nestedName[sizeof(nestedName) - 1] = '\0';
+            for (char *p = nestedName; *p; p++) {
+                if (*p == '.') *p = '/';
+            }
+            k = il2cpp_class_from_name(image, namespaze ?: "", nestedName);
+            if (k) return k;
+        }
     }
     return NULL;
 }
 
-static void *rtGetMethodPointer(const char *namespaze, const char *className,
+__attribute__((unused)) static void *rtGetMethodPointer(const char *namespaze, const char *className,
                                 const char *methodName, int argsCount) {
     Il2CppClass *klass = rtFindClass(namespaze, className);
     if (!klass) return NULL;
@@ -318,35 +345,28 @@ static void *rtHookMethod(const char *namespaze, const char *className,
     return orig;
 }
 
-#pragma mark - Original function pointers & Replacements
+#pragma mark - Function Pointers
 
-static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
-
-static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
-static void  (*orig_Drift_Release)(void *, const void *) = NULL;
-static void  (*orig_Drift_ExitCurDriftState)(void *, const void *) = NULL;
-static void  (*orig_Drift_ForceClearDriftParams)(void *, const void *) = NULL;
-
-static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
-static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
-static void  (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
-static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
-
+static void (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
+static void (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
+static void (*orig_Drift_Release)(void *, const void *) = NULL;
+static void (*orig_Drift_ExitCurDriftState)(void *, const void *) = NULL;
+static void (*orig_Drift_ForceClearDriftParams)(void *, const void *) = NULL;
+static void (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
+static void (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
+static void (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
+static void (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
 static void (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
 static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
+static void (*orig_PhyVehicleCtrl_DoSteering)(void *, float, const void *) = NULL;
+static void (*orig_NssVehicle_PreInit)(void *, uint64_t, int, void *, const void *) = NULL;
+static int  (*orig_NssVehicle_GetVehicleID)(void *, const void *) = NULL;
+static uint64_t (*orig_ItemVehicle_GetModelID)(void *, const void *) = NULL;
+static void (*orig_Previewer_ShowVehicle)(void *, void *, uint32_t, void *, void *, const void *) = NULL;
 
-// Shadow autopilot
-static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
-static void (*orig_Shadow_EnableAutoSpeedUp)(void *, bool, const void *) = NULL;
-static void (*orig_Shadow_IgnoreCollision)(void *, bool, const void *) = NULL;
-static BOOL (*orig_Input_GetKey)(void *, int, const void *) = NULL;
-static char  sShadowState[3] = {0, 0, 0};   // last applied [input, speedup, nocoll]
+#pragma mark - Hook Implementations
 
-// Offline / Always-Connected bypass
-static int (*orig_App_get_internetReachability)(const void *) = NULL;
-static int (*orig_Net_OnReturnToLogin)(void *, void *, const void *) = NULL;
-
-// 1. Race Start
+// 1. Race Start Marker
 static void hook_GoImpEnter(void *self, const void *method) {
     if (orig_GameGo_ImpEnter) orig_GameGo_ImpEnter(self, method);
     gGoTime = nowSeconds();
@@ -356,7 +376,7 @@ static void hook_GoImpEnter(void *self, const void *method) {
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
 
-// 2. Mini Boost: Gọi ForceCanTriggerOnce(Mini/Air/FallingGround) liên tục
+// 2. Mini Boost: Giữ nguyên cơ chế gọi ForceCanTriggerOnce liên tục
 static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
     if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
@@ -368,7 +388,7 @@ static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
     }
 }
 
-// 3. Auto End Drift: Tránh dính drift
+// 3. Auto End Drift
 static void hook_DriftExitCurState(void *self, const void *method) {
     if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(self, method);
 }
@@ -389,7 +409,7 @@ static void hook_DriftRelease(void *self, const void *method) {
     }
 }
 
-// 4. PowerChain Speed Boost (chỉ boost, autopilot tách riêng sang Cab::Update)
+// 4. Gia Tốc / Speed Boost (+5s gate)
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
     if (!self || gSpeedKmh <= 0.f) return;
@@ -402,121 +422,7 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + kOffPowerTorqueScale)  = 1.0f + (gSpeedKmh / 120.0f);
 }
 
-static inline BOOL rtPtrOk(const void *p) {
-    uintptr_t v = (uintptr_t)p;
-    if (v < 0x10000ULL) return NO;
-    if (v & 7) return NO;
-    return YES;
-}
-
-// ==== Auto Play state ====================================================
-//
-// Written by hook_MotionCtrlUpdate (once per motion tick) and read by
-// hook_Input_GetKey (polled several times per frame), so it must be declared
-// before both.
-//
-// InputKeyType (dump): Left=1 Right=2 PropOne=3 PropTwo=4 SmallBoost=5
-//                      Brake=6 Reset=7 Drift=8 SidewaysDrift=9 ...
-static int gAPKeyMask    = 0;   // bit N set => key N is "held" this frame
-static int gAPDriftLatch = 0;   // 1 while drift is held
-static int gAPBoostTicks = 0;   // frames left to hold SmallBoost
-
-static BOOL rtAPKey(int t) { return (gAPKeyMask >> t) & 1; }
-
-// Layer A + skill arbitration.
-//
-// Verified order in NssPhyVehicleMotionCtrl.Update (0x7B10770):
-//   sub_7AF6EC8(mDrivingCtrl, mSteeringData, dt)   // UpdateDrivingData
-//       -> _UpdatePhyDrivingParams -> set_Throttle / set_Steering
-// mSteeringData sits at +0x10, mDrivingCtrl at +0x38. So the only place a write
-// survives the tick is BEFORE the original Update runs; hooking
-// _UpdatePhyDrivingParams is too late because AssistTurning and Handbrake
-// overwrite mSteering afterwards.
-//
-//   NssSteeringData: +0x10 mForward, +0x14 mBrakingState(int),
-//                    +0x18 mIsHandbrake, +0x1C mSteeringLeft
-static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
-    if (gAutoPlay && rtPtrOk(self)) {
-        void *steerData = *(void **)((char *)self + kOffMotionSteerData);
-        void *dyn       = *(void **)((char *)self + kOffMotionDynVehicle);
-        void *phyCtrl   = *(void **)((char *)self + kOffMotionPhyCtrl);
-        void *vehicle   = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynVehicle) : NULL;
-
-        // This hook also fires for AI cars; only drive the local player's.
-        BOOL isPlayer = YES;
-        if (rtPtrOk(vehicle)) isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
-
-        if (isPlayer && rtPtrOk(steerData) && rtPtrOk(dyn) && rtPtrOk(phyCtrl)) {
-            void *acc = *(void **)((char *)dyn + kOffDynACC);
-            void *sim = *(void **)((char *)phyCtrl + kOffPhySimOutput);
-            void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
-
-            if (rtPtrOk(sim) && rtPtrOk(tp)) {
-                float fwdX = *(float *)((char *)sim + kOffSimMovingDir);
-                float fwdZ = *(float *)((char *)sim + kOffSimMovingDir + 8);
-                float dirX = *(float *)((char *)tp + kOffTpDirection);
-                float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
-                float hDis = *(float *)((char *)acc + kOffAccHorizDis);
-
-                // cross(fwd,dir) = |fwd||dir|sin(theta); normalise so the gain is
-                // independent of the vector magnitudes the sim happens to report.
-                float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
-                float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
-                float cross = (fwdX * dirZ) - (fwdZ * dirX);
-                if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
-
-                float steer = (cross * 2.4f) - (hDis * 0.045f);
-                if (steer > 1.0f) steer = 1.0f;
-                if (steer < -1.0f) steer = -1.0f;
-
-                float userSteer = *(float *)((char *)steerData + kOffSteerWheel);
-                BOOL playerSteering = fabsf(userSteer) >= 0.2f;
-
-                if (!playerSteering) *(float *)((char *)steerData + kOffSteerWheel) = steer;
-                // (no cache needed: mSteeringData is the single source of truth)
-
-                int braking = *(int *)((char *)steerData + kOffSteerBraking);
-                bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
-                if (braking == 0 && !handbrake)
-                    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
-
-                // ---- skill layer: held-key mask for GetKey ----
-                // Hysteresis: latch drift on a real corner and only release when
-                // the corner opens, otherwise the state machine toggles per frame
-                // and the drift gauge never charges.
-                int mask = 0;
-                if (fabsf(steer) > 0.55f)      gAPDriftLatch = 1;
-                else if (fabsf(steer) < 0.25f) gAPDriftLatch = 0;
-
-                if (gAPDriftLatch && !handbrake) {
-                    mask |= (1 << 8);                             // Drift
-                    mask |= (steer > 0.f) ? (1 << 2) : (1 << 1);  // Right : Left
-                } else if (!playerSteering) {
-                    if (steer > 0.15f)      mask |= (1 << 2);
-                    else if (steer < -0.15f) mask |= (1 << 1);
-                }
-
-                // Mini boost: two-tick tap on drift exit, same as a human release.
-                if (!gAPDriftLatch && gAPBoostTicks == 0 && fabsf(cross) < 0.20f)
-                    gAPBoostTicks = 2;
-                if (gAPBoostTicks > 0) {
-                    mask |= (1 << 5);                             // SmallBoost
-                    gAPBoostTicks--;
-                }
-
-                gAPKeyMask = mask;
-            }
-        }
-    } else {
-        gAPKeyMask = 0;   // off: never leak a synthetic key into the game
-        gAPDriftLatch = 0;
-        gAPBoostTicks = 0;
-    }
-
-    if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
-}
-
-// 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
+// 5. Anti-Cheat Report Speed: Khóa SdcVehicleVel ở mức 300 km/h
 static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
     if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, method);
     if (!self) return;
@@ -534,7 +440,7 @@ static void hook_SdcVehicleVelUpdate(void *self, float dt, const void *method) {
     *(float *)((char *)self + 0x94) = 300.0f; // mMaxVehicleKMPH = 300.0f
 }
 
-// 7. CheckPointMgr & ActorCpReporter: Tính MinMapTime, LapTimeLimit & Can Finish
+// 6. CheckPoint & Lap time
 static void hook_CheckPointMgrInit(void *self, void *config, bool checkCrc, bool enableReset, const void *method) {
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, checkCrc, enableReset, method);
     if (config) {
@@ -543,7 +449,6 @@ static void hook_CheckPointMgrInit(void *self, void *config, bool checkCrc, bool
         float lapDist = gMainCurveLength > 100.f ? gMainCurveLength : 2500.f;
         float totalDist = lapDist * (float)laps;
 
-        // Vận tốc chuẩn an toàn 300 km/h (≈ 83.33 m/s)
         gLapTimeLimit = lapDist / (300.0f / 3.6f);
         gMinMapTimeSeconds = totalDist / (300.0f / 3.6f);
 
@@ -570,79 +475,120 @@ static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, co
     }
 }
 
-#pragma mark - 8. Shadow autopilot
-
-// ShadowTrusteeship drives the car through four side effects. Three of them are
-// fine here, one has to be neutralised:
-//
-//   EnableMatchInput(false)  -> cuts the touch->steer/drift/nitro link  [BLOCK]
-//   EnableAutoSpeedUp(true)  -> Throttle = 1.0 on the cab             [KEEP]
-//   IgnoreCollision(true)    -> VhcActionIgnoreCollision, no wall ping [KEEP]
-//   EnableVehiclePhy(false)  -> kinematic, replay overwrites motion    [KEEP]
-//
-// We keep the player's input alive by forcing enable = true at the source, and
-// then generate the motion ourselves: this codebase has no replay blob
-// (MoveTransInfo2/EventTransInfo), so the ReplayMoveAlgm keyframe sampling is
-// replaced by live ITrackPoint sampling from IVehicleACC. The result is written
-// to NssSteeringData, the same struct ReplayMoveProcess ultimately feeds.
-static void hook_ShadowEnableMatchInput(void *self, bool enable, const void *method) {
-    bool want = gAutoPlay ? true : enable;
-    if (orig_Shadow_EnableMatchInput && want != (bool)sShadowState[0]) {
-        orig_Shadow_EnableMatchInput(self, want, method);
-        sShadowState[0] = want ? 1 : 0;
-    } else if (!orig_Shadow_EnableMatchInput) {
-        rtLog("shadow: EnableMatchInput unavailable, input path untouched");
+// 7. Sức mạnh đổi hướng (Steer Strength Multiplier)
+static void hook_PhyVehicleCtrl_DoSteering(void *self, float torque, const void *method) {
+    if (gSteerStrength > 0.0f) {
+        torque *= gSteerStrength;
     }
+    if (orig_PhyVehicleCtrl_DoSteering) orig_PhyVehicleCtrl_DoSteering(self, torque, method);
 }
 
-static void hook_ShadowEnableAutoSpeedUp(void *self, bool enable, const void *method) {
-    if (orig_Shadow_EnableAutoSpeedUp) orig_Shadow_EnableAutoSpeedUp(self, enable, method);
-}
-
-static void hook_ShadowIgnoreCollision(void *self, bool enable, const void *method) {
-    if (orig_Shadow_IgnoreCollision) orig_Shadow_IgnoreCollision(self, enable, method);
-}
-
-// ==== Auto Play core =====================================================
-//
-// The car is driven by two independent layers, both owned by the game:
-//
-//   [A] analog: NssSteeringData{mForward, mBrakingState, mIsHandbrake,
-//       mSteeringLeft} -> NssPlayerVehicleDrivingCtrl._UpdatePhyDrivingParams
-//       -> mThrottle / mSteering -> forces.                    (throttle + steer)
-//   [B] discrete: InputModule.GetKey(InputKeyType) -> ECU/Cab -> drift state
-//       machine, mini-boost trigger, nitro.                    (Drift / Boost)
-//
-// Layer A alone can steer and hold throttle but can never drift or boost, so a
-// pure-A implementation feels dead. Layer B alone has no analog resolution.
-// Auto Play therefore writes both: A for the racing line, B for the skills.
-//
-// InputKeyType (dump): Left=1 Right=2 PropOne=3 PropTwo=4 SmallBoost=5
-//                      Brake=6 Reset=7 Drift=8 SidewaysDrift=9 ...
-// Steering is recomputed once per motion tick and cached, because GetKey can be
-// polled several times per frame by different consumers.
-
-
-// Layer B: pretend the thumb holds these keys. Everything downstream (drift
-// state machine, CWW/WCW boost, nitro) runs the untouched game code path.
-static BOOL hook_Input_GetKey(void *self, int keyType, const void *method) {
-    if (gAutoPlay && keyType > 0 && keyType < 18 && rtAPKey(keyType))
-        return TRUE;
-    return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, method) : FALSE;
-}
-
-// để game không bao giờ tự ngắt tính năng hoặc ép dừng trận đua khi rớt mạng.
-static int hook_App_get_internetReachability(const void *method) {
-    return 2; // Always ReachableViaLocalAreaNetwork (WiFi)
-}
-
-// Chặn văng về màn hình đăng nhập nếu rớt mạng trong lúc xe đang tự động đua dở
-static int hook_Net_OnReturnToLogin(void *self, void *e, const void *method) {
-    if (gGoTime > 0.0 && !gCanFinish) {
-        rtLog("net: suppressed disconnect popup during active race");
-        return 0; // Chặn xử lý văng về login
+// 8. Tự động Mod Xe / Skin trong Sảnh (Lobby / Garage / Preview)
+static void hook_Previewer_ShowVehicle(void *self, void *vehiclePreviewParam, uint32_t downloadPriority, void *memberName, void *filePath, const void *method) {
+    if (gModEnabled && gModVehicleID > 0 && rtPtrOk(vehiclePreviewParam)) {
+        *(uint32_t *)((char *)vehiclePreviewParam + 0x2C) = (uint32_t)gModVehicleID; // VehicleId
+        if (gModSkinID > 0) {
+            *(uint32_t *)((char *)vehiclePreviewParam + 0x28) = (uint32_t)gModSkinID; // SkinId
+        }
+        rtLog("Lobby/Garage ShowVehicle modded -> VehicleID=%d SkinID=%d", gModVehicleID, gModSkinID);
     }
-    return orig_Net_OnReturnToLogin ? orig_Net_OnReturnToLogin(self, e, method) : 0;
+    if (orig_Previewer_ShowVehicle) orig_Previewer_ShowVehicle(self, vehiclePreviewParam, downloadPriority, memberName, filePath, method);
+}
+
+// 9. Tự động Mod Xe khi Vào Trận / Load Trận (PreInit)
+static void hook_NssVehicle_PreInit(void *self, uint64_t uid, int vehicleID, void *compConfig, const void *method) {
+    if (gModEnabled && gModVehicleID > 0) {
+        vehicleID = gModVehicleID;
+        rtLog("Load match PreInit modded vehicleID -> %d (uid=%llu)", gModVehicleID, (unsigned long long)uid);
+    }
+    if (orig_NssVehicle_PreInit) orig_NssVehicle_PreInit(self, uid, vehicleID, compConfig, method);
+}
+
+static int hook_NssVehicle_GetVehicleID(void *self, const void *method) {
+    if (gModEnabled && gModVehicleID > 0 && rtPtrOk(self)) {
+        return gModVehicleID;
+    }
+    return orig_NssVehicle_GetVehicleID ? orig_NssVehicle_GetVehicleID(self, method) : 0;
+}
+
+static uint64_t hook_ItemVehicle_GetModelID(void *self, const void *method) {
+    if (gModEnabled && gModVehicleID > 0 && rtPtrOk(self)) {
+        return (uint64_t)gModVehicleID;
+    }
+    return orig_ItemVehicle_GetModelID ? orig_ItemVehicle_GetModelID(self, method) : 0;
+}
+
+// 10. Fixed Auto Play: Instant trackpoint orientation pursuit + physical steering
+static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
+    if (rtPtrOk(self)) {
+        void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
+        if (rtPtrOk(vehicle)) {
+            gCurrentVehicle = vehicle;
+            if (gModEnabled && gModVehicleID > 0) {
+                *(int *)((char *)vehicle + kOffVehicleID) = gModVehicleID;
+            }
+        }
+
+        if (gAutoPlay) {
+            void *steerData   = *(void **)((char *)self + kOffMotionSteerData);
+            void *dyn         = *(void **)((char *)self + kOffMotionDynVehicle);
+            void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
+            void *drivingCtrl = *(void **)((char *)self + kOffMotionDrivingCtrl);
+
+            if (rtPtrOk(steerData) && rtPtrOk(dyn) && rtPtrOk(phyCtrl)) {
+                void *acc = *(void **)((char *)dyn + kOffDynACC);
+                void *sim = *(void **)((char *)phyCtrl + kOffPhySimOutput);
+                void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
+
+                if (rtPtrOk(sim) && rtPtrOk(tp)) {
+                    // Forward vector from chassis orientation quaternion
+                    float qx = *(float *)((char *)sim + kOffSimChassisRot);
+                    float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
+                    float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
+                    float qw = *(float *)((char *)sim + kOffSimChassisRot + 12);
+
+                    float fwdX = 2.0f * (qx * qz + qw * qy);
+                    float fwdZ = 1.0f - 2.0f * (qx * qx + qy * qy);
+
+                    float dirX = *(float *)((char *)tp + kOffTpDirection);
+                    float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
+                    float hDis = *(float *)((char *)acc + kOffAccHorizDis);
+
+                    float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
+                    float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
+                    float cross = (fwdX * dirZ) - (fwdZ * dirX);
+                    if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
+
+                    float steer = (cross * 2.5f) - (hDis * 0.05f);
+                    if (steer > 1.0f) steer = 1.0f;
+                    if (steer < -1.0f) steer = -1.0f;
+
+                    // Player touch override
+                    float userSteer = *(float *)((char *)steerData + kOffSteerWheel);
+                    BOOL isUserSteering = fabsf(userSteer) >= 0.2f;
+
+                    if (!isUserSteering) {
+                        *(float *)((char *)steerData + kOffSteerWheel) = steer;
+                        if (rtPtrOk(drivingCtrl)) {
+                            *(float *)((char *)drivingCtrl + kOffDrvInputXPos) = steer;
+                            *(float *)((char *)drivingCtrl + kOffDrvSteering)  = steer;
+                        }
+                    }
+
+                    int braking = *(int *)((char *)steerData + kOffSteerBraking);
+                    bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
+                    if (braking == 0 && !handbrake) {
+                        *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
+                        if (rtPtrOk(drivingCtrl)) {
+                            *(float *)((char *)drivingCtrl + kOffDrvThrottle) = 1.0f;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
 }
 
 #pragma mark - Hook installation
@@ -662,27 +608,26 @@ static BOOL rtHooksDisabled(void) {
 
 static void installHooks(void) {
     if (rtHooksDisabled()) {
-        rtLog("install: SKIPPED (no_hooks flag present) - hooks disabled, menu only");
+        rtLog("install: SKIPPED (no_hooks flag present)");
         return;
     }
 
-    rtLog("install: installing IL2CPP metadata hooks (zero text-patching)");
+    rtLog("install: installing IL2CPP metadata hooks");
 
-    // 1. Race start marker (đếm 5s xuất phát)
+    // 1. Race start
     orig_GameGo_ImpEnter = (void (*)(void *, const void *))
         rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
 
-    // 2. Mini Boost: Gọi ForceCanTriggerOnce liên tục
+    // 2. Mini Boost
     orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
-
     ExtraVelocityTriggerMgr_ForceCanTriggerOnce = (void (*)(void *, int, const void *))
         rtGetMethodPointer("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
 
-    // 3. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
+    // 3. Auto End Drift
     orig_Drift_Release = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
     orig_Drift_ExitCurDriftState = (void (*)(void *, const void *))
@@ -690,53 +635,48 @@ static void installHooks(void) {
     orig_Drift_ForceClearDriftParams = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftForceClear);
 
-    // 4. Tốc độ trục truyền động vật lý (PowerChain)
+    // 4. Gia Tốc / Speed Boost
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
 
-    orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
-
-
-    // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
+    // 5. Anti-Cheat Report
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVelUpdate);
 
-    // 7. CheckPointMgr & ActorCpReporter (Tính MinMapTime, LapTimeLimit và Can Finish)
+    // 6. CheckPoint & Lap time
     orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
         rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgrInit);
     orig_ActorCpReporter_Update = (void (*)(void *, float, float, const void *))
         rtHookMethod("", "ActorCpReporter", "Update", 2, (void *)hook_ActorCpReporterUpdate);
 
-    // 8. Shadow autopilot: keep input alive, feed the steering struct
-    orig_Shadow_EnableMatchInput = (void (*)(void *, bool, const void *))
-        rtHookMethod("", "ShadowTrusteeship", "EnableMatchInput", 1, (void *)hook_ShadowEnableMatchInput);
-    orig_Shadow_EnableAutoSpeedUp = (void (*)(void *, bool, const void *))
-        rtHookMethod("", "ShadowTrusteeship", "EnableAutoSpeedUp", 1, (void *)hook_ShadowEnableAutoSpeedUp);
-    orig_Shadow_IgnoreCollision = (void (*)(void *, bool, const void *))
-        rtHookMethod("", "ShadowTrusteeship", "IgnoreCollision", 1, (void *)hook_ShadowIgnoreCollision);
+    // 7. MotionCtrl (Auto Play & RAM Vehicle ID)
+    orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
 
-    // Auto Play is entirely served by two hooks: MotionCtrl.Update (analog steer
-    // + throttle, written into mSteeringData before UpdateDrivingData consumes
-    // it) and InputModule.GetKey (drift / mini-boost / scrub keys).
-    // Auto Play layer B: synthesise the discrete input keys (Drift / SmallBoost /
-    // Left / Right). InputModule.GetKey is the single funnel every consumer reads.
-    orig_Input_GetKey = (BOOL (*)(void *, int, const void *))
-        rtHookMethod("", "InputModule", "GetKey", 1, (void *)hook_Input_GetKey);
+    // 8. Sức mạnh đổi hướng (DoSteering)
+    orig_PhyVehicleCtrl_DoSteering = (void (*)(void *, float, const void *))
+        rtHookMethod("", "NssPhyVehicleCtrl", "DoSteering", 1, (void *)hook_PhyVehicleCtrl_DoSteering);
 
-    rtLog("autoplay: motionCtrl=%p inputGetKey=%p", orig_MotionCtrl_Update, orig_Input_GetKey);
-    // 9. Offline / Always-Connected bypass: Xe tự lái liên tục kể cả khi rớt mạng/mất WiFi
-    orig_App_get_internetReachability = (int (*)(const void *))
-        rtHookMethod("UnityEngine", "Application", "get_internetReachability", 0, (void *)hook_App_get_internetReachability);
-    orig_Net_OnReturnToLogin = (int (*)(void *, void *, const void *))
-        rtHookMethod("", "NetGeneralMgr", "OnReturnToLoginStateAfterDisconnect", 1, (void *)hook_Net_OnReturnToLogin);
-    rtLog("offline bypass: appReachability=%p netDisconnect=%p",
-          orig_App_get_internetReachability, orig_Net_OnReturnToLogin);
+    // 9. Mod Xe trong Sảnh / Lobby (Item3DPreviewSystem)
+    orig_Previewer_ShowVehicle = (void (*)(void *, void *, uint32_t, void *, void *, const void *))
+        rtHookMethod("", "Item3DPreviewSystem.CustomPlayerPreviewer", "ShowVehicle", 4, (void *)hook_Previewer_ShowVehicle);
+    if (!orig_Previewer_ShowVehicle) {
+        orig_Previewer_ShowVehicle = (void (*)(void *, void *, uint32_t, void *, void *, const void *))
+            rtHookMethod("", "Item3DPreviewSystem.PlayerPreviewer", "ShowVehicle", 4, (void *)hook_Previewer_ShowVehicle);
+    }
+
+    // 10. Mod Xe khi Vào Trận / Load Trận (PreInit & ModelID)
+    orig_NssVehicle_PreInit = (void (*)(void *, uint64_t, int, void *, const void *))
+        rtHookMethod("", "NssVehicle", "PreInit", 3, (void *)hook_NssVehicle_PreInit);
+    orig_NssVehicle_GetVehicleID = (int (*)(void *, const void *))
+        rtHookMethod("", "NssVehicle", "GetVehicleID", 0, (void *)hook_NssVehicle_GetVehicleID);
+    orig_ItemVehicle_GetModelID = (uint64_t (*)(void *, const void *))
+        rtHookMethod("", "ItemVehicle", "GetVechicleModelID", 0, (void *)hook_ItemVehicle_GetModelID);
 
     rtLog("install: done (all hooks active)");
 }
 
-#pragma mark - UI
+#pragma mark - Modern UI Implementation with Vehicle/Skin Dropdown
 
 @interface RCPassThroughWindow : UIWindow
 @end
@@ -753,12 +693,57 @@ static void installHooks(void) {
 - (BOOL)canBecomeFocused  { return NO; }
 @end
 
+// Vehicle & Skin Catalog Definition
+typedef struct {
+    int vehicleID;
+    int skinID;
+    const char *displayName;
+} RCVehicleItem;
+
+static const RCVehicleItem kVehicleCatalog[] = {
+    { 0,     0,     "Mặc định (Không Mod)" },
+    { 4,     0,     "[A] 雷诺 / Lôi Nặc (Renault)" },
+    { 4,     10004, "[A-Skin] Lôi Nặc - Hoàng Kim (Gold)" },
+    { 439,   0,     "[S] 冰魄 / Băng Phách (S-Ice Soul)" },
+    { 439,   10439, "[S-Skin] Băng Phách - Thiên Sứ (Angel)" },
+    { 511,   0,     "[T-Mecha] 序列未来 (Future Sequence)" },
+    { 511,   10511, "[T-Skin] T-Future - Thiên Ngoại (Galaxy)" },
+    { 539,   0,     "[A] 孙悟空 / Tôn Ngộ Không (Sun Wukong)" },
+    { 539,   10539, "[A-Skin] Ngộ Không - Tề Thiên Đại Thánh" },
+    { 552,   0,     "[A] 幻星 / Huyễn Tinh (Phantasm Star)" },
+    { 567,   0,     "[B] 奶瓶 / Bình Sữa (Magic Bottle)" },
+    { 579,   0,     "[A] 破晓 / Phá Hiểu (Daybreak)" },
+    { 590,   0,     "[T-Mecha] 冥王哈迪斯 (Hades Mecha)" },
+    { 590,   10590, "[T-Skin] Hades - Dạ Quỷ (Night Hades)" },
+    { 400,   0,     "[S] 追光者 / Truy Quang (Light Chaser)" },
+    { 410,   0,     "[S] 逐星者 / Trục Tinh (Star Chaser)" },
+    { 450,   0,     "[S] 裁决者 / Tài Quyết (S-Judgement)" },
+    { 480,   0,     "[S] 天行者 / Thiên Hành (S-Skywalker)" },
+    { 500,   0,     "[T-Mecha] 源极之星EXA (Origin Star T1)" },
+    { 520,   0,     "[A] 地狱天启 / Địa Ngục Thiên Khải" },
+    { 530,   0,     "[A] 双生战神 / Song Sinh Chiến Thần" },
+    { 540,   0,     "[A] 迈凯伦600LT / McLaren 600LT" },
+    { 560,   0,     "[A] 劳斯莱斯曜影 / Rolls-Royce Dawn" },
+    { 580,   0,     "[A] 兰博基尼 / Lamborghini RACING" },
+    { 600,   0,     "[T-Mecha] 红喷奥特曼 / Ultraman Mecha" }
+};
+static const int kVehicleCatalogCount = sizeof(kVehicleCatalog) / sizeof(kVehicleCatalog[0]);
+
 @interface RCRaceToolkitMenu : NSObject
 @property (nonatomic, strong) RCPassThroughWindow *window;
 @property (nonatomic, strong) UIView *host;
 @property (nonatomic, strong) UIButton *fab;
 @property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UIScrollView *scrollView;
+
+// Dropdown components
+@property (nonatomic, strong) UIButton *dropdownBtn;
+@property (nonatomic, strong) UIView *dropdownPopup;
+@property (nonatomic, strong) UIScrollView *dropdownScroll;
+
+// Labels
 @property (nonatomic, strong) UILabel *speedLabel;
+@property (nonatomic, strong) UILabel *steerLabel;
 
 // Top HUD Overlay
 @property (nonatomic, strong) UIView *topHud;
@@ -771,18 +756,18 @@ static RCRaceToolkitMenu *gMenu = nil;
 
 @implementation RCRaceToolkitMenu
 
-- (UISwitch *)switchAtY:(CGFloat)y title:(NSString *)title on:(BOOL)on action:(SEL)action {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, 205, 32)];
+- (UISwitch *)addSwitchAtY:(CGFloat)y title:(NSString *)title on:(BOOL)on action:(SEL)action {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, 190, 24)];
     l.text = title;
     l.textColor = UIColor.whiteColor;
-    l.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    [self.panel addSubview:l];
+    l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [self.scrollView addSubview:l];
 
-    UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(226, y, 51, 31)];
-    s.onTintColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.55 alpha:1.0];
+    UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(220, y, 51, 31)];
+    s.onTintColor = [UIColor colorWithRed:0.18 green:0.85 blue:0.55 alpha:1.0];
     s.on = on;
     [s addTarget:self action:action forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:s];
+    [self.scrollView addSubview:s];
     return s;
 }
 
@@ -809,10 +794,10 @@ static RCRaceToolkitMenu *gMenu = nil;
 
     self.host = self.window.rootViewController.view;
 
-    // === TOP HUD OVERLAY (MinMapTime, LapTimeLimit & Can Finish) ===
+    // === TOP HUD OVERLAY ===
     CGFloat hudW = 340, hudH = 46;
     self.topHud = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - hudW) / 2, 8, hudW, hudH)];
-    self.topHud.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.88];
+    self.topHud.backgroundColor = [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:0.92];
     self.topHud.layer.cornerRadius = 14;
     self.topHud.layer.borderWidth = 1.0;
     self.topHud.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.18].CGColor;
@@ -834,7 +819,6 @@ static RCRaceToolkitMenu *gMenu = nil;
 
     [self.host addSubview:self.topHud];
 
-    // Timer cập nhật HUD 10 lần mỗi giây
     self.hudTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
                                                      target:self
                                                    selector:@selector(updateTopHud)
@@ -843,58 +827,181 @@ static RCRaceToolkitMenu *gMenu = nil;
 
     // === FLOATING BUTTON (FAB) ===
     self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.fab.frame = CGRectMake(screen.size.width - 68, 96, 56, 56);
-    self.fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.45 blue:0.90 alpha:0.92];
-    self.fab.layer.cornerRadius = 28;
+    self.fab.frame = CGRectMake(screen.size.width - 66, 96, 54, 54);
+    self.fab.backgroundColor = [UIColor colorWithRed:0.08 green:0.48 blue:0.98 alpha:0.94];
+    self.fab.layer.cornerRadius = 27;
     self.fab.layer.borderWidth = 1.5;
-    self.fab.layer.borderColor = UIColor.whiteColor.CGColor;
+    self.fab.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.9].CGColor;
     [self.fab setTitle:@"R" forState:UIControlStateNormal];
     self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:24];
     [self.fab addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
     [self.host addSubview:self.fab];
 
-    // === MENU PANEL ===
-    CGFloat w = 310, h = 265;
+    // === MODERN MENU PANEL ===
+    CGFloat w = 310, h = 420;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - w) / 2,
                                                         (screen.size.height - h) / 2, w, h)];
-    self.panel.backgroundColor = [UIColor colorWithWhite:0.09 alpha:0.96];
-    self.panel.layer.cornerRadius = 14;
-    self.panel.layer.borderWidth = 1;
-    self.panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
+    self.panel.backgroundColor = [UIColor colorWithRed:0.08 green:0.10 blue:0.14 alpha:0.96];
+    self.panel.layer.cornerRadius = 18;
+    self.panel.layer.borderWidth = 1.0;
+    self.panel.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.2].CGColor;
     self.panel.hidden = YES;
     [self.host addSubview:self.panel];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 240, 26)];
-    title.text = @"Race Toolkit";
+    // Panel Header
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 44)];
+    header.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.05];
+    header.layer.cornerRadius = 18;
+    [self.panel addSubview:header];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 200, 24)];
+    title.text = @"Race Toolkit Pro";
     title.textColor = UIColor.whiteColor;
-    title.font = [UIFont boldSystemFontOfSize:17];
-    [self.panel addSubview:title];
+    title.font = [UIFont boldSystemFontOfSize:16];
+    [header addSubview:title];
 
-    [self switchAtY:40  title:@"Auto Play"        on:gAutoPlay  action:@selector(onAutoPlay:)];
-    [self switchAtY:76  title:@"Inf Mini Boost"   on:gFullMiniBoost action:@selector(onMini:)];
-    [self switchAtY:112 title:@"Auto End Drift"   on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    closeBtn.frame = CGRectMake(w - 40, 8, 28, 28);
+    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
+    [closeBtn setTitleColor:[UIColor colorWithWhite:0.8 alpha:1.0] forState:UIControlStateNormal];
+    [closeBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:closeBtn];
 
-    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 150, 268, 20)];
+    // ScrollView
+    self.scrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 44, w, h - 44)];
+    self.scrollView.contentSize = CGSizeMake(w, 460);
+    self.scrollView.showsVerticalScrollIndicator = YES;
+    [self.panel addSubview:self.scrollView];
+
+    CGFloat curY = 10;
+
+    // 1. Toggles
+    [self addSwitchAtY:curY title:@"Auto Play (AI Tự Đua)" on:gAutoPlay action:@selector(onAutoPlay:)];
+    curY += 36;
+
+    [self addSwitchAtY:curY title:@"Inf Mini Boost" on:gFullMiniBoost action:@selector(onMini:)];
+    curY += 36;
+
+    [self addSwitchAtY:curY title:@"Auto End Drift" on:gAutoDriftEnd action:@selector(onAutoDrift:)];
+    curY += 40;
+
+    // 2. Slider 1: Speed Boost
+    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 268, 18)];
     self.speedLabel.textColor = UIColor.whiteColor;
-    self.speedLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.speedLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
     self.speedLabel.text = [self speedText];
-    [self.panel addSubview:self.speedLabel];
+    [self.scrollView addSubview:self.speedLabel];
+    curY += 20;
 
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 172, 268, 32)];
-    slider.minimumValue = 0.f;
-    slider.maximumValue = 300.f;
-    slider.value = gSpeedKmh;
-    slider.tintColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.55 alpha:1.0];
-    [slider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:slider];
+    UISlider *speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(16, curY, 268, 28)];
+    speedSlider.minimumValue = 0.f;
+    speedSlider.maximumValue = 300.f;
+    speedSlider.value = gSpeedKmh;
+    speedSlider.tintColor = [UIColor colorWithRed:0.20 green:0.80 blue:0.55 alpha:1.0];
+    [speedSlider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.scrollView addSubview:speedSlider];
+    curY += 34;
 
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 212, 278, 42)];
+    // 3. Slider 2: Sức mạnh đổi hướng
+    self.steerLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 268, 18)];
+    self.steerLabel.textColor = UIColor.whiteColor;
+    self.steerLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
+    self.steerLabel.text = [self steerText];
+    [self.scrollView addSubview:self.steerLabel];
+    curY += 20;
+
+    UISlider *steerSlider = [[UISlider alloc] initWithFrame:CGRectMake(16, curY, 268, 28)];
+    steerSlider.minimumValue = 0.5f;
+    steerSlider.maximumValue = 3.0f;
+    steerSlider.value = gSteerStrength;
+    steerSlider.tintColor = [UIColor colorWithRed:0.10 green:0.65 blue:1.0 alpha:1.0];
+    [steerSlider addTarget:self action:@selector(onSteerChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.scrollView addSubview:steerSlider];
+    curY += 38;
+
+    // 4. Section: Mod Skin / Xe (Dropdown Selection)
+    [self addSwitchAtY:curY title:@"Bật Mod Xe / Skin" on:gModEnabled action:@selector(onModEnabled:)];
+    curY += 36;
+
+    UILabel *dropdownLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 268, 18)];
+    dropdownLabel.text = @"Chọn Xe & Skin:";
+    dropdownLabel.textColor = [UIColor colorWithRed:1.0 green:0.75 blue:0.2 alpha:1.0];
+    dropdownLabel.font = [UIFont boldSystemFontOfSize:12.5];
+    [self.scrollView addSubview:dropdownLabel];
+    curY += 20;
+
+    // Interactive Dropdown Button
+    self.dropdownBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.dropdownBtn.frame = CGRectMake(16, curY, 268, 34);
+    self.dropdownBtn.backgroundColor = [UIColor colorWithRed:0.14 green:0.16 blue:0.22 alpha:1.0];
+    self.dropdownBtn.layer.cornerRadius = 8;
+    self.dropdownBtn.layer.borderWidth = 1.0;
+    self.dropdownBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.75 blue:0.2 alpha:0.5].CGColor;
+    [self.dropdownBtn setTitle:[NSString stringWithUTF8String:kVehicleCatalog[0].displayName] forState:UIControlStateNormal];
+    [self.dropdownBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.dropdownBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    self.dropdownBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    self.dropdownBtn.titleEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 10);
+    [self.dropdownBtn addTarget:self action:@selector(toggleDropdown) forControlEvents:UIControlEventTouchUpInside];
+    [self.scrollView addSubview:self.dropdownBtn];
+    curY += 40;
+
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 268, 36)];
     note.numberOfLines = 2;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:10.5];
-    note.text = @"Auto Play: bam tim duong, giu ga, tu drift va mini boost.\nCham phim lai bat ky luc nao de gianh quyen dieu khien.";
-    [self.panel addSubview:note];
+    note.text = @"Tự động đổi xe ở Sảnh và ngay khi Vào Trận / Load Trận.\nBật Auto Play để AI bám tim đường & giữ ga liên tục.";
+    [self.scrollView addSubview:note];
+    curY += 44;
+
+    self.scrollView.contentSize = CGSizeMake(w, curY + 10);
+
+    // === DROPDOWN POPUP OVERLAY ===
+    self.dropdownPopup = [[UIView alloc] initWithFrame:CGRectMake(16, 90, w - 32, 260)];
+    self.dropdownPopup.backgroundColor = [UIColor colorWithRed:0.10 green:0.12 blue:0.18 alpha:0.98];
+    self.dropdownPopup.layer.cornerRadius = 12;
+    self.dropdownPopup.layer.borderWidth = 1.5;
+    self.dropdownPopup.layer.borderColor = [UIColor colorWithRed:1.0 green:0.75 blue:0.2 alpha:0.8].CGColor;
+    self.dropdownPopup.hidden = YES;
+    [self.panel addSubview:self.dropdownPopup];
+
+    UILabel *popupTitle = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, 200, 20)];
+    popupTitle.text = @"Danh sách Xe & Skin:";
+    popupTitle.textColor = [UIColor colorWithRed:1.0 green:0.75 blue:0.2 alpha:1.0];
+    popupTitle.font = [UIFont boldSystemFontOfSize:12.5];
+    [self.dropdownPopup addSubview:popupTitle];
+
+    UIButton *popupClose = [UIButton buttonWithType:UIButtonTypeCustom];
+    popupClose.frame = CGRectMake(w - 32 - 32, 6, 26, 26);
+    [popupClose setTitle:@"✕" forState:UIControlStateNormal];
+    popupClose.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [popupClose setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [popupClose addTarget:self action:@selector(toggleDropdown) forControlEvents:UIControlEventTouchUpInside];
+    [self.dropdownPopup addSubview:popupClose];
+
+    self.dropdownScroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 32, w - 32, 220)];
+    self.dropdownScroll.showsVerticalScrollIndicator = YES;
+    [self.dropdownPopup addSubview:self.dropdownScroll];
+
+    CGFloat optY = 4;
+    for (int i = 0; i < kVehicleCatalogCount; i++) {
+        UIButton *opt = [UIButton buttonWithType:UIButtonTypeCustom];
+        opt.frame = CGRectMake(8, optY, w - 32 - 16, 28);
+        opt.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.04];
+        opt.layer.cornerRadius = 6;
+        opt.tag = i;
+        [opt setTitle:[NSString stringWithUTF8String:kVehicleCatalog[i].displayName] forState:UIControlStateNormal];
+        [opt setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        opt.titleLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightMedium];
+        opt.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        opt.titleEdgeInsets = UIEdgeInsetsMake(0, 8, 0, 8);
+        [opt addTarget:self action:@selector(selectVehicleOption:) forControlEvents:UIControlEventTouchUpInside];
+        [self.dropdownScroll addSubview:opt];
+        optY += 32;
+    }
+    self.dropdownScroll.contentSize = CGSizeMake(w - 32, optY + 8);
 }
 
 - (void)updateTopHud {
@@ -931,15 +1038,45 @@ static RCRaceToolkitMenu *gMenu = nil;
     }
 }
 
-
 - (NSString *)speedText {
     return [NSString stringWithFormat:@"Boost speed: %d km/h (+5s gate)", (int)gSpeedKmh];
 }
 
+- (NSString *)steerText {
+    return [NSString stringWithFormat:@"Sức mạnh đổi hướng: %.1fx", gSteerStrength];
+}
+
 - (void)togglePanel {
-    self.panel.hidden = (self.panel.hidden ? NO : YES);
+    self.panel.hidden = !self.panel.hidden;
     self.window.windowLevel = UIWindowLevelAlert + 1;
     self.window.hidden = NO;
+    if (self.panel.hidden) {
+        self.dropdownPopup.hidden = YES;
+    }
+}
+
+- (void)toggleDropdown {
+    self.dropdownPopup.hidden = !self.dropdownPopup.hidden;
+    if (!self.dropdownPopup.hidden) {
+        [self.panel bringSubviewToFront:self.dropdownPopup];
+    }
+}
+
+- (void)selectVehicleOption:(UIButton *)btn {
+    int idx = (int)btn.tag;
+    if (idx >= 0 && idx < kVehicleCatalogCount) {
+        gSelectedPreset = idx;
+        gModVehicleID = kVehicleCatalog[idx].vehicleID;
+        gModSkinID = kVehicleCatalog[idx].skinID;
+        [self.dropdownBtn setTitle:[NSString stringWithUTF8String:kVehicleCatalog[idx].displayName] forState:UIControlStateNormal];
+        self.dropdownPopup.hidden = YES;
+        rtLog("selected vehicle: ID=%d, Skin=%d (%s)", gModVehicleID, gModSkinID, kVehicleCatalog[idx].displayName);
+
+        // Apply immediately if already driving
+        if (gModEnabled && rtPtrOk(gCurrentVehicle)) {
+            *(int *)((char *)gCurrentVehicle + kOffVehicleID) = gModVehicleID;
+        }
+    }
 }
 
 - (void)dragFab:(UIPanGestureRecognizer *)g {
@@ -950,16 +1087,35 @@ static RCRaceToolkitMenu *gMenu = nil;
 
 - (void)onAutoPlay:(UISwitch *)s {
     gAutoPlay = s.isOn;
-    sShadowState[0] = 0;   // force EnableMatchInput to be re-issued on the next call
-    rtLog("auto play (offline ai)=%d", s.isOn);
+    rtLog("toggle AutoPlay=%d", s.isOn);
 }
-- (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn;  rtLog("toggle FullMiniBoost=%d", s.isOn); }
-- (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn;   rtLog("toggle AutoEndDrift=%d", s.isOn); }
+
+- (void)onMini:(UISwitch *)s {
+    gFullMiniBoost = s.isOn;
+    rtLog("toggle FullMiniBoost=%d", s.isOn);
+}
+
+- (void)onAutoDrift:(UISwitch *)s {
+    gAutoDriftEnd = s.isOn;
+    rtLog("toggle AutoEndDrift=%d", s.isOn);
+}
+
+- (void)onModEnabled:(UISwitch *)s {
+    gModEnabled = s.isOn;
+    rtLog("toggle ModEnabled=%d (VehicleID=%d, SkinID=%d)", s.isOn, gModVehicleID, gModSkinID);
+    if (gModEnabled && rtPtrOk(gCurrentVehicle) && gModVehicleID > 0) {
+        *(int *)((char *)gCurrentVehicle + kOffVehicleID) = gModVehicleID;
+    }
+}
 
 - (void)onSpeedChanged:(UISlider *)s {
     gSpeedKmh = s.value;
     self.speedLabel.text = [self speedText];
-    rtLog("speed slider = %.0f km/h", gSpeedKmh);
+}
+
+- (void)onSteerChanged:(UISlider *)s {
+    gSteerStrength = s.value;
+    self.steerLabel.text = [self steerText];
 }
 
 @end
@@ -971,7 +1127,7 @@ static void buildMenuSafely(void) {
     @try {
         gMenu = [RCRaceToolkitMenu new];
         [gMenu build];
-        rtLog("UI: menu built");
+        rtLog("UI: modern menu built");
     } @catch (NSException *e) {
         gMenu = nil;
         rtLog("UI: menu build FAILED: %s", e.reason.UTF8String ?: "?");
