@@ -339,7 +339,7 @@ static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
 static void (*orig_Shadow_EnableAutoSpeedUp)(void *, bool, const void *) = NULL;
 static void (*orig_Shadow_IgnoreCollision)(void *, bool, const void *) = NULL;
 static void (*orig_DrivingParams)(void *, void *, float, const void *) = NULL;
-static bool (*orig_AIAlign_HasLatestPredictPkg)(void *, const void *) = NULL;
+static BOOL (*orig_Input_GetKey)(void *, int, const void *) = NULL;
 static char  sShadowState[3] = {0, 0, 0};   // last applied [input, speedup, nocoll]
 
 // Offline / Always-Connected bypass
@@ -509,34 +509,55 @@ static void hook_ShadowIgnoreCollision(void *self, bool enable, const void *meth
     if (orig_Shadow_IgnoreCollision) orig_Shadow_IgnoreCollision(self, enable, method);
 }
 
-// Giả lập rớt gói tin trong AIAlignPredictAlgm:
-// Khi hàm này trả về false, hệ thống NetSync của game lập tức chuyển sang chế độ
-// AIPredict (AI tự động đua khi mất mạng), cho phép kích hoạt AI này ngay khi có mạng!
-static bool hook_AIAlign_HasLatestPredictPkg(void *self, const void *method) {
-    if (gAutoPlay) {
-        return false;
-    }
-    return orig_AIAlign_HasLatestPredictPkg ? orig_AIAlign_HasLatestPredictPkg(self, method) : true;
+// ==== Auto Play core =====================================================
+//
+// The car is driven by two independent layers, both owned by the game:
+//
+//   [A] analog: NssSteeringData{mForward, mBrakingState, mIsHandbrake,
+//       mSteeringLeft} -> NssPlayerVehicleDrivingCtrl._UpdatePhyDrivingParams
+//       -> mThrottle / mSteering -> forces.                    (throttle + steer)
+//   [B] discrete: InputModule.GetKey(InputKeyType) -> ECU/Cab -> drift state
+//       machine, mini-boost trigger, nitro.                    (Drift / Boost)
+//
+// Layer A alone can steer and hold throttle but can never drift or boost, so a
+// pure-A implementation feels dead. Layer B alone has no analog resolution.
+// Auto Play therefore writes both: A for the racing line, B for the skills.
+//
+// InputKeyType (dump): Left=1 Right=2 PropOne=3 PropTwo=4 SmallBoost=5
+//                      Brake=6 Reset=7 Drift=8 SidewaysDrift=9 ...
+// Steering is recomputed once per motion tick and cached, because GetKey can be
+// polled several times per frame by different consumers.
+
+static int   gAPKeyMask    = 0;    // bit N set => key N is "held" this frame
+static float gAPSteer      = 0.f;  // cached analog steer, -1..1
+static int   gAPDriftLatch = 0;    // 1 while drift is held
+static int   gAPBoostTicks = 0;    // frames left to hold SmallBoost
+
+static BOOL rtAPKey(int t) { return (gAPKeyMask >> t) & 1; }
+
+// Layer B: pretend the thumb holds these keys. Everything downstream (drift
+// state machine, CWW/WCW boost, nitro) runs the untouched game code path.
+static BOOL hook_Input_GetKey(void *self, int keyType, const void *method) {
+    if (gAutoPlay && gGoTime > 0.0 && keyType > 0 && keyType < 18 && rtAPKey(keyType))
+        return TRUE;
+    return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, method) : FALSE;
 }
 
-// NssPhyVehicleDrivingCtrl._UpdatePhyDrivingParams(NssSteeringData, float) is the
-// player-only override that turns the input struct into mThrottle/mSteering.
-// It runs before _UpdatePhyDrivingParams derives the forces, so writing here is
-// the earliest point that survives the whole tick.
+// Layer A + skill arbitration. Runs once per motion tick (before the forces are
+// derived), so this is where the analog steering is computed and cached, and
+// where the drift / boost key mask is decided for layer B.
 //
-//   NssSteeringData: +0x10 mForward, +0x14 mBrakingState, +0x18 mIsHandbrake,
-//                    +0x1C mSteeringLeft
+//   NssSteeringData: +0x10 mForward, +0x14 mBrakingState(int),
+//                    +0x18 mIsHandbrake, +0x1C mSteeringLeft
 static void hook_DrivingParams(void *self, void *steerData, float dt, const void *method) {
     if (gAutoPlay && rtPtrOk(self) && rtPtrOk(steerData)) {
-        void *dyn = *(void **)((char *)self + kOffDrvDynVehicle);          // IDynamicVehicle
+        void *dyn = *(void **)((char *)self + kOffDrvDynVehicle);   // IDynamicVehicle
         void *vehicle = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynVehicle) : NULL;
 
-        // Tự động lái hoạt động bất kể có mạng/WiFi hay mất mạng hoàn toàn:
-        // NssPlayerVehicleDrivingCtrl chỉ được tạo riêng cho người chơi local.
+        // NssPlayerVehicleDrivingCtrl only exists for the local car, but keep the
+        // flag check so AI/remote cars that share the base never get touched.
         BOOL isPlayer = YES;
-        if (rtPtrOk(vehicle)) {
-            isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
-        }
+        if (rtPtrOk(vehicle)) isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
 
         if (isPlayer) {
             void *phyCtrl = *(void **)((char *)self + kOffDrvPhyCtrl);
@@ -551,29 +572,72 @@ static void hook_DrivingParams(void *self, void *steerData, float dt, const void
                 float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
                 float hDis = *(float *)((char *)acc + kOffAccHorizDis);
 
-                // cross(fwd, dir) sign tells which way the road turns; hDis pulls
-                // the car back toward the centre line.
+                // Heading error, normalised: sin of the angle between nose and the
+                // track tangent. cross(fwd,dir) is already |fwd||dir|sin(theta).
+                float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
+                float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
                 float cross = (fwdX * dirZ) - (fwdZ * dirX);
-                float steer = (cross * 2.2f) - (hDis * 0.10f);
+                if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
+
+                // Two independent error terms:
+                //   heading  -> how much the nose must still rotate
+                //   hDis     -> how far the car sits off the centre line
+                // hDis is positive to one side, so it acts as a proportional
+                // correction. Both are clamped so tuning stays stable at any fps.
+                float steer = (cross * 2.4f) - (hDis * 0.045f);
                 if (steer > 1.0f) steer = 1.0f;
                 if (steer < -1.0f) steer = -1.0f;
 
-                // Player override: a real thumb input always wins.
                 float userSteer = *(float *)((char *)steerData + kOffSteerWheel);
-                if (fabsf(userSteer) < 0.2f)
-                    *(float *)((char *)steerData + kOffSteerWheel) = steer;
+                BOOL playerSteering = fabsf(userSteer) >= 0.2f;
 
-                // Throttle = 1.0, unless the player brakes or pulls the handbrake.
+                // Player override: a real thumb input always wins over the AI.
+                if (!playerSteering) *(float *)((char *)steerData + kOffSteerWheel) = steer;
+                gAPSteer = playerSteering ? userSteer : steer;
+
                 int braking = *(int *)((char *)steerData + kOffSteerBraking);
                 bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
-                if (braking == 0 && !handbrake)
-                    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
 
-                // Mirror onto the ctrl so anything reading it before the flush sees it.
+                if (braking == 0 && !handbrake) {
+                    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
+                }
+
+                // ---- skill layer: decide the held-key mask for GetKey ----
+                // Drift: enter on a real corner (|steer| large) and stay latched
+                // until the corner opens up again, otherwise the state machine
+                // flickers and the drift never charges.
+                int mask = 0;
+                if (fabsf(steer) > 0.55f) gAPDriftLatch = 1;
+                else if (fabsf(steer) < 0.25f) gAPDriftLatch = 0;
+
+                if (gAPDriftLatch && !handbrake) {
+                    mask |= (1 << 8);                            // Drift
+                    mask |= (steer > 0.f) ? (1 << 2) : (1 << 1);  // Right : Left
+                } else if (!playerSteering) {
+                    // No drift: still let the game see the analog scrub direction
+                    // so the drift state machine can enter/exit on its own rules.
+                    if (steer > 0.15f)      mask |= (1 << 2);
+                    else if (steer < -0.15f) mask |= (1 << 1);
+                }
+
+                // Mini boost: released on drift exit, same as a human would.
+                if (!gAPDriftLatch && gAPBoostTicks == 0 && fabsf(cross) < 0.20f) {
+                    gAPBoostTicks = 2;                           // short press
+                }
+                if (gAPBoostTicks > 0) {
+                    mask |= (1 << 5);                            // SmallBoost
+                    gAPBoostTicks--;
+                }
+
+                gAPKeyMask = mask;
+
+                // Mirror onto the ctrl so anything reading it before the flush agrees.
                 *(float *)((char *)self + kOffDrvThrottle) = *(float *)((char *)steerData + kOffSteerForward);
-                *(float *)((char *)self + kOffDrvSteering) = *(float *)((char *)steerData + kOffSteerWheel);
+                *(float *)((char *)self + kOffDrvSteering) = gAPSteer;
             }
         }
+    } else {
+        gAPKeyMask = 0;   // off: never leak a synthetic key into the game
     }
     if (orig_DrivingParams) orig_DrivingParams(self, steerData, dt, method);
 }
@@ -669,13 +733,12 @@ static void installHooks(void) {
     rtPatchVtable(rtFindClass("", "NssPlayerVehicleDrivingCtrl"), (void *)orig_DrivingParams,
                   (void *)hook_DrivingParams);
 
-    // Kích hoạt AI tự động đua khi mất mạng (AIPredict) kể cả khi đang online
-    orig_AIAlign_HasLatestPredictPkg = (bool (*)(void *, const void *))
-        rtHookMethod("", "AIAlignPredictAlgm", "HasLatestPredictPkg", 0, (void *)hook_AIAlign_HasLatestPredictPkg);
+    // Auto Play layer B: synthesise the discrete input keys (Drift / SmallBoost /
+    // Left / Right). InputModule.GetKey is the single funnel every consumer reads.
+    orig_Input_GetKey = (BOOL (*)(void *, int, const void *))
+        rtHookMethod("", "InputModule", "GetKey", 1, (void *)hook_Input_GetKey);
 
-    rtLog("shadow: inputHook=%p speedUp=%p noColl=%p drvParams=%p aiAlign=%p",
-          orig_Shadow_EnableMatchInput, orig_Shadow_EnableAutoSpeedUp,
-          orig_Shadow_IgnoreCollision, orig_DrivingParams, orig_AIAlign_HasLatestPredictPkg);
+    rtLog("autoplay: drvParams=%p inputGetKey=%p", orig_DrivingParams, orig_Input_GetKey);
     // 9. Offline / Always-Connected bypass: Xe tự lái liên tục kể cả khi rớt mạng/mất WiFi
     orig_App_get_internetReachability = (int (*)(const void *))
         rtHookMethod("UnityEngine", "Application", "get_internetReachability", 0, (void *)hook_App_get_internetReachability);
@@ -822,7 +885,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:40  title:@"Auto Play (Offline AI)" on:gAutoPlay  action:@selector(onAutoPlay:)];
+    [self switchAtY:40  title:@"Auto Play"        on:gAutoPlay  action:@selector(onAutoPlay:)];
     [self switchAtY:76  title:@"Inf Mini Boost"   on:gFullMiniBoost action:@selector(onMini:)];
     [self switchAtY:112 title:@"Auto End Drift"   on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
 
@@ -844,7 +907,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 2;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:10.5];
-    note.text = @"Auto Play: kich hoat che do AI tu dua khi mat mang cua game.\nHoat dong ngay ca khi dang co mang Online.";
+    note.text = @"Auto Play: bam tim duong, giu ga, tu drift va mini boost.\nCham phim lai bat ky luc nao de gianh quyen dieu khien.";
     [self.panel addSubview:note];
 }
 
