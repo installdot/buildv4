@@ -253,7 +253,7 @@ __attribute__((unused)) static void *rtGetMethodPointerByRva(const char *classNa
     return NULL;
 }
 
-static void *rtGetMethodPointer(const char *namespaze, const char *className,
+__attribute__((unused)) static void *rtGetMethodPointer(const char *namespaze, const char *className,
                                 const char *methodName, int argsCount) {
     Il2CppClass *klass = rtFindClass(namespaze, className);
     if (!klass) return NULL;
