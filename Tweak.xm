@@ -1,13 +1,12 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
 // Features & Fixes:
-// 1. Local vehicle ghost-state toggle.
-// 2. Drift slip slider: reduce drift deceleration; zero preserves baseline.
-// 3. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
-// 4. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
-// 5. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
-// 6. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
-// 7. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
+// 1. ShadowTrusted / Max Drive Assist: Nan goc bam cua & chong dung tuong max cong suat, khong khoa UI control.
+// 2. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
+// 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
+// 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
+// 5. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
+// 6. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -122,8 +121,7 @@ static void rtInstallCrashHandler(void) {
 
 #pragma mark - Toolkit state & field offsets
 
-static BOOL   gGhostCars = NO;
-static float  gDriftSlip = 0.f;
+static BOOL   gShadowTrusted  = NO;
 static void  *gPlayerVehicle = NULL;   // cached from VehicleInputCtrl
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
@@ -318,10 +316,10 @@ static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) 
 static void (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
 static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
 static void (*orig_VehicleInputCtrl_Update)(void *, float, const void *) = NULL;
-static void (*rtSetGhostState)(void *, bool, const void *) = NULL;
-static int  (*rtAddDecCoef)(void *, float, const void *) = NULL;
-static void (*rtRemoveDecCoef)(void *, int, const void *) = NULL;
-static int   s_DecCoefInst = 0;   // active drift-deceleration modifier instance
+static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
+static bool (*orig_DriveAssist_IsEnable)(void *, const void *) = NULL;
+static void (*orig_DriveAssist_CopyConfig)(void *, void *, void *, void *, const void *) = NULL;
+static void (*orig_DAVirtualCollision_Update)(void *, float, const void *) = NULL;
 
 static inline BOOL rtPtrOk(const void *p) {
     uintptr_t v = (uintptr_t)p;
@@ -399,31 +397,65 @@ static BOOL rtIsPlayerVehicle(void *vehicle) {
     return gPlayerVehicle && vehicle == gPlayerVehicle;
 }
 
-// SetGhostState disables vehicle-to-vehicle contacts only; walls and road still collide.
-// The game re-clears this flag each frame, so it must be re-asserted every tick.
-// Drift lever uses the game's own runtime modifier: coef = 1 + sum(added). The game
-// recomputes it on every Add/Remove, so the slider is applied once per change.
-static void rtApplyDriftSlip(void *motionCtrl) {
-    if (!rtAddDecCoef || !rtRemoveDecCoef) return;
-    void *driftCtrl = rtPtrOk(motionCtrl) ? *(void **)((char *)motionCtrl + 0x60) : NULL;
-    if (!rtPtrOk(driftCtrl)) return;
-    float want = -0.9f * gDriftSlip;          // lower decel -> longer, wider slides
-    static float applied = 0.f;
-    if (want == applied) return;
-    if (s_DecCoefInst) { rtRemoveDecCoef(driftCtrl, s_DecCoefInst, NULL); s_DecCoefInst = 0; }
-    if (want != 0.f) s_DecCoefInst = rtAddDecCoef(driftCtrl, want, NULL);
-    applied = want;
-    rtLog("drift slip=%.2f coef add=%.2f inst=%d", gDriftSlip, want, s_DecCoefInst);
+// 5. ShadowTrusted & Max Drive Assist (Tuyet doi KHONG khoa UI control cua nguoi choi)
+static void hook_Shadow_EnableMatchInput(void *self, bool enable, const void *method) {
+    if (gShadowTrusted) {
+        enable = true; // Luon mo khoa UI control / touch input
+    }
+    if (orig_Shadow_EnableMatchInput) orig_Shadow_EnableMatchInput(self, enable, method);
+}
+
+static bool hook_DriveAssist_IsEnable(void *self, const void *method) {
+    if (gShadowTrusted) return true; // Luon kich hoat Drive Assist cho moi map va mode
+    return orig_DriveAssist_IsEnable ? orig_DriveAssist_IsEnable(self, method) : false;
+}
+
+static void hook_DriveAssist_CopyConfig(void *self, void *cfg, void *detectConfig, void *collConfig, const void *method) {
+    if (orig_DriveAssist_CopyConfig) orig_DriveAssist_CopyConfig(self, cfg, detectConfig, collConfig, method);
+    if (!gShadowTrusted) return;
+
+    // Quet du doan va cham tam xa (0.85s)
+    if (detectConfig) {
+        *(float *)((char *)detectConfig + 0x10) = 0.85f; // mLinvelPredictTime
+        *(int *)((char *)detectConfig + 0x14)   = 1;     // mPredictType (Swept AABB)
+    }
+    // Thuat toan nan goc bam cua va chong va dap tuong max cong suat
+    if (collConfig) {
+        *(float *)((char *)collConfig + 0x10) = 16.0f; // mSlerpSpeed: keo ve tiep tuyen an toan tuc thi
+        *(float *)((char *)collConfig + 0x14) = 2.8f;  // mDriftAccCoef: tang toc do day xe khi drift
+        *(float *)((char *)collConfig + 0x18) = 0.0f;  // mDriftMaxAngSpeedKMPHThreshold: kich hoat o moi toc do
+        *(float *)((char *)collConfig + 0x1C) = 2.2f;  // mDriftMaxAngelSpeedCoef: cho phep be goc cua gat
+        *(float *)((char *)collConfig + 0x20) = 0.01f; // mDriftSlidingMaxAngSpeedCoef: bam duong tuyet doi, triet tieu vang duoi
+        *(float *)((char *)collConfig + 0x24) = 0.0f;  // mSteerAngleThreshold: tu nan lai ngay lap tuc khi chom lech
+        *(float *)((char *)collConfig + 0x28) = 25.0f; // mSteerAngleSpeed: toc do be lai tro luc toi da
+    }
+}
+
+static void hook_DAVirtualCollision_Update(void *self, float dt, const void *method) {
+    if (gShadowTrusted && self) {
+        void *collConfig = *(void **)((char *)self + 0x20); // mConfig
+        if (collConfig) {
+            *(float *)((char *)collConfig + 0x10) = 16.0f;
+            *(float *)((char *)collConfig + 0x14) = 2.8f;
+            *(float *)((char *)collConfig + 0x18) = 0.0f;
+            *(float *)((char *)collConfig + 0x1C) = 2.2f;
+            *(float *)((char *)collConfig + 0x20) = 0.01f;
+            *(float *)((char *)collConfig + 0x24) = 0.0f;
+            *(float *)((char *)collConfig + 0x28) = 25.0f;
+        }
+        void *envInfo = *(void **)((char *)self + 0x18); // mDAEnvInfo
+        if (envInfo) {
+            void *detectConfig = *(void **)((char *)envInfo + 0x70); // mConfig
+            if (detectConfig) {
+                *(float *)((char *)detectConfig + 0x10) = 0.85f;
+                *(int *)((char *)detectConfig + 0x14)   = 1;
+            }
+        }
+    }
+    if (orig_DAVirtualCollision_Update) orig_DAVirtualCollision_Update(self, dt, method);
 }
 
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
-    if (rtPtrOk(self) && rtIsPlayerVehicle(*(void **)((char *)self + 0x18))) {
-        void *dyn = *(void **)((char *)self + 0x28);
-        void *esp = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x20) : NULL;
-        if (gGhostCars && rtSetGhostState && rtPtrOk(esp))
-            rtSetGhostState(esp, true, NULL);   // game re-clears this each frame
-        rtApplyDriftSlip(self);
-    }
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
 }
 
@@ -533,13 +565,16 @@ static void installHooks(void) {
 
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
-    rtSetGhostState = (void (*)(void *, bool, const void *))
-        rtGetMethodPointerByRva("NssPhyVehicleESPBase", 0x7B04CF0);   // SetGhostState(bool)
-    rtAddDecCoef = (int (*)(void *, float, const void *))
-        rtGetMethodPointerByRva("NssVehicleDriftCtrl", 0x7C6CA48);      // AddDriftingExLinDecScaleCoef
-    rtRemoveDecCoef = (void (*)(void *, int, const void *))
-        rtGetMethodPointerByRva("NssVehicleDriftCtrl", 0x7C6CCF8);      // RemoveDriftingExLinDecScaleCoef
-    rtLog("il2cpp: ghost=%p addCoef=%p rmCoef=%p", rtSetGhostState, rtAddDecCoef, rtRemoveDecCoef);
+    orig_Shadow_EnableMatchInput = (void (*)(void *, bool, const void *))
+        rtHookMethod("", "ShadowTrusteeship", "EnableMatchInput", 1, (void *)hook_Shadow_EnableMatchInput);
+    orig_DriveAssist_IsEnable = (bool (*)(void *, const void *))
+        rtHookMethod("", "VehicleDriveAssistComp", "IsEnable", 0, (void *)hook_DriveAssist_IsEnable);
+    orig_DriveAssist_CopyConfig = (void (*)(void *, void *, void *, void *, const void *))
+        rtHookMethod("", "VehicleDriveAssistComp", "CopyDataBinConfigToMono", 3, (void *)hook_DriveAssist_CopyConfig);
+    orig_DAVirtualCollision_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "VehicleDAVirtualCollision", "Update", 1, (void *)hook_DAVirtualCollision_Update);
+    rtLog("il2cpp: shadowInput=%p daEnable=%p daCfg=%p daColl=%p",
+          orig_Shadow_EnableMatchInput, orig_DriveAssist_IsEnable, orig_DriveAssist_CopyConfig, orig_DAVirtualCollision_Update);
 
     // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
@@ -577,7 +612,6 @@ static void installHooks(void) {
 @property (nonatomic, strong) UIButton *fab;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UILabel *speedLabel;
-@property (nonatomic, strong) UILabel *slipLabel;
 
 // Top HUD Overlay
 @property (nonatomic, strong) UIView *topHud;
@@ -674,7 +708,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     [self.host addSubview:self.fab];
 
     // === MENU PANEL ===
-    CGFloat w = 310, h = 330;
+    CGFloat w = 310, h = 265;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - w) / 2,
                                                         (screen.size.height - h) / 2, w, h)];
     self.panel.backgroundColor = [UIColor colorWithWhite:0.09 alpha:0.96];
@@ -690,32 +724,17 @@ static RCRaceToolkitMenu *gMenu = nil;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:40 title:@"Xuyên xe" on:gGhostCars action:@selector(onGhostCars:)];
+    [self switchAtY:40  title:@"Shadow / Max Assist" on:gShadowTrusted action:@selector(onShadowTrusted:)];
+    [self switchAtY:76  title:@"Inf Mini Boost"       on:gFullMiniBoost  action:@selector(onMini:)];
+    [self switchAtY:112 title:@"Auto End Drift"       on:gAutoDriftEnd   action:@selector(onAutoDrift:)];
 
-    self.slipLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 78, 268, 20)];
-    self.slipLabel.textColor = UIColor.whiteColor;
-    self.slipLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    self.slipLabel.text = [self slipText];
-    [self.panel addSubview:self.slipLabel];
-
-    UISlider *slip = [[UISlider alloc] initWithFrame:CGRectMake(16, 100, 268, 32)];
-    slip.minimumValue = 0.f;
-    slip.maximumValue = 1.f;
-    slip.value = gDriftSlip;
-    slip.tintColor = [UIColor colorWithRed:0.95 green:0.65 blue:0.20 alpha:1.0];
-    [slip addTarget:self action:@selector(onSlipChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:slip];
-
-    [self switchAtY:140 title:@"Inf Mini Boost"       on:gFullMiniBoost action:@selector(onMini:)];
-    [self switchAtY:176 title:@"Auto End Drift"       on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
-
-    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 210, 268, 20)];
+    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 150, 268, 20)];
     self.speedLabel.textColor = UIColor.whiteColor;
     self.speedLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     self.speedLabel.text = [self speedText];
     [self.panel addSubview:self.speedLabel];
 
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 232, 268, 32)];
+    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 172, 268, 32)];
     slider.minimumValue = 0.f;
     slider.maximumValue = 300.f;
     slider.value = gSpeedKmh;
@@ -723,11 +742,11 @@ static RCRaceToolkitMenu *gMenu = nil;
     [slider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:slider];
 
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 270, 278, 50)];
-    note.numberOfLines = 3;
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 212, 278, 42)];
+    note.numberOfLines = 2;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:10.5];
-    note.text = @"Xuyên xe: ghost-state của game, vẫn va chạm tường/đường.\nTrượt drift: trái = mặc định, phải = giảm hãm tới 80%.";
+    note.text = @"Shadow/Assist: Tu nan goc bam cua & chong va cham tuong toi da ma khong khoa phim dieu khien.";
     [self.panel addSubview:note];
 }
 
@@ -765,9 +784,6 @@ static RCRaceToolkitMenu *gMenu = nil;
     }
 }
 
-- (NSString *)slipText {
-    return [NSString stringWithFormat:@"Độ trượt drift: %.0f%%", gDriftSlip * 100.f];
-}
 
 - (NSString *)speedText {
     return [NSString stringWithFormat:@"Boost speed: %d km/h (+5s gate)", (int)gSpeedKmh];
@@ -785,12 +801,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     [g setTranslation:CGPointZero inView:self.fab.superview];
 }
 
-- (void)onGhostCars:(UISwitch *)s { gGhostCars = s.isOn; rtLog("ghost cars=%d", s.isOn); }
-- (void)onSlipChanged:(UISlider *)s {
-    gDriftSlip = isfinite(s.value) ? fmaxf(0.f, fminf(1.f, s.value)) : 0.f;
-    self.slipLabel.text = [self slipText];
-    rtLog("drift slip=%.2f", gDriftSlip);
-}
+- (void)onShadowTrusted:(UISwitch *)s { gShadowTrusted = s.isOn; rtLog("shadow trusted=%d", s.isOn); }
 - (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn;  rtLog("toggle FullMiniBoost=%d", s.isOn); }
 - (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn;   rtLog("toggle AutoEndDrift=%d", s.isOn); }
 
