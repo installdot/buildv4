@@ -535,8 +535,7 @@ static void hook_DrivingParams(void *self, void *steerData, float dt, const void
         // NssPlayerVehicleDrivingCtrl chỉ được tạo riêng cho người chơi local.
         BOOL isPlayer = YES;
         if (rtPtrOk(vehicle)) {
-            if (gPlayerVehicle && vehicle == gPlayerVehicle) isPlayer = YES;
-            else isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
+            isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
         }
 
         if (isPlayer) {
