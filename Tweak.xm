@@ -171,6 +171,7 @@ enum {
 
     // IDynamicVehicle (DynamicVehicle)
     kOffDynVehicle        = 0x10, // mVehicle
+    kOffDynMotionCtrl     = 0x38, // mMotionCtrl
     kOffDynACC            = 0x28, // mACC
 
     // NssPhyVehicleCtrl
@@ -359,6 +360,7 @@ static void (*orig_ActorCpReporter_Update)(void *, float, float, const void *) =
 static void (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
 static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
 static void (*orig_PhyVehicleCtrl_DoSteering)(void *, float, const void *) = NULL;
+static BOOL (*orig_Input_GetKey)(void *, int, const void *) = NULL;
 static void (*orig_NssVehicle_PreInit)(void *, uint64_t, int, void *, const void *) = NULL;
 static int  (*orig_NssVehicle_GetVehicleID)(void *, const void *) = NULL;
 static uint64_t (*orig_ItemVehicle_GetModelID)(void *, const void *) = NULL;
@@ -475,37 +477,143 @@ static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, co
     }
 }
 
-// 7. Sức mạnh đổi hướng (Steer Strength Multiplier)
+// ==== Auto Play state ====================================================
+//
+// Written from hook_MotionCtrlUpdate (once per motion tick) and read from
+// hook_Input_GetKey (polled several times per frame), so both must exist
+// before either hook.
+//
+// InputKeyType (dump): Left=1 Right=2 PropOne=3 PropTwo=4 SmallBoost=5
+//                      Brake=6 Reset=7 Drift=8 SidewaysDrift=9 ...
+static int gAPKeyMask    = 0;   // bit N set => key N is "held" this frame
+static int gAPDriftLatch = 0;   // 1 while drift is held
+static int gAPBoostTicks = 0;   // frames left to hold SmallBoost
+
+static BOOL rtAPKey(int t) { return (gAPKeyMask >> t) & 1; }
+
+// Layer B: pretend the thumb holds these keys. Everything downstream (drift
+// state machine, CWW/WCW boost, nitro) runs the untouched game code path.
+static BOOL hook_Input_GetKey(void *self, int keyType, const void *method) {
+    if (gAutoPlay && keyType > 0 && keyType < 18 && rtAPKey(keyType))
+        return TRUE;
+    return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, method) : FALSE;
+}
+
+// 7 + 10. Steering strength + Auto Play steering, both injected here.
+//
+// Decompile of NssPhyVehicleCtrl::DoSteering (0x7AF5BAC):
+//     float v5 = *(float *)(self + 256) * a2;   // a2 = normalised steer
+//     PHY_VehicleDoSteering(phyHandle, v5);
+// So `torque` arrives already normalised to -1..1 and the game scales it by
+// its own mSteerTorqueScale. Writing here bypasses the whole input chain
+// (_UpdateInputXTimeRel ramp, AssistTurning overwrite, mSteering flush), which
+// is why steering from mSteeringData never survived a tick.
+static float rtAPComputeSteer(void *phyCtrl, void *vehicle) {
+    void *dyn = rtPtrOk(vehicle) ? *(void **)((char *)vehicle + kOffVehicleDyn) : NULL;
+    void *sim = *(void **)((char *)phyCtrl + kOffPhySimOutput);
+    void *acc = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynACC) : NULL;
+    void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
+    if (!rtPtrOk(sim) || !rtPtrOk(tp)) return 0.f;
+
+    // Nose direction from the chassis quaternion (valid even at standstill,
+    // unlike mMovingDirection which is zero before the car rolls).
+    float qx = *(float *)((char *)sim + kOffSimChassisRot);
+    float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
+    float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
+    float qw = *(float *)((char *)sim + kOffSimChassisRot + 12);
+
+    float fwdX = 2.0f * (qx * qz + qw * qy);
+    float fwdZ = 1.0f - 2.0f * (qx * qx + qy * qy);
+
+    // Guide line = centre-line tangent at the current track point.
+    float dirX = *(float *)((char *)tp + kOffTpDirection);
+    float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
+
+    // Signed lateral offset from that guide line (mHorizontalDis).
+    float hDis = *(float *)((char *)acc + kOffAccHorizDis);
+
+    float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
+    float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
+    float cross = (fwdX * dirZ) - (fwdZ * dirX);
+    if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
+
+    // Pull toward the line proportional to how far off it we are, with a
+    // hard cap so a big lateral error cannot demand full lock instantly.
+    float pull = hDis * 0.045f;
+    if (pull >  0.45f) pull =  0.45f;
+    if (pull < -0.45f) pull = -0.45f;
+
+    float steer = (cross * 2.6f) - pull;
+    if (steer >  1.f) steer =  1.f;
+    if (steer < -1.f) steer = -1.f;
+    return steer;
+}
+
 static void hook_PhyVehicleCtrl_DoSteering(void *self, float torque, const void *method) {
-    if (gSteerStrength > 0.0f) {
-        torque *= gSteerStrength;
+    if (rtPtrOk(self)) {
+        void *vehicle = *(void **)((char *)self + 0x10);   // NssPhyVehicleCtrl.mVehicle
+
+        BOOL isPlayer = rtPtrOk(vehicle) ? *(bool *)((char *)vehicle + kOffVehicleIsMain) : NO;
+
+        if (isPlayer && gAutoPlay) {
+            float steer = rtAPComputeSteer(self, vehicle);
+
+            // A real thumb input always wins over the AI.
+            void *dyn = *(void **)((char *)vehicle + kOffVehicleDyn);
+            void *mc  = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynMotionCtrl) : NULL;
+            void *sd  = rtPtrOk(mc) ? *(void **)((char *)mc + kOffMotionSteerData) : NULL;
+            if (rtPtrOk(sd) && fabsf(*(float *)((char *)sd + kOffSteerWheel)) >= 0.2f) {
+                steer = *(float *)((char *)sd + kOffSteerWheel);
+            }
+            torque = steer;
+        }
+
+        if (gSteerStrength > 0.0f) torque *= gSteerStrength;
     }
+
     if (orig_PhyVehicleCtrl_DoSteering) orig_PhyVehicleCtrl_DoSteering(self, torque, method);
 }
 
 // 8. Tự động Mod Xe / Skin trong Sảnh (Lobby / Garage / Preview)
+//
+// VehiclePreviewParam (+0x28 SkinId / +0x2C VehicleId) is only the *preview*
+// descriptor; the model actually resolves from InitVehicleParams inside the
+// loader. Both are patched here so the rendered car matches.
 static void hook_Previewer_ShowVehicle(void *self, void *vehiclePreviewParam, uint32_t downloadPriority, void *memberName, void *filePath, const void *method) {
     if (gModEnabled && gModVehicleID > 0 && rtPtrOk(vehiclePreviewParam)) {
         *(uint32_t *)((char *)vehiclePreviewParam + 0x2C) = (uint32_t)gModVehicleID; // VehicleId
-        if (gModSkinID > 0) {
-            *(uint32_t *)((char *)vehiclePreviewParam + 0x28) = (uint32_t)gModSkinID; // SkinId
-        }
-        rtLog("Lobby/Garage ShowVehicle modded -> VehicleID=%d SkinID=%d", gModVehicleID, gModSkinID);
+        *(uint32_t *)((char *)vehiclePreviewParam + 0x28) = (uint32_t)gModSkinID;    // SkinId (0 = default)
+
+        // DirectItemVehicle (+0x50) bypasses the id path entirely when set, so
+        // clear it to force resolution through the patched ids.
+        *(void **)((char *)vehiclePreviewParam + 0x50) = NULL;
+
+        rtLog("ShowVehicle modded -> VehicleID=%d SkinID=%d", gModVehicleID, gModSkinID);
     }
     if (orig_Previewer_ShowVehicle) orig_Previewer_ShowVehicle(self, vehiclePreviewParam, downloadPriority, memberName, filePath, method);
 }
 
-// 9. Tự động Mod Xe khi Vào Trận / Load Trận (PreInit)
+// 9. Mod Xe khi Vào Trận
+//
+// PreInit only shows "methodPointer only" in the log and never fires during a
+// match load, because IL2CPP calls the compiled address directly for internal
+// callers. So the model id is instead forced from the two accessors the loader
+// actually queries, plus the id field on the live entity every motion tick.
 static void hook_NssVehicle_PreInit(void *self, uint64_t uid, int vehicleID, void *compConfig, const void *method) {
     if (gModEnabled && gModVehicleID > 0) {
         vehicleID = gModVehicleID;
-        rtLog("Load match PreInit modded vehicleID -> %d (uid=%llu)", gModVehicleID, (unsigned long long)uid);
+        rtLog("PreInit modded vehicleID -> %d (uid=%llu)", gModVehicleID, (unsigned long long)uid);
     }
     if (orig_NssVehicle_PreInit) orig_NssVehicle_PreInit(self, uid, vehicleID, compConfig, method);
+
+    // Belt and braces: the field is what every later getter reads.
+    if (gModEnabled && gModVehicleID > 0 && rtPtrOk(self))
+        *(int *)((char *)self + kOffVehicleID) = gModVehicleID;
 }
 
 static int hook_NssVehicle_GetVehicleID(void *self, const void *method) {
     if (gModEnabled && gModVehicleID > 0 && rtPtrOk(self)) {
+        *(int *)((char *)self + kOffVehicleID) = gModVehicleID;
         return gModVehicleID;
     }
     return orig_NssVehicle_GetVehicleID ? orig_NssVehicle_GetVehicleID(self, method) : 0;
@@ -518,7 +626,13 @@ static uint64_t hook_ItemVehicle_GetModelID(void *self, const void *method) {
     return orig_ItemVehicle_GetModelID ? orig_ItemVehicle_GetModelID(self, method) : 0;
 }
 
-// 10. Fixed Auto Play: Instant trackpoint orientation pursuit + physical steering
+// 10. Auto Play: throttle + skill keys.
+//
+// Steering is NOT written here. DoSteering (0x7AF5BAC) receives the final
+// normalised torque and is the only point downstream of _UpdateInputXTimeRel
+// (which ramps mInputXPosition at ~1.0/s) and AssistTurning (which overwrites
+// mSteering). This hook therefore only owns throttle and the discrete
+// Drift / SmallBoost / Left / Right keys consumed by InputModule.GetKey.
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
     if (rtPtrOk(self)) {
         void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
@@ -540,51 +654,45 @@ static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
                 void *sim = *(void **)((char *)phyCtrl + kOffPhySimOutput);
                 void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
 
+                int braking   = *(int *)((char *)steerData + kOffSteerBraking);
+                bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
+
+                if (braking == 0 && !handbrake) {
+                    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
+                    if (rtPtrOk(drivingCtrl))
+                        *(float *)((char *)drivingCtrl + kOffDrvThrottle) = 1.0f;
+                }
+
+                // Skill keys: latch drift through corners, tap mini boost on exit.
                 if (rtPtrOk(sim) && rtPtrOk(tp)) {
-                    // Forward vector from chassis orientation quaternion
-                    float qx = *(float *)((char *)sim + kOffSimChassisRot);
-                    float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
-                    float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
-                    float qw = *(float *)((char *)sim + kOffSimChassisRot + 12);
+                    float steer = rtAPComputeSteer(phyCtrl, vehicle);
+                    int mask = 0;
 
-                    float fwdX = 2.0f * (qx * qz + qw * qy);
-                    float fwdZ = 1.0f - 2.0f * (qx * qx + qy * qy);
+                    if (fabsf(steer) > 0.55f)      gAPDriftLatch = 1;
+                    else if (fabsf(steer) < 0.25f) gAPDriftLatch = 0;
 
-                    float dirX = *(float *)((char *)tp + kOffTpDirection);
-                    float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
-                    float hDis = *(float *)((char *)acc + kOffAccHorizDis);
-
-                    float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
-                    float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
-                    float cross = (fwdX * dirZ) - (fwdZ * dirX);
-                    if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
-
-                    float steer = (cross * 2.5f) - (hDis * 0.05f);
-                    if (steer > 1.0f) steer = 1.0f;
-                    if (steer < -1.0f) steer = -1.0f;
-
-                    // Player touch override
-                    float userSteer = *(float *)((char *)steerData + kOffSteerWheel);
-                    BOOL isUserSteering = fabsf(userSteer) >= 0.2f;
-
-                    if (!isUserSteering) {
-                        *(float *)((char *)steerData + kOffSteerWheel) = steer;
-                        if (rtPtrOk(drivingCtrl)) {
-                            *(float *)((char *)drivingCtrl + kOffDrvInputXPos) = steer;
-                            *(float *)((char *)drivingCtrl + kOffDrvSteering)  = steer;
-                        }
+                    if (gAPDriftLatch && !handbrake) {
+                        mask |= (1 << 8);                              // Drift
+                        mask |= (steer > 0.f) ? (1 << 2) : (1 << 1);   // Right : Left
+                    } else {
+                        if (steer >  0.15f) mask |= (1 << 2);
+                        if (steer < -0.15f) mask |= (1 << 1);
                     }
 
-                    int braking = *(int *)((char *)steerData + kOffSteerBraking);
-                    bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
-                    if (braking == 0 && !handbrake) {
-                        *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
-                        if (rtPtrOk(drivingCtrl)) {
-                            *(float *)((char *)drivingCtrl + kOffDrvThrottle) = 1.0f;
-                        }
+                    if (!gAPDriftLatch && gAPBoostTicks == 0 && fabsf(steer) < 0.20f)
+                        gAPBoostTicks = 2;
+                    if (gAPBoostTicks > 0) {
+                        mask |= (1 << 5);                              // SmallBoost
+                        gAPBoostTicks--;
                     }
+
+                    gAPKeyMask = mask;
                 }
             }
+        } else {
+            gAPKeyMask = 0;
+            gAPDriftLatch = 0;
+            gAPBoostTicks = 0;
         }
     }
 
@@ -653,7 +761,12 @@ static void installHooks(void) {
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
 
-    // 8. Sức mạnh đổi hướng (DoSteering)
+    // Auto Play layer B: synthesise the discrete input keys (Drift / SmallBoost /
+    // Left / Right). InputModule.GetKey is the single funnel every consumer reads.
+    orig_Input_GetKey = (BOOL (*)(void *, int, const void *))
+        rtHookMethod("", "InputModule", "GetKey", 1, (void *)hook_Input_GetKey);
+
+    // 8. Sức mạnh đổi hướng + Auto Play steering (DoSteering)
     orig_PhyVehicleCtrl_DoSteering = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleCtrl", "DoSteering", 1, (void *)hook_PhyVehicleCtrl_DoSteering);
 
