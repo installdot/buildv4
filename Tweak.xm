@@ -1,12 +1,13 @@
 // Tweak.xm — Race Toolkit (iOS, IL2CPP VTable & Metadata Hook)
 //
 // Features & Fixes:
-// 1. ShadowTrusted / Max Drive Assist: Nan goc bam cua & chong dung tuong max cong suat, khong khoa UI control.
-// 2. Miniboost: Goi ForceCanTriggerOnce(Mini/Air/FallingGround) lien tuc, khong giu o muc 2 nua.
-// 3. Auto End Drift: Goi ExitCurDriftState + ForceClearDriftParams ngay khi nha nut drift -> Khong con dinh drift.
-// 4. Speed Boost: Chi bat dau kich hoat sau 5 giay tu khi xuat phat (GameGoState::ImpEnter).
-// 5. Anti-Cheat Report: Khoa SdcVehicleVel o muc 300 km/h.
-// 6. Top Overlay: Hien thi MinMapTime, LapTimeLimit & Can Finish (TRUE/FALSE).
+// 1. ShadowTrusted: autopilot that follows the track centre line, holds full
+//    throttle and leaves all touch controls to the player.
+// 2. Miniboost: zeroes the game's own post-drift mini-boost delay.
+// 3. Auto End Drift: exits the drift state when the drift key is released.
+// 4. Speed Boost: only after 5s from race start (GameGoState::ImpEnter).
+// 5. Anti-Cheat Report: clamps SdcVehicleVel to 300 km/h.
+// 6. Top Overlay: MinMapTime, LapTimeLimit and Can Finish.
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -315,6 +316,7 @@ static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
 static bool (*orig_DriveAssist_IsEnable)(void *, const void *) = NULL;
 static void (*orig_DriveAssist_CopyConfig)(void *, void *, void *, void *, const void *) = NULL;
 static void (*orig_DAVirtualCollision_Update)(void *, float, const void *) = NULL;
+static void (*orig_DrivingCtrl_UpdateDrivingData)(void *, void *, float, const void *) = NULL;
 
 static inline BOOL rtPtrOk(const void *p) {
     uintptr_t v = (uintptr_t)p;
@@ -341,11 +343,13 @@ static void hook_GoImpEnter(void *self, const void *method) {
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
 
-// 2. Mini Boost: Tu dong kich hoat tieu phun tuc thi qua AutoSmallBoostHelper (khong xung dot phim bam)
+// 2. Mini Boost: shorten the game's own post-drift auto-boost delay to zero so
+// the existing AutoSmallBoostHelper state machine fires on the first normal
+// frame. The stay timer is left alone: forcing it would break the state
+// accounting and spam the trigger every tick.
 static void hook_AutoSmallBoostHelperUpdate(void *self, float dt, const void *method) {
-    if (gFullMiniBoost && self) {
-        *(float *)((char *)self + 0x28) = 0.0f; // mAutoMiniBoostDelayTime = 0
-        *(float *)((char *)self + 0x2C) = 1.0f; // mNormalStateStayTime = 1
+    if (gFullMiniBoost && rtPtrOk(self)) {
+        *(float *)((char *)self + 0x28) = 0.0f;  // mAutoMiniBoostDelayTime
     }
     if (orig_AutoSmallBoostHelper_Update) orig_AutoSmallBoostHelper_Update(self, dt, method);
 }
@@ -425,71 +429,79 @@ static void hook_DAVirtualCollision_Update(void *self, float dt, const void *met
     if (orig_DAVirtualCollision_Update) orig_DAVirtualCollision_Update(self, dt, method);
 }
 
-static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
-    if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
-    if (!rtPtrOk(self)) return;
+// Autopilot injects into NssSteeringData, the game's own per-frame input struct
+// consumed by NssPhyVehicleDrivingCtrl._UpdatePhyDrivingParams. Writing
+// mThrottle/mSteering on the ctrl is useless: _UpdatePhyDrivingParams derives
+// them from this struct on the same tick.
+// Hooked on NssPlayerVehicleDrivingCtrl (Slot 25) because the base virtual is
+// overridden there, and only the local player uses that subclass.
+//   NssSteeringData: +0x10 mForward (float), +0x14 mBrakingState (int),
+//                    +0x18 mIsHandbrake (bool), +0x1C mSteeringLeft (float)
+static void hook_DrivingCtrl_UpdatePhyDrivingParams(void *self, void *steerData, float dt, const void *method) {
+    if (rtPtrOk(self) && rtPtrOk(steerData)) {
+        // NssPhyVehicleDrivingCtrl.mVehicle(0x10) is IDynamicVehicle;
+        // DynamicVehicle.mVehicle(0x10) is the owning IVehicle/NssVehicle.
+        void *dyn = *(void **)((char *)self + 0x10);
+        void *vehicle = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x10) : NULL;
 
-    void *vehicle = *(void **)((char *)self + 0x18); // mVehicle
-    if (!rtIsPlayerVehicle(vehicle)) return;
+        if (gShadowTrusted && rtIsPlayerVehicle(vehicle)) {
+            void *phyCtrl = *(void **)((char *)self + 0x18);                    // NssPhyVehicleCtrl
+            void *acc = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x28) : NULL;   // IVehicleACC
+            void *simOutput = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + 0x28) : NULL;
+            void *curTp = rtPtrOk(acc) ? *(void **)((char *)acc + 0x38) : NULL;  // ITrackPoint
 
-    void *drivingCtrl = *(void **)((char *)self + 0x38); // NssPhyVehicleDrivingCtrl mDrivingCtrl
+            if (rtPtrOk(simOutput) && rtPtrOk(curTp)) {
+                float fwdX = *(float *)((char *)simOutput + 0x44);  // mMovingDirection.x
+                float fwdZ = *(float *)((char *)simOutput + 0x4C);  // mMovingDirection.z
+                float dirX = *(float *)((char *)curTp + 0x1C);      // NssTrackPoint.mDirection.x
+                float dirZ = *(float *)((char *)curTp + 0x24);      // NssTrackPoint.mDirection.z
+                float hDist = *(float *)((char *)acc + 0x5C);       // mHorizontalDis
 
-    // 1. Tự động đua (ShadowTrusted Autopilot bám sát Trackline & giữ full ga)
-    if (gShadowTrusted) {
-        void *dyn = *(void **)((char *)self + 0x28);         // IDynamicVehicle mDynamicVehicle
-        void *phyCtrl = *(void **)((char *)self + 0x20);     // NssPhyVehicleCtrl mVehiclePhyCtrl
+                // 2D cross(fwd, dir): sign encodes which side the track bends to.
+                float cross = (fwdX * dirZ) - (fwdZ * dirX);
+                float steer = (cross * 2.2f) - (hDist * 0.10f);
+                if (steer > 1.0f) steer = 1.0f;
+                if (steer < -1.0f) steer = -1.0f;
 
-        if (rtPtrOk(dyn) && rtPtrOk(phyCtrl) && rtPtrOk(drivingCtrl)) {
-            void *acc = *(void **)((char *)dyn + 0x28);          // IVehicleACC mACC
-            void *simOutput = *(void **)((char *)phyCtrl + 0x28); // NssVehicleSimOutput mSimulateOutput
+                // Player override: real thumb input (|mSteeringLeft| > 0.2) always wins.
+                float userSteer = *(float *)((char *)steerData + 0x1C);
+                if (fabsf(userSteer) < 0.2f) {
+                    *(float *)((char *)steerData + 0x1C) = steer;
+                }
 
-            if (rtPtrOk(acc) && rtPtrOk(simOutput)) {
-                void *curTp = *(void **)((char *)acc + 0x38);    // ITrackPoint mCurTrackPoint
-                if (rtPtrOk(curTp)) {
-                    // Vector hướng xe (trục XZ)
-                    float fwdX = *(float *)((char *)simOutput + 0x44);
-                    float fwdZ = *(float *)((char *)simOutput + 0x4C);
-
-                    // Vector tiếp tuyến tâm đường đua
-                    float dirX = *(float *)((char *)curTp + 0x1C);
-                    float dirZ = *(float *)((char *)curTp + 0x24);
-
-                    // Khoảng cách vuông góc tới tim đường đua
-                    float hDist = *(float *)((char *)acc + 0x5C);
-
-                    // Cross product 2D: fwd × dir
-                    float cross = (fwdX * dirZ) - (fwdZ * dirX);
-
-                    // Tính góc lái bám đường: bù góc lệch + kéo về giữa tim đường
-                    float targetSteer = (cross * 1.8f) - (hDist * 0.08f);
-                    if (targetSteer > 1.0f) targetSteer = 1.0f;
-                    if (targetSteer < -1.0f) targetSteer = -1.0f;
-
-                    // Nếu người chơi KHÔNG đang tự đè phím rẽ tay (>0.2f) -> Autopilot tự bẻ lái
-                    float userSteer = *(float *)((char *)drivingCtrl + 64);
-                    if (fabsf(userSteer) < 0.2f) {
-                        *(float *)((char *)drivingCtrl + 64) = targetSteer;
-                    }
-
-                    // Tự động giữ ga full nếu không phanh tay
-                    bool isBrake = *(bool *)((char *)drivingCtrl + 0x74);
-                    if (!isBrake) {
-                        *(float *)((char *)drivingCtrl + 60) = 1.0f;
-                    }
+                // Full throttle unless the player is braking or on the handbrake.
+                int braking = *(int *)((char *)steerData + 0x14);
+                bool handbrake = *(bool *)((char *)steerData + 0x18);
+                if (braking == 0 && !handbrake) {
+                    *(float *)((char *)steerData + 0x10) = 1.0f;
                 }
             }
         }
     }
 
-    // 2. Auto End Drift an toàn: Tự thoát drift sạch sẽ khi người chơi đã nhả nút drift
-    if (gAutoDriftEnd && rtPtrOk(drivingCtrl)) {
-        bool isPressDrift = *(bool *)((char *)drivingCtrl + 0x75);
-        if (!isPressDrift) {
-            void (*exitDrift)(void *, const void *) = (void (*)(void *, const void *))
-                rtGetMethodPointerByRva("NssPhyVehicleMotionCtrl", 0x7B10C64);
-            if (exitDrift) exitDrift(self, nullptr);
-        }
+    if (orig_DrivingCtrl_UpdateDrivingData) orig_DrivingCtrl_UpdateDrivingData(self, steerData, dt, method);
+}
+
+// Auto End Drift: leave the drift state machine on the tick the player releases
+// the drift key. Edge-triggered, so it never fights an ongoing drift.
+static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
+    if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
+    if (!gAutoDriftEnd || !rtPtrOk(self)) return;
+
+    void *vehicle = *(void **)((char *)self + 0x18);
+    if (!rtIsPlayerVehicle(vehicle)) return;
+
+    void *drivingCtrl = *(void **)((char *)self + 0x38);
+    if (!rtPtrOk(drivingCtrl)) return;
+
+    bool pressed = *(bool *)((char *)drivingCtrl + 0x75);  // NssPlayerVehicleDrivingCtrl.mDriftIsPress
+    static bool sWasPressed = false;
+    if (sWasPressed && !pressed) {
+        void (*exitDrift)(void *, const void *) = (void (*)(void *, const void *))
+            rtGetMethodPointerByRva("NssPhyVehicleMotionCtrl", 0x7B10C64);
+        if (exitDrift) exitDrift(self, nullptr);
     }
+    sWasPressed = pressed;
 }
 
 // 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
@@ -586,6 +598,10 @@ static void installHooks(void) {
 
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrlUpdate);
+    // Autopilot input injection: private virtual _UpdatePhyDrivingParams on the
+    // player-only subclass. argsCount 2 -> (NssSteeringData, float).
+    orig_DrivingCtrl_UpdateDrivingData = (void (*)(void *, void *, float, const void *))
+        rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "_UpdatePhyDrivingParams", 2, (void *)hook_DrivingCtrl_UpdatePhyDrivingParams);
     orig_Shadow_EnableMatchInput = (void (*)(void *, bool, const void *))
         rtHookMethod("", "ShadowTrusteeship", "EnableMatchInput", 1, (void *)hook_Shadow_EnableMatchInput);
     orig_DriveAssist_IsEnable = (bool (*)(void *, const void *))
@@ -594,8 +610,9 @@ static void installHooks(void) {
         rtHookMethod("", "VehicleDriveAssistComp", "CopyDataBinConfigToMono", 3, (void *)hook_DriveAssist_CopyConfig);
     orig_DAVirtualCollision_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "VehicleDAVirtualCollision", "Update", 1, (void *)hook_DAVirtualCollision_Update);
-    rtLog("il2cpp: shadowInput=%p daEnable=%p daCfg=%p daColl=%p",
-          orig_Shadow_EnableMatchInput, orig_DriveAssist_IsEnable, orig_DriveAssist_CopyConfig, orig_DAVirtualCollision_Update);
+    rtLog("il2cpp: shadowInput=%p daEnable=%p daCfg=%p daColl=%p drvData=%p",
+          orig_Shadow_EnableMatchInput, orig_DriveAssist_IsEnable, orig_DriveAssist_CopyConfig,
+          orig_DAVirtualCollision_Update, orig_DrivingCtrl_UpdateDrivingData);
 
     // 5. Anti-Cheat Report: SdcVehicleVel khóa 300 km/h
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
