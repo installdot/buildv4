@@ -442,7 +442,11 @@ static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
         void *phyCtrl   = *(void **)((char *)self + kOffMotionPhyCtrl);
         void *vehicle   = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynVehicle) : NULL;
 
-        if (rtPtrOk(steerData) && rtPtrOk(dyn) && rtPtrOk(phyCtrl)) {
+        // This hook also fires for AI cars; only drive the local player's.
+        BOOL isPlayer = YES;
+        if (rtPtrOk(vehicle)) isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
+
+        if (isPlayer && rtPtrOk(steerData) && rtPtrOk(dyn) && rtPtrOk(phyCtrl)) {
             void *acc = *(void **)((char *)dyn + kOffDynACC);
             void *sim = *(void **)((char *)phyCtrl + kOffPhySimOutput);
             void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
