@@ -123,7 +123,7 @@ static void rtInstallCrashHandler(void) {
 
 static BOOL   gFullMiniBoost  = NO;
 static BOOL   gAutoDriftEnd   = NO;
-static BOOL   gShadowAuto     = NO;
+static BOOL   gAutoPlay       = NO; // Kích hoạt AI tự động đua khi mất mạng kể cả khi đang online
 static float  gSpeedKmh       = 0.f;
 static double gGoTime         = 0.0;
 static BOOL   gHooksInstalled = NO;
@@ -339,8 +339,12 @@ static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
 static void (*orig_Shadow_EnableAutoSpeedUp)(void *, bool, const void *) = NULL;
 static void (*orig_Shadow_IgnoreCollision)(void *, bool, const void *) = NULL;
 static void (*orig_DrivingParams)(void *, void *, float, const void *) = NULL;
+static bool (*orig_AIAlign_HasLatestPredictPkg)(void *, const void *) = NULL;
 static char  sShadowState[3] = {0, 0, 0};   // last applied [input, speedup, nocoll]
 
+// Offline / Always-Connected bypass
+static int (*orig_App_get_internetReachability)(const void *) = NULL;
+static int (*orig_Net_OnReturnToLogin)(void *, void *, const void *) = NULL;
 // Inherited virtuals keep a stale copy in each derived vtable; replace them all.
 static void rtPatchVtable(Il2CppClass *klass, void *orig, void *replacement) {
     if (!klass || !orig) return;
@@ -488,7 +492,7 @@ static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, co
 // replaced by live ITrackPoint sampling from IVehicleACC. The result is written
 // to NssSteeringData, the same struct ReplayMoveProcess ultimately feeds.
 static void hook_ShadowEnableMatchInput(void *self, bool enable, const void *method) {
-    bool want = gShadowAuto ? true : enable;
+    bool want = gAutoPlay ? true : enable;
     if (orig_Shadow_EnableMatchInput && want != (bool)sShadowState[0]) {
         orig_Shadow_EnableMatchInput(self, want, method);
         sShadowState[0] = want ? 1 : 0;
@@ -505,6 +509,16 @@ static void hook_ShadowIgnoreCollision(void *self, bool enable, const void *meth
     if (orig_Shadow_IgnoreCollision) orig_Shadow_IgnoreCollision(self, enable, method);
 }
 
+// Giả lập rớt gói tin trong AIAlignPredictAlgm:
+// Khi hàm này trả về false, hệ thống NetSync của game lập tức chuyển sang chế độ
+// AIPredict (AI tự động đua khi mất mạng), cho phép kích hoạt AI này ngay khi có mạng!
+static bool hook_AIAlign_HasLatestPredictPkg(void *self, const void *method) {
+    if (gAutoPlay) {
+        return false;
+    }
+    return orig_AIAlign_HasLatestPredictPkg ? orig_AIAlign_HasLatestPredictPkg(self, method) : true;
+}
+
 // NssPhyVehicleDrivingCtrl._UpdatePhyDrivingParams(NssSteeringData, float) is the
 // player-only override that turns the input struct into mThrottle/mSteering.
 // It runs before _UpdatePhyDrivingParams derives the forces, so writing here is
@@ -513,11 +527,19 @@ static void hook_ShadowIgnoreCollision(void *self, bool enable, const void *meth
 //   NssSteeringData: +0x10 mForward, +0x14 mBrakingState, +0x18 mIsHandbrake,
 //                    +0x1C mSteeringLeft
 static void hook_DrivingParams(void *self, void *steerData, float dt, const void *method) {
-    if (gShadowAuto && rtPtrOk(self) && rtPtrOk(steerData)) {
+    if (gAutoPlay && rtPtrOk(self) && rtPtrOk(steerData)) {
         void *dyn = *(void **)((char *)self + kOffDrvDynVehicle);          // IDynamicVehicle
         void *vehicle = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynVehicle) : NULL;
 
-        if (rtPtrOk(vehicle) && *(bool *)((char *)vehicle + kOffVehicleIsMain)) {
+        // Tự động lái hoạt động bất kể có mạng/WiFi hay mất mạng hoàn toàn:
+        // NssPlayerVehicleDrivingCtrl chỉ được tạo riêng cho người chơi local.
+        BOOL isPlayer = YES;
+        if (rtPtrOk(vehicle)) {
+            if (gPlayerVehicle && vehicle == gPlayerVehicle) isPlayer = YES;
+            else isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
+        }
+
+        if (isPlayer) {
             void *phyCtrl = *(void **)((char *)self + kOffDrvPhyCtrl);
             void *acc = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynACC) : NULL;
             void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
@@ -555,6 +577,21 @@ static void hook_DrivingParams(void *self, void *steerData, float dt, const void
         }
     }
     if (orig_DrivingParams) orig_DrivingParams(self, steerData, dt, method);
+}
+
+// 9. Giả lập kết nối mạng luôn sẵn sàng (ReachableViaLocalAreaNetwork = 2 / WiFi)
+// để game không bao giờ tự ngắt tính năng hoặc ép dừng trận đua khi rớt mạng.
+static int hook_App_get_internetReachability(const void *method) {
+    return 2; // Always ReachableViaLocalAreaNetwork (WiFi)
+}
+
+// Chặn văng về màn hình đăng nhập nếu rớt mạng trong lúc xe đang tự động đua dở
+static int hook_Net_OnReturnToLogin(void *self, void *e, const void *method) {
+    if (gGoTime > 0.0 && !gCanFinish) {
+        rtLog("net: suppressed disconnect popup during active race");
+        return 0; // Chặn xử lý văng về login
+    }
+    return orig_Net_OnReturnToLogin ? orig_Net_OnReturnToLogin(self, e, method) : 0;
 }
 
 #pragma mark - Hook installation
@@ -632,9 +669,21 @@ static void installHooks(void) {
         rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "_UpdatePhyDrivingParams", 2, (void *)hook_DrivingParams);
     rtPatchVtable(rtFindClass("", "NssPlayerVehicleDrivingCtrl"), (void *)orig_DrivingParams,
                   (void *)hook_DrivingParams);
-    rtLog("shadow: inputHook=%p speedUp=%p noColl=%p drvParams=%p",
+
+    // Kích hoạt AI tự động đua khi mất mạng (AIPredict) kể cả khi đang online
+    orig_AIAlign_HasLatestPredictPkg = (bool (*)(void *, const void *))
+        rtHookMethod("", "AIAlignPredictAlgm", "HasLatestPredictPkg", 0, (void *)hook_AIAlign_HasLatestPredictPkg);
+
+    rtLog("shadow: inputHook=%p speedUp=%p noColl=%p drvParams=%p aiAlign=%p",
           orig_Shadow_EnableMatchInput, orig_Shadow_EnableAutoSpeedUp,
-          orig_Shadow_IgnoreCollision, orig_DrivingParams);
+          orig_Shadow_IgnoreCollision, orig_DrivingParams, orig_AIAlign_HasLatestPredictPkg);
+    // 9. Offline / Always-Connected bypass: Xe tự lái liên tục kể cả khi rớt mạng/mất WiFi
+    orig_App_get_internetReachability = (int (*)(const void *))
+        rtHookMethod("UnityEngine", "Application", "get_internetReachability", 0, (void *)hook_App_get_internetReachability);
+    orig_Net_OnReturnToLogin = (int (*)(void *, void *, const void *))
+        rtHookMethod("", "NetGeneralMgr", "OnReturnToLoginStateAfterDisconnect", 1, (void *)hook_Net_OnReturnToLogin);
+    rtLog("offline bypass: appReachability=%p netDisconnect=%p",
+          orig_App_get_internetReachability, orig_Net_OnReturnToLogin);
 
     rtLog("install: done (all hooks active)");
 }
@@ -774,7 +823,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    [self switchAtY:40  title:@"Shadow Auto"     on:gShadowAuto    action:@selector(onShadowAuto:)];
+    [self switchAtY:40  title:@"Auto Play (Offline AI)" on:gAutoPlay  action:@selector(onAutoPlay:)];
     [self switchAtY:76  title:@"Inf Mini Boost"   on:gFullMiniBoost action:@selector(onMini:)];
     [self switchAtY:112 title:@"Auto End Drift"   on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
 
@@ -796,7 +845,7 @@ static RCRaceToolkitMenu *gMenu = nil;
     note.numberOfLines = 2;
     note.textColor = [UIColor colorWithWhite:0.65 alpha:1];
     note.font = [UIFont systemFontOfSize:10.5];
-    note.text = @"Shadow Auto: tu dong lai bam tim duong + giu full ga.\nNguoi choi van giu toan quyen lai, drift, nitro.";
+    note.text = @"Auto Play: kich hoat che do AI tu dua khi mat mang cua game.\nHoat dong ngay ca khi dang co mang Online.";
     [self.panel addSubview:note];
 }
 
@@ -851,10 +900,10 @@ static RCRaceToolkitMenu *gMenu = nil;
     [g setTranslation:CGPointZero inView:self.fab.superview];
 }
 
-- (void)onShadowAuto:(UISwitch *)s {
-    gShadowAuto = s.isOn;
+- (void)onAutoPlay:(UISwitch *)s {
+    gAutoPlay = s.isOn;
     sShadowState[0] = 0;   // force EnableMatchInput to be re-issued on the next call
-    rtLog("shadow auto=%d", s.isOn);
+    rtLog("auto play (offline ai)=%d", s.isOn);
 }
 - (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn;  rtLog("toggle FullMiniBoost=%d", s.isOn); }
 - (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn;   rtLog("toggle AutoEndDrift=%d", s.isOn); }
