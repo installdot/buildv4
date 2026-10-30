@@ -168,6 +168,7 @@ enum {
     kOffPhySimOutput      = 0x28, // mSimulateOutput
 
     // NssPhyVehicleMotionCtrlHelper
+    kOffMotionSteerData   = 0x10, // mSteeringData (NssSteeringData, by value)
     kOffMotionVehicle     = 0x18, // mVehicle
     kOffMotionPhyCtrl     = 0x20, // mVehiclePhyCtrl
     kOffMotionDynVehicle  = 0x28, // mDynamicVehicle
@@ -338,22 +339,12 @@ static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
 static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
 static void (*orig_Shadow_EnableAutoSpeedUp)(void *, bool, const void *) = NULL;
 static void (*orig_Shadow_IgnoreCollision)(void *, bool, const void *) = NULL;
-static void (*orig_DrivingParams)(void *, void *, float, const void *) = NULL;
 static BOOL (*orig_Input_GetKey)(void *, int, const void *) = NULL;
 static char  sShadowState[3] = {0, 0, 0};   // last applied [input, speedup, nocoll]
 
 // Offline / Always-Connected bypass
 static int (*orig_App_get_internetReachability)(const void *) = NULL;
 static int (*orig_Net_OnReturnToLogin)(void *, void *, const void *) = NULL;
-// Inherited virtuals keep a stale copy in each derived vtable; replace them all.
-static void rtPatchVtable(Il2CppClass *klass, void *orig, void *replacement) {
-    if (!klass || !orig) return;
-    uint16_t n = *(uint16_t *)((char *)klass + 306);
-    VirtualInvokeData *v = (VirtualInvokeData *)((char *)klass + 336);
-    for (uint16_t i = 0; i < n; i++) {
-        if (v[i].methodPtr == orig) v[i].methodPtr = replacement;
-    }
-}
 
 // 1. Race Start
 static void hook_GoImpEnter(void *self, const void *method) {
@@ -418,7 +409,92 @@ static inline BOOL rtPtrOk(const void *p) {
     return YES;
 }
 
+// Layer A + skill arbitration.
+//
+// Verified order in NssPhyVehicleMotionCtrl.Update (0x7B10770):
+//   sub_7AF6EC8(mDrivingCtrl, mSteeringData, dt)   // UpdateDrivingData
+//       -> _UpdatePhyDrivingParams -> set_Throttle / set_Steering
+// mSteeringData sits at +0x10, mDrivingCtrl at +0x38. So the only place a write
+// survives the tick is BEFORE the original Update runs; hooking
+// _UpdatePhyDrivingParams is too late because AssistTurning and Handbrake
+// overwrite mSteering afterwards.
+//
+//   NssSteeringData: +0x10 mForward, +0x14 mBrakingState(int),
+//                    +0x18 mIsHandbrake, +0x1C mSteeringLeft
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
+    if (gAutoPlay && rtPtrOk(self)) {
+        void *steerData = *(void **)((char *)self + kOffMotionSteerData);
+        void *dyn       = *(void **)((char *)self + kOffMotionDynVehicle);
+        void *phyCtrl   = *(void **)((char *)self + kOffMotionPhyCtrl);
+        void *vehicle   = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynVehicle) : NULL;
+
+        if (rtPtrOk(steerData) && rtPtrOk(dyn) && rtPtrOk(phyCtrl)) {
+            void *acc = *(void **)((char *)dyn + kOffDynACC);
+            void *sim = *(void **)((char *)phyCtrl + kOffPhySimOutput);
+            void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
+
+            if (rtPtrOk(sim) && rtPtrOk(tp)) {
+                float fwdX = *(float *)((char *)sim + kOffSimMovingDir);
+                float fwdZ = *(float *)((char *)sim + kOffSimMovingDir + 8);
+                float dirX = *(float *)((char *)tp + kOffTpDirection);
+                float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
+                float hDis = *(float *)((char *)acc + kOffAccHorizDis);
+
+                // cross(fwd,dir) = |fwd||dir|sin(theta); normalise so the gain is
+                // independent of the vector magnitudes the sim happens to report.
+                float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
+                float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
+                float cross = (fwdX * dirZ) - (fwdZ * dirX);
+                if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
+
+                float steer = (cross * 2.4f) - (hDis * 0.045f);
+                if (steer > 1.0f) steer = 1.0f;
+                if (steer < -1.0f) steer = -1.0f;
+
+                float userSteer = *(float *)((char *)steerData + kOffSteerWheel);
+                BOOL playerSteering = fabsf(userSteer) >= 0.2f;
+
+                if (!playerSteering) *(float *)((char *)steerData + kOffSteerWheel) = steer;
+                // (no cache needed: mSteeringData is the single source of truth)
+
+                int braking = *(int *)((char *)steerData + kOffSteerBraking);
+                bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
+                if (braking == 0 && !handbrake)
+                    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
+
+                // ---- skill layer: held-key mask for GetKey ----
+                // Hysteresis: latch drift on a real corner and only release when
+                // the corner opens, otherwise the state machine toggles per frame
+                // and the drift gauge never charges.
+                int mask = 0;
+                if (fabsf(steer) > 0.55f)      gAPDriftLatch = 1;
+                else if (fabsf(steer) < 0.25f) gAPDriftLatch = 0;
+
+                if (gAPDriftLatch && !handbrake) {
+                    mask |= (1 << 8);                             // Drift
+                    mask |= (steer > 0.f) ? (1 << 2) : (1 << 1);  // Right : Left
+                } else if (!playerSteering) {
+                    if (steer > 0.15f)      mask |= (1 << 2);
+                    else if (steer < -0.15f) mask |= (1 << 1);
+                }
+
+                // Mini boost: two-tick tap on drift exit, same as a human release.
+                if (!gAPDriftLatch && gAPBoostTicks == 0 && fabsf(cross) < 0.20f)
+                    gAPBoostTicks = 2;
+                if (gAPBoostTicks > 0) {
+                    mask |= (1 << 5);                             // SmallBoost
+                    gAPBoostTicks--;
+                }
+
+                gAPKeyMask = mask;
+            }
+        }
+    } else {
+        gAPKeyMask = 0;   // off: never leak a synthetic key into the game
+        gAPDriftLatch = 0;
+        gAPBoostTicks = 0;
+    }
+
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
 }
 
@@ -529,7 +605,6 @@ static void hook_ShadowIgnoreCollision(void *self, bool enable, const void *meth
 // polled several times per frame by different consumers.
 
 static int   gAPKeyMask    = 0;    // bit N set => key N is "held" this frame
-static float gAPSteer      = 0.f;  // cached analog steer, -1..1
 static int   gAPDriftLatch = 0;    // 1 while drift is held
 static int   gAPBoostTicks = 0;    // frames left to hold SmallBoost
 
@@ -538,111 +613,11 @@ static BOOL rtAPKey(int t) { return (gAPKeyMask >> t) & 1; }
 // Layer B: pretend the thumb holds these keys. Everything downstream (drift
 // state machine, CWW/WCW boost, nitro) runs the untouched game code path.
 static BOOL hook_Input_GetKey(void *self, int keyType, const void *method) {
-    if (gAutoPlay && gGoTime > 0.0 && keyType > 0 && keyType < 18 && rtAPKey(keyType))
+    if (gAutoPlay && keyType > 0 && keyType < 18 && rtAPKey(keyType))
         return TRUE;
     return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, method) : FALSE;
 }
 
-// Layer A + skill arbitration. Runs once per motion tick (before the forces are
-// derived), so this is where the analog steering is computed and cached, and
-// where the drift / boost key mask is decided for layer B.
-//
-//   NssSteeringData: +0x10 mForward, +0x14 mBrakingState(int),
-//                    +0x18 mIsHandbrake, +0x1C mSteeringLeft
-static void hook_DrivingParams(void *self, void *steerData, float dt, const void *method) {
-    if (gAutoPlay && rtPtrOk(self) && rtPtrOk(steerData)) {
-        void *dyn = *(void **)((char *)self + kOffDrvDynVehicle);   // IDynamicVehicle
-        void *vehicle = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynVehicle) : NULL;
-
-        // NssPlayerVehicleDrivingCtrl only exists for the local car, but keep the
-        // flag check so AI/remote cars that share the base never get touched.
-        BOOL isPlayer = YES;
-        if (rtPtrOk(vehicle)) isPlayer = *(bool *)((char *)vehicle + kOffVehicleIsMain);
-
-        if (isPlayer) {
-            void *phyCtrl = *(void **)((char *)self + kOffDrvPhyCtrl);
-            void *acc = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynACC) : NULL;
-            void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
-            void *tp = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
-
-            if (rtPtrOk(sim) && rtPtrOk(tp)) {
-                float fwdX = *(float *)((char *)sim + kOffSimMovingDir);
-                float fwdZ = *(float *)((char *)sim + kOffSimMovingDir + 8);
-                float dirX = *(float *)((char *)tp + kOffTpDirection);
-                float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
-                float hDis = *(float *)((char *)acc + kOffAccHorizDis);
-
-                // Heading error, normalised: sin of the angle between nose and the
-                // track tangent. cross(fwd,dir) is already |fwd||dir|sin(theta).
-                float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
-                float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
-                float cross = (fwdX * dirZ) - (fwdZ * dirX);
-                if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
-
-                // Two independent error terms:
-                //   heading  -> how much the nose must still rotate
-                //   hDis     -> how far the car sits off the centre line
-                // hDis is positive to one side, so it acts as a proportional
-                // correction. Both are clamped so tuning stays stable at any fps.
-                float steer = (cross * 2.4f) - (hDis * 0.045f);
-                if (steer > 1.0f) steer = 1.0f;
-                if (steer < -1.0f) steer = -1.0f;
-
-                float userSteer = *(float *)((char *)steerData + kOffSteerWheel);
-                BOOL playerSteering = fabsf(userSteer) >= 0.2f;
-
-                // Player override: a real thumb input always wins over the AI.
-                if (!playerSteering) *(float *)((char *)steerData + kOffSteerWheel) = steer;
-                gAPSteer = playerSteering ? userSteer : steer;
-
-                int braking = *(int *)((char *)steerData + kOffSteerBraking);
-                bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
-
-                if (braking == 0 && !handbrake) {
-                    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
-                }
-
-                // ---- skill layer: decide the held-key mask for GetKey ----
-                // Drift: enter on a real corner (|steer| large) and stay latched
-                // until the corner opens up again, otherwise the state machine
-                // flickers and the drift never charges.
-                int mask = 0;
-                if (fabsf(steer) > 0.55f) gAPDriftLatch = 1;
-                else if (fabsf(steer) < 0.25f) gAPDriftLatch = 0;
-
-                if (gAPDriftLatch && !handbrake) {
-                    mask |= (1 << 8);                            // Drift
-                    mask |= (steer > 0.f) ? (1 << 2) : (1 << 1);  // Right : Left
-                } else if (!playerSteering) {
-                    // No drift: still let the game see the analog scrub direction
-                    // so the drift state machine can enter/exit on its own rules.
-                    if (steer > 0.15f)      mask |= (1 << 2);
-                    else if (steer < -0.15f) mask |= (1 << 1);
-                }
-
-                // Mini boost: released on drift exit, same as a human would.
-                if (!gAPDriftLatch && gAPBoostTicks == 0 && fabsf(cross) < 0.20f) {
-                    gAPBoostTicks = 2;                           // short press
-                }
-                if (gAPBoostTicks > 0) {
-                    mask |= (1 << 5);                            // SmallBoost
-                    gAPBoostTicks--;
-                }
-
-                gAPKeyMask = mask;
-
-                // Mirror onto the ctrl so anything reading it before the flush agrees.
-                *(float *)((char *)self + kOffDrvThrottle) = *(float *)((char *)steerData + kOffSteerForward);
-                *(float *)((char *)self + kOffDrvSteering) = gAPSteer;
-            }
-        }
-    } else {
-        gAPKeyMask = 0;   // off: never leak a synthetic key into the game
-    }
-    if (orig_DrivingParams) orig_DrivingParams(self, steerData, dt, method);
-}
-
-// 9. Giả lập kết nối mạng luôn sẵn sàng (ReachableViaLocalAreaNetwork = 2 / WiFi)
 // để game không bao giờ tự ngắt tính năng hoặc ép dừng trận đua khi rớt mạng.
 static int hook_App_get_internetReachability(const void *method) {
     return 2; // Always ReachableViaLocalAreaNetwork (WiFi)
@@ -728,17 +703,15 @@ static void installHooks(void) {
     orig_Shadow_IgnoreCollision = (void (*)(void *, bool, const void *))
         rtHookMethod("", "ShadowTrusteeship", "IgnoreCollision", 1, (void *)hook_ShadowIgnoreCollision);
 
-    orig_DrivingParams = (void (*)(void *, void *, float, const void *))
-        rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "_UpdatePhyDrivingParams", 2, (void *)hook_DrivingParams);
-    rtPatchVtable(rtFindClass("", "NssPlayerVehicleDrivingCtrl"), (void *)orig_DrivingParams,
-                  (void *)hook_DrivingParams);
-
+    // Auto Play is entirely served by two hooks: MotionCtrl.Update (analog steer
+    // + throttle, written into mSteeringData before UpdateDrivingData consumes
+    // it) and InputModule.GetKey (drift / mini-boost / scrub keys).
     // Auto Play layer B: synthesise the discrete input keys (Drift / SmallBoost /
     // Left / Right). InputModule.GetKey is the single funnel every consumer reads.
     orig_Input_GetKey = (BOOL (*)(void *, int, const void *))
         rtHookMethod("", "InputModule", "GetKey", 1, (void *)hook_Input_GetKey);
 
-    rtLog("autoplay: drvParams=%p inputGetKey=%p", orig_DrivingParams, orig_Input_GetKey);
+    rtLog("autoplay: motionCtrl=%p inputGetKey=%p", orig_MotionCtrl_Update, orig_Input_GetKey);
     // 9. Offline / Always-Connected bypass: Xe tự lái liên tục kể cả khi rớt mạng/mất WiFi
     orig_App_get_internetReachability = (int (*)(const void *))
         rtHookMethod("UnityEngine", "Application", "get_internetReachability", 0, (void *)hook_App_get_internetReachability);
