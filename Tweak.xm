@@ -239,13 +239,6 @@ static const Il2CppImage *(*il2cpp_assembly_get_image)(const Il2CppAssembly *ass
 static Il2CppClass *(*il2cpp_class_from_name)(const Il2CppImage *image, const char *namespaze, const char *name) = NULL;
 static const MethodInfo *(*il2cpp_class_get_method_from_name)(Il2CppClass *klass, const char *name, int argsCount) = NULL;
 
-static uintptr_t unityFrameworkBase(void) {
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *n = _dyld_get_image_name(i);
-        if (n && strstr(n, "UnityFramework")) return (uintptr_t)_dyld_get_image_header(i);
-    }
-    return 0;
-}
 
 static BOOL rtInitIl2CppApi(void) {
     if (il2cpp_domain_get) return YES;
@@ -325,24 +318,32 @@ static void *rtHookMethod(const char *namespaze, const char *className,
     }
 
     void *orig = *(void **)((char *)method + 0);
-    *(void **)((char *)method + 0) = replacement;
-
-    uint16_t slot = *(uint16_t *)((char *)method + 88);
-    uint16_t vtable_count = *(uint16_t *)((char *)klass + 306);
-
-    uintptr_t base = unityFrameworkBase();
-    uintptr_t rva = base && orig ? ((uintptr_t)orig - base) : 0;
-
-    if (slot < vtable_count) {
-        VirtualInvokeData *vtable = (VirtualInvokeData *)((char *)klass + 336);
-        vtable[slot].methodPtr = replacement;
-        rtLog("il2cpp: HOOK %-24s :: %-26s (slot %2u/%2u, rva=0x%lx) orig=%p -> rep=%p",
-              className, methodName, (unsigned)slot, (unsigned)vtable_count, (unsigned long)rva, orig, replacement);
-    } else {
-        rtLog("il2cpp: HOOK %-24s :: %-26s (methodPointer only, rva=0x%lx) orig=%p -> rep=%p",
-              className, methodName, (unsigned long)rva, orig, replacement);
+    if (!orig || orig == replacement) {
+        rtLog("il2cpp: SKIP %s::%s (null or already replaced)", className, methodName);
+        return NULL;
     }
 
+    const uint16_t slot = *(const uint16_t *)((const char *)method + 88);
+    VirtualInvokeData *entry = NULL;
+    size_t matchedOffset = 0;
+    const size_t candidates[] = {328, 304, 336};
+    if (slot != UINT16_MAX && slot < 256) {
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+            VirtualInvokeData *candidate =
+                (VirtualInvokeData *)((char *)klass + candidates[i]) + slot;
+            if (candidate->methodPtr == orig) {
+                entry = candidate;
+                matchedOffset = candidates[i];
+                break;
+            }
+        }
+    }
+
+    *(void **)((char *)method + 0) = replacement;
+    if (entry) entry->methodPtr = replacement;
+    rtLog("il2cpp: HOOK %-24s :: %-26s [slot %2u, vtbl+0x%zx] orig=%p -> rep=%p (%s)",
+          className, methodName, (unsigned)slot, matchedOffset, orig, replacement,
+          entry ? "VTABLE OK" : "METADATA ONLY");
     return orig;
 }
 
@@ -365,6 +366,9 @@ static void (*orig_NssVehicle_PreInit)(void *, uint64_t, int, void *, const void
 static int  (*orig_NssVehicle_GetVehicleID)(void *, const void *) = NULL;
 static uint64_t (*orig_ItemVehicle_GetModelID)(void *, const void *) = NULL;
 static void (*orig_Previewer_ShowVehicle)(void *, void *, uint32_t, void *, void *, const void *) = NULL;
+static BOOL (*orig_GetSteeringValue)(void *, void *, float, float *, float *, const void *) = NULL;
+static void *(*orig_CreateDefaultDynamicVehicle)(void *, void *, void *, int, void *, int, const void *) = NULL;
+static float gLastAPSteer = 0.0f;
 
 #pragma mark - Hook Implementations
 
@@ -382,6 +386,12 @@ static void hook_GoImpEnter(void *self, const void *method) {
 static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
     if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
     if (!gFullMiniBoost || !self) return;
+
+    static BOOL mbLogged = NO;
+    if (!mbLogged) {
+        mbLogged = YES;
+        rtLog("RUN: FullMiniBoost active -> forcing mini/air/fall triggers");
+    }
 
     if (ExtraVelocityTriggerMgr_ForceCanTriggerOnce) {
         ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 2, nullptr);  // Mini
@@ -403,6 +413,11 @@ static void hook_DriftRelease(void *self, const void *method) {
     if (orig_Drift_Release) orig_Drift_Release(self, method);
     if (!gAutoDriftEnd || !self) return;
 
+    static int driftRelCount = 0;
+    if (++driftRelCount % 5 == 1) {
+        rtLog("RUN: AutoDriftEnd -> ReleaseDrifting triggered (times=%d)", driftRelCount);
+    }
+
     if (orig_Drift_ExitCurDriftState) {
         orig_Drift_ExitCurDriftState(self, nullptr);
     }
@@ -417,6 +432,12 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (!self || gSpeedKmh <= 0.f) return;
 
     if (gGoTime <= 0.0 || (nowSeconds() - gGoTime) < 5.0) return;
+
+    static BOOL pcLogged = NO;
+    if (!pcLogged) {
+        pcLogged = YES;
+        rtLog("RUN: PowerChain boost active -> injecting +%.1f km/h", gSpeedKmh);
+    }
 
     *(float *)((char *)self + kOffPowerExtraKMPH)    = gSpeedKmh;
     *(float *)((char *)self + kOffPowerExtraTorque)  = gSpeedKmh * 10.0f;
@@ -466,7 +487,13 @@ static void hook_ActorCpReporterUpdate(void *self, float dt, float matchTime, co
     gCurrentMatchTime = matchTime;
     int laps = *(int *)((char *)self + kOffActorCpLaps);
     if (laps > 0) gMapTotalLaps = laps;
+
+    int prevCp = gLastCheckPointId;
     gLastCheckPointId = *(int *)((char *)self + kOffActorCpLastCp);
+    if (gLastCheckPointId != prevCp) {
+        rtLog("RUN: CheckPoint passed -> ID=%d (matchTime=%.2fs, canFinish=%d)",
+              gLastCheckPointId, matchTime, gCanFinish);
+    }
 
     float curTime = gCurrentMatchTime > 0.f ? gCurrentMatchTime :
                     (gGoTime > 0.0 ? (float)(nowSeconds() - gGoTime) : 0.f);
@@ -515,8 +542,7 @@ static float rtAPComputeSteer(void *phyCtrl, void *vehicle) {
     void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
     if (!rtPtrOk(sim) || !rtPtrOk(tp)) return 0.f;
 
-    // Nose direction from the chassis quaternion (valid even at standstill,
-    // unlike mMovingDirection which is zero before the car rolls).
+    // Nose direction from the chassis quaternion
     float qx = *(float *)((char *)sim + kOffSimChassisRot);
     float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
     float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
@@ -524,28 +550,46 @@ static float rtAPComputeSteer(void *phyCtrl, void *vehicle) {
 
     float fwdX = 2.0f * (qx * qz + qw * qy);
     float fwdZ = 1.0f - 2.0f * (qx * qx + qy * qy);
-
-    // Guide line = centre-line tangent at the current track point.
-    float dirX = *(float *)((char *)tp + kOffTpDirection);
-    float dirZ = *(float *)((char *)tp + kOffTpDirection + 8);
-
-    // Signed lateral offset from that guide line (mHorizontalDis).
-    float hDis = *(float *)((char *)acc + kOffAccHorizDis);
-
     float flen = sqrtf(fwdX * fwdX + fwdZ * fwdZ);
-    float dlen = sqrtf(dirX * dirX + dirZ * dirZ);
-    float cross = (fwdX * dirZ) - (fwdZ * dirX);
-    if (flen > 1e-4f && dlen > 1e-4f) cross /= (flen * dlen);
+    if (flen > 1e-4f) { fwdX /= flen; fwdZ /= flen; }
 
-    // Pull toward the line proportional to how far off it we are, with a
-    // hard cap so a big lateral error cannot demand full lock instantly.
-    float pull = hDis * 0.045f;
-    if (pull >  0.45f) pull =  0.45f;
-    if (pull < -0.45f) pull = -0.45f;
+    // Pure pursuit: lookahead target along track center line
+    float carX = *(float *)((char *)sim + 0x64);
+    float carZ = *(float *)((char *)sim + 0x6C);
 
-    float steer = (cross * 2.6f) - pull;
-    if (steer >  1.f) steer =  1.f;
-    if (steer < -1.f) steer = -1.f;
+    float tpPosX = *(float *)((char *)tp + 0x10);
+    float tpPosZ = *(float *)((char *)tp + 0x18);
+
+    float tpDirX = *(float *)((char *)tp + 0x1C);
+    float tpDirZ = *(float *)((char *)tp + 0x24);
+    float dlen = sqrtf(tpDirX * tpDirX + tpDirZ * tpDirZ);
+    if (dlen > 1e-4f) { tpDirX /= dlen; tpDirZ /= dlen; }
+
+    // 12m lookahead point along guide line
+    float targetX = tpPosX + tpDirX * 12.0f;
+    float targetZ = tpPosZ + tpDirZ * 12.0f;
+
+    float dx = targetX - carX;
+    float dz = targetZ - carZ;
+    float dist = sqrtf(dx * dx + dz * dz);
+    if (dist > 1e-4f) { dx /= dist; dz /= dist; }
+
+    // 2D Cross product (dx, dz) x (fwdX, fwdZ):
+    // dx*fwdZ - dz*fwdX > 0 when target is to the RIGHT (steer right > 0)
+    // dx*fwdZ - dz*fwdX < 0 when target is to the LEFT (steer left < 0)
+    float cross = (dx * fwdZ) - (dz * fwdX);
+
+    // Lateral offset pull damping from guide line (mHorizontalDis)
+    float hDis = *(float *)((char *)acc + kOffAccHorizDis);
+    float pull = hDis * 0.035f;
+    if (pull >  0.35f) pull =  0.35f;
+    if (pull < -0.35f) pull = -0.35f;
+
+    float steer = (cross * 2.2f) - pull;
+    if (steer >  1.0f) steer =  1.0f;
+    if (steer < -1.0f) steer = -1.0f;
+
+    gLastAPSteer = steer;
     return steer;
 }
 
@@ -553,12 +597,13 @@ static void hook_PhyVehicleCtrl_DoSteering(void *self, float torque, const void 
     if (rtPtrOk(self)) {
         void *vehicle = *(void **)((char *)self + 0x10);   // NssPhyVehicleCtrl.mVehicle
 
-        BOOL isPlayer = rtPtrOk(vehicle) ? *(bool *)((char *)vehicle + kOffVehicleIsMain) : NO;
+        BOOL isPlayer = (vehicle == gCurrentVehicle) ||
+                        (rtPtrOk(vehicle) && (*(int *)((char *)vehicle + 0x14) == 0 || *(bool *)((char *)vehicle + kOffVehicleIsMain)));
 
         if (isPlayer && gAutoPlay) {
-            float steer = rtAPComputeSteer(self, vehicle);
+            float steer = gLastAPSteer;
 
-            // A real thumb input always wins over the AI.
+            // Real thumb input always wins over AI
             void *dyn = *(void **)((char *)vehicle + kOffVehicleDyn);
             void *mc  = rtPtrOk(dyn) ? *(void **)((char *)dyn + kOffDynMotionCtrl) : NULL;
             void *sd  = rtPtrOk(mc) ? *(void **)((char *)mc + kOffMotionSteerData) : NULL;
@@ -569,26 +614,57 @@ static void hook_PhyVehicleCtrl_DoSteering(void *self, float torque, const void 
         }
 
         if (gSteerStrength > 0.0f) torque *= gSteerStrength;
+
+        static int dsCounter = 0;
+        if (isPlayer && (++dsCounter % 120 == 1)) {
+            rtLog("RUN: DoSteering -> isPlayer=1 torque=%.3f gAutoPlay=%d gSteerStrength=%.2f", torque, gAutoPlay, gSteerStrength);
+        }
     }
 
     if (orig_PhyVehicleCtrl_DoSteering) orig_PhyVehicleCtrl_DoSteering(self, torque, method);
 }
 
-// 8. Tự động Mod Xe / Skin trong Sảnh (Lobby / Garage / Preview)
-//
-// VehiclePreviewParam (+0x28 SkinId / +0x2C VehicleId) is only the *preview*
-// descriptor; the model actually resolves from InitVehicleParams inside the
-// loader. Both are patched here so the rendered car matches.
+// Intercept GetSteeringValue (Slot 33) called directly by DoSteering
+static BOOL hook_GetSteeringValue(void *self, void *carParams, float deltaTime, float *steerValue, float *steeringTime, const void *method) {
+    BOOL ret = orig_GetSteeringValue ? orig_GetSteeringValue(self, carParams, deltaTime, steerValue, steeringTime, method) : FALSE;
+    if (gAutoPlay && rtPtrOk(steerValue)) {
+        void *dyn = rtPtrOk(self) ? *(void **)((char *)self + 0x10) : NULL; // mVehicle (IDynamicVehicle)
+        void *vhc = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x10) : NULL;   // mVehicle (IVehicle)
+        BOOL isPlayer = (vhc == gCurrentVehicle) || (rtPtrOk(vhc) && (*(int *)((char *)vhc + 0x14) == 0 || *(bool *)((char *)vhc + 0xF8)));
+        if (isPlayer) {
+            *steerValue = gLastAPSteer;
+            ret = TRUE;
+            static int gsvCounter = 0;
+            if (++gsvCounter % 120 == 1) {
+                rtLog("RUN: GetSteeringValue -> applied steer=%.3f to drivingCtrl=%p", gLastAPSteer, self);
+            }
+        }
+    }
+    return ret;
+}
+
+// 8. Mod Xe / Skin trong Sảnh (Lobby / Garage / Preview)
 static void hook_Previewer_ShowVehicle(void *self, void *vehiclePreviewParam, uint32_t downloadPriority, void *memberName, void *filePath, const void *method) {
     if (gModEnabled && gModVehicleID > 0 && rtPtrOk(vehiclePreviewParam)) {
         *(uint32_t *)((char *)vehiclePreviewParam + 0x2C) = (uint32_t)gModVehicleID; // VehicleId
-        *(uint32_t *)((char *)vehiclePreviewParam + 0x28) = (uint32_t)gModSkinID;    // SkinId (0 = default)
+        *(uint32_t *)((char *)vehiclePreviewParam + 0x28) = (uint32_t)gModSkinID;    // SkinId
+        *(bool *)((char *)vehiclePreviewParam + 0x58) = true;                        // IsTrustVehicleId
 
-        // DirectItemVehicle (+0x50) bypasses the id path entirely when set, so
-        // clear it to force resolution through the patched ids.
-        *(void **)((char *)vehiclePreviewParam + 0x50) = NULL;
+        // Keep DirectItemVehicle alive but patch its internal configs so GetItemVehicle resolves correctly
+        void *div = *(void **)((char *)vehiclePreviewParam + 0x50);
+        if (rtPtrOk(div)) {
+            void *vcfg = *(void **)((char *)div + 0xE0); // mVehicleConfig
+            if (rtPtrOk(vcfg)) {
+                *(uint32_t *)((char *)vcfg + 0x10) = (uint32_t)gModVehicleID;
+                *(uint64_t *)((char *)vcfg + 0x18) = (uint64_t)gModVehicleID;
+            }
+            void *icfg = *(void **)((char *)div + 0x10); // ItemBase.mItemConfig
+            if (rtPtrOk(icfg)) {
+                *(uint32_t *)((char *)icfg + 0x10) = (uint32_t)gModVehicleID;
+            }
+        }
 
-        rtLog("ShowVehicle modded -> VehicleID=%d SkinID=%d", gModVehicleID, gModSkinID);
+        rtLog("ShowVehicle modded -> VehicleID=%d SkinID=%d DirectItemVehicle=%p", gModVehicleID, gModSkinID, div);
     }
     if (orig_Previewer_ShowVehicle) orig_Previewer_ShowVehicle(self, vehiclePreviewParam, downloadPriority, memberName, filePath, method);
 }
@@ -613,6 +689,11 @@ static void hook_NssVehicle_PreInit(void *self, uint64_t uid, int vehicleID, voi
 
 static int hook_NssVehicle_GetVehicleID(void *self, const void *method) {
     if (gModEnabled && gModVehicleID > 0 && rtPtrOk(self)) {
+        static void *lastVhc = NULL;
+        if (lastVhc != self) {
+            lastVhc = self;
+            rtLog("RUN: NssVehicle::GetVehicleID -> returning %d (self=%p)", gModVehicleID, self);
+        }
         *(int *)((char *)self + kOffVehicleID) = gModVehicleID;
         return gModVehicleID;
     }
@@ -621,23 +702,51 @@ static int hook_NssVehicle_GetVehicleID(void *self, const void *method) {
 
 static uint64_t hook_ItemVehicle_GetModelID(void *self, const void *method) {
     if (gModEnabled && gModVehicleID > 0 && rtPtrOk(self)) {
+        static void *lastItem = NULL;
+        if (lastItem != self) {
+            lastItem = self;
+            rtLog("RUN: ItemVehicle::GetVechicleModelID -> returning %d (self=%p)", gModVehicleID, self);
+        }
         return (uint64_t)gModVehicleID;
     }
     return orig_ItemVehicle_GetModelID ? orig_ItemVehicle_GetModelID(self, method) : 0;
 }
 
-// 10. Auto Play: throttle + skill keys.
-//
-// Steering is NOT written here. DoSteering (0x7AF5BAC) receives the final
-// normalised torque and is the only point downstream of _UpdateInputXTimeRel
-// (which ramps mInputXPosition at ~1.0/s) and AssistTurning (which overwrites
-// mSteering). This hook therefore only owns throttle and the discrete
-// Drift / SmallBoost / Left / Right keys consumed by InputModule.GetKey.
+// 10. Mod Xe Trong Trận (In-Match Dynamic Vehicle Creation)
+static void *hook_CreateDefaultDynamicVehicle(void *self, void *presentationVehicle, void *initParams, int inputCarPos, void *actor, int startPointIndex, const void *method) {
+    if (gModEnabled && gModVehicleID > 0 && rtPtrOk(initParams)) {
+        int actorType = *(int *)((char *)initParams + 0x2C);
+        if (actorType == 0) { // EPAY_RealPlayer
+            *(int *)((char *)initParams + 0x0) = gModVehicleID; // mID
+            void *iv = *(void **)((char *)initParams + 0x30);   // mItemVehicle
+            if (rtPtrOk(iv)) {
+                void *vcfg = *(void **)((char *)iv + 0xE0); // mVehicleConfig
+                if (rtPtrOk(vcfg)) {
+                    *(uint32_t *)((char *)vcfg + 0x10) = (uint32_t)gModVehicleID;
+                    *(uint64_t *)((char *)vcfg + 0x18) = (uint64_t)gModVehicleID;
+                }
+                void *icfg = *(void **)((char *)iv + 0x10); // ItemBase.mItemConfig
+                if (rtPtrOk(icfg)) {
+                    *(uint32_t *)((char *)icfg + 0x10) = (uint32_t)gModVehicleID;
+                }
+            }
+            rtLog("CreateDefaultDynamicVehicle modded -> mID=%d", gModVehicleID);
+        }
+    }
+    return orig_CreateDefaultDynamicVehicle ?
+        orig_CreateDefaultDynamicVehicle(self, presentationVehicle, initParams, inputCarPos, actor, startPointIndex, method) : NULL;
+}
+
+// 11. Auto Play: steering, throttle, and skill keys.
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
     if (rtPtrOk(self)) {
         void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
         if (rtPtrOk(vehicle)) {
-            gCurrentVehicle = vehicle;
+            if (gCurrentVehicle != vehicle) {
+                gCurrentVehicle = vehicle;
+                rtLog("RUN: MotionCtrlUpdate -> captured player vehicle=%p (current ID=%d)",
+                      vehicle, *(int *)((char *)vehicle + kOffVehicleID));
+            }
             if (gModEnabled && gModVehicleID > 0) {
                 *(int *)((char *)vehicle + kOffVehicleID) = gModVehicleID;
             }
@@ -654,18 +763,30 @@ static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
                 void *sim = *(void **)((char *)phyCtrl + kOffPhySimOutput);
                 void *tp  = rtPtrOk(acc) ? *(void **)((char *)acc + kOffAccCurTrackPoint) : NULL;
 
+                float steer = rtAPComputeSteer(phyCtrl, vehicle);
+
+                // Write steer directly into steerData and drivingCtrl
+                *(float *)((char *)steerData + kOffSteerWheel) = steer; // 0x1C mSteeringLeft
+                if (rtPtrOk(drivingCtrl)) {
+                    *(float *)((char *)drivingCtrl + 0x40) = steer; // mSteering
+                    *(float *)((char *)drivingCtrl + 0x68) = steer; // mInputXPosition
+                    *(float *)((char *)drivingCtrl + 0x34) = steer; // mVehicleCtrlParams.steering
+                }
+
+                // Throttle
                 int braking   = *(int *)((char *)steerData + kOffSteerBraking);
                 bool handbrake = *(bool *)((char *)steerData + kOffSteerHandbrake);
 
                 if (braking == 0 && !handbrake) {
                     *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
-                    if (rtPtrOk(drivingCtrl))
+                    if (rtPtrOk(drivingCtrl)) {
                         *(float *)((char *)drivingCtrl + kOffDrvThrottle) = 1.0f;
+                        *(float *)((char *)drivingCtrl + 0x3C) = 1.0f;
+                    }
                 }
 
                 // Skill keys: latch drift through corners, tap mini boost on exit.
                 if (rtPtrOk(sim) && rtPtrOk(tp)) {
-                    float steer = rtAPComputeSteer(phyCtrl, vehicle);
                     int mask = 0;
 
                     if (fabsf(steer) > 0.55f)      gAPDriftLatch = 1;
@@ -687,6 +808,13 @@ static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
                     }
 
                     gAPKeyMask = mask;
+                }
+
+                static int apCounter = 0;
+                if (++apCounter % 120 == 0) {
+                    float spd = *(float *)((char *)sim + 0x10);
+                    float hDis = *(float *)((char *)acc + kOffAccHorizDis);
+                    rtLog("RUN: AutoPlay tick -> steer=%.3f hDis=%.2f spd=%.1f km/h", steer, hDis, spd);
                 }
             }
         } else {
@@ -769,6 +897,9 @@ static void installHooks(void) {
     // 8. Sức mạnh đổi hướng + Auto Play steering (DoSteering)
     orig_PhyVehicleCtrl_DoSteering = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleCtrl", "DoSteering", 1, (void *)hook_PhyVehicleCtrl_DoSteering);
+    orig_GetSteeringValue = (BOOL (*)(void *, void *, float, float *, float *, const void *))
+        rtHookMethod("", "NssPhyVehicleDrivingCtrl", "GetSteeringValue", 4, (void *)hook_GetSteeringValue);
+    rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "GetSteeringValue", 4, (void *)hook_GetSteeringValue);
 
     // 9. Mod Xe trong Sảnh / Lobby (Item3DPreviewSystem)
     orig_Previewer_ShowVehicle = (void (*)(void *, void *, uint32_t, void *, void *, const void *))
@@ -778,14 +909,15 @@ static void installHooks(void) {
             rtHookMethod("", "Item3DPreviewSystem.PlayerPreviewer", "ShowVehicle", 4, (void *)hook_Previewer_ShowVehicle);
     }
 
-    // 10. Mod Xe khi Vào Trận / Load Trận (PreInit & ModelID)
+    // 10. Mod Xe khi Vào Trận / Load Trận (PreInit, ModelID, CreateDefaultDynamicVehicle)
     orig_NssVehicle_PreInit = (void (*)(void *, uint64_t, int, void *, const void *))
         rtHookMethod("", "NssVehicle", "PreInit", 3, (void *)hook_NssVehicle_PreInit);
     orig_NssVehicle_GetVehicleID = (int (*)(void *, const void *))
         rtHookMethod("", "NssVehicle", "GetVehicleID", 0, (void *)hook_NssVehicle_GetVehicleID);
     orig_ItemVehicle_GetModelID = (uint64_t (*)(void *, const void *))
         rtHookMethod("", "ItemVehicle", "GetVechicleModelID", 0, (void *)hook_ItemVehicle_GetModelID);
-
+    orig_CreateDefaultDynamicVehicle = (void *(*)(void *, void *, void *, int, void *, int, const void *))
+        rtHookMethod("", "NssVehicleResMgr", "CreateDefaultDynamicVehicle", 5, (void *)hook_CreateDefaultDynamicVehicle);
     rtLog("install: done (all hooks active)");
 }
 
