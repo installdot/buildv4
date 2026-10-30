@@ -303,17 +303,12 @@ static void *rtHookMethod(const char *namespaze, const char *className,
 
 static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
 
-static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
-static void  (*orig_Drift_Release)(void *, const void *) = NULL;
-static void  (*orig_Drift_ExitCurDriftState)(void *, const void *) = NULL;
-static void  (*orig_Drift_ForceClearDriftParams)(void *, const void *) = NULL;
-
+static void  (*orig_AutoSmallBoostHelper_Update)(void *, float, const void *) = NULL;
 static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
 static void  (*orig_SdcVehicleVel_Update)(void *, float, const void *) = NULL;
 static void  (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *) = NULL;
 static void  (*orig_ActorCpReporter_Update)(void *, float, float, const void *) = NULL;
 
-static void (*ExtraVelocityTriggerMgr_ForceCanTriggerOnce)(void *, int, const void *) = NULL;
 static void (*orig_MotionCtrl_Update)(void *, float, const void *) = NULL;
 static void (*orig_VehicleInputCtrl_Update)(void *, float, const void *) = NULL;
 static void (*orig_Shadow_EnableMatchInput)(void *, bool, const void *) = NULL;
@@ -346,39 +341,14 @@ static void hook_GoImpEnter(void *self, const void *method) {
           gGoTime, gMinMapTimeSeconds, gLapTimeLimit);
 }
 
-// 2. Mini Boost: Gọi ForceCanTriggerOnce(Mini/Air/FallingGround) liên tục
-static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
-    if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
-    if (!gFullMiniBoost || !self) return;
-
-    if (ExtraVelocityTriggerMgr_ForceCanTriggerOnce) {
-        ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 2, nullptr);  // Mini
-        ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 3, nullptr);  // Air
-        ExtraVelocityTriggerMgr_ForceCanTriggerOnce(self, 11, nullptr); // FallingGround
+// 2. Mini Boost: Tu dong kich hoat tieu phun tuc thi qua AutoSmallBoostHelper (khong xung dot phim bam)
+static void hook_AutoSmallBoostHelperUpdate(void *self, float dt, const void *method) {
+    if (gFullMiniBoost && self) {
+        *(float *)((char *)self + 0x28) = 0.0f; // mAutoMiniBoostDelayTime = 0
+        *(float *)((char *)self + 0x2C) = 1.0f; // mNormalStateStayTime = 1
     }
+    if (orig_AutoSmallBoostHelper_Update) orig_AutoSmallBoostHelper_Update(self, dt, method);
 }
-
-// 3. Auto End Drift: Tránh dính drift
-static void hook_DriftExitCurState(void *self, const void *method) {
-    if (orig_Drift_ExitCurDriftState) orig_Drift_ExitCurDriftState(self, method);
-}
-
-static void hook_DriftForceClear(void *self, const void *method) {
-    if (orig_Drift_ForceClearDriftParams) orig_Drift_ForceClearDriftParams(self, method);
-}
-
-static void hook_DriftRelease(void *self, const void *method) {
-    if (orig_Drift_Release) orig_Drift_Release(self, method);
-    if (!gAutoDriftEnd || !self) return;
-
-    if (orig_Drift_ExitCurDriftState) {
-        orig_Drift_ExitCurDriftState(self, nullptr);
-    }
-    if (orig_Drift_ForceClearDriftParams) {
-        orig_Drift_ForceClearDriftParams(self, nullptr);
-    }
-}
-
 // 4. PowerChain Speed Boost (chỉ boost, autopilot tách riêng sang Cab::Update)
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
     if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
@@ -394,7 +364,9 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
 
 // Player identity comes from the input controller, which only the local player owns.
 __attribute__((unused)) static BOOL rtIsPlayerVehicle(void *vehicle) {
-    return gPlayerVehicle && vehicle == gPlayerVehicle;
+    if (!rtPtrOk(vehicle)) return NO;
+    if (gPlayerVehicle && vehicle == gPlayerVehicle) return YES;
+    return *(bool *)((char *)vehicle + 0xF8); // NssVehicle.mIsMainPlayer
 }
 
 // 5. ShadowTrusted & Max Drive Assist (Tuyet doi KHONG khoa UI control cua nguoi choi)
@@ -414,20 +386,18 @@ static void hook_DriveAssist_CopyConfig(void *self, void *cfg, void *detectConfi
     if (orig_DriveAssist_CopyConfig) orig_DriveAssist_CopyConfig(self, cfg, detectConfig, collConfig, method);
     if (!gShadowTrusted) return;
 
-    // Quet du doan va cham tam xa (0.85s)
     if (detectConfig) {
-        *(float *)((char *)detectConfig + 0x10) = 0.85f; // mLinvelPredictTime
-        *(int *)((char *)detectConfig + 0x14)   = 1;     // mPredictType (Swept AABB)
+        *(float *)((char *)detectConfig + 0x10) = 0.55f; // mLinvelPredictTime: du doan vua phai
+        *(int *)((char *)detectConfig + 0x14)   = 1;     // mPredictType: Swept AABB
     }
-    // Thuat toan nan goc bam cua va chong va dap tuong max cong suat
     if (collConfig) {
-        *(float *)((char *)collConfig + 0x10) = 16.0f; // mSlerpSpeed: keo ve tiep tuyen an toan tuc thi
-        *(float *)((char *)collConfig + 0x14) = 2.8f;  // mDriftAccCoef: tang toc do day xe khi drift
-        *(float *)((char *)collConfig + 0x18) = 0.0f;  // mDriftMaxAngSpeedKMPHThreshold: kich hoat o moi toc do
-        *(float *)((char *)collConfig + 0x1C) = 2.2f;  // mDriftMaxAngelSpeedCoef: cho phep be goc cua gat
-        *(float *)((char *)collConfig + 0x20) = 0.01f; // mDriftSlidingMaxAngSpeedCoef: bam duong tuyet doi, triet tieu vang duoi
-        *(float *)((char *)collConfig + 0x24) = 0.0f;  // mSteerAngleThreshold: tu nan lai ngay lap tuc khi chom lech
-        *(float *)((char *)collConfig + 0x28) = 25.0f; // mSteerAngleSpeed: toc do be lai tro luc toi da
+        *(float *)((char *)collConfig + 0x10) = 8.0f;  // mSlerpSpeed: keo huong nhe nhang
+        *(float *)((char *)collConfig + 0x14) = 1.8f;  // mDriftAccCoef: tang toc drift hop ly
+        *(float *)((char *)collConfig + 0x18) = 0.0f;  // mDriftMaxAngSpeedKMPHThreshold
+        *(float *)((char *)collConfig + 0x1C) = 1.3f;  // mDriftMaxAngelSpeedCoef
+        *(float *)((char *)collConfig + 0x20) = 1.0f;  // mDriftSlidingMaxAngSpeedCoef: GIU DRIFT TU NHIEN, khong clamp 0.01
+        *(float *)((char *)collConfig + 0x24) = 0.12f; // mSteerAngleThreshold: chi ho tro khi chệch huong lon
+        *(float *)((char *)collConfig + 0x28) = 4.0f;  // mSteerAngleSpeed: tro luc vua phai, khong cuop tay lai
     }
 }
 
@@ -435,19 +405,19 @@ static void hook_DAVirtualCollision_Update(void *self, float dt, const void *met
     if (gShadowTrusted && self) {
         void *collConfig = *(void **)((char *)self + 0x20); // mConfig
         if (collConfig) {
-            *(float *)((char *)collConfig + 0x10) = 16.0f;
-            *(float *)((char *)collConfig + 0x14) = 2.8f;
+            *(float *)((char *)collConfig + 0x10) = 8.0f;
+            *(float *)((char *)collConfig + 0x14) = 1.8f;
             *(float *)((char *)collConfig + 0x18) = 0.0f;
-            *(float *)((char *)collConfig + 0x1C) = 2.2f;
-            *(float *)((char *)collConfig + 0x20) = 0.01f;
-            *(float *)((char *)collConfig + 0x24) = 0.0f;
-            *(float *)((char *)collConfig + 0x28) = 25.0f;
+            *(float *)((char *)collConfig + 0x1C) = 1.3f;
+            *(float *)((char *)collConfig + 0x20) = 1.0f;
+            *(float *)((char *)collConfig + 0x24) = 0.12f;
+            *(float *)((char *)collConfig + 0x28) = 4.0f;
         }
         void *envInfo = *(void **)((char *)self + 0x18); // mDAEnvInfo
         if (envInfo) {
             void *detectConfig = *(void **)((char *)envInfo + 0x70); // mConfig
             if (detectConfig) {
-                *(float *)((char *)detectConfig + 0x10) = 0.85f;
+                *(float *)((char *)detectConfig + 0x10) = 0.55f;
                 *(int *)((char *)detectConfig + 0x14)   = 1;
             }
         }
@@ -457,6 +427,69 @@ static void hook_DAVirtualCollision_Update(void *self, float dt, const void *met
 
 static void hook_MotionCtrlUpdate(void *self, float dt, const void *method) {
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, method);
+    if (!rtPtrOk(self)) return;
+
+    void *vehicle = *(void **)((char *)self + 0x18); // mVehicle
+    if (!rtIsPlayerVehicle(vehicle)) return;
+
+    void *drivingCtrl = *(void **)((char *)self + 0x38); // NssPhyVehicleDrivingCtrl mDrivingCtrl
+
+    // 1. Tự động đua (ShadowTrusted Autopilot bám sát Trackline & giữ full ga)
+    if (gShadowTrusted) {
+        void *dyn = *(void **)((char *)self + 0x28);         // IDynamicVehicle mDynamicVehicle
+        void *phyCtrl = *(void **)((char *)self + 0x20);     // NssPhyVehicleCtrl mVehiclePhyCtrl
+
+        if (rtPtrOk(dyn) && rtPtrOk(phyCtrl) && rtPtrOk(drivingCtrl)) {
+            void *acc = *(void **)((char *)dyn + 0x28);          // IVehicleACC mACC
+            void *simOutput = *(void **)((char *)phyCtrl + 0x28); // NssVehicleSimOutput mSimulateOutput
+
+            if (rtPtrOk(acc) && rtPtrOk(simOutput)) {
+                void *curTp = *(void **)((char *)acc + 0x38);    // ITrackPoint mCurTrackPoint
+                if (rtPtrOk(curTp)) {
+                    // Vector hướng xe (trục XZ)
+                    float fwdX = *(float *)((char *)simOutput + 0x44);
+                    float fwdZ = *(float *)((char *)simOutput + 0x4C);
+
+                    // Vector tiếp tuyến tâm đường đua
+                    float dirX = *(float *)((char *)curTp + 0x1C);
+                    float dirZ = *(float *)((char *)curTp + 0x24);
+
+                    // Khoảng cách vuông góc tới tim đường đua
+                    float hDist = *(float *)((char *)acc + 0x5C);
+
+                    // Cross product 2D: fwd × dir
+                    float cross = (fwdX * dirZ) - (fwdZ * dirX);
+
+                    // Tính góc lái bám đường: bù góc lệch + kéo về giữa tim đường
+                    float targetSteer = (cross * 1.8f) - (hDist * 0.08f);
+                    if (targetSteer > 1.0f) targetSteer = 1.0f;
+                    if (targetSteer < -1.0f) targetSteer = -1.0f;
+
+                    // Nếu người chơi KHÔNG đang tự đè phím rẽ tay (>0.2f) -> Autopilot tự bẻ lái
+                    float userSteer = *(float *)((char *)drivingCtrl + 64);
+                    if (fabsf(userSteer) < 0.2f) {
+                        *(float *)((char *)drivingCtrl + 64) = targetSteer;
+                    }
+
+                    // Tự động giữ ga full nếu không phanh tay
+                    bool isBrake = *(bool *)((char *)drivingCtrl + 0x74);
+                    if (!isBrake) {
+                        *(float *)((char *)drivingCtrl + 60) = 1.0f;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Auto End Drift an toàn: Tự thoát drift sạch sẽ khi người chơi đã nhả nút drift
+    if (gAutoDriftEnd && rtPtrOk(drivingCtrl)) {
+        bool isPressDrift = *(bool *)((char *)drivingCtrl + 0x75);
+        if (!isPressDrift) {
+            void (*exitDrift)(void *, const void *) = (void (*)(void *, const void *))
+                rtGetMethodPointerByRva("NssPhyVehicleMotionCtrl", 0x7B10C64);
+            if (exitDrift) exitDrift(self, nullptr);
+        }
+    }
 }
 
 // 5. Anti-Cheat Report: Khóa SdcVehicleVel ở mức 300 km/h
@@ -543,22 +576,10 @@ static void installHooks(void) {
     rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
 
-    // 2. Mini Boost: Gọi ForceCanTriggerOnce liên tục
-    orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
+    // 2. Mini Boost: AutoSmallBoostHelper tự động kích hoạt
+    orig_AutoSmallBoostHelper_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "AutoSmallBoostHelper", "Update", 1, (void *)hook_AutoSmallBoostHelperUpdate);
     rtHookMethod("", "VehicleInputCtrl", "Update", 1, (void *)hook_VehicleInputCtrlUpdate);
-
-    ExtraVelocityTriggerMgr_ForceCanTriggerOnce = (void (*)(void *, int, const void *))
-        rtGetMethodPointer("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
-
-    // 3. Auto End Drift (ExitCurDriftState + ForceClearDriftParams)
-    orig_Drift_Release = (void (*)(void *, const void *))
-        rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
-    orig_Drift_ExitCurDriftState = (void (*)(void *, const void *))
-        rtHookMethod("", "NssVehicleDriftCtrl", "ExitCurDriftState", 0, (void *)hook_DriftExitCurState);
-    orig_Drift_ForceClearDriftParams = (void (*)(void *, const void *))
-        rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftForceClear);
-
     // 4. Tốc độ trục truyền động vật lý (PowerChain)
     orig_PowerChain_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
