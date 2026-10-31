@@ -670,11 +670,6 @@ static int *rtKeyFlagsPtr(void) {
     return (int *)((char *)kd + kOffKeyDataFlags);
 }
 
-static int rtReadKeyFlags(void) {
-    int *p = rtKeyFlagsPtr();
-    return p ? *p : gKeyMask;
-}
-
 static void rtWriteKeyFlags(int mask) {
     int *p = rtKeyFlagsPtr();
     if (p) *p = mask;
