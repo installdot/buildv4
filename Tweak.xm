@@ -49,9 +49,10 @@ static void rtLog(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int m = vsnprintf(buf + n, sizeof buf - (size_t)n, fmt, ap);
     va_end(ap);
-    if (m < 0) return;
+    if (m < 0 || n < 0 || (size_t)n >= sizeof buf) return;
     size_t total = (size_t)n + (size_t)m;
-    if (total + 1 < sizeof buf) buf[total++] = '\n';
+    if (total >= sizeof buf - 1) total = sizeof buf - 2;
+    buf[total++] = '\n';
     ssize_t w = write(gLogFd, buf, total); (void)w;
 }
 
@@ -113,7 +114,7 @@ static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int 
 
     void *orig = *(void **)((char *)m + 0);
     if (!orig) { rtLog("il2cpp: %s::%s null", cls, mth); return NULL; }
-    if (orig == rep) return orig;
+    if (orig == rep) return NULL;
 
     const uint16_t slot = *(const uint16_t *)((const char *)m + 0x58);
     *(void **)((char *)m + 0) = rep;
@@ -168,7 +169,7 @@ enum {
 static void rtAlert(NSString *title, NSString *msg);
 static UIViewController *rtTopVC(void);
 
-#define RC_MAGIC "RKR1"
+#define RC_MAGIC "RKR2"
 #define RC_MAX_FRAMES 21600
 #define RC_SAMPLE_DT  0.008f
 
@@ -177,10 +178,10 @@ typedef struct {
     float px, py, pz;
     float qx, qy, qz, qw;
     float steer;
-    uint8_t keys;
+    uint32_t keys;                    // Preserve Drift bit 8 and higher keys.
     uint8_t flags;
-    uint16_t pad;
-} RCFrame;                            // 40 byte
+    uint8_t pad[3];
+} RCFrame;
 
 typedef struct {
     char     magic[4];
@@ -316,7 +317,7 @@ static void rtRecordTick(void *steerData, void *sim, double now) {
     int braking = *(int *)((char *)steerData + kOffSteerBraking);
     BOOL hb = *(bool *)((char *)steerData + kOffSteerHandbrake);
     fr.flags = (uint8_t)((braking ? 1 : 0) | (hb ? 2 : 0));
-    fr.keys  = (uint8_t)(rtReadKeyFlags() & 0xff);
+    fr.keys = (uint32_t)rtReadKeyFlags();
 
     gFrames[gFrameCount++] = fr;
 }
@@ -384,6 +385,7 @@ static void   (*orig_MotionCtrl_Update)(void *, float, const void *);
 static void   (*orig_Input_Update)(void *, float, const void *);
 static BOOL   (*orig_GetSteeringValue)(void *, void *, float, float *, float *, const void *);
 static void   (*orig_GoImpEnter)(void *, const void *);
+static void   (*orig_RaceKingGoImpEnter)(void *, const void *);
 static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *);
 
 static void hook_Input_Update(void *self, float dt, const void *m) {
@@ -405,8 +407,7 @@ static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
     return r;
 }
 
-static void hook_GoImpEnter(void *self, const void *m) {
-    if (orig_GoImpEnter) orig_GoImpEnter(self, m);
+static void rtBeginRace(void) {
     gGoTime = rtNow();
 
     if (gRecArmed) {
@@ -427,19 +428,31 @@ static void hook_GoImpEnter(void *self, const void *m) {
     } else gPlaying = NO;
 }
 
+static void hook_GoImpEnter(void *self, const void *m) {
+    if (orig_GoImpEnter) orig_GoImpEnter(self, m);
+    rtBeginRace();
+}
+
+static void hook_RaceKingGoImpEnter(void *self, const void *m) {
+    // Different classes have different originals; never call GameGoState on this instance.
+    if (orig_RaceKingGoImpEnter) orig_RaceKingGoImpEnter(self, m);
+    rtBeginRace();
+}
+
 static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool reset, const void *m) {
+    if (gRecording && gFrameCount) rtSaveRecord();
+    gRecording = NO;
+    gPlaying = NO;
+    gPlayerVehicle = NULL;
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, crc, reset, m);
-    if (rtPtrOk(config)) {
-        int mapId = *(int *)((char *)config + kOffCpMapId);
-        float len = *(float *)((char *)config + kOffCpCurveLength);
-        if (mapId > 0) gMapId = mapId;
-        if (len > 1.f) gTrackLen = len;
-    }
+    gMapId = rtPtrOk(self) ? *(int *)((char *)self + 0x40) : 0;
+    gTrackLen = 0.f;
+    rtLog("MAP resolved from CheckPointMgr self=%p config=%p", self, config);
     rtLog("map init map=%d len=%.2f", gMapId, gTrackLen);
 }
 
 static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
-    if (rtPtrOk(self)) {
+    if ((gRecording || gPlaying) && rtPtrOk(self)) {
         void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
         if (rtPtrOk(vehicle) && *(int *)((char *)vehicle + kOffVehicleActorType) == 0) {
             gPlayerVehicle = vehicle;
@@ -649,7 +662,8 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "GetSteeringValue", 4, (void *)hook_GetSteeringValue);
     orig_GoImpEnter = (void (*)(void *, const void *))
         rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
-    rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    orig_RaceKingGoImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_RaceKingGoImpEnter);
     orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
         rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgr_Init);
 }
