@@ -1028,7 +1028,7 @@ static void rtAlert(NSString *title, NSString *msg) {
 }
 
 - (void)tapRec {
-    gRecArmed = __omp_shell("gRecArmed;")
+    gRecArmed = !gRecArmed;
     if (!gRecArmed && gRecording) {
         gRecording = NO;
         BOOL ok = rtSaveRecord();
@@ -1053,7 +1053,7 @@ static void rtAlert(NSString *title, NSString *msg) {
 }
 
 - (void)tapAuto {
-    gAutoArmed = __omp_shell("gAutoArmed;")
+    gAutoArmed = !gAutoArmed;
     if (gAutoArmed) { gRecArmed = NO; gRecording = NO; }
     else { gPlaying = NO; rtWriteKeyFlags(0); }
     rtLog("AUTO armed=%d", (int)gAutoArmed);
