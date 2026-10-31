@@ -220,12 +220,17 @@ static int      gMapId;
 static float    gTrackLen;
 static double   gGoTime;
 static BOOL gAutoArmed, gPlaying;
+static BOOL gNoReplay = YES;
 static void *gPlayerVehicle;
 static void *gInputModule;
 static int   gKeyMask;
 static float gCurPlaybackSteer;
 static void *gMapDataComponent = NULL;
 static BOOL gDownloading = NO;
+static void  *gQuickMatchMdl = NULL;
+static int    gAutoMatchMode = 5; // Mặc định: 5 (Rank Tốc Độ Đơn)
+static BOOL   gAutoQueue = NO;    // Tự động bấm nút ghép trận
+static double gLastFinishTime = 0.0;
 
 #pragma mark - Storage & Parser .rep
 
@@ -828,6 +833,29 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     rtWriteKeyFlags((int)keys);
 }
 
+static void rtTriggerQuickMatch(void) {
+    if (!rtPtrOk(gQuickMatchMdl)) {
+        rtLog("AUTO MATCH: gQuickMatchMdl is NULL");
+        return;
+    }
+    uintptr_t base = rtGetUnityBase();
+    if (!base) return;
+
+    typedef bool (*fn_isMatching_t)(void *);
+    fn_isMatching_t fn_isMatching = (fn_isMatching_t)(base + 0x8DCAB90);
+    if (fn_isMatching && fn_isMatching(gQuickMatchMdl)) {
+        rtLog("AUTO MATCH: Already matching!");
+        return;
+    }
+
+    typedef void (*fn_QuickMatch_t)(void *, int, bool, uint8_t, int, int);
+    fn_QuickMatch_t fn_qm = (fn_QuickMatch_t)(base + 0x8DCBD60);
+    if (fn_qm) {
+        rtLog("AUTO MATCH: Triggering QuickMatch(mode=%d)...", gAutoMatchMode);
+        fn_qm(gQuickMatchMdl, gAutoMatchMode, true, 6, -1, 0);
+    }
+}
+
 #pragma mark - UI Interface
 
 @interface RCPanel : NSObject
@@ -835,7 +863,9 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 @property (nonatomic, strong) UIView *host;
 @property (nonatomic, strong) UILabel *status;
 @property (nonatomic, strong) UIButton *bDl;
+@property (nonatomic, strong) UIButton *bNoRep;
 @property (nonatomic, strong) UIButton *bAuto;
+@property (nonatomic, strong) UIButton *bQueue;
 - (void)show;
 - (void)refresh;
 @end
@@ -905,6 +935,18 @@ static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void 
 static void   (*orig_MapDataComponent_InitComponent)(void *, const void *);
 static void  *(*orig_DataCenterMdl_GetMapDataComponent)(void *, bool, const void *);
 
+// Auto Matchmaking Hooks
+static void   (*orig_QuickMatchMdl_Update)(void *, float, const void *);
+static void   (*orig_RankedEntranceButtonComponent_OnClickMatchBtn)(void *, int, const void *);
+
+// No Replay Hooks
+static int    (*orig_MatchVideoMdl_StartEnterGame)(void *, int, void *, void *, const void *);
+static int    (*orig_MatchVideoMdl_ChallengeShadow_info)(void *, void *, uint64_t, const void *);
+static int    (*orig_MatchVideoMdl_ChallengeShadow_mark)(void *, int64_t, uint64_t, const void *);
+static int    (*orig_MatchVideoMdl_ReplayVideo_bytes)(void *, void *, uint64_t, void *, void *, const void *);
+static int    (*orig_MatchVideoMdl_ReplayVideo_mark)(void *, int64_t, uint64_t, const void *);
+static int    (*orig_MatchVideoMdl_ReplayTeachingVideo)(void *, int, void *, bool, const void *);
+
 // Anti-AFK Hooks
 static void   (*orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime)(void *, float, const void *);
 static void   (*orig_SdcVehicleInput_Update)(void *, float, const void *);
@@ -912,6 +954,27 @@ static void   (*orig_SdcPlayerInput_Update)(void *, float, const void *);
 static void   (*orig_CPR_FillVehicleInputData)(void *, void **, const void *);
 static void   (*orig_CPR_FillPVPButtonUseData)(void *, void **, const void *);
 static BOOL   (*orig_MatchUIMgr_Trusteeship)(void *, int, const void *);
+
+static void hook_QuickMatchMdl_Update(void *self, float dt, const void *m) {
+    if (rtPtrOk(self)) {
+        gQuickMatchMdl = self;
+        if (gAutoQueue && !gPlaying && gLastFinishTime > 0.0) {
+            double now = rtNow();
+            if (now - gLastFinishTime >= 6.0) { // Đợi 6s sau khi cán đích về sảnh để ghép trận tiếp theo
+                gLastFinishTime = 0.0;
+                rtTriggerQuickMatch();
+            }
+        }
+    }
+    if (orig_QuickMatchMdl_Update) orig_QuickMatchMdl_Update(self, dt, m);
+}
+
+static void hook_RankedEntranceButtonComponent_OnClickMatchBtn(void *self, int mode, const void *m) {
+    gAutoMatchMode = mode;
+    rtLog("MATCH BUTTON CLICKED: Remembered mode %d", mode);
+    if (orig_RankedEntranceButtonComponent_OnClickMatchBtn)
+        orig_RankedEntranceButtonComponent_OnClickMatchBtn(self, mode, m);
+}
 
 static void hook_Input_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
@@ -979,6 +1042,9 @@ static void hook_ReplayActionGoImpEnter(void *self, const void *m) {
 static void hook_GameFinishImpEnter(void *self, const void *m) {
     if (orig_GameFinishImpEnter) orig_GameFinishImpEnter(self, m);
     rtLog("FINISH reached");
+    gPlaying = NO;
+    gLastFinishTime = rtNow(); // Bắt đầu đếm thời gian chuyển về sảnh để tự ghép trận tiếp
+    rtWriteKeyFlags(0);
 }
 
 static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *videoBytes, const void *m) {
@@ -1024,6 +1090,61 @@ static void *hook_DataCenterMdl_GetMapDataComponent(void *self, bool withInit, c
         gMapDataComponent = res;
     }
     return res;
+}
+
+// ==================== NO REPLAY HOOKS (CHẶN MỞ REPLAY / BÓNG) ====================
+static int hook_MatchVideoMdl_StartEnterGame(void *self, int videoId, void *bytes, void *summaryInfo, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted StartEnterGame (id=%d)", videoId);
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận.");
+        return 0; // NotErr
+    }
+    return orig_MatchVideoMdl_StartEnterGame ? orig_MatchVideoMdl_StartEnterGame(self, videoId, bytes, summaryInfo, m) : 0;
+}
+
+static int hook_MatchVideoMdl_ChallengeShadow_info(void *self, void *summaryInfo, uint64_t shadowUID, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ChallengeShadow(info)");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
+        return 0;
+    }
+    return orig_MatchVideoMdl_ChallengeShadow_info ? orig_MatchVideoMdl_ChallengeShadow_info(self, summaryInfo, shadowUID, m) : 0;
+}
+
+static int hook_MatchVideoMdl_ChallengeShadow_mark(void *self, int64_t videoMark, uint64_t shadowUID, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ChallengeShadow(mark=%lld)", (long long)videoMark);
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
+        return 0;
+    }
+    return orig_MatchVideoMdl_ChallengeShadow_mark ? orig_MatchVideoMdl_ChallengeShadow_mark(self, videoMark, shadowUID, m) : 0;
+}
+
+static int hook_MatchVideoMdl_ReplayVideo_bytes(void *self, void *videoBytes, uint64_t uid, void *name, void *icon, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ReplayVideo(bytes)");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        return 0; // NotErr
+    }
+    return orig_MatchVideoMdl_ReplayVideo_bytes ? orig_MatchVideoMdl_ReplayVideo_bytes(self, videoBytes, uid, name, icon, m) : 0;
+}
+
+static int hook_MatchVideoMdl_ReplayVideo_mark(void *self, int64_t mark, uint64_t uid, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ReplayVideo(mark=%lld)", (long long)mark);
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        return 0; // NotErr
+    }
+    return orig_MatchVideoMdl_ReplayVideo_mark ? orig_MatchVideoMdl_ReplayVideo_mark(self, mark, uid, m) : 0;
+}
+
+static int hook_MatchVideoMdl_ReplayTeachingVideo(void *self, int videoId, void *url, bool uncomp, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ReplayTeachingVideo(id=%d)", videoId);
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        return 0; // NotErr
+    }
+    return orig_MatchVideoMdl_ReplayTeachingVideo ? orig_MatchVideoMdl_ReplayTeachingVideo(self, videoId, url, uncomp, m) : 0;
 }
 
 // ==================== ANTI-AFK (4 TẦNG CHỐNG TREO MÁY) ====================
@@ -1204,7 +1325,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
             }
         }
 
-        UIView *host = [[UIView alloc] initWithFrame:CGRectMake(14, scr.size.height * 0.30, 132, 162)];
+        UIView *host = [[UIView alloc] initWithFrame:CGRectMake(14, scr.size.height * 0.25, 132, 234)];
         host.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.88];
         host.layer.cornerRadius = 12;
         host.layer.borderWidth = 1;
@@ -1224,14 +1345,22 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
         [host addSubview:t];
 
         self.bDl = [self mk:@"⬇ TẢI .REP" sel:@selector(tapDownload)];
-        self.bDl.frame = CGRectMake(10, 28, 112, 34);
+        self.bDl.frame = CGRectMake(10, 28, 112, 32);
         [host addSubview:self.bDl];
 
+        self.bNoRep = [self mk:@"NO REP: BẬT" sel:@selector(tapNoRep)];
+        self.bNoRep.frame = CGRectMake(10, 62, 112, 32);
+        [host addSubview:self.bNoRep];
+
         self.bAuto = [self mk:@"▶ AUTO" sel:@selector(tapAuto)];
-        self.bAuto.frame = CGRectMake(10, 68, 112, 34);
+        self.bAuto.frame = CGRectMake(10, 96, 112, 32);
         [host addSubview:self.bAuto];
 
-        self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, 108, 112, 48)];
+        self.bQueue = [self mk:@"⚡ GHÉP TRẬN" sel:@selector(tapQueue)];
+        self.bQueue.frame = CGRectMake(10, 130, 112, 32);
+        [host addSubview:self.bQueue];
+
+        self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, 166, 112, 62)];
         self.status.numberOfLines = 3;
         self.status.font = [UIFont systemFontOfSize:9];
         self.status.textColor = [UIColor colorWithWhite:1 alpha:0.75];
@@ -1254,12 +1383,36 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     dispatch_async(dispatch_get_main_queue(), ^{
         self.bAuto.backgroundColor = gAutoArmed ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
                                                 : [UIColor colorWithWhite:0.12 alpha:0.92];
+        self.bNoRep.backgroundColor = gNoReplay ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
+                                                : [UIColor colorWithWhite:0.12 alpha:0.92];
+        [self.bNoRep setTitle:gNoReplay ? @"NO REP: BẬT" : @"NO REP: TẮT" forState:UIControlStateNormal];
+
+        self.bQueue.backgroundColor = gAutoQueue ? [UIColor colorWithRed:0.10 green:0.35 blue:0.75 alpha:0.95]
+                                                 : [UIColor colorWithWhite:0.12 alpha:0.92];
+        [self.bQueue setTitle:gAutoQueue ? @"⚡ GHÉP: BẬT" : @"⚡ GHÉP: TẮT" forState:UIControlStateNormal];
+
         if (!gDownloading) {
             NSString *stateStr = gAutoArmed ? @"AUTO: BẬT" : @"AUTO: TẮT";
-            self.status.text = [NSString stringWithFormat:@"Map: %d (%u frame)\n%@\nPlay: %d",
-                                gMapId, gFrameCount, stateStr, (int)gPlaying];
+            NSString *queueStr = gAutoQueue ? @"GHÉP: TỰ ĐỘNG" : @"GHÉP: TAY";
+            self.status.text = [NSString stringWithFormat:@"Map: %d (%u f)\n%@ | %@\nPlay: %d",
+                                gMapId, gFrameCount, stateStr, queueStr, (int)gPlaying];
         }
     });
+}
+
+- (void)tapQueue {
+    gAutoQueue = gAutoQueue ? NO : YES;
+    rtLog("AUTO QUEUE changed to %d", (int)gAutoQueue);
+    if (gAutoQueue) {
+        rtTriggerQuickMatch(); // Bấm là kích hoạt ghép ngay lập tức!
+    }
+    [self refresh];
+}
+
+- (void)tapNoRep {
+    gNoReplay = gNoReplay ? NO : YES;
+    rtLog("NO REPLAY changed to %d", (int)gNoReplay);
+    [self refresh];
 }
 
 - (void)tapDownload {
@@ -1322,7 +1475,27 @@ static void rtInstallHooks(void) {
     orig_DataCenterMdl_GetMapDataComponent = (void *(*)(void *, bool, const void *))
         rtHookMethod("", "DataCenterMdl", "GetMapDataComponent", 1, (void *)hook_DataCenterMdl_GetMapDataComponent);
 
-    // Anti-AFK Hooks (4 tầng chống treo máy & chống phạt)
+    // Auto Matchmaking Hooks (Tự động bấm nút ghép trận)
+    orig_QuickMatchMdl_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "QuickMatchMdl", "Update", 1, (void *)hook_QuickMatchMdl_Update);
+    orig_RankedEntranceButtonComponent_OnClickMatchBtn = (void (*)(void *, int, const void *))
+        rtHookMethod("", "RankedEntranceButtonComponent", "OnClickMatchBtn", 1, (void *)hook_RankedEntranceButtonComponent_OnClickMatchBtn);
+
+    // No Replay Hooks (chặn game tự động mở Replay & Bóng khi tải .rep)
+    orig_MatchVideoMdl_StartEnterGame = (int (*)(void *, int, void *, void *, const void *))
+        rtHookMethod("", "MatchVideoMdl", "StartEnterGame", 3, (void *)hook_MatchVideoMdl_StartEnterGame);
+    orig_MatchVideoMdl_ChallengeShadow_info = (int (*)(void *, void *, uint64_t, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ChallengeShadow", 2, (void *)hook_MatchVideoMdl_ChallengeShadow_info);
+    orig_MatchVideoMdl_ChallengeShadow_mark = (int (*)(void *, int64_t, uint64_t, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ChallengeShadow", 2, (void *)hook_MatchVideoMdl_ChallengeShadow_mark);
+    orig_MatchVideoMdl_ReplayVideo_bytes = (int (*)(void *, void *, uint64_t, void *, void *, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ReplayVideo", 4, (void *)hook_MatchVideoMdl_ReplayVideo_bytes);
+    orig_MatchVideoMdl_ReplayVideo_mark = (int (*)(void *, int64_t, uint64_t, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ReplayVideo", 2, (void *)hook_MatchVideoMdl_ReplayVideo_mark);
+    orig_MatchVideoMdl_ReplayTeachingVideo = (int (*)(void *, int, void *, bool, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ReplayTeachingVideo", 3, (void *)hook_MatchVideoMdl_ReplayTeachingVideo);
+
+// Anti-AFK Hooks (4 tầng chống treo máy & chống phạt)
     orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleInput", "UpdateVehicleNotControlMaxTime", 1, (void *)hook_SdcVehicleInput_UpdateVehicleNotControlMaxTime);
     orig_SdcVehicleInput_Update = (void (*)(void *, float, const void *))
