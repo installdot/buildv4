@@ -180,6 +180,8 @@ enum {
 #pragma mark - Frame format
 
 @class RCPassWindow;
+@class RCPanel;
+static RCPanel *gPanel = nil;
 static void rtAlert(NSString *title, NSString *msg);
 static UIViewController *rtTopVC(void);
 
@@ -1201,7 +1203,7 @@ static void rtAlert(NSString *title, NSString *msg) {
 }
 
 - (void)tapAuto {
-    gAutoArmed = __omp_shell("gAutoArmed;")
+    gAutoArmed = gAutoArmed ? NO : YES;
     if (!gAutoArmed) { gPlaying = NO; rtWriteKeyFlags(0); }
     rtLog("AUTO armed=%d", (int)gAutoArmed);
     [self refresh];
