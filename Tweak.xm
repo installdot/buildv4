@@ -173,6 +173,9 @@ enum {
 
 #pragma mark - Frame format
 
+#define RC_MAGIC "RKR3"
+#define RC_MAX_FRAMES 21600
+#define RC_SAMPLE_DT  0.008f
 typedef struct {
     float    t;               // Thời gian tương đối (s)
     float    px, py, pz;      // Vị trí 3D
