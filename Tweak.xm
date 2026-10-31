@@ -86,6 +86,8 @@ static const Il2CppAssembly **(*il2cpp_domain_get_assemblies)(const Il2CppDomain
 static Il2CppImage *(*il2cpp_assembly_get_image)(const Il2CppAssembly *);
 static Il2CppClass *(*il2cpp_class_from_name)(const Il2CppImage *, const char *, const char *);
 static const MethodInfo *(*il2cpp_class_get_method_from_name)(Il2CppClass *, const char *, int);
+static void *(*il2cpp_array_new)(void *elemClass, size_t length);
+static void *(*il2cpp_object_new)(void *klass);
 
 static BOOL rtInitIl2Cpp(void) {
     if (il2cpp_domain_get) return YES;
@@ -96,9 +98,11 @@ static BOOL rtInitIl2Cpp(void) {
     *(void **)&il2cpp_assembly_get_image         = dlsym(h, "il2cpp_assembly_get_image");
     *(void **)&il2cpp_class_from_name            = dlsym(h, "il2cpp_class_from_name");
     *(void **)&il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
+    *(void **)&il2cpp_array_new                  = dlsym(h, "il2cpp_array_new");
+    *(void **)&il2cpp_object_new                 = dlsym(h, "il2cpp_object_new");
     BOOL ok = il2cpp_domain_get && il2cpp_domain_get_assemblies && il2cpp_assembly_get_image
            && il2cpp_class_from_name && il2cpp_class_get_method_from_name;
-    rtLog("il2cpp api: %s", ok ? "OK" : "MISSING");
+    rtLog("il2cpp api: %s (arrNew=%p objNew=%p)", ok ? "OK" : "MISSING", il2cpp_array_new, il2cpp_object_new);
     return ok;
 }
 
@@ -256,29 +260,214 @@ static BOOL rtSaveRecord(void) {
     return YES;
 }
 
+static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
+    if (!rtPtrOk(desHelper)) return NO;
+    void *summary = *(void **)((char *)desHelper + 0x40); // <SummaryInfo>k__BackingField
+    if (!rtPtrOk(summary)) {
+        rtLog("[Rep] SummaryInfo is null");
+        return NO;
+    }
+
+    uint32_t mapId = *(uint32_t *)((char *)summary + 0x20); // MapID
+    uint64_t uid   = *(uint64_t *)((char *)summary + 0x30); // RecordPlayerUID
+    rtLog("[Rep] Found Summary: mapId=%u, uid=%llu", mapId, (unsigned long long)uid);
+
+    uintptr_t base = rtGetUnityBase();
+    if (!base) return NO;
+
+    typedef void *(*fn_GetTransInfos_t)(void *, uint64_t);
+    fn_GetTransInfos_t fn_GetTransInfos = (fn_GetTransInfos_t)(base + 0x71B5608);
+
+    void *p2p = fn_GetTransInfos ? fn_GetTransInfos(desHelper, uid) : NULL;
+    if (!rtPtrOk(p2p)) {
+        rtLog("[Rep] GetTransInfos returned null for uid %llu", (unsigned long long)uid);
+        return NO;
+    }
+
+    void *moveList = *(void **)((char *)p2p + 0x10); // MoveInfo (ListView<VideoVehicleMoveInfo>)
+    if (!rtPtrOk(moveList)) {
+        rtLog("[Rep] MoveInfo list is null");
+        return NO;
+    }
+
+    int count = *(int *)((char *)moveList + 0x18); // _size
+    void *arr = *(void **)((char *)moveList + 0x10); // Context array
+    if (!rtPtrOk(arr) || count <= 0) {
+        rtLog("[Rep] MoveInfo empty (count=%d)", count);
+        return NO;
+    }
+
+    if (count > RC_MAX_FRAMES) count = RC_MAX_FRAMES;
+    if (gFrames) { free(gFrames); gFrames = NULL; }
+    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * count);
+    if (!gFrames) return NO;
+
+    void **items = (void **)((char *)arr + 0x20);
+    for (int i = 0; i < count; i++) {
+        void *m = items[i];
+        if (!rtPtrOk(m)) continue;
+
+        RCFrame fr;
+        memset(&fr, 0, sizeof fr);
+        fr.t    = *(float *)((char *)m + 0x18); // mClientTime
+        fr.keys = *(uint32_t *)((char *)m + 0x20); // mKeyFlag
+        fr.px   = *(float *)((char *)m + 0x24); // mPos.x
+        fr.py   = *(float *)((char *)m + 0x28); // mPos.y
+        fr.pz   = *(float *)((char *)m + 0x2C); // mPos.z
+        fr.qx   = *(float *)((char *)m + 0x30); // mRot.x
+        fr.qy   = *(float *)((char *)m + 0x34); // mRot.y
+        fr.qz   = *(float *)((char *)m + 0x38); // mRot.z
+        fr.qw   = *(float *)((char *)m + 0x3C); // mRot.w
+        fr.vx   = *(float *)((char *)m + 0x40); // mLinVel.x
+        fr.vy   = *(float *)((char *)m + 0x44); // mLinVel.y
+        fr.vz   = *(float *)((char *)m + 0x48); // mLinVel.z
+        fr.kmph = *(float *)((char *)m + 0x5C); // mKMPH
+        fr.steer = 0.f;
+
+        uint8_t flags = 0;
+        if (fr.keys & (1 << 6)) flags |= 0x01; // Brake
+        if (fr.keys & ((1 << 8) | (1 << 9))) flags |= 0x04; // Drift
+        if (fr.keys & (1 << 3)) flags |= 0x08; // Nitro
+        if (fr.keys & (1 << 5)) flags |= 0x10; // Boost
+        fr.flags = flags;
+
+        gFrames[i] = fr;
+    }
+    gFrameCount = count;
+    if (mapId > 0) gMapId = (int)mapId;
+    rtLog("[Rep] SUCCESSFULLY extracted %u frames from .rep! MapId=%d", gFrameCount, gMapId);
+
+    rtSaveRecord();
+    return YES;
+}
+
+static BOOL rtLoadRepFromDisk(NSString *repPath) {
+    if (!repPath || ![[NSFileManager defaultManager] fileExistsAtPath:repPath]) return NO;
+    NSData *data = [NSData dataWithContentsOfFile:repPath];
+    if (!data || !data.length) return NO;
+
+    rtLog("[Rep] Reading file: %s (%lu bytes)", repPath.UTF8String, (unsigned long)data.length);
+
+    void *byteClass = rtFindClass("System", "Byte");
+    void *desClass  = rtFindClass("", "MatchVideoDesHelper");
+    if (!byteClass || !desClass || !il2cpp_array_new || !il2cpp_object_new) {
+        rtLog("[Rep] il2cpp functions missing: byteClass=%p desClass=%p arrNew=%p objNew=%p",
+              byteClass, desClass, il2cpp_array_new, il2cpp_object_new);
+        return NO;
+    }
+
+    uintptr_t base = rtGetUnityBase();
+    if (!base) return NO;
+
+    // 1. Tạo Il2CppArray chứa dữ liệu file
+    void *arr = il2cpp_array_new(byteClass, data.length);
+    if (!arr) return NO;
+    memcpy((char *)arr + 0x20, data.bytes, data.length);
+
+    // 2. Giải nén nếu file bị nén qua MatchVideoStaticHelper.GetUnZipData (0x71E28EC)
+    typedef void *(*fn_unzip_t)(void *, ...);
+    fn_unzip_t fn_unzip = (fn_unzip_t)(base + 0x71E28EC);
+    void *unzipArr = fn_unzip ? fn_unzip(arr) : arr;
+    if (!unzipArr) unzipArr = arr;
+
+    // 3. Khởi tạo đối tượng MatchVideoDesHelper
+    void *helper = il2cpp_object_new(desClass);
+    if (!helper) return NO;
+    typedef void (*fn_ctor_t)(void *);
+    fn_ctor_t fn_ctor = (fn_ctor_t)(base + 0x71B6A88);
+    if (fn_ctor) fn_ctor(helper);
+
+    // 4. Giải mã dữ liệu qua InitByVideoBytes (0x71B3E20)
+    typedef BOOL (*fn_init_t)(void *, void *, ...);
+    fn_init_t fn_init = (fn_init_t)(base + 0x71B3E20);
+    BOOL ok = fn_init ? fn_init(helper, unzipArr) : NO;
+    rtLog("[Rep] InitByVideoBytes result=%d", (int)ok);
+    if (ok) {
+        return rtExtractFramesFromDesHelper(helper);
+    }
+    return NO;
+}
+
+static NSString *rtFindRepFile(int targetMapId) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
+    NSArray *dirs = @[@"TempMatchVideos", @"MatchVideos", @"RaceKit"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSString *bestMatch = nil;
+    NSString *newestFile = nil;
+    NSDate *newestDate = [NSDate distantPast];
+
+    NSString *mapStr = targetMapId > 0 ? [NSString stringWithFormat:@"%d", targetMapId] : nil;
+
+    for (NSString *sub in dirs) {
+        NSString *dir = [doc stringByAppendingPathComponent:sub];
+        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
+        for (NSString *name in files) {
+            if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
+                NSString *full = [dir stringByAppendingPathComponent:name];
+                if (mapStr && [name containsString:mapStr]) {
+                    bestMatch = full;
+                    break;
+                }
+                NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
+                NSDate *mod = attr.fileModificationDate ?: [NSDate date];
+                if ([mod compare:newestDate] == NSOrderedDescending) {
+                    newestDate = mod;
+                    newestFile = full;
+                }
+            }
+        }
+        if (bestMatch) break;
+    }
+    return bestMatch ?: newestFile;
+}
+
+static BOOL rtScanAndLoadRepFiles(int targetMapId) {
+    NSString *rep = rtFindRepFile(targetMapId);
+    if (!rep) {
+        rtLog("[Rep] No .rep file found in TempMatchVideos/MatchVideos");
+        return NO;
+    }
+    rtLog("[Rep] Selected .rep file: %s", rep.UTF8String);
+    return rtLoadRepFromDisk(rep);
+}
+
 static BOOL rtLoadRecord(void) {
     gFrameCount = 0;
     if (gFrames) { free(gFrames); gFrames = NULL; }
+
+    // 1. Thử load record .rk đã lưu sẵn
     NSString *path = rtPathForTrack();
-    if (!path) return NO;
-    FILE *f = fopen(path.fileSystemRepresentation, "rb");
-    if (!f) return NO;
-
-    RCHeader h;
-    if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, RC_MAGIC, 4)
-        || h.frameSize != sizeof(RCFrame) || !h.count) {
-        fclose(f); return NO;
+    if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        FILE *f = fopen(path.fileSystemRepresentation, "rb");
+        if (f) {
+            RCHeader h;
+            if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, RC_MAGIC, 4)
+                && h.frameSize == sizeof(RCFrame) && h.count) {
+                if (h.count > RC_MAX_FRAMES) h.count = RC_MAX_FRAMES;
+                gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
+                if (gFrames) {
+                    gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
+                    fclose(f);
+                    if (gFrameCount) {
+                        rtLog("load: %u frames (%.2fs) map=%d len=%.1f", gFrameCount,
+                              gFrames[gFrameCount - 1].t, h.mapId, h.trackLen);
+                        return YES;
+                    }
+                }
+            }
+            fclose(f);
+        }
     }
-    if (h.count > RC_MAX_FRAMES) h.count = RC_MAX_FRAMES;
 
-    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
-    if (!gFrames) { fclose(f); return NO; }
-    gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
-    fclose(f);
-    if (!gFrameCount) { free(gFrames); gFrames = NULL; return NO; }
-    rtLog("load: %u frames (%.2fs) map=%d len=%.1f", gFrameCount,
-          gFrames[gFrameCount - 1].t, h.mapId, h.trackLen);
-    return YES;
+    // 2. Nếu chưa có .rk, tự động quét TempMatchVideos đọc file .rep!
+    rtLog("No .rk record found, checking TempMatchVideos for .rep...");
+    if (rtScanAndLoadRepFiles(gMapId)) {
+        return (gFrameCount > 0);
+    }
+
+    return NO;
 }
 
 #pragma mark - Key injection (đúng cơ chế game)
@@ -491,8 +680,8 @@ static void   (*orig_RaceKingGoImpEnter)(void *, const void *);
 static void   (*orig_ReplayGoImpEnter)(void *, const void *);
 static void   (*orig_ReplayActionGoImpEnter)(void *, const void *);
 static void   (*orig_GameFinishImpEnter)(void *, const void *);
+static BOOL   (*orig_MatchVideoDesHelper_InitByVideoBytes)(void *, void *, const void *);
 static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *);
-
 static void hook_Input_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
     if (orig_Input_Update) orig_Input_Update(self, dt, m);
@@ -562,6 +751,15 @@ static void hook_GameFinishImpEnter(void *self, const void *m) {
         rtSaveRecord();
         gRecording = NO;
     }
+}
+
+static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *videoBytes, const void *m) {
+    BOOL res = orig_MatchVideoDesHelper_InitByVideoBytes ? orig_MatchVideoDesHelper_InitByVideoBytes(self, videoBytes, m) : NO;
+    rtLog("HOOK MatchVideoDesHelper::InitByVideoBytes res=%d", (int)res);
+    if (res && rtPtrOk(self)) {
+        rtExtractFramesFromDesHelper(self);
+    }
+    return res;
 }
 
 static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool reset, const void *m) {
@@ -829,6 +1027,8 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "GameFinishState", "ImpEnter", 0, (void *)hook_GameFinishImpEnter);
     orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
         rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgr_Init);
+    orig_MatchVideoDesHelper_InitByVideoBytes = (BOOL (*)(void *, void *, const void *))
+        rtHookMethod("", "MatchVideoDesHelper", "InitByVideoBytes", 1, (void *)hook_MatchVideoDesHelper_InitByVideoBytes);
 }
 
 __attribute__((constructor))
