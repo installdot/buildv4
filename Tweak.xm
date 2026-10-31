@@ -87,7 +87,7 @@ static BOOL rtInitIl2Cpp(void) {
     if (sInit) return YES;
     sInit = YES;
     void *h = dlopen(NULL, RTLD_NOW);
-    #define RESOLVE(fn) fn = (typeof(fn))dlsym(h, #fn)
+    #define RESOLVE(fn) fn = (__typeof__(fn))dlsym(h, #fn)
     RESOLVE(il2cpp_domain_get);
     RESOLVE(il2cpp_domain_get_assemblies);
     RESOLVE(il2cpp_assembly_get_image);
@@ -108,7 +108,7 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
     const Il2CppAssembly **asms = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &n);
     if (!asms) return NULL;
     for (size_t i = 0; i < n; i++) {
-        Il2CppImage *img = il2cpp_assembly_get_image(asms[i]);
+        const Il2CppImage *img = il2cpp_assembly_get_image(asms[i]);
         if (!img) continue;
         Il2CppClass *k = il2cpp_class_from_name(img, ns, name);
         if (k) return k;
@@ -532,8 +532,8 @@ static BOOL rtLoadRepFromDisk(NSString *repPath) {
 
     rtLog("[Rep] Feeding %lu bytes into game parser...", (unsigned long)data.length);
 
-    void *byteClass = rtFindClass("System", "Byte");
-    void *desClass  = rtFindClass("", "MatchVideoDesHelper");
+    Il2CppClass *byteClass = rtFindClass("System", "Byte");
+    Il2CppClass *desClass  = rtFindClass("", "MatchVideoDesHelper");
     if (!byteClass || !desClass || !il2cpp_array_new || !il2cpp_object_new) {
         rtLog("[Rep] il2cpp functions missing: byteClass=%p desClass=%p arrNew=%p objNew=%p",
               byteClass, desClass, il2cpp_array_new, il2cpp_object_new);
@@ -1275,7 +1275,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 }
 
 - (void)onAuto {
-    gAutoArmed = __omp_shell("gAutoArmed;")
+    gAutoArmed = !gAutoArmed;
     if (!gAutoArmed) { gPlaying = NO; rtWriteKeyFlags(0); }
     [self refresh];
 }
