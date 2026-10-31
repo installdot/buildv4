@@ -229,8 +229,6 @@ static int      gKeyMask = 0;
 static float    gCurPlaybackSteer = 0.f;
 
 static void *gMapDataComponent = NULL;
-static BOOL  sHasStartPos = NO;
-static float sStartPos[3] = {0.f, 0.f, 0.f};
 
 #pragma mark - Helper Functions & Background BXH Downloader
 
@@ -511,16 +509,6 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
     gFrameCount = count;
     rtLog("[Rep] Successfully extracted %u frames from game parser!", gFrameCount);
 
-    // CHUẨN HÓA MỐC THỜI GIAN XUẤT PHÁT t = 0.0s (loại bỏ thời gian đếm ngược trong Replay)
-    if (count > 0) {
-        float t0 = gFrames[0].t;
-        if (t0 > 0.001f) {
-            for (int i = 0; i < count; i++) {
-                gFrames[i].t -= t0;
-            }
-        }
-    }
-
     rtSaveRecord();
     return YES;
 }
@@ -715,27 +703,10 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     if (al < 0.f) al = 0.f;
     if (al > 1.f) al = 1.f;
 
-    // Ghi nhận vị trí xuất phát thực tế trên làn của xe trong trận Rank/PVP
-    if (!sHasStartPos && rtPtrOk(sim)) {
-        sStartPos[0] = *(float *)((char *)sim + kOffSimChassisPos + 0);
-        sStartPos[1] = *(float *)((char *)sim + kOffSimChassisPos + 4);
-        sStartPos[2] = *(float *)((char *)sim + kOffSimChassisPos + 8);
-        sHasStartPos = YES;
-    }
-
     // --- 1. TỌA ĐỘ VÀ VẬN TỐC NỘI SUY ---
     float tx = a->px + (b->px - a->px) * al;
     float ty = a->py + (b->py - a->py) * al;
     float tz = a->pz + (b->pz - a->pz) * al;
-
-    // Chuyển làn mượt mà trong 0.6s đầu từ vị trí xuất phát vào đường đua (chống kẹt / lệch làn xe)
-    if (sHasStartPos && t < 0.6f) {
-        float blend = t / 0.6f;
-        blend = blend * blend * (3.0f - 2.0f * blend); // smoothstep
-        tx = sStartPos[0] + (tx - sStartPos[0]) * blend;
-        ty = sStartPos[1] + (ty - sStartPos[1]) * blend;
-        tz = sStartPos[2] + (tz - sStartPos[2]) * blend;
-    }
 
     // --- 2. NỘI SUY GÓC XOAY QUATERNION CHUẨN XÁC (Shortest-path NLerp chống lật góc 180 độ) ---
     float dot = a->qx * b->qx + a->qy * b->qy + a->qz * b->qz + a->qw * b->qw;
@@ -968,7 +939,6 @@ static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
 static void rtBeginRace(void) {
     gGoTime = rtNow();
     gCurPlaybackSteer = 0.f;
-    sHasStartPos = NO;
 
     if (gAutoArmed) {
         BOOL ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
@@ -1007,7 +977,6 @@ static void hook_GameFinishImpEnter(void *self, const void *m) {
     if (orig_GameFinishImpEnter) orig_GameFinishImpEnter(self, m);
     gPlaying = NO;
     gCurPlaybackSteer = 0.f;
-    sHasStartPos = NO;
     rtWriteKeyFlags(0);
 }
 
@@ -1131,15 +1100,14 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) {
         void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
         if (rtPtrOk(vehicle)) {
-            // SỬA LỖI VỊ TRÍ XE: Trong phòng Rank / Map thường có 6 xe, tất cả đều có actorType == 0!
-            // CHỈ điều khiển xe của chính người chơi (mIsMainPlayer == true tại offset 0xF8)!
-            // TUYỆT ĐỐI không can thiệp vào 5 xe của người chơi khác!
+            int actorType = *(int *)((char *)vehicle + kOffVehicleActorType);
             bool isMain = *(bool *)((char *)vehicle + kOffVehicleIsMainPlayer);
-            if (!isMain) return;
+            // Chấp nhận: RealPlayer (0), ReplayPlayer (3), BeObservePlayer (5), hoặc xe mIsMainPlayer (0xF8)
+            BOOL isTarget = isMain || (actorType == 0) || (actorType == 3) || (actorType == 5);
+            if (isTarget) {
+                gPlayerVehicle = vehicle;
 
-            gPlayerVehicle = vehicle;
-
-            if (gPlaying) {
+                if (gPlaying) {
                 void *steerData   = *(void **)((char *)self + kOffMotionSteerData);
                 void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
                 void *drivingCtrl = *(void **)((char *)self + kOffMotionDriving);
@@ -1164,7 +1132,8 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
             }
         }
     }
-    if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, m);
+}
+if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, m);
 }
 
 #pragma mark - UI Implementation (Kéo thả di chuyển, Tải .rep toàn diện & Auto)
