@@ -1,5 +1,7 @@
 // RaceRec — Ghi / Phát lại đường đua (record & playback)
-// Hỗ trợ tải replay Top 3 tất cả map trong Đỉnh Cực Tốc, menu di chuyển được, auto update UI khi đổi map.
+// Chế độ No Replay: chặn tự động mở replay khi tải file .rep trong game.
+// Chế độ Auto: Teleport frame-by-frame và set toàn bộ state từ file .rep.
+// Chống phát hiện AFK / Treo máy khi Auto đua.
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -106,14 +108,6 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
 
 static BOOL rtPtrOk(const void *p) { return p && (uintptr_t)p > 0x1000 && (uintptr_t)p < 0x00007fffffffffffULL; }
 
-static NSString *rtIl2CppString(void *il2cppStr) {
-    if (!rtPtrOk(il2cppStr)) return nil;
-    int32_t len = *(int32_t *)((char *)il2cppStr + 0x10);
-    if (len <= 0 || len > 2048) return nil;
-    const unichar *chars = (const unichar *)((char *)il2cppStr + 0x14);
-    return [NSString stringWithCharacters:chars length:len];
-}
-
 static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int argc, void *rep) {
     Il2CppClass *k = rtFindClass(ns, cls);
     if (!k) { rtLog("il2cpp: %s::%s class NOT FOUND", cls, mth); return NULL; }
@@ -179,10 +173,6 @@ enum {
 
 #pragma mark - Frame format
 
-#define RC_MAGIC "RKR3"
-#define RC_MAX_FRAMES 21600
-#define RC_SAMPLE_DT  0.008f
-
 typedef struct {
     float    t;               // Thời gian tương đối (s)
     float    px, py, pz;      // Vị trí 3D
@@ -214,18 +204,18 @@ typedef struct {
     uint32_t frameSize;
 } RCHeader;
 
-static RCFrame *gFrames;
-static uint32_t gFrameCount;
-static int      gMapId;
-static float    gTrackLen;
-static double   gGoTime;
-static BOOL gAutoArmed, gPlaying;
-static void *gPlayerVehicle;
-static void *gInputModule;
-static int   gKeyMask;
-static float gCurPlaybackSteer;
-static void *gMapDataComponent = NULL;
-static BOOL gDownloading = NO;
+static RCFrame *gFrames = NULL;
+static uint32_t gFrameCount = 0;
+static int      gMapId = 0;
+static float    gTrackLen = 0.f;
+static double   gGoTime = 0.0;
+static BOOL     gAutoArmed = YES;
+static BOOL     gNoReplay = YES;
+static BOOL     gPlaying = NO;
+static void    *gPlayerVehicle = NULL;
+static void    *gInputModule = NULL;
+static int      gKeyMask = 0;
+static float    gCurPlaybackSteer = 0.f;
 
 #pragma mark - Storage & Parser .rep
 
@@ -327,7 +317,6 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         if (ql > 1e-4f) { fr.qx /= ql; fr.qy /= ql; fr.qz /= ql; fr.qw /= ql; }
 
         // ĐỌC VÀ TÍNH TỐC ĐỘ:
-        // mKMPH ở 0x5C trong Replay bằng 0, tính tốc độ chuẩn từ vector mLinVel:
         float v_mps = sqrtf(fr.vx * fr.vx + fr.vy * fr.vy + fr.vz * fr.vz);
         float spd_kmh = v_mps * 3.6f;
         if (spd_kmh < 1.0f && i > 0) {
@@ -442,30 +431,43 @@ static NSString *rtFindRepFile(int targetMapId) {
     NSString *dir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 1. ƯU TIÊN ĐÚNG FILE TOP 3: <mapId>_3.rep
+    NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    if (!files || !files.count) {
+        rtLog("[Rep] TempMatchVideos is empty or not found: %s", dir.UTF8String);
+        return nil;
+    }
+
+    // 1. Ưu tiên tìm file Top 3: <mapId>_3.rep
     NSString *top3Path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%d_3.rep", targetMapId]];
     if ([fm fileExistsAtPath:top3Path]) {
         return top3Path;
     }
 
-    // 2. Tìm file bắt đầu bằng <mapId>_ (bỏ qua file map khác hoặc map 0)
-    NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
-    NSString *prefix = [NSString stringWithFormat:@"%d_", targetMapId];
-    NSString *newest = nil;
+    NSString *bestMatch = nil;
+    NSString *newestFile = nil;
     NSDate *newestDate = [NSDate distantPast];
 
+    NSString *targetPrefix = [NSString stringWithFormat:@"%d_", targetMapId];
+    NSString *targetContain = [NSString stringWithFormat:@"%d", targetMapId];
+
     for (NSString *name in files) {
-        if ([name.pathExtension.lowercaseString isEqualToString:@"rep"] && [name hasPrefix:prefix]) {
+        if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
             NSString *full = [dir stringByAppendingPathComponent:name];
+            if ([name hasPrefix:targetPrefix]) {
+                return full;
+            }
+            if ([name containsString:targetContain]) {
+                bestMatch = full;
+            }
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
             NSDate *mod = attr.fileModificationDate ?: [NSDate date];
             if ([mod compare:newestDate] == NSOrderedDescending) {
                 newestDate = mod;
-                newest = full;
+                newestFile = full;
             }
         }
     }
-    return newest;
+    return bestMatch ?: newestFile;
 }
 
 static BOOL rtLoadRecord(void) {
@@ -524,124 +526,8 @@ static BOOL rtLoadRecord(void) {
             }
         }
     }
+
     return NO;
-}
-
-#pragma mark - Tải Replay Top 3 tất cả map (Đỉnh Cực Tốc)
-
-static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total, NSString *info), void (^onComplete)(int totalDownloaded)) {
-    if (gDownloading) return;
-    gDownloading = YES;
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
-        NSString *tempDir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:tempDir withIntermediateDirectories:YES attributes:nil error:NULL];
-
-        // CHỈ LẤY DUY NHẤT TOP 3 (bGradeID == 3) CỦA MỖI MAP (KHÔNG XÓA FILE NÀO TRONG THƯ MỤC)
-        NSMutableArray *queue = [NSMutableArray array];
-        NSMutableSet *queuedMaps = [NSMutableSet set];
-
-        if (rtPtrOk(gMapDataComponent)) {
-            void *list = *(void **)((char *)gMapDataComponent + 0x98); // ListView<VideoDetailCfg>
-            if (rtPtrOk(list)) {
-                int count = *(int *)((char *)list + 0x18);
-                void *arr = *(void **)((char *)list + 0x10);
-                if (rtPtrOk(arr) && count > 0) {
-                    void **items = (void **)((char *)arr + 0x20);
-                    for (int i = 0; i < count; i++) {
-                        void *cfg = items[i];
-                        if (!rtPtrOk(cfg)) continue;
-                        int mapId = *(int *)((char *)cfg + 0x14);
-
-                        uint8_t gradeId = *(uint8_t *)((char *)cfg + 0x18);
-                        // CHỈ LẤY THỨ 3 (TOP 3 TRÊN BẢNG XẾP HẠNG)
-                        if (gradeId != 3) continue;
-
-                        if ([queuedMaps containsObject:@(mapId)]) continue;
-                        [queuedMaps addObject:@(mapId)];
-
-                        void *urlPtr = *(void **)((char *)cfg + 0x30);
-                        NSString *urlStr = rtIl2CppString(urlPtr);
-                        if (urlStr.length > 0) {
-                            NSString *fileName = [NSString stringWithFormat:@"%d_3.rep", mapId];
-                            NSString *destPath = [tempDir stringByAppendingPathComponent:fileName];
-                            [queue addObject:@{
-                                @"url": urlStr,
-                                @"path": destPath,
-                                @"map": @(mapId)
-                            }];
-                        }
-                    }
-                }
-            }
-        }
-
-        // KHÔNG copy file _timestamp từ LocLo vào nữa để mỗi map chỉ duy nhất có 1 file <mapId>_3.rep!
-
-        int total = (int)queue.count;
-        if (total == 0) {
-            NSArray *files = [fm contentsOfDirectoryAtPath:tempDir error:NULL];
-            int count = 0;
-            for (NSString *n in files) {
-                if ([n.pathExtension.lowercaseString isEqualToString:@"rep"]) count++;
-            }
-            gDownloading = NO;
-            if (onComplete) onComplete(count);
-            return;
-        }
-
-        __block int done = 0;
-        __block int successCount = 0;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(4);
-
-        for (NSDictionary *item in queue) {
-            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-            NSString *urlStr = item[@"url"];
-            NSString *destPath = item[@"path"];
-            int mapId = [item[@"map"] intValue];
-
-            if ([fm fileExistsAtPath:destPath]) {
-                done++;
-                successCount++;
-                if (onProgress) onProgress(done, total, [NSString stringWithFormat:@"Map %d (Top 3)", mapId]);
-                dispatch_semaphore_signal(sem);
-                continue;
-            }
-
-            NSURL *url = [NSURL URLWithString:urlStr];
-            if (!url && ![urlStr hasPrefix:@"http"]) {
-                url = [NSURL URLWithString:[@"http://" stringByAppendingString:urlStr]];
-            }
-
-            if (!url) {
-                done++;
-                dispatch_semaphore_signal(sem);
-                continue;
-            }
-
-            NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithURL:url
-                completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
-                    if (!error && location) {
-                        [fm removeItemAtPath:destPath error:NULL];
-                        NSError *mErr = nil;
-                        [fm moveItemAtURL:location toURL:[NSURL fileURLWithPath:destPath] error:&mErr];
-                        if (!mErr) successCount++;
-                    }
-                    done++;
-                    if (onProgress) onProgress(done, total, [NSString stringWithFormat:@"Map %d (Top 3)", mapId]);
-                    dispatch_semaphore_signal(sem);
-
-                    if (done >= total) {
-                        gDownloading = NO;
-                        if (onComplete) onComplete(successCount);
-                    }
-                }];
-            [task resume];
-        }
-    });
 }
 
 #pragma mark - Key injection (đúng cơ chế game)
@@ -699,7 +585,7 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     float dot = a->qx * b->qx + a->qy * b->qy + a->qz * b->qz + a->qw * b->qw;
     float bx = b->qx, by = b->qy, bz = b->qz, bw = b->qw;
     if (dot < 0.0f) {
-        bx = -bx; by = -by; bz = -bz; bw = -bw; // Triệt tiêu góc lật
+        bx = -bx; by = -by; bz = -bz; bw = -bw;
     }
     float qx = a->qx + (bx - a->qx) * al;
     float qy = a->qy + (by - a->qy) * al;
@@ -740,7 +626,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     }
 
     // --- 3. CƯỠNG BỨC SET STATE TỌA ĐỘ & VẬN TỐC (State-Locking TAS) ---
-    // Dù người chơi không có nitro/miniboost, xe vẫn được khóa chặt theo frame:
     if (rtPtrOk(motionCtrl)) {
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 0) = tx;
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 4) = ty;
@@ -812,13 +697,13 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     rtWriteKeyFlags((int)keys);
 }
 
-#pragma mark - UI Interface
+#pragma mark - UI Interface & Declarations
 
 @interface RCPanel : NSObject
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) UIView *host;
 @property (nonatomic, strong) UILabel *status;
-@property (nonatomic, strong) UIButton *bDl;
+@property (nonatomic, strong) UIButton *bNoRep;
 @property (nonatomic, strong) UIButton *bAuto;
 - (void)show;
 - (void)refresh;
@@ -840,7 +725,7 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 }
 @end
 
-static RCPanel *gPanel;
+static RCPanel *gPanel = nil;
 
 static UIViewController *rtTopVC(void) {
     UIWindow *best = nil;
@@ -886,8 +771,16 @@ static void   (*orig_ReplayActionGoImpEnter)(void *, const void *);
 static void   (*orig_GameFinishImpEnter)(void *, const void *);
 static BOOL   (*orig_MatchVideoDesHelper_InitByVideoBytes)(void *, void *, const void *);
 static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *);
-static void   (*orig_MapDataComponent_InitComponent)(void *, const void *);
-static void  *(*orig_DataCenterMdl_GetMapDataComponent)(void *, bool, const void *);
+
+// No Replay Hooks
+static int    (*orig_MatchVideoMdl_ReplayVideo_bytes)(void *, void *, uint64_t, void *, void *, const void *);
+static int    (*orig_MatchVideoMdl_ReplayVideo_mark)(void *, int64_t, uint64_t, const void *);
+static int    (*orig_MatchVideoMdl_ReplayTeachingVideo)(void *, int, void *, bool, const void *);
+
+// Anti-AFK Hooks
+static void   (*orig_SdcVehicleInput_Update)(void *, float, const void *);
+static void   (*orig_SdcPlayerInput_Update)(void *, float, const void *);
+static BOOL   (*orig_MatchUIMgr_Trusteeship)(void *, int, const void *);
 
 static void hook_Input_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
@@ -986,20 +879,72 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
     });
 }
 
-static void hook_MapDataComponent_InitComponent(void *self, const void *m) {
-    if (rtPtrOk(self)) {
-        gMapDataComponent = self;
-        rtLog("Captured MapDataComponent=%p", self);
+// Chặn Replay khi gNoReplay BẬT
+static int hook_MatchVideoMdl_ReplayVideo_bytes(void *self, void *videoBytes, uint64_t uid, void *name, void *icon, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ReplayVideo(bytes)");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        return 0; // NotErr
     }
-    if (orig_MapDataComponent_InitComponent) orig_MapDataComponent_InitComponent(self, m);
+    return orig_MatchVideoMdl_ReplayVideo_bytes ? orig_MatchVideoMdl_ReplayVideo_bytes(self, videoBytes, uid, name, icon, m) : 0;
 }
 
-static void *hook_DataCenterMdl_GetMapDataComponent(void *self, bool withInit, const void *m) {
-    void *res = orig_DataCenterMdl_GetMapDataComponent ? orig_DataCenterMdl_GetMapDataComponent(self, withInit, m) : NULL;
-    if (rtPtrOk(res)) {
-        gMapDataComponent = res;
+static int hook_MatchVideoMdl_ReplayVideo_mark(void *self, int64_t mark, uint64_t uid, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ReplayVideo(mark=%lld)", (long long)mark);
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        return 0; // NotErr
     }
-    return res;
+    return orig_MatchVideoMdl_ReplayVideo_mark ? orig_MatchVideoMdl_ReplayVideo_mark(self, mark, uid, m) : 0;
+}
+
+static int hook_MatchVideoMdl_ReplayTeachingVideo(void *self, int videoId, void *url, bool uncomp, const void *m) {
+    if (gNoReplay) {
+        rtLog("NO REPLAY: Intercepted ReplayTeachingVideo(id=%d)", videoId);
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        return 0; // NotErr
+    }
+    return orig_MatchVideoMdl_ReplayTeachingVideo ? orig_MatchVideoMdl_ReplayTeachingVideo(self, videoId, url, uncomp, m) : 0;
+}
+
+// ANTI-AFK: Reset liên tục bộ đếm thời gian không điều khiển & tăng số lần thao tác giả lập
+static void hook_SdcVehicleInput_Update(void *self, float dt, const void *m) {
+    if (orig_SdcVehicleInput_Update) orig_SdcVehicleInput_Update(self, dt, m);
+    if (gPlaying && rtPtrOk(self)) {
+        *(float *)((char *)self + 0x9C) = 0.f;  // mNotControlTime = 0
+        *(bool  *)((char *)self + 0xA0) = true; // mLastIsControl = true
+        *(float *)((char *)self + 0xA4) = 0.f;  // mLastControlTime = 0
+
+        void *endData = *(void **)((char *)self + 0x58); // mEndData (SdcVehicleInputEndData)
+        if (rtPtrOk(endData)) {
+            *(int *)((char *)endData + 0x2C) = 0; // CarNonControlTimeMax = 0
+            *(int *)((char *)endData + 0x30) = 0; // CarNonControlTimeTotal = 0
+            (*(int *)((char *)endData + 0x10))++; // CarLeftTurnCount++
+            (*(int *)((char *)endData + 0x18))++; // CarRightTurnCount++
+            (*(int *)((char *)endData + 0x24))++; // CarDriftingCount++
+        }
+    }
+}
+
+static void hook_SdcPlayerInput_Update(void *self, float dt, const void *m) {
+    if (orig_SdcPlayerInput_Update) orig_SdcPlayerInput_Update(self, dt, m);
+    if (gPlaying && rtPtrOk(self)) {
+        void *endData = *(void **)((char *)self + 0x58); // mEndData (SdcPlayerInputEndData)
+        if (rtPtrOk(endData)) {
+            (*(int *)((char *)endData + 0x14))++; // UserLeftTurnCount++
+            (*(int *)((char *)endData + 0x18))++; // UserRightTurnCount++
+            (*(int *)((char *)endData + 0x20))++; // UserDriftingCount++
+            (*(int *)((char *)endData + 0x24))++; // UserMiniJetCount++
+        }
+    }
+}
+
+static BOOL hook_MatchUIMgr_Trusteeship(void *self, int aiActionID, const void *m) {
+    if (gPlaying) {
+        rtLog("ANTI-AFK: Blocked in-game Trusteeship (%d)", aiActionID);
+        return FALSE; // Không cho game chuyển sang xe AI tự lái của AFK
+    }
+    return orig_MatchUIMgr_Trusteeship ? orig_MatchUIMgr_Trusteeship(self, aiActionID, m) : FALSE;
 }
 
 static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
@@ -1044,9 +989,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, m);
 }
 
-#pragma mark - UI
-
-
+#pragma mark - UI Implementation
 
 @implementation RCPanel
 
@@ -1120,9 +1063,9 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
         t.font = [UIFont boldSystemFontOfSize:12];
         [host addSubview:t];
 
-        self.bDl = [self mk:@"⬇ TẢI .REP" sel:@selector(tapDownload)];
-        self.bDl.frame = CGRectMake(10, 28, 112, 34);
-        [host addSubview:self.bDl];
+        self.bNoRep = [self mk:@"NO REP: BẬT" sel:@selector(tapNoRep)];
+        self.bNoRep.frame = CGRectMake(10, 28, 112, 34);
+        [host addSubview:self.bNoRep];
 
         self.bAuto = [self mk:@"▶ AUTO" sel:@selector(tapAuto)];
         self.bAuto.frame = CGRectMake(10, 68, 112, 34);
@@ -1149,34 +1092,23 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 
 - (void)refresh {
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.bAuto.backgroundColor = gAutoArmed ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
+        self.bNoRep.backgroundColor = gNoReplay  ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
                                                 : [UIColor colorWithWhite:0.12 alpha:0.92];
-        if (!gDownloading) {
-            NSString *stateStr = gAutoArmed ? @"AUTO: BẬT" : @"AUTO: TẮT";
-            self.status.text = [NSString stringWithFormat:@"Map: %d (%u frame)\n%@\nPlay: %d",
-                                gMapId, gFrameCount, stateStr, (int)gPlaying];
-        }
+        [self.bNoRep setTitle:gNoReplay ? @"NO REP: BẬT" : @"NO REP: TẮT" forState:UIControlStateNormal];
+
+        self.bAuto.backgroundColor  = gAutoArmed ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
+                                                : [UIColor colorWithWhite:0.12 alpha:0.92];
+
+        NSString *stateStr = gAutoArmed ? @"AUTO: BẬT" : @"AUTO: TẮT";
+        self.status.text = [NSString stringWithFormat:@"Map: %d (%u frame)\n%@\nPlay: %d",
+                            gMapId, gFrameCount, stateStr, (int)gPlaying];
     });
 }
 
-- (void)tapDownload {
-    if (gDownloading) return;
-    self.status.text = @"Đang quét BXH\nĐỉnh Cực Tốc...";
-    [self.bDl setTitle:@"⏳ ĐANG TẢI" forState:UIControlStateNormal];
-
-    rtDownloadAllPeakSpeedReplays(^(int done, int total, NSString *sub) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.status.text = [NSString stringWithFormat:@"Tải: %d/%d\n(%@)", done, total, sub];
-        });
-    }, ^(int totalDownloaded) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self.bDl setTitle:@"⬇ TẢI .REP" forState:UIControlStateNormal];
-            self.status.text = [NSString stringWithFormat:@"Đã tải %d rep!\nMap %d sẵn sàng", totalDownloaded, gMapId];
-            if (gAutoArmed) {
-                rtLoadRecord();
-            }
-        });
-    });
+- (void)tapNoRep {
+    gNoReplay = gNoReplay ? NO : YES;
+    rtLog("NO REPLAY changed to %d", (int)gNoReplay);
+    [self refresh];
 }
 
 - (void)tapAuto {
@@ -1214,10 +1146,22 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgr_Init);
     orig_MatchVideoDesHelper_InitByVideoBytes = (BOOL (*)(void *, void *, const void *))
         rtHookMethod("", "MatchVideoDesHelper", "InitByVideoBytes", 1, (void *)hook_MatchVideoDesHelper_InitByVideoBytes);
-    orig_MapDataComponent_InitComponent = (void (*)(void *, const void *))
-        rtHookMethod("", "MapDataComponent", "InitComponent", 0, (void *)hook_MapDataComponent_InitComponent);
-    orig_DataCenterMdl_GetMapDataComponent = (void *(*)(void *, bool, const void *))
-        rtHookMethod("", "DataCenterMdl", "GetMapDataComponent", 1, (void *)hook_DataCenterMdl_GetMapDataComponent);
+
+    // No Replay Hooks (chặn game tự động mở Replay)
+    orig_MatchVideoMdl_ReplayVideo_bytes = (int (*)(void *, void *, uint64_t, void *, void *, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ReplayVideo", 4, (void *)hook_MatchVideoMdl_ReplayVideo_bytes);
+    orig_MatchVideoMdl_ReplayVideo_mark = (int (*)(void *, int64_t, uint64_t, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ReplayVideo", 2, (void *)hook_MatchVideoMdl_ReplayVideo_mark);
+    orig_MatchVideoMdl_ReplayTeachingVideo = (int (*)(void *, int, void *, bool, const void *))
+        rtHookMethod("", "MatchVideoMdl", "ReplayTeachingVideo", 3, (void *)hook_MatchVideoMdl_ReplayTeachingVideo);
+
+    // Anti-AFK Hooks (chặn treo máy)
+    orig_SdcVehicleInput_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "SdcVehicleInput", "Update", 1, (void *)hook_SdcVehicleInput_Update);
+    orig_SdcPlayerInput_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "SdcPlayerInput", "Update", 1, (void *)hook_SdcPlayerInput_Update);
+    orig_MatchUIMgr_Trusteeship = (BOOL (*)(void *, int, const void *))
+        rtHookMethod("", "MatchUIMgr", "Trusteeship", 1, (void *)hook_MatchUIMgr_Trusteeship);
 }
 
 __attribute__((constructor))
