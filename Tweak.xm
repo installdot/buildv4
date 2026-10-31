@@ -179,12 +179,6 @@ enum {
 
 #pragma mark - Frame format
 
-@class RCPassWindow;
-@class RCPanel;
-static RCPanel *gPanel = nil;
-static void rtAlert(NSString *title, NSString *msg);
-static UIViewController *rtTopVC(void);
-
 #define RC_MAGIC "RKR3"
 #define RC_MAX_FRAMES 21600
 #define RC_SAMPLE_DT  0.008f
@@ -839,6 +833,67 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     rtWriteKeyFlags((int)keys);
 }
 
+#pragma mark - UI Interface
+
+@interface RCPanel : NSObject
+@property (nonatomic, strong) UIWindow *win;
+@property (nonatomic, strong) UIView *host;
+@property (nonatomic, strong) UILabel *status;
+@property (nonatomic, strong) UIButton *bDl;
+@property (nonatomic, strong) UIButton *bAuto;
+- (void)show;
+- (void)refresh;
+@end
+
+@interface RCPassWindow : UIWindow
+@property (nonatomic, weak) UIView *panel;
+@end
+
+@implementation RCPassWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!self.hidden && self.panel) {
+        CGPoint p = [self convertPoint:point toView:self.panel];
+        if ([self.panel pointInside:p withEvent:event]) {
+            return [super hitTest:point withEvent:event];
+        }
+    }
+    return nil;
+}
+@end
+
+static RCPanel *gPanel;
+
+static UIViewController *rtTopVC(void) {
+    UIWindow *best = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (!w.isKeyWindow) continue;
+        if ([w isKindOfClass:[RCPassWindow class]]) continue;
+        best = w;
+    }
+    if (!best) {
+        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+            if ([w isKindOfClass:[RCPassWindow class]]) continue;
+            if (w.windowLevel < UIWindowLevelAlert) best = w;
+        }
+    }
+    UIViewController *vc = best.rootViewController;
+    if (!vc) vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+static void rtAlert(NSString *title, NSString *msg) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = rtTopVC();
+        if (!vc) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                                  message:msg
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [vc presentViewController:a animated:YES completion:nil];
+    });
+}
+
 #pragma mark - Hooks
 
 static void   (*orig_MotionCtrl_Update)(void *, float, const void *);
@@ -1012,64 +1067,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 
 #pragma mark - UI
 
-@interface RCPanel : NSObject
-@property (nonatomic, strong) UIWindow *win;
-@property (nonatomic, strong) UIView *host;
-@property (nonatomic, strong) UILabel *status;
-@property (nonatomic, strong) UIButton *bDl;
-@property (nonatomic, strong) UIButton *bAuto;
-- (void)show;
-- (void)refresh;
-@end
 
-@interface RCPassWindow : UIWindow
-@property (nonatomic, weak) UIView *panel;
-@end
-
-@implementation RCPassWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!self.hidden && self.panel) {
-        CGPoint p = [self convertPoint:point toView:self.panel];
-        if ([self.panel pointInside:p withEvent:event]) {
-            return [super hitTest:point withEvent:event];
-        }
-    }
-    return nil;
-}
-@end
-
-static RCPanel *gPanel;
-
-static UIViewController *rtTopVC(void) {
-    UIWindow *best = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (!w.isKeyWindow) continue;
-        if ([w isKindOfClass:[RCPassWindow class]]) continue;
-        best = w;
-    }
-    if (!best) {
-        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-            if ([w isKindOfClass:[RCPassWindow class]]) continue;
-            if (w.windowLevel < UIWindowLevelAlert) best = w;
-        }
-    }
-    UIViewController *vc = best.rootViewController;
-    if (!vc) vc = UIApplication.sharedApplication.keyWindow.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    return vc;
-}
-
-static void rtAlert(NSString *title, NSString *msg) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = rtTopVC();
-        if (!vc) return;
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:title
-                                                                  message:msg
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [vc presentViewController:a animated:YES completion:nil];
-    });
-}
 
 @implementation RCPanel
 
