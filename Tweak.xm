@@ -131,35 +131,36 @@ static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int 
 #pragma mark - Offsets (đã kiểm chứng)
 
 enum {
-    kOffVehicleActorType = 0x14,   // NssVehicle.mActorType
-    kOffVehicleDyn       = 0x20,   // NssVehicle.mDynamicVehicle
+    kOffVehicleActorType      = 0x14,   // NssVehicle.mActorType
+    kOffVehicleDyn            = 0x20,   // NssVehicle.mDynamicVehicle
 
-    kOffDynACC           = 0x28,   // DynamicVehicle.mACC
+    kOffMotionSteerData       = 0x10,   // NssPhyVehicleMotionCtrlHelper.mSteeringData
+    kOffMotionVehicle         = 0x18,   // .mVehicle
+    kOffMotionPhyCtrl         = 0x20,   // .mVehiclePhyCtrl
+    kOffMotionDynVehicle      = 0x28,   // .mDynamicVehicle
+    kOffMotionDriving         = 0x38,   // .mDrivingCtrl
+    kOffMotionForcePos        = 0x40,   // .mForceSetPos (Vector3)
+    kOffMotionForceRot        = 0x4C,   // .mForceSetRot (Quaternion)
+    kOffMotionDrift           = 0x60,   // .mDriftCtrl (IVehicleDriftCtrl)
+    kOffMotionIsSetTransform  = 0x70,   // .mIsSetTransform (bool)
 
-    kOffMotionSteerData  = 0x10,   // NssPhyVehicleMotionCtrlHelper.mSteeringData
-    kOffMotionVehicle    = 0x18,   // .mVehicle
-    kOffMotionPhyCtrl    = 0x20,   // .mVehiclePhyCtrl
-    kOffMotionDynVehicle = 0x28,   // .mDynamicVehicle
-    kOffMotionDriving    = 0x38,   // .mDrivingCtrl
+    kOffPhySimOutput          = 0x28,   // NssPhyVehicleCtrl.mSimulateOutput
 
-    kOffPhySimOutput     = 0x28,   // NssPhyVehicleCtrl.mSimulateOutput
+    kOffSimKmph               = 0x10,   // NssVehicleSimOutput.mKmph
+    kOffSimLinearVel          = 0x38,   // .mLinearVelocity (Vector3)
+    kOffSimChassisPos         = 0x64,   // .mChassisPosition (Vector3)
+    kOffSimChassisRot         = 0x70,   // .mChassisRotation (Quaternion)
 
-    kOffSimChassisPos    = 0x64,   // NssVehicleSimOutput.mChassisPosition
-    kOffSimChassisRot    = 0x70,   // NssVehicleSimOutput.mChassisRotation
+    kOffSteerForward          = 0x10,   // NssSteeringData.mForward
+    kOffSteerBraking          = 0x14,   // .mBrakingState
+    kOffSteerHandbrake        = 0x18,   // .mIsHandbrake
+    kOffSteerLeft             = 0x1C,   // .mSteeringLeft
 
-    kOffSteerForward     = 0x10,   // NssSteeringData.mForward
-    kOffSteerBraking     = 0x14,   // .mBrakingState
-    kOffSteerHandbrake   = 0x18,   // .mIsHandbrake
-    kOffSteerLeft        = 0x1C,   // .mSteeringLeft
+    kOffDrvThrottle           = 0x3C,   // NssPhyVehicleDrivingCtrl.mThrottle
+    kOffDrvSteering           = 0x40,   // .mSteering
 
-    kOffDrvThrottle      = 0x3C,   // NssPhyVehicleDrivingCtrl.mThrottle
-    kOffDrvSteering      = 0x40,   // .mSteering
-
-    kOffCpMapId          = 0x14,   // CheckPointConfig.MapId
-    kOffCpCurveLength    = 0x2C,   // CheckPointConfig.MainCurveLength
-
-    kOffInputKeyData     = 0xA8,   // InputModule.mInputKeyData
-    kOffKeyDataFlags     = 0x10,   // InputKeyData.KeyFlags
+    kOffInputKeyData          = 0xA8,   // InputModule.mInputKeyData
+    kOffKeyDataFlags          = 0x10,   // InputKeyData.KeyFlags
 };
 
 #pragma mark - Frame format
@@ -169,28 +170,30 @@ enum {
 static void rtAlert(NSString *title, NSString *msg);
 static UIViewController *rtTopVC(void);
 
-#define RC_MAGIC "RKR2"
+#define RC_MAGIC "RKR3"
 #define RC_MAX_FRAMES 21600
 #define RC_SAMPLE_DT  0.008f
 
 typedef struct {
-    float t;
-    float px, py, pz;
-    float qx, qy, qz, qw;
-    float steer;
-    uint32_t keys;                    // Preserve Drift bit 8 and higher keys.
-    uint8_t flags;
-    uint8_t pad[3];
-} RCFrame;
+    float    t;               // Thời gian tương đối (s)
+    float    px, py, pz;      // Vị trí khung gầm (mChassisPosition)
+    float    qx, qy, qz, qw;  // Hướng xoay Quaternion (mChassisRotation)
+    float    vx, vy, vz;      // Vận tốc tuyến tính (mLinearVelocity)
+    float    kmph;            // Tốc độ hiển thị km/h
+    float    steer;           // Góc đánh lái (-1.0 đến 1.0)
+    uint32_t keys;            // Bitmask phím (Drift, SmallBoost, Nitro, v.v.)
+    uint8_t  flags;           // b0: phanh, b1: phanh tay, b2: drift, b3: nitro, b4: miniboost
+    uint8_t  pad[3];          // Đệm căn byte
+} RCFrame;                    // 60 byte
 
 typedef struct {
-    char     magic[4];
-    uint32_t ver;
-    uint32_t count;
-    float    trackLen;
-    int32_t  mapId;
-    uint32_t frameSize;
-} RCHeader;                           // 24 byte
+    char     magic[4];        // "RKR3"
+    uint32_t ver;            // 3
+    uint32_t count;          // Số lượng frame
+    float    trackLen;       // Chiều dài đường đua
+    int32_t  mapId;          // ID bản đồ
+    uint32_t frameSize;      // 60
+} RCHeader;                   // 24 byte
 
 static RCFrame *gFrames;
 static uint32_t gFrameCount;
@@ -202,8 +205,6 @@ static void *gPlayerVehicle;
 static void *gInputModule;
 static int   gKeyMask;
 static float gCurPlaybackSteer;
-static float gSpawnOffsetX, gSpawnOffsetZ;
-static BOOL  gSpawnOffsetInit;
 
 #pragma mark - Storage
 
@@ -291,7 +292,7 @@ static double rtNow(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-static void rtRecordTick(void *steerData, void *sim, double now) {
+static void rtRecordTick(void *motionCtrl, void *steerData, void *sim, double now) {
     if (!gRecording) return;
     if (!gFrames) {
         gFrames = (RCFrame *)malloc(sizeof(RCFrame) * RC_MAX_FRAMES);
@@ -314,17 +315,34 @@ static void rtRecordTick(void *steerData, void *sim, double now) {
     fr.qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
     fr.qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
     fr.qw = *(float *)((char *)sim + kOffSimChassisRot + 12);
+    fr.vx = *(float *)((char *)sim + kOffSimLinearVel + 0);
+    fr.vy = *(float *)((char *)sim + kOffSimLinearVel + 4);
+    fr.vz = *(float *)((char *)sim + kOffSimLinearVel + 8);
+    fr.kmph = *(float *)((char *)sim + kOffSimKmph);
     fr.steer = *(float *)((char *)steerData + kOffSteerLeft);
+    fr.keys = (uint32_t)rtReadKeyFlags();
 
     int braking = *(int *)((char *)steerData + kOffSteerBraking);
     BOOL hb = *(bool *)((char *)steerData + kOffSteerHandbrake);
-    fr.flags = (uint8_t)((braking ? 1 : 0) | (hb ? 2 : 0));
-    fr.keys = (uint32_t)rtReadKeyFlags();
+
+    void *driftCtrl = *(void **)((char *)motionCtrl + kOffMotionDrift);
+    BOOL isDrift = (driftCtrl && *(bool *)((char *)driftCtrl + 0x76)) ||
+                   ((fr.keys & ((1 << 8) | (1 << 9))) != 0);
+    BOOL isNitro = (fr.keys & (1 << 3)) || (fr.kmph > 275.f);
+    BOOL isBoost = (fr.keys & (1 << 5)) != 0;
+
+    uint8_t flags = 0;
+    if (braking) flags |= 0x01;
+    if (hb)      flags |= 0x02;
+    if (isDrift) flags |= 0x04;
+    if (isNitro) flags |= 0x08;
+    if (isBoost) flags |= 0x10;
+    fr.flags = flags;
 
     gFrames[gFrameCount++] = fr;
 }
 
-static void rtPlaybackTick(void *steerData, void *drivingCtrl, void *sim, double now) {
+static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl, void *sim, double now) {
     if (!gFrames || !gFrameCount) return;
 
     float t = (float)(now - gGoTime);
@@ -347,48 +365,60 @@ static void rtPlaybackTick(void *steerData, void *drivingCtrl, void *sim, double
     if (al < 0.f) al = 0.f;
     if (al > 1.f) al = 1.f;
 
-    // --- 1. Bù trừ sai lệch vị trí xuất phát (Spawn Offset Compensation) ---
-    float cx = *(float *)((char *)sim + kOffSimChassisPos + 0);
-    float cz = *(float *)((char *)sim + kOffSimChassisPos + 8);
+    // --- 1. TELEPORT TRỰC TIẾP TỚI TỌA ĐỘ FRAME (Frame-by-Frame TAS) ---
+    // Khi bắt đầu (t=0), teleport thẳng tới tọa độ frame 0, hoàn toàn bám 1:1 theo frame đã lưu
+    float tx = a->px + (b->px - a->px) * al;
+    float ty = a->py + (b->py - a->py) * al;
+    float tz = a->pz + (b->pz - a->pz) * al;
+    // Nội suy Quaternion góc quay
+    float qx = a->qx + (b->qx - a->qx) * al;
+    float qy = a->qy + (b->qy - a->qy) * al;
+    float qz = a->qz + (b->qz - a->qz) * al;
+    float qw = a->qw + (b->qw - a->qw) * al;
+    float ql = sqrtf(qx*qx + qy*qy + qz*qz + qw*qw);
+    if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
 
-    if (!gSpawnOffsetInit) {
-        gSpawnOffsetX = cx - gFrames[0].px;
-        gSpawnOffsetZ = cz - gFrames[0].pz;
-        gSpawnOffsetInit = YES;
-        rtLog("OFFSET comp init: dx=%.2f dz=%.2f (spawn pos=%.2f, %.2f | rec=%.2f, %.2f)",
-              gSpawnOffsetX, gSpawnOffsetZ, cx, cz, gFrames[0].px, gFrames[0].pz);
+    // Nội suy vận tốc & tốc độ hiển thị
+    float vx = a->vx + (b->vx - a->vx) * al;
+    float vy = a->vy + (b->vy - a->vy) * al;
+    float vz = a->vz + (b->vz - a->vz) * al;
+    float kmph = a->kmph + (b->kmph - a->kmph) * al;
+
+    // --- 2. CƯỠNG BỨC SET STATE TỌA ĐỘ & VẬN TỐC (State-Locking TAS) ---
+    // Dù người chơi không có nitro/miniboost, xe vẫn được khóa chặt theo frame:
+    if (rtPtrOk(motionCtrl)) {
+        *(float *)((char *)motionCtrl + kOffMotionForcePos + 0) = tx;
+        *(float *)((char *)motionCtrl + kOffMotionForcePos + 4) = ty;
+        *(float *)((char *)motionCtrl + kOffMotionForcePos + 8) = tz;
+
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 0) = qx;
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 4) = qy;
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 8) = qz;
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 12) = qw;
+
+        *(bool *)((char *)motionCtrl + kOffMotionIsSetTransform) = true;
     }
 
-    // Sai lệch lane ban đầu giảm dần trong 3.5s để xe từ từ nhập làn chính
-    float decay = 1.0f - (t / 3.5f);
-    if (decay < 0.0f) decay = 0.0f;
+    if (rtPtrOk(sim)) {
+        *(float *)((char *)sim + kOffSimChassisPos + 0) = tx;
+        *(float *)((char *)sim + kOffSimChassisPos + 4) = ty;
+        *(float *)((char *)sim + kOffSimChassisPos + 8) = tz;
 
-    float tx = (a->px + (b->px - a->px) * al) + gSpawnOffsetX * decay;
-    float tz = (a->pz + (b->pz - a->pz) * al) + gSpawnOffsetZ * decay;
+        *(float *)((char *)sim + kOffSimChassisRot + 0) = qx;
+        *(float *)((char *)sim + kOffSimChassisRot + 4) = qy;
+        *(float *)((char *)sim + kOffSimChassisRot + 8) = qz;
+        *(float *)((char *)sim + kOffSimChassisRot + 12) = qw;
 
-    // --- 2. Tính góc hướng và độ lệch vuông góc (Cross-track error) ---
-    float qx = *(float *)((char *)sim + kOffSimChassisRot + 0);
-    float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
-    float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
-    float qw = *(float *)((char *)sim + kOffSimChassisRot + 12);
-    float fx = 2.0f * (qx * qz + qw * qy);
-    float fz = 1.0f - 2.0f * (qx * qx + qy * qy);
-    float fl = sqrtf(fx * fx + fz * fz);
-    if (fl > 1e-4f) { fx /= fl; fz /= fl; }
+        *(float *)((char *)sim + kOffSimLinearVel + 0) = vx;
+        *(float *)((char *)sim + kOffSimLinearVel + 4) = vy;
+        *(float *)((char *)sim + kOffSimLinearVel + 8) = vz;
+        *(float *)((char *)sim + kOffSimKmph) = kmph;
+    }
 
-    float dx = tx - cx, dz = tz - cz;
-
-    // Độ lệch ngang theo mét (cross product với vector forward)
-    // Không chuẩn hóa dx, dz để phản hồi tỉ lệ mượt mà, tránh rung lắc cực đại
-    float latDist = (dx * fz) - (dz * fx);
-    float corr = latDist * 0.15f;
-    if (corr >  0.35f) corr =  0.35f;
-    if (corr < -0.35f) corr = -0.35f;
-
-    float steer = a->steer + (b->steer - a->steer) * al + corr;
+    // --- 3. ĐÁNH LÁI & ĐIỀU KHIỂN ---
+    float steer = a->steer + (b->steer - a->steer) * al;
     if (steer >  1.0f) steer =  1.0f;
     if (steer < -1.0f) steer = -1.0f;
-
     gCurPlaybackSteer = steer;
 
     *(float *)((char *)steerData + kOffSteerLeft) = steer;
@@ -398,11 +428,10 @@ static void rtPlaybackTick(void *steerData, void *drivingCtrl, void *sim, double
     }
     *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
 
-    // --- 3. Start Mini-Boost & Key Replay ---
+    // --- 4. BƠM PHÍM BẤM (Keys, Nitro, MiniBoost, Drift) ---
     uint32_t keys = a->keys;
-    // Bật phím SmallBoost (bit 5) trong 0.06s - 0.40s đầu để kích hoạt tiểu phóng xuất phát
     if (t >= 0.06f && t <= 0.40f) {
-        keys |= (1 << 5); // InputKeyType.SmallBoost
+        keys |= (1 << 5); // Start MiniBoost
     }
     gKeyMask = (int)keys;
     rtWriteKeyFlags((int)keys);
@@ -437,9 +466,7 @@ static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
 
 static void rtBeginRace(void) {
     gGoTime = rtNow();
-    gSpawnOffsetX = 0.f;
-    gSpawnOffsetZ = 0.f;
-    gSpawnOffsetInit = NO;
+
     gCurPlaybackSteer = 0.f;
     if (gRecArmed) {
         gRecording = YES; gPlaying = NO;
@@ -508,8 +535,8 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 
             if (rtPtrOk(steerData) && rtPtrOk(sim)) {
                 double now = rtNow();
-                if (gPlaying)        rtPlaybackTick(steerData, drivingCtrl, sim, now);
-                else if (gRecording) rtRecordTick(steerData, sim, now);
+                if (gPlaying)        rtPlaybackTick(self, steerData, drivingCtrl, sim, now);
+                else if (gRecording) rtRecordTick(self, steerData, sim, now);
             }
         }
     }
