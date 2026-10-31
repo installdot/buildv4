@@ -343,9 +343,17 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         fr.vz   = *(float *)((char *)m + 0x48); // mLinVel.z
         fr.kmph = *(float *)((char *)m + 0x5C); // mKMPH
 
-        if (inputKeys & (1 << 1)) fr.steer = -0.85f;
-        else if (inputKeys & (1 << 2)) fr.steer = 0.85f;
-        else fr.steer = 0.f;
+        float yawRate = *(float *)((char *)m + 0x50); // mAngVel.y
+        if (inputKeys & (1 << 1)) fr.steer = -0.90f;
+        else if (inputKeys & (1 << 2)) fr.steer = 0.90f;
+        else if (fabsf(yawRate) > 0.08f) {
+            float s = -yawRate * 0.45f;
+            if (s > 1.0f) s = 1.0f;
+            if (s < -1.0f) s = -1.0f;
+            fr.steer = s;
+        } else {
+            fr.steer = 0.f;
+        }
 
         uint8_t flags = 0;
         if (inputKeys & (1 << 6)) flags |= 0x01; // Brake
@@ -460,7 +468,13 @@ static BOOL rtLoadRecord(void) {
     gFrameCount = 0;
     if (gFrames) { free(gFrames); gFrames = NULL; }
 
-    // 1. Thử load record .rk đã lưu sẵn
+    // 1. ƯU TIÊN HÀNG ĐẦU: Quét và phân tích file .rep từ TempMatchVideos/MatchVideos
+    rtLog("Checking TempMatchVideos for .rep file (map=%d)...", gMapId);
+    if (rtScanAndLoadRepFiles(gMapId)) {
+        if (gFrameCount > 0) return YES;
+    }
+
+    // 2. Nếu không có file .rep, nạp từ file .rk đã lưu sẵn
     NSString *path = rtPathForTrack();
     if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
         FILE *f = fopen(path.fileSystemRepresentation, "rb");
@@ -506,13 +520,6 @@ static BOOL rtLoadRecord(void) {
             }
         }
     }
-
-    // 2. Nếu chưa có .rk, tự động quét TempMatchVideos đọc file .rep!
-    rtLog("No .rk record found, checking TempMatchVideos for .rep...");
-    if (rtScanAndLoadRepFiles(gMapId)) {
-        return (gFrameCount > 0);
-    }
-
     return NO;
 }
 
@@ -617,39 +624,60 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     if (al < 0.f) al = 0.f;
     if (al > 1.f) al = 1.f;
 
-    // --- 1. Tọa độ mục tiêu nội suy theo thời gian ---
+    // --- 1. Tọa độ, góc xoay, vận tốc nội suy theo thời gian từ frame .rep ---
     float tx = a->px + (b->px - a->px) * al;
+    float ty = a->py + (b->py - a->py) * al;
     float tz = a->pz + (b->pz - a->pz) * al;
 
-    // --- 2. Tính góc hướng hiện tại và độ lệch quỹ đạo (Cua chuẩn xác như bản trước) ---
-    float qx = *(float *)((char *)sim + kOffSimChassisRot + 0);
-    float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
-    float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
-    float qw = *(float *)((char *)sim + kOffSimChassisRot + 12);
-    float fx = 2.0f * (qx * qz + qw * qy);
-    float fz = 1.0f - 2.0f * (qx * qx + qy * qy);
-    float fl = sqrtf(fx * fx + fz * fz);
-    if (fl > 1e-4f) { fx /= fl; fz /= fl; }
+    float qx = a->qx + (b->qx - a->qx) * al;
+    float qy = a->qy + (b->qy - a->qy) * al;
+    float qz = a->qz + (b->qz - a->qz) * al;
+    float qw = a->qw + (b->qw - a->qw) * al;
+    float ql = sqrtf(qx*qx + qy*qy + qz*qz + qw*qw);
+    if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
 
-    float cx = *(float *)((char *)sim + kOffSimChassisPos + 0);
-    float cz = *(float *)((char *)sim + kOffSimChassisPos + 8);
+    float vx = a->vx + (b->vx - a->vx) * al;
+    float vy = a->vy + (b->vy - a->vy) * al;
+    float vz = a->vz + (b->vz - a->vz) * al;
+    float kmph = a->kmph + (b->kmph - a->kmph) * al;
 
-    float dx = tx - cx;
-    float dz = tz - cz;
+    // --- 2. TP TRỰC TIẾP FRAME BY FRAME (Vị trí, góc, tốc độ như file .rep) ---
+    // Mặc kệ nếu người chơi không có nitro hay miniboost, xe vẫn tp và chạy đúng tốc độ frame
+    if (rtPtrOk(sim)) {
+        *(float *)((char *)sim + kOffSimChassisPos + 0) = tx;
+        *(float *)((char *)sim + kOffSimChassisPos + 4) = ty;
+        *(float *)((char *)sim + kOffSimChassisPos + 8) = tz;
 
-    // Sai lệch ngang (mét): khoảng cách vuông góc từ xe tới đường đua mục tiêu
-    float latDist = (dx * fz) - (dz * fx);
-    float corr = latDist * 0.22f;
-    if (corr >  0.45f) corr =  0.45f;
-    if (corr < -0.45f) corr = -0.45f;
+        *(float *)((char *)sim + kOffSimChassisRot + 0) = qx;
+        *(float *)((char *)sim + kOffSimChassisRot + 4) = qy;
+        *(float *)((char *)sim + kOffSimChassisRot + 8) = qz;
+        *(float *)((char *)sim + kOffSimChassisRot + 12) = qw;
 
-    // Góc đánh lái tổng hợp: góc ghi + góc sửa sai lệch quỹ đạo
-    float steer = a->steer + (b->steer - a->steer) * al + corr;
+        *(float *)((char *)sim + kOffSimLinearVel + 0) = vx;
+        *(float *)((char *)sim + kOffSimLinearVel + 4) = vy;
+        *(float *)((char *)sim + kOffSimLinearVel + 8) = vz;
+        *(float *)((char *)sim + kOffSimKmph) = kmph;
+    }
+
+    if (rtPtrOk(motionCtrl)) {
+        *(float *)((char *)motionCtrl + kOffMotionForcePos + 0) = tx;
+        *(float *)((char *)motionCtrl + kOffMotionForcePos + 4) = ty;
+        *(float *)((char *)motionCtrl + kOffMotionForcePos + 8) = tz;
+
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 0) = qx;
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 4) = qy;
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 8) = qz;
+        *(float *)((char *)motionCtrl + kOffMotionForceRot + 12) = qw;
+
+        *(bool *)((char *)motionCtrl + kOffMotionIsSetTransform) = true;
+    }
+
+    // --- 3. ĐÁNH LÁI & GA (CUA) ---
+    float steer = a->steer + (b->steer - a->steer) * al;
     if (steer >  1.0f) steer =  1.0f;
     if (steer < -1.0f) steer = -1.0f;
     gCurPlaybackSteer = steer;
 
-    // Gán góc lái xuống PhysX DrivingCtrl và SteeringData
     *(float *)((char *)steerData + kOffSteerLeft) = steer;
     if (rtPtrOk(drivingCtrl)) {
         *(float *)((char *)drivingCtrl + 0x40) = steer; // mSteering
@@ -660,36 +688,29 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     }
     *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
 
-    // --- 3. PHÍM BẤM: MINIBOOST, NITRO, DRIFT & TRÁI/PHẢI ---
+    // --- 4. BƠM PHÍM BẤM (Nitro, MiniBoost, Drift, Phanh, Trái, Phải) ---
     uint32_t keys = a->keys;
-    if (a->flags & 0x04) keys |= (1 << 8); // Cờ Drift
-    if (a->flags & 0x08) keys |= (1 << 3); // Cờ Nitro
-    if (a->flags & 0x10) keys |= (1 << 5); // Cờ MiniBoost
+    if (a->flags & 0x01) keys |= (1 << 6); // Phanh
+    if (a->flags & 0x04) keys |= (1 << 8); // Drift
+    if (a->flags & 0x08) keys |= (1 << 3); // Nitro
+    if (a->flags & 0x10) keys |= (1 << 5); // MiniBoost
 
     // Kích hoạt tiểu phóng xuất phát (Start MiniBoost)
-    if (t >= 0.06f && t <= 0.42f) {
+    if (t >= 0.06f && t <= 0.45f) {
         keys |= (1 << 5);
     }
 
-    // Bơm phím rẽ Trái/Phải theo góc lái thực tế để hiển thị animation quay vô-lăng và bẻ bánh
-    if (steer < -0.10f) {
-        keys |= (1 << 1);  // Phím Left
+    // Bơm phím rẽ Trái/Phải theo góc cua
+    if (steer < -0.15f) {
+        keys |= (1 << 1);  // Left
         keys &= ~(1 << 2); // Thả Right
-    } else if (steer > 0.10f) {
-        keys |= (1 << 2);  // Phím Right
+    } else if (steer > 0.15f) {
+        keys |= (1 << 2);  // Right
         keys &= ~(1 << 1); // Thả Left
     }
 
     gKeyMask = (int)keys;
     rtWriteKeyFlags((int)keys);
-
-    // --- 4. GIỮ TỐC ĐỘ XE & CHỐNG LỆCH MAP (Soft-sync, không đóng băng vật lý) ---
-    float distSq = dx * dx + dz * dz;
-    if (distSq > 16.0f) {
-        // Chỉ kéo nhẹ vị trí nếu bị chệch quá 4 mét do va chạm mạng
-        *(float *)((char *)sim + kOffSimChassisPos + 0) = tx;
-        *(float *)((char *)sim + kOffSimChassisPos + 8) = tz;
-    }
 }
 
 #pragma mark - Hooks
@@ -743,12 +764,12 @@ static void rtBeginRace(void) {
     } else gRecording = NO;
 
     if (gAutoArmed) {
-        BOOL ok = rtLoadRecord();
+        BOOL ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
         gPlaying = ok;
-        rtLog("AUTO map=%d -> %s", gMapId, ok ? "playing" : "no record");
+        rtLog("AUTO start map=%d -> %s (%u frames)", gMapId, ok ? "playing" : "no record", gFrameCount);
         if (!ok) {
             rtAlert(@"Đua lập trình",
-                    [NSString stringWithFormat:@"Chưa có record cho map %d.\nBấm REC rồi chạy 1 vòng để tạo.", gMapId]);
+                    [NSString stringWithFormat:@"Không tìm thấy file .rep hoặc record cho map %d", gMapId]);
         }
     } else gPlaying = NO;
 }
@@ -800,9 +821,17 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
     gPlayerVehicle = NULL;
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, crc, reset, m);
     gMapId = rtPtrOk(self) ? *(int *)((char *)self + 0x40) : 0;
+    if (gMapId <= 0 && rtPtrOk(config)) {
+        gMapId = *(int *)((char *)config + kOffCpMapId);
+    }
     gTrackLen = 0.f;
-    rtLog("MAP resolved from CheckPointMgr self=%p config=%p", self, config);
-    rtLog("map init map=%d len=%.2f", gMapId, gTrackLen);
+    rtLog("MAP resolved from CheckPointMgr self=%p config=%p mapId=%d", self, config, gMapId);
+
+    // Khi người chơi vào map: tự động check và phân tích file .rep ngay lập tức
+    if (gAutoArmed) {
+        BOOL ok = rtLoadRecord();
+        rtLog("MAP enter: auto-load .rep map=%d -> %s (%u frames)", gMapId, ok ? "OK" : "fail", gFrameCount);
+    }
 }
 
 static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
