@@ -163,6 +163,11 @@ enum {
 
 #pragma mark - Frame format
 
+// Forward: UI helpers dùng trước khi định nghĩa
+@class RCPassWindow;
+static void rtAlert(NSString *title, NSString *msg);
+static UIViewController *rtTopVC(void);
+
 #define RC_MAGIC "RKR1"
 #define RC_MAX_FRAMES 21600
 #define RC_SAMPLE_DT  0.008f
@@ -416,17 +421,8 @@ static void hook_GoImpEnter(void *self, const void *m) {
         gPlaying = ok;
         rtLog("AUTO map=%d -> %s", gMapId, ok ? "playing" : "no record");
         if (!ok) {
-            int mid = gMapId;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *a = [UIAlertController
-                    alertControllerWithTitle:@"Đua lập trình"
-                    message:[NSString stringWithFormat:@"Chưa có record cho map %d.\nBấm REC rồi chạy 1 vòng để tạo.", mid]
-                    preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
-                while (vc.presentedViewController) vc = vc.presentedViewController;
-                [vc presentViewController:a animated:YES completion:nil];
-            });
+            rtAlert(@"Đua lập trình",
+                    [NSString stringWithFormat:@"Chưa có record cho map %d.\nBấm REC rồi chạy 1 vòng để tạo.", gMapId]);
         }
     } else gPlaying = NO;
 }
@@ -466,6 +462,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 
 @interface RCPanel : NSObject
 @property (nonatomic, strong) UIWindow *win;
+@property (nonatomic, strong) UIView *host;
 @property (nonatomic, strong) UILabel *status;
 @property (nonatomic, strong) UIButton *bRec;
 @property (nonatomic, strong) UIButton *bAuto;
@@ -473,7 +470,56 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 - (void)refresh;
 @end
 
+// Window chỉ nhận touch bên trong panel; ngoài ra trả nil để game nhận.
+@interface RCPassWindow : UIWindow
+@property (nonatomic, weak) UIView *panel;
+@end
+
+@implementation RCPassWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!self.hidden && self.panel) {
+        CGPoint p = [self convertPoint:point toView:self.panel];
+        if ([self.panel pointInside:p withEvent:event]) {
+            return [super hitTest:point withEvent:event];
+        }
+    }
+    return nil;
+}
+@end
+
 static RCPanel *gPanel;
+
+// Tìm UIViewController của game (bỏ qua window overlay của tweak)
+static UIViewController *rtTopVC(void) {
+    UIWindow *best = nil;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (!w.isKeyWindow) continue;
+        if ([w isKindOfClass:[RCPassWindow class]]) continue;
+        best = w;
+    }
+    if (!best) {
+        for (UIWindow *w in UIApplication.sharedApplication.windows) {
+            if ([w isKindOfClass:[RCPassWindow class]]) continue;
+            if (w.windowLevel < UIWindowLevelAlert) best = w;
+        }
+    }
+    UIViewController *vc = best.rootViewController;
+    if (!vc) vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+static void rtAlert(NSString *title, NSString *msg) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = rtTopVC();
+        if (!vc) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                                  message:msg
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [vc presentViewController:a animated:YES completion:nil];
+    });
+}
 
 @implementation RCPanel
 
@@ -493,18 +539,33 @@ static RCPanel *gPanel;
 - (void)show {
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect scr = UIScreen.mainScreen.bounds;
-        self.win = [[UIWindow alloc] initWithFrame:scr];
+        self.win = [[RCPassWindow alloc] initWithFrame:scr];
         self.win.windowLevel = UIWindowLevelAlert + 2;
         self.win.backgroundColor = UIColor.clearColor;
+        self.win.opaque = NO;
         self.win.rootViewController = [UIViewController new];
         self.win.rootViewController.view.backgroundColor = UIColor.clearColor;
+        self.win.rootViewController.view.userInteractionEnabled = YES;
+
+        // iOS 13+: phải gắn windowScene thì window mới thực sự nổi lên
+        if (@available(iOS 13.0, *)) {
+            if (!self.win.windowScene) {
+                for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                    if ([w isKindOfClass:[RCPassWindow class]]) continue;
+                    if (w.windowScene) { self.win.windowScene = w.windowScene; break; }
+                }
+            }
+        }
 
         UIView *host = [[UIView alloc] initWithFrame:CGRectMake(14, scr.size.height * 0.30, 132, 150)];
         host.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.86];
         host.layer.cornerRadius = 12;
         host.layer.borderWidth = 1;
         host.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.12].CGColor;
+        host.userInteractionEnabled = YES;
         [self.win.rootViewController.view addSubview:host];
+        self.host = host;
+        ((RCPassWindow *)self.win).panel = host;
 
         UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, 112, 18)];
         t.text = @"RaceKit R/P";
@@ -527,6 +588,15 @@ static RCPanel *gPanel;
         [host addSubview:self.status];
 
         self.win.hidden = NO;
+        [self.win makeKeyAndVisible];
+
+        // Không được để overlay giữ key window — game cần key window để nhận touch.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                if ([w isKindOfClass:[RCPassWindow class]]) continue;
+                if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyAndVisible]; break; }
+            }
+        });
         [self refresh];
     });
 }
@@ -548,17 +618,9 @@ static RCPanel *gPanel;
         gRecording = NO;
         BOOL ok = rtSaveRecord();
         uint32_t n = gFrameCount;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController *a = [UIAlertController
-                alertControllerWithTitle:@"REC"
-                message:ok ? [NSString stringWithFormat:@"Đã lưu %u frame (map %d)", n, gMapId]
-                           : @"Không có frame nào để lưu"
-                preferredStyle:UIAlertControllerStyleAlert];
-            [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
-            while (vc.presentedViewController) vc = vc.presentedViewController;
-            [vc presentViewController:a animated:YES completion:nil];
-        });
+        int mid = gMapId;
+        if (ok) rtAlert(@"REC", [NSString stringWithFormat:@"Đã lưu %u frame (map %d)", n, mid]);
+        else    rtAlert(@"REC", @"Không có frame nào để lưu");
     } else if (gRecArmed) {
         gAutoArmed = NO;
         rtLog("REC armed");
