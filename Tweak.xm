@@ -442,37 +442,30 @@ static NSString *rtFindRepFile(int targetMapId) {
     NSString *dir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
-    if (!files || !files.count) {
-        rtLog("[Rep] TempMatchVideos is empty or not found: %s", dir.UTF8String);
-        return nil;
+    // 1. ƯU TIÊN ĐÚNG FILE TOP 3: <mapId>_3.rep
+    NSString *top3Path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%d_3.rep", targetMapId]];
+    if ([fm fileExistsAtPath:top3Path]) {
+        return top3Path;
     }
 
-    NSString *bestMatch = nil;
-    NSString *newestFile = nil;
+    // 2. Tìm file bắt đầu bằng <mapId>_ (bỏ qua file map khác hoặc map 0)
+    NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    NSString *prefix = [NSString stringWithFormat:@"%d_", targetMapId];
+    NSString *newest = nil;
     NSDate *newestDate = [NSDate distantPast];
 
-    NSString *targetPrefix = targetMapId > 0 ? [NSString stringWithFormat:@"%d_", targetMapId] : nil;
-    NSString *targetContain = targetMapId > 0 ? [NSString stringWithFormat:@"%d", targetMapId] : nil;
-
     for (NSString *name in files) {
-        if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
+        if ([name.pathExtension.lowercaseString isEqualToString:@"rep"] && [name hasPrefix:prefix]) {
             NSString *full = [dir stringByAppendingPathComponent:name];
-            if (targetPrefix && [name hasPrefix:targetPrefix]) {
-                return full;
-            }
-            if (targetContain && [name containsString:targetContain]) {
-                bestMatch = full;
-            }
             NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
             NSDate *mod = attr.fileModificationDate ?: [NSDate date];
             if ([mod compare:newestDate] == NSOrderedDescending) {
                 newestDate = mod;
-                newestFile = full;
+                newest = full;
             }
         }
     }
-    return bestMatch ?: newestFile;
+    return newest;
 }
 
 static BOOL rtLoadRecord(void) {
@@ -547,8 +540,9 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:tempDir withIntermediateDirectories:YES attributes:nil error:NULL];
 
-        // 1. Quét MapDataComponent.VideoDetailCfgs lấy URL Replay Top 1, 2, 3 của tất cả map
+        // CHỈ LẤY DUY NHẤT TOP 3 (bGradeID == 3) CỦA MỖI MAP (KHÔNG XÓA FILE NÀO TRONG THƯ MỤC)
         NSMutableArray *queue = [NSMutableArray array];
+        NSMutableSet *queuedMaps = [NSMutableSet set];
 
         if (rtPtrOk(gMapDataComponent)) {
             void *list = *(void **)((char *)gMapDataComponent + 0x98); // ListView<VideoDetailCfg>
@@ -561,19 +555,23 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
                         void *cfg = items[i];
                         if (!rtPtrOk(cfg)) continue;
                         int mapId = *(int *)((char *)cfg + 0x14);
+
                         uint8_t gradeId = *(uint8_t *)((char *)cfg + 0x18);
-                        if (gradeId < 1 || gradeId > 3) continue; // Chỉ tải Top 3
+                        // CHỈ LẤY THỨ 3 (TOP 3 TRÊN BẢNG XẾP HẠNG)
+                        if (gradeId != 3) continue;
+
+                        if ([queuedMaps containsObject:@(mapId)]) continue;
+                        [queuedMaps addObject:@(mapId)];
 
                         void *urlPtr = *(void **)((char *)cfg + 0x30);
                         NSString *urlStr = rtIl2CppString(urlPtr);
                         if (urlStr.length > 0) {
-                            NSString *fileName = [NSString stringWithFormat:@"%d_%d.rep", mapId, gradeId];
+                            NSString *fileName = [NSString stringWithFormat:@"%d_3.rep", mapId];
                             NSString *destPath = [tempDir stringByAppendingPathComponent:fileName];
                             [queue addObject:@{
                                 @"url": urlStr,
                                 @"path": destPath,
-                                @"map": @(mapId),
-                                @"grade": @(gradeId)
+                                @"map": @(mapId)
                             }];
                         }
                     }
@@ -581,21 +579,7 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
             }
         }
 
-        // 2. Đồng bộ các file .rep có sẵn trong documents/bundle (LocLo, MatchVideos) vào TempMatchVideos
-        NSArray *localDirs = @[@"LocLo", @"MatchVideos", @"RaceKit"];
-        for (NSString *sub in localDirs) {
-            NSString *dir = [doc stringByAppendingPathComponent:sub];
-            NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
-            for (NSString *name in files) {
-                if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
-                    NSString *src = [dir stringByAppendingPathComponent:name];
-                    NSString *dst = [tempDir stringByAppendingPathComponent:name];
-                    if (![fm fileExistsAtPath:dst]) {
-                        [fm copyItemAtPath:src toPath:dst error:NULL];
-                    }
-                }
-            }
-        }
+        // KHÔNG copy file _timestamp từ LocLo vào nữa để mỗi map chỉ duy nhất có 1 file <mapId>_3.rep!
 
         int total = (int)queue.count;
         if (total == 0) {
@@ -622,7 +606,7 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
             if ([fm fileExistsAtPath:destPath]) {
                 done++;
                 successCount++;
-                if (onProgress) onProgress(done, total, [NSString stringWithFormat:@"Map %d", mapId]);
+                if (onProgress) onProgress(done, total, [NSString stringWithFormat:@"Map %d (Top 3)", mapId]);
                 dispatch_semaphore_signal(sem);
                 continue;
             }
@@ -647,7 +631,7 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
                         if (!mErr) successCount++;
                     }
                     done++;
-                    if (onProgress) onProgress(done, total, [NSString stringWithFormat:@"Map %d", mapId]);
+                    if (onProgress) onProgress(done, total, [NSString stringWithFormat:@"Map %d (Top 3)", mapId]);
                     dispatch_semaphore_signal(sem);
 
                     if (done >= total) {
