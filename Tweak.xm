@@ -28,7 +28,7 @@
 #import <dlfcn.h>
 #import <unistd.h>
 #import <fcntl.h>
-
+#import <mach-o/dyld.h>
 #pragma mark - Log
 
 static int gLogFd = -1;
@@ -56,6 +56,21 @@ static void rtLog(const char *fmt, ...) {
     ssize_t w = write(gLogFd, buf, total); (void)w;
 }
 
+
+static uintptr_t gUnityBase = 0;
+static uintptr_t rtGetUnityBase(void) {
+    if (gUnityBase) return gUnityBase;
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "UnityFramework")) {
+            gUnityBase = (uintptr_t)_dyld_get_image_header(i);
+            rtLog("UnityFramework base: 0x%lx", (unsigned long)gUnityBase);
+            break;
+        }
+    }
+    return gUnityBase;
+}
 #pragma mark - IL2CPP
 
 typedef struct Il2CppClass Il2CppClass;
@@ -384,7 +399,34 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     float vz = a->vz + (b->vz - a->vz) * al;
     float kmph = a->kmph + (b->kmph - a->kmph) * al;
 
-    // --- 2. CƯỠNG BỨC SET STATE TỌA ĐỘ & VẬN TỐC (State-Locking TAS) ---
+    // --- 2. TELEPORT TRỰC TIẾP THỰC THỂ VẬT LÝ PHYSX (mPhyHandle) ---
+    // Đây là mấu chốt để xe thực sự dịch chuyển tức thời (TP) từng frame thay vì tự lái
+    void *phyCtrl = rtPtrOk(motionCtrl) ? *(void **)((char *)motionCtrl + kOffMotionPhyCtrl) : NULL;
+    if (rtPtrOk(phyCtrl)) {
+        void *ent = *(void **)((char *)phyCtrl + 0x18); // mPhyHandle
+        if (rtPtrOk(ent)) {
+            float pos[3]  = { tx, ty, tz };
+            float quat[4] = { qx, qy, qz, qw };
+            float vel[3]  = { vx, vy, vz };
+
+            uintptr_t base = rtGetUnityBase();
+            if (base) {
+                typedef void (*fn_SetTrans_t)(void *, float *, float *);
+                typedef void (*fn_SetLinVel_t)(void *, float *);
+                fn_SetTrans_t fn_SetTrans = (fn_SetTrans_t)(base + 0xF718248);
+                fn_SetLinVel_t fn_SetLinVel = (fn_SetLinVel_t)(base + 0xF7181F4);
+                fn_SetTrans(ent, pos, quat);
+                fn_SetLinVel(ent, vel);
+            } else {
+                void (*set_transform)(void *, float *, float *) = *(void **)(*(char **)ent + 112);
+                void (*set_vel)(void *, float *) = *(void **)(*(char **)ent + 136);
+                if (set_transform) set_transform(ent, pos, quat);
+                if (set_vel) set_vel(ent, vel);
+            }
+        }
+    }
+
+    // --- 3. CƯỠNG BỨC SET STATE TỌA ĐỘ & VẬN TỐC (State-Locking TAS) ---
     // Dù người chơi không có nitro/miniboost, xe vẫn được khóa chặt theo frame:
     if (rtPtrOk(motionCtrl)) {
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 0) = tx;
