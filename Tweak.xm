@@ -409,17 +409,17 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
             float quat[4] = { qx, qy, qz, qw };
             float vel[3]  = { vx, vy, vz };
 
+            typedef void (*fn_SetTrans_t)(void *, float *, float *);
+            typedef void (*fn_SetLinVel_t)(void *, float *);
             uintptr_t base = rtGetUnityBase();
             if (base) {
-                typedef void (*fn_SetTrans_t)(void *, float *, float *);
-                typedef void (*fn_SetLinVel_t)(void *, float *);
                 fn_SetTrans_t fn_SetTrans = (fn_SetTrans_t)(base + 0xF718248);
                 fn_SetLinVel_t fn_SetLinVel = (fn_SetLinVel_t)(base + 0xF7181F4);
                 fn_SetTrans(ent, pos, quat);
                 fn_SetLinVel(ent, vel);
             } else {
-                void (*set_transform)(void *, float *, float *) = *(void **)(*(char **)ent + 112);
-                void (*set_vel)(void *, float *) = *(void **)(*(char **)ent + 136);
+                fn_SetTrans_t set_transform = (fn_SetTrans_t)*(void **)(*(char **)ent + 112);
+                fn_SetLinVel_t set_vel = (fn_SetLinVel_t)*(void **)(*(char **)ent + 136);
                 if (set_transform) set_transform(ent, pos, quat);
                 if (set_vel) set_vel(ent, vel);
             }
