@@ -75,11 +75,11 @@ static BOOL rtInitIl2Cpp(void) {
     if (il2cpp_domain_get) return YES;
     void *h = dlopen("Frameworks/UnityFramework.framework/UnityFramework", RTLD_NOW);
     if (!h) h = RTLD_DEFAULT;
-    il2cpp_domain_get                 = dlsym(h, "il2cpp_domain_get");
-    il2cpp_domain_get_assemblies      = dlsym(h, "il2cpp_domain_get_assemblies");
-    il2cpp_assembly_get_image         = dlsym(h, "il2cpp_assembly_get_image");
-    il2cpp_class_from_name            = dlsym(h, "il2cpp_class_from_name");
-    il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
+    *(void **)&il2cpp_domain_get                 = dlsym(h, "il2cpp_domain_get");
+    *(void **)&il2cpp_domain_get_assemblies      = dlsym(h, "il2cpp_domain_get_assemblies");
+    *(void **)&il2cpp_assembly_get_image         = dlsym(h, "il2cpp_assembly_get_image");
+    *(void **)&il2cpp_class_from_name            = dlsym(h, "il2cpp_class_from_name");
+    *(void **)&il2cpp_class_get_method_from_name = dlsym(h, "il2cpp_class_get_method_from_name");
     BOOL ok = il2cpp_domain_get && il2cpp_domain_get_assemblies && il2cpp_assembly_get_image
            && il2cpp_class_from_name && il2cpp_class_get_method_from_name;
     rtLog("il2cpp api: %s", ok ? "OK" : "MISSING");
@@ -245,7 +245,7 @@ static BOOL rtLoadRecord(void) {
     }
     if (h.count > RC_MAX_FRAMES) h.count = RC_MAX_FRAMES;
 
-    gFrames = malloc(sizeof(RCFrame) * h.count);
+    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
     if (!gFrames) { fclose(f); return NO; }
     gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
     fclose(f);
@@ -286,7 +286,7 @@ static double rtNow(void) {
 static void rtRecordTick(void *steerData, void *sim, double now) {
     if (!gRecording) return;
     if (!gFrames) {
-        gFrames = malloc(sizeof(RCFrame) * RC_MAX_FRAMES);
+        gFrames = (RCFrame *)malloc(sizeof(RCFrame) * RC_MAX_FRAMES);
         if (!gFrames) { gRecording = NO; return; }
         gFrameCount = 0;
     }
