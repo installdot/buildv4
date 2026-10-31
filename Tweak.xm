@@ -1,22 +1,5 @@
 // RaceRec — Ghi / Phát lại đường đua (record & playback)
-//
-// Nút REC  : bật → vào map → tự ghi từng frame. Tắt → lưu Documents/RaceKit/rec_map<MapId>.rk
-// Nút AUTO : bật → vào map → có record thì đua lập trình, không có thì báo lỗi.
-//
-// Mọi offset dưới đây đã được kiểm chứng bằng decompile trên UnityFramework.i64:
-//   NssVehicle.GetActorType            0x7C60B70 -> *(u32*)(a1+20)          => 0x14
-//   NssVehicle.get_DynamicVehicleImpl  0x7C5F6E0 -> *(qword*)(a1+32)        => 0x20
-//   NssVehicleSimOutput.get_Position   0x7C94C90 -> *(float*)(a1+100)       => 0x64
-//   NssVehicleSimOutput.get_Rotation   0x7C94C9C -> *(float*)(a1+112)       => 0x70
-//   NssPhyVehicleDrivingCtrl.get_Throttle       0x7AF6DE0 -> a1+60          => 0x3C
-//   NssPhyVehicleDrivingCtrl.set_Throttle       0x7AF6DE8 -> a1+60          => 0x3C
-//   NssPhyVehicleDrivingCtrl.get_Steering       0x7AF6DF0 -> a1+64          => 0x40
-//   NssPhyVehicleDrivingCtrl.set_Steering       0x7AF6DF8 -> a1+64          => 0x40
-//   NssSteeringData.IsBraking                   0x7BCE598 -> *(u32*)(a1+20) => 0x14
-//   InputModule.GetKey                          0x5AD62AC -> (*(u32*)(*(a1+168)+16) >> keyType) & 1
-//   InputModule.SetKeyFlags                     0x5AD61B8 -> *(u32*)(*(a1+168)+16) = flags
-//   CheckPointConfig.MapId               (dump.cs)                          => 0x14
-//   CheckPointConfig.MainCurveLength     (dump.cs)                          => 0x2C
+// Đọc file .rep từ TempMatchVideos, phân tích frame-by-frame, teleport và set toàn bộ state xe
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -29,6 +12,7 @@
 #import <unistd.h>
 #import <fcntl.h>
 #import <mach-o/dyld.h>
+
 #pragma mark - Log
 
 static int gLogFd = -1;
@@ -56,7 +40,6 @@ static void rtLog(const char *fmt, ...) {
     ssize_t w = write(gLogFd, buf, total); (void)w;
 }
 
-
 static uintptr_t gUnityBase = 0;
 static uintptr_t rtGetUnityBase(void) {
     if (gUnityBase) return gUnityBase;
@@ -71,6 +54,7 @@ static uintptr_t rtGetUnityBase(void) {
     }
     return gUnityBase;
 }
+
 #pragma mark - IL2CPP
 
 typedef struct Il2CppClass Il2CppClass;
@@ -122,8 +106,6 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
 
 static BOOL rtPtrOk(const void *p) { return p && (uintptr_t)p > 0x1000 && (uintptr_t)p < 0x00007fffffffffffULL; }
 
-// MethodInfo.slot ở +0x58 (kiểm chứng: il2cpp_method_get_param_count đọc +90 => layout runtime
-// rộng hơn header dumper; slot 0x58 là giá trị khớp khi hook thành công trên thiết bị)
 static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int argc, void *rep) {
     Il2CppClass *k = rtFindClass(ns, cls);
     if (!k) { rtLog("il2cpp: %s::%s class NOT FOUND", cls, mth); return NULL; }
@@ -141,7 +123,7 @@ static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int 
     BOOL vt = NO;
     if (slot < 512) {
         VirtualInvokeData *e = (VirtualInvokeData *)((char *)k + 328) + slot;
-        if (e->methodPtr == orig) { e->methodPtr = rep; vt = YES; }
+        e->methodPtr = rep; vt = YES;
     }
     rtLog("il2cpp: HOOK %s::%s slot=%u vtable=%s", cls, mth, (unsigned)slot, vt ? "OK" : "none");
     return orig;
@@ -167,6 +149,7 @@ enum {
     kOffPhySimOutput          = 0x28,   // NssPhyVehicleCtrl.mSimulateOutput
 
     kOffSimKmph               = 0x10,   // NssVehicleSimOutput.mKmph
+    kOffSimMps                = 0x14,   // .mMps
     kOffSimLinearVel          = 0x38,   // .mLinearVelocity (Vector3)
     kOffSimChassisPos         = 0x64,   // .mChassisPosition (Vector3)
     kOffSimChassisRot         = 0x70,   // .mChassisRotation (Quaternion)
@@ -188,7 +171,6 @@ enum {
 
 #pragma mark - Frame format
 
-// Forward: UI helpers dùng trước khi định nghĩa
 @class RCPassWindow;
 static void rtAlert(NSString *title, NSString *msg);
 static UIViewController *rtTopVC(void);
@@ -199,24 +181,24 @@ static UIViewController *rtTopVC(void);
 
 typedef struct {
     float    t;               // Thời gian tương đối (s)
-    float    px, py, pz;      // Vị trí khung gầm (mChassisPosition)
-    float    qx, qy, qz, qw;  // Hướng xoay Quaternion (mChassisRotation)
-    float    vx, vy, vz;      // Vận tốc tuyến tính (mLinearVelocity)
-    float    kmph;            // Tốc độ hiển thị km/h
+    float    px, py, pz;      // Vị trí 3D
+    float    qx, qy, qz, qw;  // Góc xoay Quaternion
+    float    vx, vy, vz;      // Vận tốc tuyến tính
+    float    kmph;            // Tốc độ km/h
     float    steer;           // Góc đánh lái (-1.0 đến 1.0)
-    uint32_t keys;            // Bitmask phím (Drift, SmallBoost, Nitro, v.v.)
+    uint32_t keys;            // Cờ phím (Nitro, MiniBoost, Drift, Brake, Left, Right)
     uint8_t  flags;           // b0: phanh, b1: phanh tay, b2: drift, b3: nitro, b4: miniboost
-    uint8_t  pad[3];          // Đệm căn byte
-} RCFrame;                    // 60 byte
+    uint8_t  pad[3];
+} RCFrame;
 
 typedef struct {
     char     magic[4];        // "RKR3"
-    uint32_t ver;            // 3
-    uint32_t count;          // Số lượng frame
-    float    trackLen;       // Chiều dài đường đua
-    int32_t  mapId;          // ID bản đồ
-    uint32_t frameSize;      // 60
-} RCHeader;                   // 24 byte
+    uint32_t ver;
+    uint32_t count;
+    float    trackLen;
+    int32_t  mapId;
+    uint32_t frameSize;
+} RCHeader;
 
 static RCFrame *gFrames;
 static uint32_t gFrameCount;
@@ -229,7 +211,7 @@ static void *gInputModule;
 static int   gKeyMask;
 static float gCurPlaybackSteer;
 
-#pragma mark - Storage
+#pragma mark - Storage & Parser .rep
 
 static NSString *rtDir(void) {
     NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -249,7 +231,7 @@ static BOOL rtSaveRecord(void) {
     NSString *path = rtPathForTrack();
     if (!path) return NO;
     FILE *f = fopen(path.fileSystemRepresentation, "wb");
-    if (!f) { rtLog("save: fopen fail"); return NO; }
+    if (!f) return NO;
 
     RCHeader h;
     memcpy(h.magic, RC_MAGIC, 4);
@@ -313,7 +295,6 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         RCFrame fr;
         memset(&fr, 0, sizeof fr);
         fr.t    = *(float *)((char *)m + 0x18); // mClientTime
-        fr.keys = *(uint32_t *)((char *)m + 0x20); // mKeyFlag
         fr.px   = *(float *)((char *)m + 0x24); // mPos.x
         fr.py   = *(float *)((char *)m + 0x28); // mPos.y
         fr.pz   = *(float *)((char *)m + 0x2C); // mPos.z
@@ -325,8 +306,11 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         fr.vy   = *(float *)((char *)m + 0x44); // mLinVel.y
         fr.vz   = *(float *)((char *)m + 0x48); // mLinVel.z
 
-        // ĐỌC TỐC ĐỘ:
-        // mKMPH ở 0x5C trong Replay bằng 0, tính tốc độ chuẩn từ vector mLinVel:
+        // Chuẩn hóa Quaternion ngay khi trích xuất
+        float ql = sqrtf(fr.qx * fr.qx + fr.qy * fr.qy + fr.qz * fr.qz + fr.qw * fr.qw);
+        if (ql > 1e-4f) { fr.qx /= ql; fr.qy /= ql; fr.qz /= ql; fr.qw /= ql; }
+
+        // Tính tốc độ (km/h) từ vector vận tốc tuyến tính
         float v_mps = sqrtf(fr.vx * fr.vx + fr.vy * fr.vy + fr.vz * fr.vz);
         float spd_kmh = v_mps * 3.6f;
         if (spd_kmh < 1.0f && i > 0) {
@@ -340,10 +324,25 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         }
         fr.kmph = spd_kmh;
 
-        // ĐỌC GÓC CUA:
+        // Chuyển đổi mã phím Replay sang InputKeyType chuẩn:
+        uint32_t repKeys = *(uint32_t *)((char *)m + 0x20); // mKeyFlag
+        uint32_t inputKeys = 0;
+        if (repKeys & ((1 << 1) | (1 << 13))) inputKeys |= (1 << 1); // Left (1)
+        if (repKeys & ((1 << 2) | (1 << 14))) inputKeys |= (1 << 2); // Right (2)
+        if (repKeys & ((1 << 3) | (1 << 4)))  inputKeys |= (1 << 3); // Nitro (3)
+        if (repKeys & ((1 << 7) | (1 << 8)))  inputKeys |= (1 << 5); // MiniBoost (5)
+        if (repKeys & ((1 << 9) | (1 << 10))) inputKeys |= (1 << 6); // Brake (6)
+        if (repKeys & ((1 << 13) | (1 << 14))) inputKeys |= (1 << 8); // Drift (8)
+
+        int state = *(int *)((char *)m + 0x74); // mState
+        if (state == 2) inputKeys |= (1 << 8);  // NssVehicleState.Drifting
+
+        fr.keys = inputKeys;
+
+        // Góc đánh lái (steer)
         float yawRate = *(float *)((char *)m + 0x50); // mAngVel.y
-        if (fr.keys & (1 << 1)) fr.steer = -0.90f;
-        else if (fr.keys & (1 << 2)) fr.steer = 0.90f;
+        if (inputKeys & (1 << 1)) fr.steer = -0.90f;
+        else if (inputKeys & (1 << 2)) fr.steer = 0.90f;
         else if (fabsf(yawRate) > 0.08f) {
             float s = -yawRate * 0.45f;
             if (s > 1.0f) s = 1.0f;
@@ -354,10 +353,10 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         }
 
         uint8_t flags = 0;
-        if (fr.keys & (1 << 6)) flags |= 0x01; // Brake
-        if (fr.keys & ((1 << 8) | (1 << 9))) flags |= 0x04; // Drift
-        if (fr.keys & (1 << 3)) flags |= 0x08; // Nitro
-        if (fr.keys & (1 << 5)) flags |= 0x10; // Boost
+        if (inputKeys & (1 << 6)) flags |= 0x01; // Brake
+        if (inputKeys & (1 << 8)) flags |= 0x04; // Drift
+        if (inputKeys & (1 << 3)) flags |= 0x08; // Nitro
+        if (inputKeys & (1 << 5)) flags |= 0x10; // MiniBoost
         fr.flags = flags;
 
         gFrames[i] = fr;
@@ -375,7 +374,7 @@ static BOOL rtLoadRepFromDisk(NSString *repPath) {
     NSData *data = [NSData dataWithContentsOfFile:repPath];
     if (!data || !data.length) return NO;
 
-    rtLog("[Rep] Reading file: %s (%lu bytes)", repPath.UTF8String, (unsigned long)data.length);
+    rtLog("[Rep] Feeding %lu bytes into game parser...", (unsigned long)data.length);
 
     void *byteClass = rtFindClass("System", "Byte");
     void *desClass  = rtFindClass("", "MatchVideoDesHelper");
@@ -388,29 +387,29 @@ static BOOL rtLoadRepFromDisk(NSString *repPath) {
     uintptr_t base = rtGetUnityBase();
     if (!base) return NO;
 
-    // 1. Tạo Il2CppArray chứa dữ liệu file
+    // 1. Tạo Il2CppArray chứa dữ liệu byte file .rep
     void *arr = il2cpp_array_new(byteClass, data.length);
     if (!arr) return NO;
     memcpy((char *)arr + 0x20, data.bytes, data.length);
 
-    // 2. Giải nén nếu file bị nén qua MatchVideoStaticHelper.GetUnZipData (0x71E28EC)
+    // 2. Gọi hàm giải nén của game: MatchVideoStaticHelper.GetUnZipData (0x71E28EC)
     typedef void *(*fn_unzip_t)(void *, ...);
     fn_unzip_t fn_unzip = (fn_unzip_t)(base + 0x71E28EC);
     void *unzipArr = fn_unzip ? fn_unzip(arr) : arr;
     if (!unzipArr) unzipArr = arr;
 
-    // 3. Khởi tạo đối tượng MatchVideoDesHelper
+    // 3. Khởi tạo đối tượng parser của game: MatchVideoDesHelper
     void *helper = il2cpp_object_new(desClass);
     if (!helper) return NO;
     typedef void (*fn_ctor_t)(void *);
     fn_ctor_t fn_ctor = (fn_ctor_t)(base + 0x71B6A88);
     if (fn_ctor) fn_ctor(helper);
 
-    // 4. Giải mã dữ liệu qua InitByVideoBytes (0x71B3E20)
+    // 4. Giải mã toàn bộ qua parser của game: InitByVideoBytes (0x71B3E20)
     typedef BOOL (*fn_init_t)(void *, void *, ...);
     fn_init_t fn_init = (fn_init_t)(base + 0x71B3E20);
     BOOL ok = fn_init ? fn_init(helper, unzipArr) : NO;
-    rtLog("[Rep] InitByVideoBytes result=%d", (int)ok);
+    rtLog("[Rep] Parser InitByVideoBytes result=%d", (int)ok);
     if (ok) {
         return rtExtractFramesFromDesHelper(helper);
     }
@@ -420,55 +419,50 @@ static BOOL rtLoadRepFromDisk(NSString *repPath) {
 static NSString *rtFindRepFile(int targetMapId) {
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
-    NSArray *dirs = @[@"TempMatchVideos", @"MatchVideos", @"RaceKit"];
+    NSString *dir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
     NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    if (!files || !files.count) {
+        rtLog("[Rep] TempMatchVideos is empty or not found: %s", dir.UTF8String);
+        return nil;
+    }
 
     NSString *bestMatch = nil;
     NSString *newestFile = nil;
     NSDate *newestDate = [NSDate distantPast];
 
-    NSString *mapStr = targetMapId > 0 ? [NSString stringWithFormat:@"%d", targetMapId] : nil;
+    NSString *targetPrefix = targetMapId > 0 ? [NSString stringWithFormat:@"%d_", targetMapId] : nil;
+    NSString *targetContain = targetMapId > 0 ? [NSString stringWithFormat:@"%d", targetMapId] : nil;
 
-    for (NSString *sub in dirs) {
-        NSString *dir = [doc stringByAppendingPathComponent:sub];
-        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
-        for (NSString *name in files) {
-            if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
-                NSString *full = [dir stringByAppendingPathComponent:name];
-                if (mapStr && [name containsString:mapStr]) {
-                    bestMatch = full;
-                    break;
-                }
-                NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
-                NSDate *mod = attr.fileModificationDate ?: [NSDate date];
-                if ([mod compare:newestDate] == NSOrderedDescending) {
-                    newestDate = mod;
-                    newestFile = full;
-                }
+    for (NSString *name in files) {
+        if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
+            NSString *full = [dir stringByAppendingPathComponent:name];
+            if (targetPrefix && [name hasPrefix:targetPrefix]) {
+                return full;
+            }
+            if (targetContain && [name containsString:targetContain]) {
+                bestMatch = full;
+            }
+            NSDictionary *attr = [fm attributesOfItemAtPath:full error:NULL];
+            NSDate *mod = attr.fileModificationDate ?: [NSDate date];
+            if ([mod compare:newestDate] == NSOrderedDescending) {
+                newestDate = mod;
+                newestFile = full;
             }
         }
-        if (bestMatch) break;
     }
     return bestMatch ?: newestFile;
-}
-
-static BOOL rtScanAndLoadRepFiles(int targetMapId) {
-    NSString *rep = rtFindRepFile(targetMapId);
-    if (!rep) {
-        rtLog("[Rep] No .rep file found in TempMatchVideos/MatchVideos");
-        return NO;
-    }
-    rtLog("[Rep] Selected .rep file: %s", rep.UTF8String);
-    return rtLoadRepFromDisk(rep);
 }
 
 static BOOL rtLoadRecord(void) {
     gFrameCount = 0;
     if (gFrames) { free(gFrames); gFrames = NULL; }
 
-    // 1. Quét tìm và đưa file .rep vào parser của game
+    // 1. Quét tìm và đưa file .rep từ TempMatchVideos vào parser của game
     rtLog("Searching TempMatchVideos for map %d .rep file...", gMapId);
-    if (rtScanAndLoadRepFiles(gMapId)) {
+    NSString *rep = rtFindRepFile(gMapId);
+    if (rep && rtLoadRepFromDisk(rep)) {
         if (gFrameCount > 0) {
             rtLog("LOADED %u frames from .rep file!", gFrameCount);
             return YES;
@@ -492,6 +486,7 @@ static BOOL rtLoadRecord(void) {
             fclose(f);
         }
     }
+
     return NO;
 }
 
@@ -596,26 +591,35 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     if (al < 0.f) al = 0.f;
     if (al > 1.f) al = 1.f;
 
-    // --- 1. TELEPORT TRỰC TIẾP TỚI TỌA ĐỘ FRAME (Frame-by-Frame TAS) ---
-    // Khi bắt đầu (t=0), teleport thẳng tới tọa độ frame 0, hoàn toàn bám 1:1 theo frame đã lưu
+    // --- 1. TỌA ĐỘ VÀ VẬN TỐC NỘI SUY ---
     float tx = a->px + (b->px - a->px) * al;
     float ty = a->py + (b->py - a->py) * al;
     float tz = a->pz + (b->pz - a->pz) * al;
-    // Nội suy Quaternion góc quay
-    float qx = a->qx + (b->qx - a->qx) * al;
-    float qy = a->qy + (b->qy - a->qy) * al;
-    float qz = a->qz + (b->qz - a->qz) * al;
-    float qw = a->qw + (b->qw - a->qw) * al;
-    float ql = sqrtf(qx*qx + qy*qy + qz*qz + qw*qw);
+
+    // --- 2. NỘI SUY GÓC XOAY QUATERNION CHUẨN XÁC (Shortest-path NLerp chống lật góc) ---
+    float dot = a->qx * b->qx + a->qy * b->qy + a->qz * b->qz + a->qw * b->qw;
+    float bx = b->qx, by = b->qy, bz = b->qz, bw = b->qw;
+    if (dot < 0.0f) {
+        bx = -bx; by = -by; bz = -bz; bw = -bw; // Triệt tiêu góc lật 180 độ
+    }
+    float qx = a->qx + (bx - a->qx) * al;
+    float qy = a->qy + (by - a->qy) * al;
+    float qz = a->qz + (bz - a->qz) * al;
+    float qw = a->qw + (bw - a->qw) * al;
+    float ql = sqrtf(qx * qx + qy * qy + qz * qz + qw * qw);
     if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
 
-    // Nội suy vận tốc & tốc độ hiển thị
     float vx = a->vx + (b->vx - a->vx) * al;
     float vy = a->vy + (b->vy - a->vy) * al;
     float vz = a->vz + (b->vz - a->vz) * al;
     float kmph = a->kmph + (b->kmph - a->kmph) * al;
 
-    // --- 2. TP TRỰC TIẾP TỌA ĐỘ, GÓC XOAY & ÁP DỤNG TỐC ĐỘ THEO FRAME ---
+    // Vector hướng mũi xe
+    float fx = 2.0f * (qx * qz + qw * qy);
+    float fy = 2.0f * (qy * qz - qw * qx);
+    float fz = 1.0f - 2.0f * (qx * qx + qy * qy);
+
+    // --- 3. TP VỊ TRÍ, GÓC XOAY & SET STATE TOÀN BỘ THEO FRAME ---
     if (rtPtrOk(motionCtrl)) {
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 0) = tx;
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 4) = ty;
@@ -627,35 +631,55 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         *(float *)((char *)motionCtrl + kOffMotionForceRot + 12) = qw;
 
         *(bool *)((char *)motionCtrl + kOffMotionIsSetTransform) = true;
+
+        void *driftCtrl = *(void **)((char *)motionCtrl + kOffMotionDrift);
+        if (rtPtrOk(driftCtrl) && (a->flags & 0x04)) {
+            *(bool *)((char *)driftCtrl + 0x76) = true; // mHasEnterDrifting
+        }
     }
 
     if (rtPtrOk(sim)) {
+        // Cập nhật cả vị trí khung gầm và model hiển thị
         *(float *)((char *)sim + kOffSimChassisPos + 0) = tx;
         *(float *)((char *)sim + kOffSimChassisPos + 4) = ty;
         *(float *)((char *)sim + kOffSimChassisPos + 8) = tz;
 
+        *(float *)((char *)sim + 0x80)                 = tx; // mInnerPosition.x
+        *(float *)((char *)sim + 0x84)                 = ty; // mInnerPosition.y
+        *(float *)((char *)sim + 0x88)                 = tz; // mInnerPosition.z
+
+        // Cập nhật cả góc xoay khung gầm và góc xoay model
         *(float *)((char *)sim + kOffSimChassisRot + 0) = qx;
         *(float *)((char *)sim + kOffSimChassisRot + 4) = qy;
         *(float *)((char *)sim + kOffSimChassisRot + 8) = qz;
         *(float *)((char *)sim + kOffSimChassisRot + 12) = qw;
 
-        // ÁP DỤNG TỐC ĐỘ:
+        *(float *)((char *)sim + 0x8C)                 = qx; // mInnerRotation.x
+        *(float *)((char *)sim + 0x90)                 = qy; // mInnerRotation.y
+        *(float *)((char *)sim + 0x94)                 = qz; // mInnerRotation.z
+        *(float *)((char *)sim + 0x98)                 = qw; // mInnerRotation.w
+
+        // Hướng di chuyển & vận tốc
+        *(float *)((char *)sim + 0x44)                 = fx; // mMovingDirection.x
+        *(float *)((char *)sim + 0x48)                 = fy; // mMovingDirection.y
+        *(float *)((char *)sim + 0x4C)                 = fz; // mMovingDirection.z
+
         *(float *)((char *)sim + kOffSimLinearVel + 0) = vx;
         *(float *)((char *)sim + kOffSimLinearVel + 4) = vy;
         *(float *)((char *)sim + kOffSimLinearVel + 8) = vz;
-        *(float *)((char *)sim + kOffSimKmph)          = kmph;        // 0x10: mKmph
-        *(float *)((char *)sim + 0x14)                 = kmph / 3.6f; // 0x14: mMps (speedometer HUD)
-        *(float *)((char *)sim + 0xB4)                 = 1.0f;        // 0xB4: mForwardForce
+        *(float *)((char *)sim + kOffSimKmph)          = kmph;        // 0x10 mKmph
+        *(float *)((char *)sim + kOffSimMps)           = kmph / 3.6f; // 0x14 mMps (HUD Speedometer)
+        *(float *)((char *)sim + 0xB4)                 = 1.0f;        // 0xB4 mForwardForce
     }
 
-    // --- 3. ĐÁNH LÁI & GA (CUA & TỐC ĐỘ) ---
+    // --- 4. ĐÁNH LÁI & GA (CUA) ---
     float steer = a->steer + (b->steer - a->steer) * al;
     if (steer >  1.0f) steer =  1.0f;
     if (steer < -1.0f) steer = -1.0f;
     gCurPlaybackSteer = steer;
 
     *(float *)((char *)steerData + kOffSteerLeft) = steer;
-    *(float *)((char *)steerData + kOffSteerForward) = 1.0f; // Luôn full ga
+    *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
     if (rtPtrOk(drivingCtrl)) {
         *(float *)((char *)drivingCtrl + 0x40) = steer; // mSteering
         *(float *)((char *)drivingCtrl + 0x68) = steer; // mInputXPosition
@@ -664,11 +688,27 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         *(float *)((char *)drivingCtrl + 0x38) = 1.0f;  // mVehicleCtrlParams.throttle
     }
 
-    // --- 4. BƠM PHÍM BẤM (Keys, Nitro, MiniBoost, Drift) ---
+    // --- 5. BƠM PHÍM BẤM (Nitro, MiniBoost, Drift, Phanh, Trái, Phải) ---
     uint32_t keys = a->keys;
-    if (t >= 0.06f && t <= 0.40f) {
-        keys |= (1 << 5); // Start MiniBoost
+    if (a->flags & 0x01) keys |= (1 << 6); // Phanh
+    if (a->flags & 0x04) keys |= (1 << 8); // Drift
+    if (a->flags & 0x08) keys |= (1 << 3); // Nitro
+    if (a->flags & 0x10) keys |= (1 << 5); // MiniBoost
+
+    // Kích hoạt tiểu phóng xuất phát ở giây đầu
+    if (t >= 0.06f && t <= 0.45f) {
+        keys |= (1 << 5);
     }
+
+    // Phím rẽ Trái/Phải theo góc cua
+    if (steer < -0.15f) {
+        keys |= (1 << 1);  // Left
+        keys &= ~(1 << 2);
+    } else if (steer > 0.15f) {
+        keys |= (1 << 2);  // Right
+        keys &= ~(1 << 1);
+    }
+
     gKeyMask = (int)keys;
     rtWriteKeyFlags((int)keys);
 }
@@ -677,6 +717,7 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 
 static void   (*orig_MotionCtrl_Update)(void *, float, const void *);
 static void   (*orig_Input_Update)(void *, float, const void *);
+static BOOL   (*orig_Input_GetKey)(void *, int, const void *);
 static BOOL   (*orig_GetSteeringValue)(void *, void *, float, float *, float *, const void *);
 static void   (*orig_GoImpEnter)(void *, const void *);
 static void   (*orig_RaceKingGoImpEnter)(void *, const void *);
@@ -685,12 +726,21 @@ static void   (*orig_ReplayActionGoImpEnter)(void *, const void *);
 static void   (*orig_GameFinishImpEnter)(void *, const void *);
 static BOOL   (*orig_MatchVideoDesHelper_InitByVideoBytes)(void *, void *, const void *);
 static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *);
+
 static void hook_Input_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
     if (orig_Input_Update) orig_Input_Update(self, dt, m);
     if (gPlaying) {
         rtWriteKeyFlags(gKeyMask);
     }
+}
+
+static BOOL hook_Input_GetKey(void *self, int keyType, const void *m) {
+    if (rtPtrOk(self)) gInputModule = self;
+    if (gPlaying && keyType > 0 && keyType < 18) {
+        if ((gKeyMask >> keyType) & 1) return TRUE;
+    }
+    return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, m) : FALSE;
 }
 
 static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
@@ -729,8 +779,8 @@ static void hook_GoImpEnter(void *self, const void *m) {
     if (orig_GoImpEnter) orig_GoImpEnter(self, m);
     rtBeginRace();
 }
+
 static void hook_RaceKingGoImpEnter(void *self, const void *m) {
-    // Different classes have different originals; never call GameGoState on this instance.
     if (orig_RaceKingGoImpEnter) orig_RaceKingGoImpEnter(self, m);
     rtBeginRace();
 }
@@ -778,7 +828,7 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
     gTrackLen = 0.f;
     rtLog("MAP resolved from CheckPointMgr self=%p config=%p mapId=%d", self, config, gMapId);
 
-    // KHI VÀO MAP: BỎ FILE .REP VÀO PARSER NGAY LẬP TỨC
+    // KHI VÀO MAP: NẾU BẬT AUTO THÌ TỰ ĐỘNG BỎ FILE .REP VÀO PARSER NGAY
     if (gAutoArmed) {
         rtLoadRecord();
     }
@@ -839,7 +889,6 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 - (void)refresh;
 @end
 
-// Window chỉ nhận touch bên trong panel; ngoài ra trả nil để game nhận.
 @interface RCPassWindow : UIWindow
 @property (nonatomic, weak) UIView *panel;
 @end
@@ -858,7 +907,6 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 
 static RCPanel *gPanel;
 
-// Tìm UIViewController của game (bỏ qua window overlay của tweak)
 static UIViewController *rtTopVC(void) {
     UIWindow *best = nil;
     for (UIWindow *w in UIApplication.sharedApplication.windows) {
@@ -916,7 +964,6 @@ static void rtAlert(NSString *title, NSString *msg) {
         self.win.rootViewController.view.backgroundColor = UIColor.clearColor;
         self.win.rootViewController.view.userInteractionEnabled = YES;
 
-        // iOS 13+: phải gắn windowScene thì window mới thực sự nổi lên
         if (@available(iOS 13.0, *)) {
             if (!self.win.windowScene) {
                 for (UIWindow *w in UIApplication.sharedApplication.windows) {
@@ -959,7 +1006,6 @@ static void rtAlert(NSString *title, NSString *msg) {
         self.win.hidden = NO;
         [self.win makeKeyAndVisible];
 
-        // Không được để overlay giữ key window — game cần key window để nhận touch.
         dispatch_async(dispatch_get_main_queue(), ^{
             for (UIWindow *w in UIApplication.sharedApplication.windows) {
                 if ([w isKindOfClass:[RCPassWindow class]]) continue;
@@ -982,7 +1028,7 @@ static void rtAlert(NSString *title, NSString *msg) {
 }
 
 - (void)tapRec {
-    gRecArmed = !gRecArmed;
+    gRecArmed = __omp_shell("gRecArmed;")
     if (!gRecArmed && gRecording) {
         gRecording = NO;
         BOOL ok = rtSaveRecord();
@@ -1007,7 +1053,7 @@ static void rtAlert(NSString *title, NSString *msg) {
 }
 
 - (void)tapAuto {
-    gAutoArmed = !gAutoArmed;
+    gAutoArmed = __omp_shell("gAutoArmed;")
     if (gAutoArmed) { gRecArmed = NO; gRecording = NO; }
     else { gPlaying = NO; rtWriteKeyFlags(0); }
     rtLog("AUTO armed=%d", (int)gAutoArmed);
@@ -1023,8 +1069,11 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrl_Update);
     orig_Input_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "InputModule", "Update", 1, (void *)hook_Input_Update);
+    orig_Input_GetKey = (BOOL (*)(void *, int, const void *))
+        rtHookMethod("", "InputModule", "GetKey", 1, (void *)hook_Input_GetKey);
     orig_GetSteeringValue = (BOOL (*)(void *, void *, float, float *, float *, const void *))
         rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "GetSteeringValue", 4, (void *)hook_GetSteeringValue);
+    rtHookMethod("", "NssPhyVehicleDrivingCtrl", "GetSteeringValue", 4, (void *)hook_GetSteeringValue);
     orig_GoImpEnter = (void (*)(void *, const void *))
         rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     orig_RaceKingGoImpEnter = (void (*)(void *, const void *))
