@@ -148,6 +148,7 @@ static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int 
 enum {
     kOffVehicleActorType      = 0x14,   // NssVehicle.mActorType
     kOffVehicleDyn            = 0x20,   // NssVehicle.mDynamicVehicle
+    kOffVehicleIsMainPlayer   = 0xF8,   // NssVehicle.mIsMainPlayer (bool)
 
     kOffMotionSteerData       = 0x10,   // NssPhyVehicleMotionCtrlHelper.mSteeringData
     kOffMotionVehicle         = 0x18,   // .mVehicle
@@ -231,12 +232,13 @@ static NSString *rtDir(void) {
 }
 
 static NSString *rtPathForTrack(void) {
-    if (gMapId <= 0) return nil;
-    return [rtDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"rec_map%d.rk", gMapId]];
+    int mid = gMapId > 0 ? gMapId : 1;
+    return [rtDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"rec_map%d.rk", mid]];
 }
 
 static BOOL rtSaveRecord(void) {
-    if (!gFrameCount || gMapId <= 0) return NO;
+    if (!gFrameCount) return NO;
+    int mid = gMapId > 0 ? gMapId : 1;
     NSString *path = rtPathForTrack();
     if (!path) return NO;
     FILE *f = fopen(path.fileSystemRepresentation, "wb");
@@ -244,13 +246,13 @@ static BOOL rtSaveRecord(void) {
 
     RCHeader h;
     memcpy(h.magic, RC_MAGIC, 4);
-    h.ver = 1; h.count = gFrameCount;
-    h.trackLen = gTrackLen; h.mapId = gMapId; h.frameSize = sizeof(RCFrame);
+    h.ver = 3; h.count = gFrameCount;
+    h.trackLen = gTrackLen; h.mapId = mid; h.frameSize = sizeof(RCFrame);
     fwrite(&h, sizeof h, 1, f);
     fwrite(gFrames, sizeof(RCFrame), gFrameCount, f);
     fclose(f);
     rtLog("save: %u frames (%.2fs) map=%d -> %s", gFrameCount,
-          gFrames[gFrameCount - 1].t, gMapId, path.UTF8String);
+          gFrames[gFrameCount - 1].t, mid, path.UTF8String);
     return YES;
 }
 
@@ -486,6 +488,9 @@ static void   (*orig_Input_Update)(void *, float, const void *);
 static BOOL   (*orig_GetSteeringValue)(void *, void *, float, float *, float *, const void *);
 static void   (*orig_GoImpEnter)(void *, const void *);
 static void   (*orig_RaceKingGoImpEnter)(void *, const void *);
+static void   (*orig_ReplayGoImpEnter)(void *, const void *);
+static void   (*orig_ReplayActionGoImpEnter)(void *, const void *);
+static void   (*orig_GameFinishImpEnter)(void *, const void *);
 static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *);
 
 static void hook_Input_Update(void *self, float dt, const void *m) {
@@ -532,11 +537,31 @@ static void hook_GoImpEnter(void *self, const void *m) {
     if (orig_GoImpEnter) orig_GoImpEnter(self, m);
     rtBeginRace();
 }
-
 static void hook_RaceKingGoImpEnter(void *self, const void *m) {
     // Different classes have different originals; never call GameGoState on this instance.
     if (orig_RaceKingGoImpEnter) orig_RaceKingGoImpEnter(self, m);
     rtBeginRace();
+}
+
+static void hook_ReplayGoImpEnter(void *self, const void *m) {
+    if (orig_ReplayGoImpEnter) orig_ReplayGoImpEnter(self, m);
+    rtLog("ENTER ReplayGameGoState");
+    rtBeginRace();
+}
+
+static void hook_ReplayActionGoImpEnter(void *self, const void *m) {
+    if (orig_ReplayActionGoImpEnter) orig_ReplayActionGoImpEnter(self, m);
+    rtLog("ENTER ReplayActionSpeedGameGoState");
+    rtBeginRace();
+}
+
+static void hook_GameFinishImpEnter(void *self, const void *m) {
+    if (orig_GameFinishImpEnter) orig_GameFinishImpEnter(self, m);
+    rtLog("FINISH reached -> auto save record");
+    if (gRecording && gFrameCount) {
+        rtSaveRecord();
+        gRecording = NO;
+    }
 }
 
 static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool reset, const void *m) {
@@ -552,33 +577,42 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
 }
 
 static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
-    if ((gRecording || gPlaying) && rtPtrOk(self)) {
+    if (rtPtrOk(self)) {
         void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
-        if (rtPtrOk(vehicle) && *(int *)((char *)vehicle + kOffVehicleActorType) == 0) {
-            gPlayerVehicle = vehicle;
-            void *steerData   = *(void **)((char *)self + kOffMotionSteerData);
-            void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
-            void *drivingCtrl = *(void **)((char *)self + kOffMotionDriving);
-            void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
+        if (rtPtrOk(vehicle)) {
+            int actorType = *(int *)((char *)vehicle + kOffVehicleActorType);
+            bool isMain = *(bool *)((char *)vehicle + kOffVehicleIsMainPlayer);
+            // Chấp nhận: RealPlayer (0), ReplayPlayer (3), BeObservePlayer (5), hoặc xe mIsMainPlayer (0xF8)
+            BOOL isTarget = isMain || (actorType == 0) || (actorType == 3) || (actorType == 5);
+            if (isTarget) {
+                gPlayerVehicle = vehicle;
 
-            // Hook vtable slot 33 (GetSteeringValue) trực tiếp trên instance của drivingCtrl
-            if (gPlaying && rtPtrOk(drivingCtrl)) {
-                void *k = *(void **)drivingCtrl;
-                if (rtPtrOk(k)) {
-                    void **vt_slot = (void **)((char *)k + 856);
-                    if (*vt_slot != (void *)hook_GetSteeringValue) {
-                        if (!orig_GetSteeringValue) {
-                            orig_GetSteeringValue = (BOOL (*)(void *, void *, float, float *, float *, const void *))*vt_slot;
+                if (gRecording || gPlaying) {
+                    void *steerData   = *(void **)((char *)self + kOffMotionSteerData);
+                    void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
+                    void *drivingCtrl = *(void **)((char *)self + kOffMotionDriving);
+                    void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
+
+                    // Hook vtable slot 33 (GetSteeringValue) trực tiếp trên instance của drivingCtrl
+                    if (gPlaying && rtPtrOk(drivingCtrl)) {
+                        void *k = *(void **)drivingCtrl;
+                        if (rtPtrOk(k)) {
+                            void **vt_slot = (void **)((char *)k + 856);
+                            if (*vt_slot != (void *)hook_GetSteeringValue) {
+                                if (!orig_GetSteeringValue) {
+                                    orig_GetSteeringValue = (BOOL (*)(void *, void *, float, float *, float *, const void *))*vt_slot;
+                                }
+                                *vt_slot = (void *)hook_GetSteeringValue;
+                            }
                         }
-                        *vt_slot = (void *)hook_GetSteeringValue;
+                    }
+
+                    if (rtPtrOk(steerData) && rtPtrOk(sim)) {
+                        double now = rtNow();
+                        if (gPlaying)        rtPlaybackTick(self, steerData, drivingCtrl, sim, now);
+                        else if (gRecording) rtRecordTick(self, steerData, sim, now);
                     }
                 }
-            }
-
-            if (rtPtrOk(steerData) && rtPtrOk(sim)) {
-                double now = rtNow();
-                if (gPlaying)        rtPlaybackTick(self, steerData, drivingCtrl, sim, now);
-                else if (gRecording) rtRecordTick(self, steerData, sim, now);
             }
         }
     }
@@ -745,12 +779,21 @@ static void rtAlert(NSString *title, NSString *msg) {
         gRecording = NO;
         BOOL ok = rtSaveRecord();
         uint32_t n = gFrameCount;
-        int mid = gMapId;
+        int mid = gMapId > 0 ? gMapId : 1;
         if (ok) rtAlert(@"REC", [NSString stringWithFormat:@"Đã lưu %u frame (map %d)", n, mid]);
         else    rtAlert(@"REC", @"Không có frame nào để lưu");
     } else if (gRecArmed) {
         gAutoArmed = NO;
-        rtLog("REC armed");
+        gPlaying = NO;
+        if (gPlayerVehicle) {
+            gRecording = YES;
+            gGoTime = rtNow();
+            gFrameCount = 0;
+            if (gFrames) { free(gFrames); gFrames = NULL; }
+            rtLog("REC manual start mid-race/replay map=%d", gMapId);
+        } else {
+            rtLog("REC armed");
+        }
     }
     [self refresh];
 }
@@ -778,6 +821,12 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     orig_RaceKingGoImpEnter = (void (*)(void *, const void *))
         rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_RaceKingGoImpEnter);
+    orig_ReplayGoImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "ReplayGameGoState", "ImpEnter", 0, (void *)hook_ReplayGoImpEnter);
+    orig_ReplayActionGoImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "ReplayActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_ReplayActionGoImpEnter);
+    orig_GameFinishImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "GameFinishState", "ImpEnter", 0, (void *)hook_GameFinishImpEnter);
     orig_CheckPointMgr_Init = (void (*)(void *, void *, bool, bool, const void *))
         rtHookMethod("", "CheckPointMgr", "Init", 3, (void *)hook_CheckPointMgr_Init);
 }
