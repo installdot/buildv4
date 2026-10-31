@@ -197,11 +197,13 @@ static uint32_t gFrameCount;
 static int      gMapId;
 static float    gTrackLen;
 static double   gGoTime;
-
 static BOOL gRecArmed, gAutoArmed, gRecording, gPlaying;
 static void *gPlayerVehicle;
 static void *gInputModule;
 static int   gKeyMask;
+static float gCurPlaybackSteer;
+static float gSpawnOffsetX, gSpawnOffsetZ;
+static BOOL  gSpawnOffsetInit;
 
 #pragma mark - Storage
 
@@ -327,7 +329,12 @@ static void rtPlaybackTick(void *steerData, void *drivingCtrl, void *sim, double
 
     float t = (float)(now - gGoTime);
     if (t < 0.f) return;
-    if (t >= gFrames[gFrameCount - 1].t) { rtWriteKeyFlags(0); return; }
+    if (t >= gFrames[gFrameCount - 1].t) {
+        gPlaying = NO;
+        gCurPlaybackSteer = 0.f;
+        rtWriteKeyFlags(0);
+        return;
+    }
 
     uint32_t lo = 0, hi = gFrameCount - 1;
     while (lo + 1 < hi) {
@@ -340,9 +347,26 @@ static void rtPlaybackTick(void *steerData, void *drivingCtrl, void *sim, double
     if (al < 0.f) al = 0.f;
     if (al > 1.f) al = 1.f;
 
-    float steer = a->steer + (b->steer - a->steer) * al;
+    // --- 1. Bù trừ sai lệch vị trí xuất phát (Spawn Offset Compensation) ---
+    float cx = *(float *)((char *)sim + kOffSimChassisPos + 0);
+    float cz = *(float *)((char *)sim + kOffSimChassisPos + 8);
 
-    // Bù sai lệch quỹ đạo: cross(forward, toTarget)
+    if (!gSpawnOffsetInit) {
+        gSpawnOffsetX = cx - gFrames[0].px;
+        gSpawnOffsetZ = cz - gFrames[0].pz;
+        gSpawnOffsetInit = YES;
+        rtLog("OFFSET comp init: dx=%.2f dz=%.2f (spawn pos=%.2f, %.2f | rec=%.2f, %.2f)",
+              gSpawnOffsetX, gSpawnOffsetZ, cx, cz, gFrames[0].px, gFrames[0].pz);
+    }
+
+    // Sai lệch lane ban đầu giảm dần trong 3.5s để xe từ từ nhập làn chính
+    float decay = 1.0f - (t / 3.5f);
+    if (decay < 0.0f) decay = 0.0f;
+
+    float tx = (a->px + (b->px - a->px) * al) + gSpawnOffsetX * decay;
+    float tz = (a->pz + (b->pz - a->pz) * al) + gSpawnOffsetZ * decay;
+
+    // --- 2. Tính góc hướng và độ lệch vuông góc (Cross-track error) ---
     float qx = *(float *)((char *)sim + kOffSimChassisRot + 0);
     float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
     float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
@@ -352,22 +376,20 @@ static void rtPlaybackTick(void *steerData, void *drivingCtrl, void *sim, double
     float fl = sqrtf(fx * fx + fz * fz);
     if (fl > 1e-4f) { fx /= fl; fz /= fl; }
 
-    float cx = *(float *)((char *)sim + kOffSimChassisPos + 0);
-    float cz = *(float *)((char *)sim + kOffSimChassisPos + 8);
-    float tx = a->px + (b->px - a->px) * al;
-    float tz = a->pz + (b->pz - a->pz) * al;
-
     float dx = tx - cx, dz = tz - cz;
-    float dl = sqrtf(dx * dx + dz * dz);
-    if (dl > 1e-3f) { dx /= dl; dz /= dl; }
 
-    float corr = ((dx * fz) - (dz * fx)) * 0.55f;
-    if (corr >  0.40f) corr =  0.40f;
-    if (corr < -0.40f) corr = -0.40f;
+    // Độ lệch ngang theo mét (cross product với vector forward)
+    // Không chuẩn hóa dx, dz để phản hồi tỉ lệ mượt mà, tránh rung lắc cực đại
+    float latDist = (dx * fz) - (dz * fx);
+    float corr = latDist * 0.15f;
+    if (corr >  0.35f) corr =  0.35f;
+    if (corr < -0.35f) corr = -0.35f;
 
-    steer += corr;
-    if (steer >  1.f) steer =  1.f;
-    if (steer < -1.f) steer = -1.f;
+    float steer = a->steer + (b->steer - a->steer) * al + corr;
+    if (steer >  1.0f) steer =  1.0f;
+    if (steer < -1.0f) steer = -1.0f;
+
+    gCurPlaybackSteer = steer;
 
     *(float *)((char *)steerData + kOffSteerLeft) = steer;
     if (rtPtrOk(drivingCtrl)) {
@@ -376,7 +398,14 @@ static void rtPlaybackTick(void *steerData, void *drivingCtrl, void *sim, double
     }
     *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
 
-    rtWriteKeyFlags(a->keys);
+    // --- 3. Start Mini-Boost & Key Replay ---
+    uint32_t keys = a->keys;
+    // Bật phím SmallBoost (bit 5) trong 0.06s - 0.40s đầu để kích hoạt tiểu phóng xuất phát
+    if (t >= 0.06f && t <= 0.40f) {
+        keys |= (1 << 5); // InputKeyType.SmallBoost
+    }
+    gKeyMask = (int)keys;
+    rtWriteKeyFlags((int)keys);
 }
 
 #pragma mark - Hooks
@@ -391,25 +420,27 @@ static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void 
 static void hook_Input_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
     if (orig_Input_Update) orig_Input_Update(self, dt, m);
+    if (gPlaying) {
+        rtWriteKeyFlags(gKeyMask);
+    }
 }
 
 static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
                                   float *steerValue, float *steeringTime, const void *m) {
-    BOOL r = orig_GetSteeringValue ? orig_GetSteeringValue(self, carParams, dt, steerValue, steeringTime, m) : FALSE;
-    if (gPlaying && rtPtrOk(steerValue) && rtPtrOk(self)) {
-        void *dyn = *(void **)((char *)self + 0x10);
-        void *vhc = rtPtrOk(dyn) ? *(void **)((char *)dyn + 0x10) : NULL;
-        if (vhc && vhc == gPlayerVehicle) {
-            *steerValue = *(float *)((char *)self + kOffDrvSteering);
-            r = TRUE;
-        }
+    if (gPlaying && steerValue) {
+        *steerValue = gCurPlaybackSteer;
+        if (steeringTime) *steeringTime = 0.5f;
+        return TRUE;
     }
-    return r;
+    return orig_GetSteeringValue ? orig_GetSteeringValue(self, carParams, dt, steerValue, steeringTime, m) : FALSE;
 }
 
 static void rtBeginRace(void) {
     gGoTime = rtNow();
-
+    gSpawnOffsetX = 0.f;
+    gSpawnOffsetZ = 0.f;
+    gSpawnOffsetInit = NO;
+    gCurPlaybackSteer = 0.f;
     if (gRecArmed) {
         gRecording = YES; gPlaying = NO;
         gFrameCount = 0;
@@ -460,6 +491,20 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
             void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
             void *drivingCtrl = *(void **)((char *)self + kOffMotionDriving);
             void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
+
+            // Hook vtable slot 33 (GetSteeringValue) trực tiếp trên instance của drivingCtrl
+            if (gPlaying && rtPtrOk(drivingCtrl)) {
+                void *k = *(void **)drivingCtrl;
+                if (rtPtrOk(k)) {
+                    void **vt_slot = (void **)((char *)k + 856);
+                    if (*vt_slot != (void *)hook_GetSteeringValue) {
+                        if (!orig_GetSteeringValue) {
+                            orig_GetSteeringValue = (BOOL (*)(void *, void *, float, float *, float *, const void *))*vt_slot;
+                        }
+                        *vt_slot = (void *)hook_GetSteeringValue;
+                    }
+                }
+            }
 
             if (rtPtrOk(steerData) && rtPtrOk(sim)) {
                 double now = rtNow();
