@@ -466,36 +466,32 @@ static BOOL rtLoadRecord(void) {
     gFrameCount = 0;
     if (gFrames) { free(gFrames); gFrames = NULL; }
 
-    // 1. Thử load record .rk đã lưu sẵn
+    // 1. Quét tìm và đưa file .rep vào parser của game
+    rtLog("Searching TempMatchVideos for map %d .rep file...", gMapId);
+    if (rtScanAndLoadRepFiles(gMapId)) {
+        if (gFrameCount > 0) {
+            rtLog("LOADED %u frames from .rep file!", gFrameCount);
+            return YES;
+        }
+    }
+
+    // 2. Fallback nếu có file .rk
     NSString *path = rtPathForTrack();
     if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
         FILE *f = fopen(path.fileSystemRepresentation, "rb");
         if (f) {
             RCHeader h;
-            if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, RC_MAGIC, 4)
-                && h.frameSize == sizeof(RCFrame) && h.count) {
-                if (h.count > RC_MAX_FRAMES) h.count = RC_MAX_FRAMES;
+            if (fread(&h, sizeof h, 1, f) == 1 && h.count > 0 && h.count <= RC_MAX_FRAMES) {
                 gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
                 if (gFrames) {
                     gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
                     fclose(f);
-                    if (gFrameCount) {
-                        rtLog("load: %u frames (%.2fs) map=%d len=%.1f", gFrameCount,
-                              gFrames[gFrameCount - 1].t, h.mapId, h.trackLen);
-                        return YES;
-                    }
+                    if (gFrameCount) return YES;
                 }
             }
             fclose(f);
         }
     }
-
-    // 2. Nếu chưa có .rk, tự động quét TempMatchVideos đọc file .rep!
-    rtLog("No .rk record found, checking TempMatchVideos for .rep...");
-    if (rtScanAndLoadRepFiles(gMapId)) {
-        return (gFrameCount > 0);
-    }
-
     return NO;
 }
 
@@ -719,12 +715,12 @@ static void rtBeginRace(void) {
     } else gRecording = NO;
 
     if (gAutoArmed) {
-        BOOL ok = rtLoadRecord();
+        BOOL ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
         gPlaying = ok;
-        rtLog("AUTO map=%d -> %s", gMapId, ok ? "playing" : "no record");
+        rtLog("AUTO map=%d -> %s (%u frames)", gMapId, ok ? "playing" : "no record", gFrameCount);
         if (!ok) {
             rtAlert(@"Đua lập trình",
-                    [NSString stringWithFormat:@"Chưa có record cho map %d.\nBấm REC rồi chạy 1 vòng để tạo.", gMapId]);
+                    [NSString stringWithFormat:@"Không tìm thấy file .rep cho map %d trong TempMatchVideos", gMapId]);
         }
     } else gPlaying = NO;
 }
@@ -776,9 +772,16 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
     gPlayerVehicle = NULL;
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, crc, reset, m);
     gMapId = rtPtrOk(self) ? *(int *)((char *)self + 0x40) : 0;
+    if (gMapId <= 0 && rtPtrOk(config)) {
+        gMapId = *(int *)((char *)config + kOffCpMapId);
+    }
     gTrackLen = 0.f;
-    rtLog("MAP resolved from CheckPointMgr self=%p config=%p", self, config);
-    rtLog("map init map=%d len=%.2f", gMapId, gTrackLen);
+    rtLog("MAP resolved from CheckPointMgr self=%p config=%p mapId=%d", self, config, gMapId);
+
+    // KHI VÀO MAP: BỎ FILE .REP VÀO PARSER NGAY LẬP TỨC
+    if (gAutoArmed) {
+        rtLoadRecord();
+    }
 }
 
 static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
