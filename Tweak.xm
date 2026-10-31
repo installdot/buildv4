@@ -619,7 +619,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 
     // --- 1. Tọa độ mục tiêu nội suy theo thời gian ---
     float tx = a->px + (b->px - a->px) * al;
-    float ty = a->py + (b->py - a->py) * al;
     float tz = a->pz + (b->pz - a->pz) * al;
 
     // --- 2. Tính góc hướng hiện tại và độ lệch quỹ đạo (Cua chuẩn xác như bản trước) ---
