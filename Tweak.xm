@@ -172,7 +172,8 @@ enum {
     kOffDrvThrottle           = 0x3C,   // NssPhyVehicleDrivingCtrl.mThrottle
     kOffDrvSteering           = 0x40,   // .mSteering
 
-    kOffCpMapId               = 0x14,   // CheckPointConfig.MapId
+    kOffCpMapId               = 0x1C,   // CheckPointConfig.MapId (offset 28)
+    kOffCpMgrMapId            = 0x40,   // CheckPointMgr.mMapId (offset 64)
     kOffCpCurveLength         = 0x2C,   // CheckPointConfig.MainCurveLength
 
     kOffInputKeyData          = 0xA8,   // InputModule.mInputKeyData
@@ -681,7 +682,7 @@ static double rtNow(void) {
 }
 
 static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl, void *sim, double now) {
-    if (!gFrames || !gFrameCount) return;
+    if (!gPlaying || !gFrames || gFrameCount < 2) return;
 
     float t = (float)(now - gGoTime);
     if (t < 0.f) return;
@@ -941,14 +942,17 @@ static void rtBeginRace(void) {
     gCurPlaybackSteer = 0.f;
 
     if (gAutoArmed) {
-        BOOL ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
+        // Luôn nạp đúng file replay cho map hiện tại, không tái sử dụng map cũ
+        BOOL ok = rtLoadRecord();
         gPlaying = ok;
         rtLog("AUTO map=%d -> %s (%u frames)", gMapId, ok ? "playing" : "no record", gFrameCount);
         if (!ok) {
             rtAlert(@"Đua lập trình",
                     [NSString stringWithFormat:@"Không tìm thấy file .rep cho map %d trong TempMatchVideos!\nHãy nhấn nút TẢI .REP trên menu.", gMapId]);
         }
-    } else gPlaying = NO;
+    } else {
+        gPlaying = NO;
+    }
 }
 
 static void hook_GoImpEnter(void *self, const void *m) {
@@ -990,11 +994,36 @@ static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *bytes, c
 
 static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool reset, const void *m) {
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, crc, reset, m);
-    if (config) {
-        gMapId = *(int *)((char *)config + kOffCpMapId);
-        gTrackLen = *(float *)((char *)config + kOffCpCurveLength);
-        rtLog("MAP LOAD: mapId=%d trackLen=%.1fm", gMapId, gTrackLen);
+
+    // Xóa bộ nhớ replay của map trước đó ngay khi vào map mới (chống kẹt Map 1)
+    gPlaying = NO;
+    if (gFrames) {
+        free(gFrames);
+        gFrames = NULL;
+        gFrameCount = 0;
     }
+
+    int detectedMapId = 0;
+    // Cách 1: Đọc trực tiếp từ CheckPointMgr.mMapId (offset 0x40 = 64 bytes) đã được khởi tạo xong
+    if (rtPtrOk(self)) {
+        detectedMapId = *(int *)((char *)self + kOffCpMgrMapId);
+    }
+    // Cách 2: Đọc từ CheckPointConfig.MapId (offset 0x1C = 28 bytes)
+    if (detectedMapId <= 0 && rtPtrOk(config)) {
+        detectedMapId = *(int *)((char *)config + kOffCpMapId);
+    }
+
+    if (detectedMapId > 0) {
+        gMapId = detectedMapId;
+    }
+    if (rtPtrOk(config)) {
+        gTrackLen = *(float *)((char *)config + kOffCpCurveLength);
+    }
+    rtLog("MAP LOAD: Detected MapId=%d (Mgr_0x40=%d, Cfg_0x1C=%d), trackLen=%.1fm",
+          gMapId,
+          rtPtrOk(self) ? *(int *)((char *)self + kOffCpMgrMapId) : 0,
+          rtPtrOk(config) ? *(int *)((char *)config + kOffCpMapId) : 0,
+          gTrackLen);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gAutoArmed) {
@@ -1108,28 +1137,14 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
                 gPlayerVehicle = vehicle;
 
                 if (gPlaying) {
-                void *steerData   = *(void **)((char *)self + kOffMotionSteerData);
-                void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
-                void *drivingCtrl = *(void **)((char *)self + kOffMotionDriving);
-                void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
+                    void *steerData   = *(void **)((char *)self + kOffMotionSteerData);
+                    void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
+                    void *drivingCtrl = *(void **)((char *)self + kOffMotionDriving);
+                    void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
 
-                // Hook vtable slot 33 (GetSteeringValue) trực tiếp trên instance của drivingCtrl
-                if (rtPtrOk(drivingCtrl)) {
-                    void *k = *(void **)drivingCtrl;
-                    if (rtPtrOk(k)) {
-                        void **vt_slot = (void **)((char *)k + 856);
-                        if (*vt_slot != (void *)hook_GetSteeringValue) {
-                            if (!orig_GetSteeringValue) {
-                                orig_GetSteeringValue = (BOOL (*)(void *, void *, float, float *, float *, const void *))*vt_slot;
-                            }
-                            *vt_slot = (void *)hook_GetSteeringValue;
-                        }
-                    }
+                    // Thực hiện nội suy và khóa quỹ đạo chính xác cho xe người chơi (GetSteeringValue đã được hook toàn cục an toàn)
+                    rtPlaybackTick(self, steerData, drivingCtrl, sim, rtNow());
                 }
-
-                // Thực hiện nội suy và khóa quỹ đạo chính xác cho xe người chơi
-                rtPlaybackTick(self, steerData, drivingCtrl, sim, rtNow());
-            }
         }
     }
 }
