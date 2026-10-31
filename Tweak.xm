@@ -179,6 +179,9 @@ enum {
     kOffDrvThrottle           = 0x3C,   // NssPhyVehicleDrivingCtrl.mThrottle
     kOffDrvSteering           = 0x40,   // .mSteering
 
+    kOffCpMapId               = 0x14,   // CheckPointConfig.MapId
+    kOffCpCurveLength         = 0x2C,   // CheckPointConfig.MainCurveLength
+
     kOffInputKeyData          = 0xA8,   // InputModule.mInputKeyData
     kOffKeyDataFlags          = 0x10,   // InputKeyData.KeyFlags
 };
