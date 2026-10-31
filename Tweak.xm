@@ -141,7 +141,7 @@ static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int 
     BOOL vt = NO;
     if (slot < 512) {
         VirtualInvokeData *e = (VirtualInvokeData *)((char *)k + 328) + slot;
-        if (e->methodPtr == orig) { e->methodPtr = rep; vt = YES; }
+        e->methodPtr = rep; vt = YES;
     }
     rtLog("il2cpp: HOOK %s::%s slot=%u vtable=%s", cls, mth, (unsigned)slot, vt ? "OK" : "none");
     return orig;
@@ -205,6 +205,16 @@ typedef struct {
     uint8_t  flags;           // b0: phanh, b1: phanh tay, b2: drift, b3: nitro, b4: miniboost
     uint8_t  pad[3];          // Đệm căn byte
 } RCFrame;                    // 60 byte
+
+typedef struct {
+    float    t;
+    float    px, py, pz;
+    float    qx, qy, qz, qw;
+    float    steer;
+    uint32_t keys;
+    uint8_t  flags;
+    uint8_t  pad[3];
+} RCFrameV2;                   // 44 byte (tương thích các file tự record trước đó)
 
 typedef struct {
     char     magic[4];        // "RKR3"
@@ -310,7 +320,17 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         RCFrame fr;
         memset(&fr, 0, sizeof fr);
         fr.t    = *(float *)((char *)m + 0x18); // mClientTime
-        fr.keys = *(uint32_t *)((char *)m + 0x20); // mKeyFlag
+        uint32_t repKeys = *(uint32_t *)((char *)m + 0x20); // mKeyFlag (MatchInputKeyType)
+        uint32_t inputKeys = 0;
+        // Chuyển đổi mã phím Replay sang InputKeyType chuẩn:
+        if (repKeys & ((1 << 1) | (1 << 13))) inputKeys |= (1 << 1); // Left (1)
+        if (repKeys & ((1 << 2) | (1 << 14))) inputKeys |= (1 << 2); // Right (2)
+        if (repKeys & ((1 << 3) | (1 << 4)))  inputKeys |= (1 << 3); // Nitro (3)
+        if (repKeys & ((1 << 7) | (1 << 8)))  inputKeys |= (1 << 5); // MiniBoost (5)
+        if (repKeys & ((1 << 9) | (1 << 10))) inputKeys |= (1 << 6); // Brake (6)
+        if (repKeys & ((1 << 13) | (1 << 14))) inputKeys |= (1 << 8); // Drift (8)
+
+        fr.keys = inputKeys;
         fr.px   = *(float *)((char *)m + 0x24); // mPos.x
         fr.py   = *(float *)((char *)m + 0x28); // mPos.y
         fr.pz   = *(float *)((char *)m + 0x2C); // mPos.z
@@ -322,13 +342,16 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         fr.vy   = *(float *)((char *)m + 0x44); // mLinVel.y
         fr.vz   = *(float *)((char *)m + 0x48); // mLinVel.z
         fr.kmph = *(float *)((char *)m + 0x5C); // mKMPH
-        fr.steer = 0.f;
+
+        if (inputKeys & (1 << 1)) fr.steer = -0.85f;
+        else if (inputKeys & (1 << 2)) fr.steer = 0.85f;
+        else fr.steer = 0.f;
 
         uint8_t flags = 0;
-        if (fr.keys & (1 << 6)) flags |= 0x01; // Brake
-        if (fr.keys & ((1 << 8) | (1 << 9))) flags |= 0x04; // Drift
-        if (fr.keys & (1 << 3)) flags |= 0x08; // Nitro
-        if (fr.keys & (1 << 5)) flags |= 0x10; // Boost
+        if (inputKeys & (1 << 6)) flags |= 0x01; // Brake
+        if (inputKeys & (1 << 8)) flags |= 0x04; // Drift
+        if (inputKeys & (1 << 3)) flags |= 0x08; // Nitro
+        if (inputKeys & (1 << 5)) flags |= 0x10; // MiniBoost
         fr.flags = flags;
 
         gFrames[i] = fr;
@@ -443,21 +466,44 @@ static BOOL rtLoadRecord(void) {
         FILE *f = fopen(path.fileSystemRepresentation, "rb");
         if (f) {
             RCHeader h;
-            if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, RC_MAGIC, 4)
-                && h.frameSize == sizeof(RCFrame) && h.count) {
-                if (h.count > RC_MAX_FRAMES) h.count = RC_MAX_FRAMES;
-                gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
-                if (gFrames) {
-                    gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
-                    fclose(f);
-                    if (gFrameCount) {
-                        rtLog("load: %u frames (%.2fs) map=%d len=%.1f", gFrameCount,
-                              gFrames[gFrameCount - 1].t, h.mapId, h.trackLen);
-                        return YES;
+            if (fread(&h, sizeof h, 1, f) == 1 && h.count > 0 && h.count <= RC_MAX_FRAMES) {
+                if (!memcmp(h.magic, "RKR3", 4) && h.frameSize == sizeof(RCFrame)) {
+                    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
+                    if (gFrames) {
+                        gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
                     }
+                } else if (!memcmp(h.magic, "RKR2", 4) && h.frameSize == sizeof(RCFrameV2)) {
+                    RCFrameV2 *v2 = (RCFrameV2 *)malloc(sizeof(RCFrameV2) * h.count);
+                    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
+                    if (v2 && gFrames) {
+                        uint32_t n = (uint32_t)fread(v2, sizeof(RCFrameV2), h.count, f);
+                        for (uint32_t i = 0; i < n; i++) {
+                            memset(&gFrames[i], 0, sizeof(RCFrame));
+                            gFrames[i].t      = v2[i].t;
+                            gFrames[i].px     = v2[i].px;
+                            gFrames[i].py     = v2[i].py;
+                            gFrames[i].pz     = v2[i].pz;
+                            gFrames[i].qx     = v2[i].qx;
+                            gFrames[i].qy     = v2[i].qy;
+                            gFrames[i].qz     = v2[i].qz;
+                            gFrames[i].qw     = v2[i].qw;
+                            gFrames[i].steer  = v2[i].steer;
+                            gFrames[i].keys   = v2[i].keys;
+                            gFrames[i].flags  = v2[i].flags;
+                        }
+                        gFrameCount = n;
+                    }
+                    if (v2) free(v2);
                 }
+                fclose(f);
+                if (gFrameCount) {
+                    rtLog("load: %u frames (%.2fs) map=%d len=%.1f", gFrameCount,
+                          gFrames[gFrameCount - 1].t, h.mapId, h.trackLen);
+                    return YES;
+                }
+            } else {
+                fclose(f);
             }
-            fclose(f);
         }
     }
 
@@ -571,109 +617,87 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     if (al < 0.f) al = 0.f;
     if (al > 1.f) al = 1.f;
 
-    // --- 1. TELEPORT TRỰC TIẾP TỚI TỌA ĐỘ FRAME (Frame-by-Frame TAS) ---
-    // Khi bắt đầu (t=0), teleport thẳng tới tọa độ frame 0, hoàn toàn bám 1:1 theo frame đã lưu
+    // --- 1. Tọa độ mục tiêu nội suy theo thời gian ---
     float tx = a->px + (b->px - a->px) * al;
     float ty = a->py + (b->py - a->py) * al;
     float tz = a->pz + (b->pz - a->pz) * al;
-    // Nội suy Quaternion góc quay
-    float qx = a->qx + (b->qx - a->qx) * al;
-    float qy = a->qy + (b->qy - a->qy) * al;
-    float qz = a->qz + (b->qz - a->qz) * al;
-    float qw = a->qw + (b->qw - a->qw) * al;
-    float ql = sqrtf(qx*qx + qy*qy + qz*qz + qw*qw);
-    if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
 
-    // Nội suy vận tốc & tốc độ hiển thị
-    float vx = a->vx + (b->vx - a->vx) * al;
-    float vy = a->vy + (b->vy - a->vy) * al;
-    float vz = a->vz + (b->vz - a->vz) * al;
-    float kmph = a->kmph + (b->kmph - a->kmph) * al;
+    // --- 2. Tính góc hướng hiện tại và độ lệch quỹ đạo (Cua chuẩn xác như bản trước) ---
+    float qx = *(float *)((char *)sim + kOffSimChassisRot + 0);
+    float qy = *(float *)((char *)sim + kOffSimChassisRot + 4);
+    float qz = *(float *)((char *)sim + kOffSimChassisRot + 8);
+    float qw = *(float *)((char *)sim + kOffSimChassisRot + 12);
+    float fx = 2.0f * (qx * qz + qw * qy);
+    float fz = 1.0f - 2.0f * (qx * qx + qy * qy);
+    float fl = sqrtf(fx * fx + fz * fz);
+    if (fl > 1e-4f) { fx /= fl; fz /= fl; }
 
-    // --- 2. TELEPORT TRỰC TIẾP THỰC THỂ VẬT LÝ PHYSX (mPhyHandle) ---
-    // Đây là mấu chốt để xe thực sự dịch chuyển tức thời (TP) từng frame thay vì tự lái
-    void *phyCtrl = rtPtrOk(motionCtrl) ? *(void **)((char *)motionCtrl + kOffMotionPhyCtrl) : NULL;
-    if (rtPtrOk(phyCtrl)) {
-        void *ent = *(void **)((char *)phyCtrl + 0x18); // mPhyHandle
-        if (rtPtrOk(ent)) {
-            float pos[3]  = { tx, ty, tz };
-            float quat[4] = { qx, qy, qz, qw };
-            float vel[3]  = { vx, vy, vz };
+    float cx = *(float *)((char *)sim + kOffSimChassisPos + 0);
+    float cz = *(float *)((char *)sim + kOffSimChassisPos + 8);
 
-            typedef void (*fn_SetTrans_t)(void *, float *, float *);
-            typedef void (*fn_SetLinVel_t)(void *, float *);
-            uintptr_t base = rtGetUnityBase();
-            if (base) {
-                fn_SetTrans_t fn_SetTrans = (fn_SetTrans_t)(base + 0xF718248);
-                fn_SetLinVel_t fn_SetLinVel = (fn_SetLinVel_t)(base + 0xF7181F4);
-                fn_SetTrans(ent, pos, quat);
-                fn_SetLinVel(ent, vel);
-            } else {
-                fn_SetTrans_t set_transform = (fn_SetTrans_t)*(void **)(*(char **)ent + 112);
-                fn_SetLinVel_t set_vel = (fn_SetLinVel_t)*(void **)(*(char **)ent + 136);
-                if (set_transform) set_transform(ent, pos, quat);
-                if (set_vel) set_vel(ent, vel);
-            }
-        }
-    }
+    float dx = tx - cx;
+    float dz = tz - cz;
 
-    // --- 3. CƯỠNG BỨC SET STATE TỌA ĐỘ & VẬN TỐC (State-Locking TAS) ---
-    // Dù người chơi không có nitro/miniboost, xe vẫn được khóa chặt theo frame:
-    if (rtPtrOk(motionCtrl)) {
-        *(float *)((char *)motionCtrl + kOffMotionForcePos + 0) = tx;
-        *(float *)((char *)motionCtrl + kOffMotionForcePos + 4) = ty;
-        *(float *)((char *)motionCtrl + kOffMotionForcePos + 8) = tz;
+    // Sai lệch ngang (mét): khoảng cách vuông góc từ xe tới đường đua mục tiêu
+    float latDist = (dx * fz) - (dz * fx);
+    float corr = latDist * 0.22f;
+    if (corr >  0.45f) corr =  0.45f;
+    if (corr < -0.45f) corr = -0.45f;
 
-        *(float *)((char *)motionCtrl + kOffMotionForceRot + 0) = qx;
-        *(float *)((char *)motionCtrl + kOffMotionForceRot + 4) = qy;
-        *(float *)((char *)motionCtrl + kOffMotionForceRot + 8) = qz;
-        *(float *)((char *)motionCtrl + kOffMotionForceRot + 12) = qw;
-
-        *(bool *)((char *)motionCtrl + kOffMotionIsSetTransform) = true;
-    }
-
-    if (rtPtrOk(sim)) {
-        *(float *)((char *)sim + kOffSimChassisPos + 0) = tx;
-        *(float *)((char *)sim + kOffSimChassisPos + 4) = ty;
-        *(float *)((char *)sim + kOffSimChassisPos + 8) = tz;
-
-        *(float *)((char *)sim + kOffSimChassisRot + 0) = qx;
-        *(float *)((char *)sim + kOffSimChassisRot + 4) = qy;
-        *(float *)((char *)sim + kOffSimChassisRot + 8) = qz;
-        *(float *)((char *)sim + kOffSimChassisRot + 12) = qw;
-
-        *(float *)((char *)sim + kOffSimLinearVel + 0) = vx;
-        *(float *)((char *)sim + kOffSimLinearVel + 4) = vy;
-        *(float *)((char *)sim + kOffSimLinearVel + 8) = vz;
-        *(float *)((char *)sim + kOffSimKmph) = kmph;
-    }
-
-    // --- 3. ĐÁNH LÁI & ĐIỀU KHIỂN ---
-    float steer = a->steer + (b->steer - a->steer) * al;
+    // Góc đánh lái tổng hợp: góc ghi + góc sửa sai lệch quỹ đạo
+    float steer = a->steer + (b->steer - a->steer) * al + corr;
     if (steer >  1.0f) steer =  1.0f;
     if (steer < -1.0f) steer = -1.0f;
     gCurPlaybackSteer = steer;
 
+    // Gán góc lái xuống PhysX DrivingCtrl và SteeringData
     *(float *)((char *)steerData + kOffSteerLeft) = steer;
     if (rtPtrOk(drivingCtrl)) {
-        *(float *)((char *)drivingCtrl + kOffDrvSteering) = steer;
-        *(float *)((char *)drivingCtrl + kOffDrvThrottle) = 1.0f;
+        *(float *)((char *)drivingCtrl + 0x40) = steer; // mSteering
+        *(float *)((char *)drivingCtrl + 0x68) = steer; // mInputXPosition
+        *(float *)((char *)drivingCtrl + 0x34) = steer; // mVehicleCtrlParams.steering
+        *(float *)((char *)drivingCtrl + 0x3C) = 1.0f;  // mThrottle
+        *(float *)((char *)drivingCtrl + 0x38) = 1.0f;  // mVehicleCtrlParams.throttle
     }
     *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
 
-    // --- 4. BƠM PHÍM BẤM (Keys, Nitro, MiniBoost, Drift) ---
+    // --- 3. PHÍM BẤM: MINIBOOST, NITRO, DRIFT & TRÁI/PHẢI ---
     uint32_t keys = a->keys;
-    if (t >= 0.06f && t <= 0.40f) {
-        keys |= (1 << 5); // Start MiniBoost
+    if (a->flags & 0x04) keys |= (1 << 8); // Cờ Drift
+    if (a->flags & 0x08) keys |= (1 << 3); // Cờ Nitro
+    if (a->flags & 0x10) keys |= (1 << 5); // Cờ MiniBoost
+
+    // Kích hoạt tiểu phóng xuất phát (Start MiniBoost)
+    if (t >= 0.06f && t <= 0.42f) {
+        keys |= (1 << 5);
     }
+
+    // Bơm phím rẽ Trái/Phải theo góc lái thực tế để hiển thị animation quay vô-lăng và bẻ bánh
+    if (steer < -0.10f) {
+        keys |= (1 << 1);  // Phím Left
+        keys &= ~(1 << 2); // Thả Right
+    } else if (steer > 0.10f) {
+        keys |= (1 << 2);  // Phím Right
+        keys &= ~(1 << 1); // Thả Left
+    }
+
     gKeyMask = (int)keys;
     rtWriteKeyFlags((int)keys);
+
+    // --- 4. GIỮ TỐC ĐỘ XE & CHỐNG LỆCH MAP (Soft-sync, không đóng băng vật lý) ---
+    float distSq = dx * dx + dz * dz;
+    if (distSq > 16.0f) {
+        // Chỉ kéo nhẹ vị trí nếu bị chệch quá 4 mét do va chạm mạng
+        *(float *)((char *)sim + kOffSimChassisPos + 0) = tx;
+        *(float *)((char *)sim + kOffSimChassisPos + 8) = tz;
+    }
 }
 
 #pragma mark - Hooks
 
 static void   (*orig_MotionCtrl_Update)(void *, float, const void *);
 static void   (*orig_Input_Update)(void *, float, const void *);
+static BOOL   (*orig_Input_GetKey)(void *, int, const void *);
 static BOOL   (*orig_GetSteeringValue)(void *, void *, float, float *, float *, const void *);
 static void   (*orig_GoImpEnter)(void *, const void *);
 static void   (*orig_RaceKingGoImpEnter)(void *, const void *);
@@ -688,6 +712,14 @@ static void hook_Input_Update(void *self, float dt, const void *m) {
     if (gPlaying) {
         rtWriteKeyFlags(gKeyMask);
     }
+}
+
+static BOOL hook_Input_GetKey(void *self, int keyType, const void *m) {
+    if (rtPtrOk(self)) gInputModule = self;
+    if (gPlaying && keyType > 0 && keyType < 18) {
+        if ((gKeyMask >> keyType) & 1) return TRUE;
+    }
+    return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, m) : FALSE;
 }
 
 static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
@@ -1013,8 +1045,11 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrl_Update);
     orig_Input_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "InputModule", "Update", 1, (void *)hook_Input_Update);
+    orig_Input_GetKey = (BOOL (*)(void *, int, const void *))
+        rtHookMethod("", "InputModule", "GetKey", 1, (void *)hook_Input_GetKey);
     orig_GetSteeringValue = (BOOL (*)(void *, void *, float, float *, float *, const void *))
         rtHookMethod("", "NssPlayerVehicleDrivingCtrl", "GetSteeringValue", 4, (void *)hook_GetSteeringValue);
+    rtHookMethod("", "NssPhyVehicleDrivingCtrl", "GetSteeringValue", 4, (void *)hook_GetSteeringValue);
     orig_GoImpEnter = (void (*)(void *, const void *))
         rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     orig_RaceKingGoImpEnter = (void (*)(void *, const void *))
