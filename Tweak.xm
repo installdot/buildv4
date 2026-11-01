@@ -1126,6 +1126,11 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
 
+    // 0. QUAN TRỌNG: Nếu đang có Alert Popup (Lỗi Map / Thông báo), cho phép nhận 100% tương tác
+    if (self.rootViewController && self.rootViewController.presentedViewController) {
+        return [super hitTest:point withEvent:event];
+    }
+
     // 1. Chạm vào bong bóng nổi
     if (self.bubble && !self.bubble.hidden && self.bubble.userInteractionEnabled) {
         CGPoint p = [self convertPoint:point toView:self.bubble];
@@ -1179,10 +1184,18 @@ static void rtAlert(NSString *title, NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = rtTopVC();
         if (!vc) return;
+        if (gPanel && gPanel.win) [gPanel.win makeKeyAndVisible];
         UIAlertController *a = [UIAlertController alertControllerWithTitle:title
                                                                   message:msg
                                                            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                    if ([w isKindOfClass:[RCPassWindow class]]) continue;
+                    if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
+                }
+            });
+        }]];
         [vc presentViewController:a animated:YES completion:nil];
     });
 }
@@ -1958,6 +1971,7 @@ static BOOL sBubbleDragged = NO;
 }
 
 - (void)tapFixMap {
+    if (self.win) [self.win makeKeyAndVisible];
     if (gMapId <= 0) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sửa Lỗi Map"
                                                                        message:@"Chưa vào trận! Vui lòng nhập Map ID cần xóa và tải lại (ví dụ: 46, 105):"
@@ -1966,8 +1980,21 @@ static BOOL sBubbleDragged = NO;
             textField.placeholder = @"Map ID (số)";
             textField.keyboardType = UIKeyboardTypeNumberPad;
         }];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                    if ([w isKindOfClass:[RCPassWindow class]]) continue;
+                    if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
+                }
+            });
+        }]];
         [alert addAction:[UIAlertAction actionWithTitle:@"Tải lại (Yes)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                    if ([w isKindOfClass:[RCPassWindow class]]) continue;
+                    if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
+                }
+            });
             UITextField *tf = alert.textFields.firstObject;
             int mid = tf.text.intValue;
             if (mid > 0) {
@@ -1984,8 +2011,21 @@ static BOOL sBubbleDragged = NO;
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sửa Lỗi Map"
                                                                    message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                if ([w isKindOfClass:[RCPassWindow class]]) continue;
+                if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
+            }
+        });
+    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Đồng ý (Yes)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (UIWindow *w in UIApplication.sharedApplication.windows) {
+                if ([w isKindOfClass:[RCPassWindow class]]) continue;
+                if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
+            }
+        });
         [self doFixMap:curMap];
     }]];
 
