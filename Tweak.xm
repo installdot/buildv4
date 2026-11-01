@@ -1,6 +1,5 @@
 // RaceRec — Ghi / Phát lại đường đua (record & playback)
 // Hỗ trợ tải replay Top 3 tất cả map trong Đỉnh Cực Tốc, menu di chuyển được, auto update UI khi đổi map.
-
 #import <UIKit/UIKit.h>
 #import <math.h>
 #import <string.h>
@@ -12,18 +11,14 @@
 #import <unistd.h>
 #import <fcntl.h>
 #import <mach-o/dyld.h>
-
 #pragma mark - Log
-
 static int gLogFd = -1;
-
 static void rtLogOpen(void) {
     if (gLogFd >= 0) return;
     NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *path = [(p.firstObject ?: NSTemporaryDirectory()) stringByAppendingPathComponent:@"racekit_rp.log"];
     gLogFd = open(path.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
 }
-
 static void rtLog(const char *fmt, ...) {
     if (gLogFd < 0) rtLogOpen();
     if (gLogFd < 0) return;
@@ -39,7 +34,6 @@ static void rtLog(const char *fmt, ...) {
     buf[total++] = '\n';
     ssize_t w = write(gLogFd, buf, total); (void)w;
 }
-
 static uintptr_t gUnityBase = 0;
 static uintptr_t rtGetUnityBase(void) {
     if (gUnityBase) return gUnityBase;
@@ -54,17 +48,13 @@ static uintptr_t rtGetUnityBase(void) {
     }
     return gUnityBase;
 }
-
 #pragma mark - IL2CPP
-
 typedef struct Il2CppClass Il2CppClass;
 typedef struct MethodInfo MethodInfo;
 typedef struct Il2CppImage Il2CppImage;
 typedef struct Il2CppAssembly Il2CppAssembly;
 typedef struct Il2CppDomain Il2CppDomain;
-
 typedef struct VirtualInvokeData { void *methodPtr; const MethodInfo *method; } VirtualInvokeData;
-
 static Il2CppDomain *(*il2cpp_domain_get)(void);
 static const Il2CppAssembly **(*il2cpp_domain_get_assemblies)(const Il2CppDomain *, size_t *);
 static Il2CppImage *(*il2cpp_assembly_get_image)(const Il2CppAssembly *);
@@ -72,7 +62,6 @@ static Il2CppClass *(*il2cpp_class_from_name)(const Il2CppImage *, const char *,
 static const MethodInfo *(*il2cpp_class_get_method_from_name)(Il2CppClass *, const char *, int);
 static void *(*il2cpp_array_new)(void *elemClass, size_t length);
 static void *(*il2cpp_object_new)(void *klass);
-
 static BOOL rtInitIl2Cpp(void) {
     if (il2cpp_domain_get) return YES;
     void *h = dlopen("Frameworks/UnityFramework.framework/UnityFramework", RTLD_NOW);
@@ -89,7 +78,6 @@ static BOOL rtInitIl2Cpp(void) {
     rtLog("il2cpp api: %s (arrNew=%p objNew=%p)", ok ? "OK" : "MISSING", il2cpp_array_new, il2cpp_object_new);
     return ok;
 }
-
 static Il2CppClass *rtFindClass(const char *ns, const char *name) {
     if (!rtInitIl2Cpp()) return NULL;
     size_t n = 0;
@@ -103,9 +91,7 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
     }
     return NULL;
 }
-
 static BOOL rtPtrOk(const void *p) { return p && (uintptr_t)p > 0x1000 && (uintptr_t)p < 0x00007fffffffffffULL; }
-
 static NSString *rtIl2CppString(void *il2cppStr) {
     if (!rtPtrOk(il2cppStr)) return nil;
     int32_t len = *(int32_t *)((char *)il2cppStr + 0x10);
@@ -113,21 +99,16 @@ static NSString *rtIl2CppString(void *il2cppStr) {
     const unichar *chars = (const unichar *)((char *)il2cppStr + 0x14);
     return [NSString stringWithCharacters:chars length:len];
 }
-
 static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int argc, void *rep) {
     Il2CppClass *k = rtFindClass(ns, cls);
     if (!k) { rtLog("il2cpp: %s::%s class NOT FOUND", cls, mth); return NULL; }
-
     const MethodInfo *m = il2cpp_class_get_method_from_name(k, mth, argc);
     if (!m) { rtLog("il2cpp: %s::%s(%d) NOT FOUND", cls, mth, argc); return NULL; }
-
     void *orig = *(void **)((char *)m + 0);
     if (!orig) { rtLog("il2cpp: %s::%s null", cls, mth); return NULL; }
     if (orig == rep) return NULL;
-
     const uint16_t slot = *(const uint16_t *)((const char *)m + 0x58);
     *(void **)((char *)m + 0) = rep;
-
     BOOL vt = NO;
     if (slot < 512) {
         VirtualInvokeData *e = (VirtualInvokeData *)((char *)k + 328) + slot;
@@ -136,14 +117,11 @@ static void *rtHookMethod(const char *ns, const char *cls, const char *mth, int 
     rtLog("il2cpp: HOOK %s::%s slot=%u vtable=%s", cls, mth, (unsigned)slot, vt ? "OK" : "none");
     return orig;
 }
-
 #pragma mark - Offsets (đã kiểm chứng)
-
 enum {
     kOffVehicleActorType      = 0x14,   // NssVehicle.mActorType
     kOffVehicleDyn            = 0x20,   // NssVehicle.mDynamicVehicle
     kOffVehicleIsMainPlayer   = 0xF8,   // NssVehicle.mIsMainPlayer (bool)
-
     kOffMotionSteerData       = 0x10,   // NssPhyVehicleMotionCtrlHelper.mSteeringData
     kOffMotionVehicle         = 0x18,   // .mVehicle
     kOffMotionPhyCtrl         = 0x20,   // .mVehiclePhyCtrl
@@ -153,36 +131,27 @@ enum {
     kOffMotionForceRot        = 0x4C,   // .mForceSetRot (Quaternion)
     kOffMotionDrift           = 0x60,   // .mDriftCtrl (IVehicleDriftCtrl)
     kOffMotionIsSetTransform  = 0x70,   // .mIsSetTransform (bool)
-
     kOffPhySimOutput          = 0x28,   // NssPhyVehicleCtrl.mSimulateOutput
-
     kOffSimKmph               = 0x10,   // NssVehicleSimOutput.mKmph
     kOffSimMps                = 0x14,   // .mMps
     kOffSimLinearVel          = 0x38,   // .mLinearVelocity (Vector3)
     kOffSimChassisPos         = 0x64,   // .mChassisPosition (Vector3)
     kOffSimChassisRot         = 0x70,   // .mChassisRotation (Quaternion)
-
     kOffSteerForward          = 0x10,   // NssSteeringData.mForward
     kOffSteerBraking          = 0x14,   // .mBrakingState
     kOffSteerHandbrake        = 0x18,   // .mIsHandbrake
     kOffSteerLeft             = 0x1C,   // .mSteeringLeft
-
     kOffDrvThrottle           = 0x3C,   // NssPhyVehicleDrivingCtrl.mThrottle
     kOffDrvSteering           = 0x40,   // .mSteering
-
     kOffCpMapId               = 0x1C,   // CheckPointConfig.MapId (offset 28)
     kOffCpCurveLength         = 0x2C,   // CheckPointConfig.MainCurveLength
-
     kOffInputKeyData          = 0xA8,   // InputModule.mInputKeyData
     kOffKeyDataFlags          = 0x10,   // InputKeyData.KeyFlags
 };
-
 #pragma mark - Frame format
-
 #define RC_MAGIC "RKR3"
 #define RC_MAX_FRAMES 21600
 #define RC_SAMPLE_DT  0.008f
-
 typedef struct {
     float    t;               // Thời gian tương đối (s)
     float    px, py, pz;      // Vị trí 3D
@@ -194,7 +163,6 @@ typedef struct {
     uint8_t  flags;           // b0: phanh, b1: phanh tay, b2: drift, b3: nitro, b4: miniboost
     uint8_t  pad[3];
 } RCFrame;
-
 typedef struct {
     float    t;
     float    px, py, pz;
@@ -204,7 +172,6 @@ typedef struct {
     uint8_t  flags;
     uint8_t  pad[3];
 } RCFrameV2;
-
 typedef struct {
     char     magic[4];        // "RKR3"
     uint32_t ver;
@@ -213,7 +180,6 @@ typedef struct {
     int32_t  mapId;
     uint32_t frameSize;
 } RCHeader;
-
 static RCFrame *gFrames;
 static uint32_t gFrameCount;
 static int      gMapId;
@@ -226,20 +192,17 @@ static BOOL gAutoArmed, gPlaying;
 static BOOL gNoReplay = YES;
 static BOOL gRaceModeGuide = NO; // NO = Đua Rec (.rep), YES = Đua Guide Line (299 km/h)
 static BOOL gRecordSelf = NO; // Tự động ghi lại hành trình người chơi lái
-
 // Cấu trúc và bộ đệm ghi hành trình tự làm (Custom Record)
 #define RC_MAX_RECORD_FRAMES 15000 // ~4 phút ở 60fps
 static RCFrame *gRecordBuffer = NULL;
 static uint32_t gRecordCount = 0;
 static BOOL     gIsRecordingActive = NO;
 static double   gRecordStartTime = 0.0;
-
 // Đồng bộ nút bấm UI Game lúc Auto Play
 static void *gOperatingModeHelper = NULL;
 typedef void (*fn_SetKeyState_InputKey_t)(void *self, int keyType, BOOL isPress);
 static fn_SetKeyState_InputKey_t fnSetKeyState = NULL;
 static int sLastSyncedKeys = 0;
-
 static void rtSyncUIKeys(int newKeys) {
     if (!gOperatingModeHelper || !fnSetKeyState) return;
     int diff = newKeys ^ sLastSyncedKeys;
@@ -252,12 +215,39 @@ static void rtSyncUIKeys(int newKeys) {
     }
     sLastSyncedKeys = newKeys;
 }
+static BOOL   gEnableOffsetFix = YES;
+static BOOL   gOffsetApplied = NO;
+static float  gOffsetDelta[3] = {0.f, 0.f, 0.f};
+static float  gOffsetAngleDeg = 0.f;
+static float  gRepOriginPos[3] = {0.f, 0.f, 0.f};
+static float  gRepOriginRot[4] = {0.f, 0.f, 0.f, 1.f};
+static float  gMapActualPos[3] = {0.f, 0.f, 0.f};
+static int    gRepStartSlot = 0;
+static int    gMapStartSlot = 0;
+static void *gPlayerVehicle;
+static void *gInputModule;
+static int   gKeyMask;
+static float gCurPlaybackSteer;
+static void *gMapDataComponent = NULL;
+static void *gCheckPointMgr = NULL;
+static void *gCheckPointConfig = NULL;
+static BOOL gDownloading = NO;
+#pragma mark - Storage & Parser .rep
+static NSString *rtDir(void) {
+    NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *d = [(p.firstObject ?: NSTemporaryDirectory()) stringByAppendingPathComponent:@"RaceKit"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:NULL];
+    return d;
+}
+static NSString *rtPathForTrack(void) {
+    int mid = gMapId > 0 ? gMapId : 1;
+    return [rtDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"rec_map%d.rk", mid]];
+}
 
 // Lưu & Đọc Cấu Hình (Settings Persistence)
 static NSString *rtSettingsPath(void) {
     return [rtDir() stringByAppendingPathComponent:@"settings.plist"];
 }
-
 static void rtLoadSettings(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:rtSettingsPath()];
     if (d) {
@@ -269,7 +259,6 @@ static void rtLoadSettings(void) {
         if (d[@"enableOffsetFix"]) gEnableOffsetFix = [d[@"enableOffsetFix"] boolValue];
     }
 }
-
 static void rtSaveSettings(void) {
     NSDictionary *d = @{
         @"autoArmed": @(gAutoArmed),
@@ -281,7 +270,6 @@ static void rtSaveSettings(void) {
     };
     [d writeToFile:rtSettingsPath() atomically:YES];
 }
-
 static void rtStopAndSaveCustomRecord(void) {
     if (!gIsRecordingActive) return;
     gIsRecordingActive = NO;
@@ -307,40 +295,7 @@ static void rtStopAndSaveCustomRecord(void) {
     }
     gRecordCount = 0;
 }
-
 // Tính toán độ lệch vị trí
-static BOOL   gEnableOffsetFix = YES;
-static BOOL   gOffsetApplied = NO;
-static float  gOffsetDelta[3] = {0.f, 0.f, 0.f};
-static float  gOffsetAngleDeg = 0.f;
-static float  gRepOriginPos[3] = {0.f, 0.f, 0.f};
-static float  gRepOriginRot[4] = {0.f, 0.f, 0.f, 1.f};
-static float  gMapActualPos[3] = {0.f, 0.f, 0.f};
-static int    gRepStartSlot = 0;
-static int    gMapStartSlot = 0;
-static void *gPlayerVehicle;
-static void *gInputModule;
-static int   gKeyMask;
-static float gCurPlaybackSteer;
-static void *gMapDataComponent = NULL;
-static void *gCheckPointMgr = NULL;
-static void *gCheckPointConfig = NULL;
-static BOOL gDownloading = NO;
-
-#pragma mark - Storage & Parser .rep
-
-static NSString *rtDir(void) {
-    NSArray *p = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *d = [(p.firstObject ?: NSTemporaryDirectory()) stringByAppendingPathComponent:@"RaceKit"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:NULL];
-    return d;
-}
-
-static NSString *rtPathForTrack(void) {
-    int mid = gMapId > 0 ? gMapId : 1;
-    return [rtDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"rec_map%d.rk", mid]];
-}
-
 static BOOL rtSaveRecord(void) {
     if (!gFrameCount) return NO;
     int mid = gMapId > 0 ? gMapId : 1;
@@ -348,7 +303,6 @@ static BOOL rtSaveRecord(void) {
     if (!path) return NO;
     FILE *f = fopen(path.fileSystemRepresentation, "wb");
     if (!f) return NO;
-
     RCHeader h;
     memcpy(h.magic, RC_MAGIC, 4);
     h.ver = 3; h.count = gFrameCount;
@@ -360,7 +314,6 @@ static BOOL rtSaveRecord(void) {
           gFrames[gFrameCount - 1].t, mid, path.UTF8String);
     return YES;
 }
-
 static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
     if (!rtPtrOk(desHelper)) return NO;
     void *summary = *(void **)((char *)desHelper + 0x40); // <SummaryInfo>k__BackingField
@@ -368,46 +321,37 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         rtLog("[Rep] SummaryInfo is null");
         return NO;
     }
-
     uint32_t mapId = *(uint32_t *)((char *)summary + 0x20); // MapID
     uint64_t uid   = *(uint64_t *)((char *)summary + 0x30); // RecordPlayerUID
     rtLog("[Rep] Found Summary: mapId=%u, uid=%llu", mapId, (unsigned long long)uid);
-
     uintptr_t base = rtGetUnityBase();
     if (!base) return NO;
-
     typedef void *(*fn_GetTransInfos_t)(void *, uint64_t);
     fn_GetTransInfos_t fn_GetTransInfos = (fn_GetTransInfos_t)(base + 0x71B5608);
-
     void *p2p = fn_GetTransInfos ? fn_GetTransInfos(desHelper, uid) : NULL;
     if (!rtPtrOk(p2p)) {
         rtLog("[Rep] GetTransInfos returned null for uid %llu", (unsigned long long)uid);
         return NO;
     }
-
     void *moveList = *(void **)((char *)p2p + 0x10); // MoveInfo (ListView<VideoVehicleMoveInfo>)
     if (!rtPtrOk(moveList)) {
         rtLog("[Rep] MoveInfo list is null");
         return NO;
     }
-
     int count = *(int *)((char *)moveList + 0x18); // _size
     void *arr = *(void **)((char *)moveList + 0x10); // Context array
     if (!rtPtrOk(arr) || count <= 0) {
         rtLog("[Rep] MoveInfo empty (count=%d)", count);
         return NO;
     }
-
     if (count > RC_MAX_FRAMES) count = RC_MAX_FRAMES;
     if (gFrames) { free(gFrames); gFrames = NULL; }
     gFrames = (RCFrame *)malloc(sizeof(RCFrame) * count);
     if (!gFrames) return NO;
-
     void **items = (void **)((char *)arr + 0x20);
     for (int i = 0; i < count; i++) {
         void *m = items[i];
         if (!rtPtrOk(m)) continue;
-
         RCFrame fr;
         memset(&fr, 0, sizeof fr);
         fr.t    = *(float *)((char *)m + 0x18); // mClientTime
@@ -421,11 +365,9 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         fr.vx   = *(float *)((char *)m + 0x40); // mLinVel.x
         fr.vy   = *(float *)((char *)m + 0x44); // mLinVel.y
         fr.vz   = *(float *)((char *)m + 0x48); // mLinVel.z
-
         // Chuẩn hóa Quaternion ngay khi trích xuất
         float ql = sqrtf(fr.qx * fr.qx + fr.qy * fr.qy + fr.qz * fr.qz + fr.qw * fr.qw);
         if (ql > 1e-4f) { fr.qx /= ql; fr.qy /= ql; fr.qz /= ql; fr.qw /= ql; }
-
         // ĐỌC VÀ TÍNH TỐC ĐỘ:
         // mKMPH ở 0x5C trong Replay bằng 0, tính tốc độ chuẩn từ vector mLinVel:
         float v_mps = sqrtf(fr.vx * fr.vx + fr.vy * fr.vy + fr.vz * fr.vz);
@@ -443,7 +385,6 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
             }
         }
         fr.kmph = spd_kmh;
-
         // Chuyển đổi mã phím Replay sang InputKeyType chuẩn:
         uint32_t repKeys = *(uint32_t *)((char *)m + 0x20); // mKeyFlag
         uint32_t inputKeys = 0;
@@ -453,12 +394,9 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         if (repKeys & ((1 << 7) | (1 << 8)))  inputKeys |= (1 << 5); // MiniBoost (5)
         if (repKeys & ((1 << 9) | (1 << 10))) inputKeys |= (1 << 6); // Brake (6)
         if (repKeys & ((1 << 13) | (1 << 14))) inputKeys |= (1 << 8); // Drift (8)
-
         int state = *(int *)((char *)m + 0x74); // mState
         if (state == 2) inputKeys |= (1 << 8);  // NssVehicleState.Drifting
-
         fr.keys = inputKeys;
-
         // Góc đánh lái (steer)
         float yawRate = *(float *)((char *)m + 0x50); // mAngVel.y
         if (inputKeys & (1 << 1)) fr.steer = -0.90f;
@@ -471,20 +409,17 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         } else {
             fr.steer = 0.f;
         }
-
         uint8_t flags = 0;
         if (inputKeys & (1 << 6)) flags |= 0x01; // Brake
         if (inputKeys & (1 << 8)) flags |= 0x04; // Drift
         if (inputKeys & (1 << 3)) flags |= 0x08; // Nitro
         if (inputKeys & (1 << 5)) flags |= 0x10; // MiniBoost
         fr.flags = flags;
-
         gFrames[i] = fr;
     }
     gFrameCount = count;
     if (mapId > 0) gMapId = (int)mapId;
     rtLog("[Rep] SUCCESSFULLY extracted %u frames from .rep! MapId=%d", gFrameCount, gMapId);
-
     // Ghi nhận vị trí xuất phát gốc, góc xoay và slot của rep
     if (count > 0) {
         gRepOriginPos[0] = gFrames[0].px;
@@ -497,7 +432,6 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
         gOffsetAngleDeg = 0.f;
         gOffsetApplied = NO;
         memset(gOffsetDelta, 0, sizeof(gOffsetDelta));
-
         void *playerInfos = *(void **)((char *)summary + 0x38); // ListView<PlayerMatchVideoInfo>
         if (rtPtrOk(playerInfos)) {
             int pCount = *(int *)((char *)playerInfos + 0x18);
@@ -510,18 +444,14 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
             }
         }
     }
-
     rtSaveRecord();
     return YES;
 }
-
 static BOOL rtLoadRepFromDisk(NSString *repPath) {
     if (!repPath || ![[NSFileManager defaultManager] fileExistsAtPath:repPath]) return NO;
     NSData *data = [NSData dataWithContentsOfFile:repPath];
     if (!data || !data.length) return NO;
-
     rtLog("[Rep] Feeding %lu bytes into game parser...", (unsigned long)data.length);
-
     Il2CppClass *byteClass = rtFindClass("System", "Byte");
     Il2CppClass *desClass  = rtFindClass("", "MatchVideoDesHelper");
     if (!byteClass || !desClass || !il2cpp_array_new || !il2cpp_object_new) {
@@ -529,28 +459,23 @@ static BOOL rtLoadRepFromDisk(NSString *repPath) {
               byteClass, desClass, il2cpp_array_new, il2cpp_object_new);
         return NO;
     }
-
     uintptr_t base = rtGetUnityBase();
     if (!base) return NO;
-
     // 1. Tạo Il2CppArray chứa dữ liệu byte file .rep
     void *arr = il2cpp_array_new(byteClass, data.length);
     if (!arr) return NO;
     memcpy((char *)arr + 0x20, data.bytes, data.length);
-
     // 2. Gọi hàm giải nén của game: MatchVideoStaticHelper.GetUnZipData (0x71E28EC)
     typedef void *(*fn_unzip_t)(void *, ...);
     fn_unzip_t fn_unzip = (fn_unzip_t)(base + 0x71E28EC);
     void *unzipArr = fn_unzip ? fn_unzip(arr) : arr;
     if (!unzipArr) unzipArr = arr;
-
     // 3. Khởi tạo đối tượng parser của game: MatchVideoDesHelper
     void *helper = il2cpp_object_new(desClass);
     if (!helper) return NO;
     typedef void (*fn_ctor_t)(void *);
     fn_ctor_t fn_ctor = (fn_ctor_t)(base + 0x71B6A88);
     if (fn_ctor) fn_ctor(helper);
-
     // 4. Giải mã toàn bộ qua parser của game: InitByVideoBytes (0x71B3E20)
     typedef BOOL (*fn_init_t)(void *, void *, ...);
     fn_init_t fn_init = (fn_init_t)(base + 0x71B3E20);
@@ -561,26 +486,21 @@ static BOOL rtLoadRepFromDisk(NSString *repPath) {
     }
     return NO;
 }
-
 static NSString *rtFindRepFile(int targetMapId) {
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
     NSString *dir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
     NSFileManager *fm = [NSFileManager defaultManager];
-
     NSArray *files = [fm contentsOfDirectoryAtPath:dir error:NULL];
     if (!files || !files.count) {
         rtLog("[Rep] TempMatchVideos is empty or not found: %s", dir.UTF8String);
         return nil;
     }
-
     NSString *bestMatch = nil;
     NSString *newestFile = nil;
     NSDate *newestDate = [NSDate distantPast];
-
     NSString *targetPrefix = targetMapId > 0 ? [NSString stringWithFormat:@"%d_", targetMapId] : nil;
     NSString *targetContain = targetMapId > 0 ? [NSString stringWithFormat:@"%d", targetMapId] : nil;
-
     for (NSString *name in files) {
         if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
             NSString *full = [dir stringByAppendingPathComponent:name];
@@ -600,11 +520,9 @@ static NSString *rtFindRepFile(int targetMapId) {
     }
     return bestMatch ?: newestFile;
 }
-
 static BOOL rtLoadRecord(void) {
     gFrameCount = 0;
     if (gFrames) { free(gFrames); gFrames = NULL; }
-
     // 1. ƯU TIÊN SỐ 1: Kiểm tra record tự làm (custom record .rk)
     NSString *customPath = rtPathForTrack();
     if (customPath && [[NSFileManager defaultManager] fileExistsAtPath:customPath]) {
@@ -625,7 +543,6 @@ static BOOL rtLoadRecord(void) {
             fclose(f);
         }
     }
-
     // 2. Nếu không có record tự làm: Quét tìm file .rep từ TempMatchVideos
     rtLog("Searching TempMatchVideos for map %d .rep file...", gMapId);
     NSString *rep = rtFindRepFile(gMapId);
@@ -635,26 +552,20 @@ static BOOL rtLoadRecord(void) {
             return YES;
         }
     }
-
     return NO;
 }
-
 #pragma mark - Tải Replay Top 3 tất cả map (Đỉnh Cực Tốc)
-
 static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total, NSString *info), void (^onComplete)(int totalDownloaded)) {
     if (gDownloading) return;
     gDownloading = YES;
-
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
         NSString *tempDir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:tempDir withIntermediateDirectories:YES attributes:nil error:NULL];
-
         // 1. Quét MapDataComponent.VideoDetailCfgs lấy URL Replay Top 1, 2, 3 của tất cả map
         NSMutableArray *queue = [NSMutableArray array];
-
         if (rtPtrOk(gMapDataComponent)) {
             void *list = *(void **)((char *)gMapDataComponent + 0x98); // ListView<VideoDetailCfg>
             if (rtPtrOk(list)) {
@@ -668,7 +579,6 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
                         int mapId = *(int *)((char *)cfg + 0x14);
                         uint8_t gradeId = *(uint8_t *)((char *)cfg + 0x18);
                         if (gradeId < 1 || gradeId > 3) continue; // Chỉ tải Top 3
-
                         void *urlPtr = *(void **)((char *)cfg + 0x30);
                         NSString *urlStr = rtIl2CppString(urlPtr);
                         if (urlStr.length > 0) {
@@ -685,7 +595,6 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
                 }
             }
         }
-
         // 2. Đồng bộ các file .rep có sẵn trong documents/bundle (LocLo, MatchVideos) vào TempMatchVideos
         NSArray *localDirs = @[@"LocLo", @"MatchVideos", @"RaceKit"];
         for (NSString *sub in localDirs) {
@@ -701,7 +610,6 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
                 }
             }
         }
-
         int total = (int)queue.count;
         if (total == 0) {
             NSArray *files = [fm contentsOfDirectoryAtPath:tempDir error:NULL];
@@ -713,17 +621,14 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
             if (onComplete) onComplete(count);
             return;
         }
-
         __block int done = 0;
         __block int successCount = 0;
         dispatch_semaphore_t sem = dispatch_semaphore_create(4);
-
         for (NSDictionary *item in queue) {
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
             NSString *urlStr = item[@"url"];
             NSString *destPath = item[@"path"];
             int mapId = [item[@"map"] intValue];
-
             if ([fm fileExistsAtPath:destPath]) {
                 done++;
                 successCount++;
@@ -731,18 +636,15 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
                 dispatch_semaphore_signal(sem);
                 continue;
             }
-
             NSURL *url = [NSURL URLWithString:urlStr];
             if (!url && ![urlStr hasPrefix:@"http"]) {
                 url = [NSURL URLWithString:[@"http://" stringByAppendingString:urlStr]];
             }
-
             if (!url) {
                 done++;
                 dispatch_semaphore_signal(sem);
                 continue;
             }
-
             NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithURL:url
                 completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
                     if (!error && location) {
@@ -754,7 +656,6 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
                     done++;
                     if (onProgress) onProgress(done, total, [NSString stringWithFormat:@"Map %d", mapId]);
                     dispatch_semaphore_signal(sem);
-
                     if (done >= total) {
                         gDownloading = NO;
                         if (onComplete) onComplete(successCount);
@@ -764,14 +665,12 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
         }
     });
 }
-
 static void rtRedownloadRepForMap(int targetMapId, void (^onComplete)(BOOL success, NSString *msg)) {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
         NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
         NSString *tempDir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
         NSFileManager *fm = [NSFileManager defaultManager];
-
         // 1. Xóa toàn bộ file .rep cũ của mapId này trong TempMatchVideos
         NSArray *files = [fm contentsOfDirectoryAtPath:tempDir error:NULL];
         NSString *prefix = [NSString stringWithFormat:@"%d_", targetMapId];
@@ -785,63 +684,52 @@ static void rtRedownloadRepForMap(int targetMapId, void (^onComplete)(BOOL succe
                 }
             }
         }
-
         // 2. Xóa cache .rk
         NSString *rkPath = [rtDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"rec_map%d.rk", targetMapId]];
         [fm removeItemAtPath:rkPath error:NULL];
-
         // 3. Giải phóng bộ nhớ RAM
         if (gFrames) {
             free(gFrames);
             gFrames = NULL;
             gFrameCount = 0;
         }
-
         // 4. Tìm URL tải mới trong gMapDataComponent
         if (!rtPtrOk(gMapDataComponent)) {
             if (onComplete) onComplete(NO, @"Chưa có dữ liệu bản đồ. Vui lòng vào màn hình Chọn Map hoặc BXH một lần!");
             return;
         }
-
         void *list = *(void **)((char *)gMapDataComponent + 0x98); // ListView<VideoDetailCfg>
         if (!rtPtrOk(list)) {
             if (onComplete) onComplete(NO, @"Không tìm thấy danh sách VideoDetailCfg!");
             return;
         }
-
         int count = *(int *)((char *)list + 0x18);
         void *arr = *(void **)((char *)list + 0x10);
         if (!rtPtrOk(arr) || count <= 0) {
             if (onComplete) onComplete(NO, @"Danh sách video trống!");
             return;
         }
-
         void **items = (void **)((char *)arr + 0x20);
         NSString *bestUrlStr = nil;
         uint8_t bestGrade = 0;
-
         for (int i = 0; i < count; i++) {
             void *cfg = items[i];
             if (!rtPtrOk(cfg)) continue;
             int mid = *(int *)((char *)cfg + 0x14);
             if (mid != targetMapId) continue;
-
             uint8_t gradeId = *(uint8_t *)((char *)cfg + 0x18);
             void *urlPtr = *(void **)((char *)cfg + 0x30);
             NSString *urlStr = rtIl2CppString(urlPtr);
             if (!urlStr || !urlStr.length) continue;
-
             if (!bestUrlStr || gradeId >= bestGrade) {
                 bestGrade = gradeId;
                 bestUrlStr = urlStr;
             }
         }
-
         if (!bestUrlStr || !bestUrlStr.length) {
             if (onComplete) onComplete(NO, [NSString stringWithFormat:@"Không tìm thấy video kỷ lục cho Map %d trên BXH!", targetMapId]);
             return;
         }
-
         NSURL *url = [NSURL URLWithString:bestUrlStr];
         if (!url && ![bestUrlStr hasPrefix:@"http"]) {
             url = [NSURL URLWithString:[@"http://" stringByAppendingString:bestUrlStr]];
@@ -850,7 +738,6 @@ static void rtRedownloadRepForMap(int targetMapId, void (^onComplete)(BOOL succe
             if (onComplete) onComplete(NO, @"URL video không hợp lệ!");
             return;
         }
-
         NSString *destPath = [tempDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%d_3.rep", targetMapId]];
         NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithURL:url
             completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
@@ -869,49 +756,37 @@ static void rtRedownloadRepForMap(int targetMapId, void (^onComplete)(BOOL succe
         [task resume];
     });
 }
-
 static BOOL rtCalculateStartSlotPosAndDirInMap(int slotIndex, float *outPos, float *outDir) {
     if (!rtPtrOk(gCheckPointConfig) || !outPos) return NO;
-
     int cpSize = *(int *)((char *)gCheckPointConfig + 0x30); // CheckPointDataListSize
     void *cpArr = *(void **)((char *)gCheckPointConfig + 0x38); // CheckPointDataList
     int startIndex = *(int *)((char *)gCheckPointConfig + 0x18); // RaceStartCheckPointIndex
     if (startIndex < 0 || startIndex >= cpSize) startIndex = 0;
-
     void **cpItems = cpArr ? (void **)((char *)cpArr + 0x20) : NULL;
     if (!cpItems || cpSize <= 0) return NO;
-
     void *startCP = cpItems[startIndex];
     if (!rtPtrOk(startCP)) return NO;
-
     void *posObj   = *(void **)((char *)startCP + 0x28); // TDR_Vector3 Position
     void *fwdObj   = *(void **)((char *)startCP + 0x30); // TDR_Vector3 Forward
     void *leftObj  = *(void **)((char *)startCP + 0x38); // TDR_Vector3 LeftPoint
     void *rightObj = *(void **)((char *)startCP + 0x40); // TDR_Vector3 RightPoint
-
     if (!rtPtrOk(posObj) || !rtPtrOk(fwdObj)) return NO;
-
     float sx = *(float *)((char *)posObj + 0x10);
     float sy = *(float *)((char *)posObj + 0x14);
     float sz = *(float *)((char *)posObj + 0x18);
-
     float dx = *(float *)((char *)fwdObj + 0x10);
     float dy = *(float *)((char *)fwdObj + 0x14);
     float dz = *(float *)((char *)fwdObj + 0x18);
-
     if (fabsf(sx) < 1e-3f && fabsf(sz) < 1e-3f) return NO;
-
     float flen = sqrtf(dx * dx + dy * dy + dz * dz);
     float fx = (flen > 1e-4f) ? dx / flen : 0.f;
     float fy = (flen > 1e-4f) ? dy / flen : 0.f;
     float fz = (flen > 1e-4f) ? dz / flen : 1.f;
-
     if (outDir) {
         outDir[0] = fx;
         outDir[1] = fy;
         outDir[2] = fz;
     }
-
     // Vector Right từ RightPoint - LeftPoint hoặc Cross(Forward, Up)
     float rx = 0.f, ry = 0.f, rz = 0.f;
     if (rtPtrOk(rightObj) && rtPtrOk(leftObj)) {
@@ -927,36 +802,30 @@ static BOOL rtCalculateStartSlotPosAndDirInMap(int slotIndex, float *outPos, flo
         rlen = sqrtf(rx * rx + rz * rz);
         if (rlen > 1e-4f) { rx /= rlen; rz /= rlen; }
     }
-
     float gapX = 4.5f;
     int carsPerRow = 6;
     int slot = (slotIndex >= 0 && slotIndex <= 5) ? slotIndex : 0;
     float lateralMult = ((float)slot - 0.5f * (float)(carsPerRow - 1)) * gapX;
-
     outPos[0] = sx + (rx * lateralMult);
     outPos[1] = sy + (ry * lateralMult);
     outPos[2] = sz + (rz * lateralMult);
     return YES;
 }
-
 static BOOL rtCalculateAndApplyOffset(void) {
     if (!gEnableOffsetFix) return NO;
     if (!gFrames || gFrameCount < 2) return NO;
     if (gOffsetApplied) return YES;
-
     // 1. TÍNH TỌA ĐỘ VÀ HƯỚNG VỊ TRÍ XUẤT PHÁT CỦA MAP (TỪ GCHECKPOINTCONFIG HỢP LỆ)
     float mapStartDir[3] = {0.f, 0.f, 1.f};
     if (!rtCalculateStartSlotPosAndDirInMap(gRepStartSlot, gMapActualPos, mapStartDir)) {
         rtLog("[Offset] Map start position not ready yet (gCheckPointConfig=%p)", gCheckPointConfig);
         return NO;
     }
-
     // 2. TÍNH VECTOR VÀ GÓC HƯỚNG CỦA MAP
     float fMapLen = sqrtf(mapStartDir[0] * mapStartDir[0] + mapStartDir[2] * mapStartDir[2]);
     float fMapX = (fMapLen > 1e-4f) ? (mapStartDir[0] / fMapLen) : 0.f;
     float fMapZ = (fMapLen > 1e-4f) ? (mapStartDir[2] / fMapLen) : 1.f;
     float thetaMap = atan2f(fMapX, fMapZ);
-
     // 3. TÍNH VECTOR VÀ GÓC HƯỚNG CỦA REPLAY TẠI FRAME 0
     float rqx = gRepOriginRot[0], rqy = gRepOriginRot[1], rqz = gRepOriginRot[2], rqw = gRepOriginRot[3];
     float fRepX = 2.0f * (rqx * rqz + rqw * rqy);
@@ -964,28 +833,23 @@ static BOOL rtCalculateAndApplyOffset(void) {
     float fRepLen = sqrtf(fRepX * fRepX + fRepZ * fRepZ);
     if (fRepLen > 1e-4f) { fRepX /= fRepLen; fRepZ /= fRepLen; } else { fRepX = 0.f; fRepZ = 1.f; }
     float thetaRep = atan2f(fRepX, fRepZ);
-
     // 4. TÍNH ĐỘ LỆCH GÓC XOAY DELTA THETA
     float deltaTheta = thetaMap - thetaRep;
     while (deltaTheta > (float)M_PI)  deltaTheta -= 2.0f * (float)M_PI;
     while (deltaTheta < -(float)M_PI) deltaTheta += 2.0f * (float)M_PI;
     gOffsetAngleDeg = deltaTheta * (180.0f / (float)M_PI);
-
     // 5. TÍNH ĐỘ LỆCH DỊCH CHUYỂN TỌA ĐỘ
     float dx = gMapActualPos[0] - gRepOriginPos[0];
     float dy = gMapActualPos[1] - gRepOriginPos[1];
     float dz = gMapActualPos[2] - gRepOriginPos[2];
     float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-
     gOffsetDelta[0] = dx;
     gOffsetDelta[1] = dy;
     gOffsetDelta[2] = dz;
-
     rtLog("[Offset] AUTO CALC: RepSlot=%d Rep0=(%.2f, %.2f, %.2f) MapSlot%d=(%.2f, %.2f, %.2f) -> DeltaPos=(%.2f, %.2f, %.2f, dist=%.2fm) DeltaAngle=%.1f°",
           gRepStartSlot, gRepOriginPos[0], gRepOriginPos[1], gRepOriginPos[2],
           gRepStartSlot, gMapActualPos[0], gMapActualPos[1], gMapActualPos[2],
           dx, dy, dz, dist, gOffsetAngleDeg);
-
     // 6. ÁP DỤNG BIẾN ĐỔI RIGID BODY
     if (dist > 0.05f || fabsf(deltaTheta) > 0.008f) {
         float cosA = cosf(deltaTheta);
@@ -993,26 +857,21 @@ static BOOL rtCalculateAndApplyOffset(void) {
         float halfA = deltaTheta * 0.5f;
         float dQy = sinf(halfA);
         float dQw = cosf(halfA);
-
         for (uint32_t i = 0; i < gFrameCount; i++) {
             float relX = gFrames[i].px - gRepOriginPos[0];
             float relY = gFrames[i].py - gRepOriginPos[1];
             float relZ = gFrames[i].pz - gRepOriginPos[2];
-
             float rotRelX = relX * cosA + relZ * sinA;
             float rotRelY = relY;
             float rotRelZ = -relX * sinA + relZ * cosA;
-
             gFrames[i].px = gMapActualPos[0] + rotRelX;
             gFrames[i].py = gMapActualPos[1] + rotRelY;
             gFrames[i].pz = gMapActualPos[2] + rotRelZ;
-
             float qx = gFrames[i].qx, qy = gFrames[i].qy, qz = gFrames[i].qz, qw = gFrames[i].qw;
             gFrames[i].qx = dQw * qx + dQy * qz;
             gFrames[i].qy = dQw * qy + dQy * qw;
             gFrames[i].qz = dQw * qz - dQy * qx;
             gFrames[i].qw = dQw * qw - dQy * qy;
-
             float vx = gFrames[i].vx, vz = gFrames[i].vz;
             gFrames[i].vx = vx * cosA + vz * sinA;
             gFrames[i].vz = -vx * sinA + vz * cosA;
@@ -1024,7 +883,6 @@ static BOOL rtCalculateAndApplyOffset(void) {
     gOffsetApplied = YES;
     return NO;
 }
-
 static float rtGetMyBestScoreTime(int mapId) {
     NSString *rkPath = rtPathForTrack();
     if (rkPath && [[NSFileManager defaultManager] fileExistsAtPath:rkPath]) {
@@ -1044,41 +902,32 @@ static float rtGetMyBestScoreTime(int mapId) {
     }
     return 0.0f;
 }
-
 static BOOL rtBuildGuideLineFrames(void) {
     if (!rtPtrOk(gCheckPointConfig)) {
         rtLog("[Guide] gCheckPointConfig is null");
         return NO;
     }
-
     void *config = gCheckPointConfig;
-
     // 1. Đọc số vòng đua của trận: nếu cổng bắt đầu == cổng kết thúc -> 2 vòng, ngược lại 1 vòng
     int startIndex = *(int *)((char *)config + 0x18); // RaceStartCheckPointIndex
     int endIndex   = *(int *)((char *)config + 0x20); // RaceEndCheckPointIndex
     int laps = (startIndex == endIndex) ? 2 : 1;
-
     // Chiều dài 1 vòng
     float lapLength = *(float *)((char *)config + 0x2C); // MainCurveLength
     if (lapLength < 100.0f) lapLength = 3000.0f;
-
     // 2. Thu thập điểm mốc tim đường từ TrackPointDataList
     int realSize = *(int *)((char *)config + 0x40); // TrackPointDataListSize
     void *tpArr  = *(void **)((char *)config + 0x48); // TrackPointDataList
     int rawCap   = tpArr ? *(int *)((char *)tpArr + 0x18) : 0;
     void **items = tpArr ? (void **)((char *)tpArr + 0x20) : NULL;
-
     int validCount = (realSize > 0 && realSize <= rawCap) ? realSize : 0;
     if (validCount > 10000) validCount = 10000;
-
     typedef struct {
         float x, y, z;
         float dist;
     } GuidePoint;
-
     GuidePoint *gpts = NULL;
     int numGpts = 0;
-
     if (items && validCount > 10) {
         gpts = (GuidePoint *)malloc(sizeof(GuidePoint) * (validCount + 2));
         if (gpts) {
@@ -1091,10 +940,8 @@ static BOOL rtBuildGuideLineFrames(void) {
                 float px = *(float *)((char *)posObj + 0x10);
                 float py = *(float *)((char *)posObj + 0x14);
                 float pz = *(float *)((char *)posObj + 0x18);
-
                 if (fabsf(px) < 1e-3f && fabsf(py) < 1e-3f && fabsf(pz) < 1e-3f) continue;
                 if (isnan(px) || isnan(py) || isnan(pz)) continue;
-
                 if (numGpts > 0) {
                     float dx = px - gpts[numGpts - 1].x;
                     float dy = py - gpts[numGpts - 1].y;
@@ -1111,7 +958,6 @@ static BOOL rtBuildGuideLineFrames(void) {
             }
         }
     }
-
     // Fallback: CheckPointDataList nếu TrackPointData trống
     if (!gpts || numGpts < 5) {
         if (gpts) { free(gpts); gpts = NULL; }
@@ -1121,7 +967,6 @@ static BOOL rtBuildGuideLineFrames(void) {
         void **cpItems = cpArr ? (void **)((char *)cpArr + 0x20) : NULL;
         int cpValid = (cpSize > 0 && cpSize <= cpCap) ? cpSize : 0;
         if (cpValid > 5000) cpValid = 5000;
-
         if (cpItems && cpValid > 3) {
             gpts = (GuidePoint *)malloc(sizeof(GuidePoint) * (cpValid + 2));
             if (gpts) {
@@ -1137,7 +982,6 @@ static BOOL rtBuildGuideLineFrames(void) {
                     float pz = *(float *)((char *)posObj + 0x18);
                     if (fabsf(px) < 1e-3f && fabsf(py) < 1e-3f && fabsf(pz) < 1e-3f) continue;
                     if (isnan(px) || isnan(py) || isnan(pz)) continue;
-
                     if (numGpts > 0) {
                         float dx = px - gpts[numGpts - 1].x;
                         float dy = py - gpts[numGpts - 1].y;
@@ -1155,23 +999,19 @@ static BOOL rtBuildGuideLineFrames(void) {
             }
         }
     }
-
     if (!gpts || numGpts < 3) {
         if (gpts) free(gpts);
         rtLog("[Guide] Failed to extract track points (count=%d)", numGpts);
         return NO;
     }
-
     if (gpts[numGpts - 1].dist > 100.0f) {
         lapLength = gpts[numGpts - 1].dist;
     }
     float totalDistance = lapLength * (float)laps;
     if (totalDistance < 200.0f) totalDistance = 2000.0f;
-
     // 3. Tính toán thời gian hoàn thành theo tốc độ chuẩn 299 km/h:
     float targetSpeedMps = 299.0f / 3.6f; // ~83.0556 m/s
     float targetFinishTime = totalDistance / targetSpeedMps;
-
     float myBest = rtGetMyBestScoreTime(gMapId);
     if (myBest > 10.0f && myBest < 300.0f) {
         float bestSpeed = totalDistance / myBest;
@@ -1187,65 +1027,53 @@ static BOOL rtBuildGuideLineFrames(void) {
     } else {
         rtLog("[Guide] Standard 299 km/h finish time: %.2fs for %d lap(s)", targetFinishTime, laps);
     }
-
     if (targetFinishTime < 5.0f) targetFinishTime = 30.0f;
-
     // 4. Chia thành chuỗi các frame liên tục (Interval = 0.010s -> 100 FPS)
     float dt = 0.010f;
     uint32_t totalFrames = (uint32_t)(targetFinishTime / dt) + 1;
     if (totalFrames > RC_MAX_FRAMES) totalFrames = RC_MAX_FRAMES;
     if (totalFrames < 100) totalFrames = 100;
-
     RCFrame *newFrames = (RCFrame *)malloc(sizeof(RCFrame) * totalFrames);
     if (!newFrames) {
         free(gpts);
         return NO;
     }
-
     uint32_t segIdx = 0;
     for (uint32_t i = 0; i < totalFrames; i++) {
         float t = (float)i * dt;
         if (t > targetFinishTime) t = targetFinishTime;
-
         float sDist = (t / targetFinishTime) * totalDistance;
         int curLap = (int)(sDist / lapLength);
         if (curLap >= laps) curLap = laps - 1;
         float sInLap = sDist - ((float)curLap * lapLength);
-
         while (segIdx + 2 < (uint32_t)numGpts && gpts[segIdx + 1].dist < sInLap) {
             segIdx++;
         }
         if (segIdx + 1 >= (uint32_t)numGpts) segIdx = (uint32_t)numGpts - 2;
-
         GuidePoint *pA = &gpts[segIdx];
         GuidePoint *pB = &gpts[segIdx + 1];
         float segLen = pB->dist - pA->dist;
         float alpha = (segLen > 1e-4f) ? ((sInLap - pA->dist) / segLen) : 0.0f;
         if (alpha < 0.0f) alpha = 0.0f;
         if (alpha > 1.0f) alpha = 1.0f;
-
         float px = pA->x + (pB->x - pA->x) * alpha;
         float py = pA->y + (pB->y - pA->y) * alpha;
         float pz = pA->z + (pB->z - pA->z) * alpha;
-
         float fx = pB->x - pA->x;
         float fy = pB->y - pA->y;
         float fz = pB->z - pA->z;
         float flen = sqrtf(fx * fx + fy * fy + fz * fz);
         if (flen > 1e-4f) { fx /= flen; fy /= flen; fz /= flen; }
         else { fx = 0.f; fy = 0.f; fz = 1.f; }
-
         float theta = atan2f(fx, fz);
         float clampedY = -fy;
         if (clampedY < -1.0f) clampedY = -1.0f;
         if (clampedY > 1.0f)  clampedY = 1.0f;
         float phi = asinf(clampedY);
-
         float halfT = theta * 0.5f;
         float halfP = phi * 0.5f;
         float sinT = sinf(halfT), cosT = cosf(halfT);
         float sinP = sinf(halfP), cosP = cosf(halfP);
-
         float qx = cosT * sinP;
         float qy = sinT * cosP;
         float qz = -sinT * sinP;
@@ -1253,7 +1081,6 @@ static BOOL rtBuildGuideLineFrames(void) {
         float ql = sqrtf(qx * qx + qy * qy + qz * qz + qw * qw);
         if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
         else { qx = 0.f; qy = 0.f; qz = 0.f; qw = 1.f; }
-
         RCFrame fr;
         memset(&fr, 0, sizeof(fr));
         fr.t    = t;
@@ -1271,24 +1098,19 @@ static BOOL rtBuildGuideLineFrames(void) {
         fr.steer = 0.0f;
         fr.keys = (1 << 3) | (1 << 5); // Nitro + MiniBoost
         fr.flags = 0x08 | 0x10;
-
         newFrames[i] = fr;
     }
-
     free(gpts);
-
     // Gán nguyên tử an toàn để tránh xung đột luồng
     RCFrame *oldF = gFrames;
     gFrames = newFrames;
     gFrameCount = totalFrames;
     if (oldF) free(oldF);
-
     gOffsetApplied = YES;
     rtLog("[Guide] Generated %u frames for %d lap(s) (%.1fm, finishTime=%.2fs, speed=%.1f km/h)!",
           gFrameCount, laps, totalDistance, targetFinishTime, targetSpeedMps * 3.6f);
     return YES;
 }
-
 // InputModule.mInputKeyData (0xA8) -> InputKeyData.KeyFlags (0x10)
 static int *rtKeyFlagsPtr(void) {
     if (!rtPtrOk(gInputModule)) return NULL;
@@ -1296,30 +1118,33 @@ static int *rtKeyFlagsPtr(void) {
     if (!rtPtrOk(kd)) return NULL;
     return (int *)((char *)kd + kOffKeyDataFlags);
 }
-
 static void rtWriteKeyFlags(int mask) {
     int *p = rtKeyFlagsPtr();
     if (p) *p = mask;
     gKeyMask = mask;
 }
+@class RCPanel;
+@interface RCPanel : NSObject <UIGestureRecognizerDelegate>
+- (void)show;
+- (void)refresh;
+- (void)showPlayFrameHud:(BOOL)show;
+- (void)updatePlayFrameHud:(uint32_t)cur count:(uint32_t)total time:(float)t;
+@end
+static RCPanel *gPanel;
 
 #pragma mark - Playback
-
 static double rtNow(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
-
 static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl, void *sim, double now) {
     if (!gFrames || !gFrameCount) return;
-
     double dt = now - sLastPlaybackRealTime;
     if (dt < 0.0) dt = 0.0;
     if (dt > 0.1) dt = 0.1; // clamp lag spike
     sLastPlaybackRealTime = now;
     sAccumulatedPlaybackTime += (float)dt * gSpeedMultiplier;
     float t = sAccumulatedPlaybackTime;
-
     if (t < 0.f) return;
     if (t >= gFrames[gFrameCount - 1].t) {
         gPlaying = NO;
@@ -1329,7 +1154,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         if (gPanel) [gPanel showPlayFrameHud:NO];
         return;
     }
-
     uint32_t lo = 0, hi = gFrameCount - 1;
     while (lo + 1 < hi) {
         uint32_t mid = (lo + hi) >> 1;
@@ -1340,12 +1164,10 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     float al = span > 1e-5f ? (t - a->t) / span : 0.f;
     if (al < 0.f) al = 0.f;
     if (al > 1.f) al = 1.f;
-
     // --- 1. TỌA ĐỘ VÀ VẬN TỐC NỘI SUY ---
     float tx = a->px + (b->px - a->px) * al;
     float ty = a->py + (b->py - a->py) * al;
     float tz = a->pz + (b->pz - a->pz) * al;
-
     // --- 2. NỘI SUY GÓC XOAY QUATERNION CHUẨN XÁC (Shortest-path NLerp chống lật góc 180 độ) ---
     float dot = a->qx * b->qx + a->qy * b->qy + a->qz * b->qz + a->qw * b->qw;
     float bx = b->qx, by = b->qy, bz = b->qz, bw = b->qw;
@@ -1358,12 +1180,10 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     float qw = a->qw + (bw - a->qw) * al;
     float ql = sqrtf(qx * qx + qy * qy + qz * qz + qw * qw);
     if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
-
     float vx = (a->vx + (b->vx - a->vx) * al) * gSpeedMultiplier;
     float vy = (a->vy + (b->vy - a->vy) * al) * gSpeedMultiplier;
     float vz = (a->vz + (b->vz - a->vz) * al) * gSpeedMultiplier;
     float kmph = (a->kmph + (b->kmph - a->kmph) * al) * gSpeedMultiplier;
-
     // --- 2. TELEPORT TRỰC TIẾP THỰC THỂ VẬT LÝ PHYSX (mPhyHandle) ---
     void *phyCtrl = rtPtrOk(motionCtrl) ? *(void **)((char *)motionCtrl + kOffMotionPhyCtrl) : NULL;
     if (rtPtrOk(phyCtrl)) {
@@ -1374,10 +1194,8 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
                 float pos[3]  = { tx, ty, tz };
                 float quat[4] = { qx, qy, qz, qw };
                 float vel[3]  = { vx, vy, vz };
-
                 typedef void (*fn_SetTrans_t)(void *, float *, float *);
                 typedef void (*fn_SetLinVel_t)(void *, float *);
-
                 uintptr_t base = rtGetUnityBase();
                 if (base) {
                     fn_SetTrans_t fn_SetTrans = (fn_SetTrans_t)(base + 0xF718248);
@@ -1393,32 +1211,26 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
             }
         }
     }
-
     // --- 3. CƯỠNG BỨC SET STATE TỌA ĐỘ & VẬN TỐC (State-Locking TAS) ---
     // Dù người chơi không có nitro/miniboost, xe vẫn được khóa chặt theo frame:
     if (rtPtrOk(motionCtrl)) {
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 0) = tx;
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 4) = ty;
         *(float *)((char *)motionCtrl + kOffMotionForcePos + 8) = tz;
-
         *(float *)((char *)motionCtrl + kOffMotionForceRot + 0) = qx;
         *(float *)((char *)motionCtrl + kOffMotionForceRot + 4) = qy;
         *(float *)((char *)motionCtrl + kOffMotionForceRot + 8) = qz;
         *(float *)((char *)motionCtrl + kOffMotionForceRot + 12) = qw;
-
         *(bool *)((char *)motionCtrl + kOffMotionIsSetTransform) = true;
     }
-
     if (rtPtrOk(sim)) {
         *(float *)((char *)sim + kOffSimChassisPos + 0) = tx;
         *(float *)((char *)sim + kOffSimChassisPos + 4) = ty;
         *(float *)((char *)sim + kOffSimChassisPos + 8) = tz;
-
         *(float *)((char *)sim + kOffSimChassisRot + 0) = qx;
         *(float *)((char *)sim + kOffSimChassisRot + 4) = qy;
         *(float *)((char *)sim + kOffSimChassisRot + 8) = qz;
         *(float *)((char *)sim + kOffSimChassisRot + 12) = qw;
-
         // ÁP DỤNG VẬN TỐC & TỐC ĐỘ:
         *(float *)((char *)sim + kOffSimLinearVel + 0) = vx;
         *(float *)((char *)sim + kOffSimLinearVel + 4) = vy;
@@ -1427,13 +1239,11 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         *(float *)((char *)sim + 0x14)                 = kmph / 3.6f; // 0x14 mMps (HUD Speedometer)
         *(float *)((char *)sim + 0xB4)                 = 1.0f;        // 0xB4 mForwardForce
     }
-
     // --- 4. ĐÁNH LÁI & GA (CUA) ---
     float steer = a->steer + (b->steer - a->steer) * al;
     if (steer >  1.0f) steer =  1.0f;
     if (steer < -1.0f) steer = -1.0f;
     gCurPlaybackSteer = steer;
-
     *(float *)((char *)steerData + kOffSteerLeft) = steer;
     *(float *)((char *)steerData + kOffSteerForward) = 1.0f;
     if (rtPtrOk(drivingCtrl)) {
@@ -1443,18 +1253,15 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         *(float *)((char *)drivingCtrl + 0x3C) = 1.0f;  // mThrottle
         *(float *)((char *)drivingCtrl + 0x38) = 1.0f;  // mVehicleCtrlParams.throttle
     }
-
     // --- 5. BƠM PHÍM BẤM (Nitro, MiniBoost, Drift, Phanh, Trái, Phải) ---
     uint32_t keys = a->keys;
     if (a->flags & 0x01) keys |= (1 << 6); // Phanh
     if (a->flags & 0x04) keys |= (1 << 8); // Drift
     if (a->flags & 0x08) keys |= (1 << 3); // Nitro
     if (a->flags & 0x10) keys |= (1 << 5); // MiniBoost
-
     if (t >= 0.06f && t <= 0.45f) {
         keys |= (1 << 5); // Start MiniBoost
     }
-
     if (steer < -0.15f) {
         keys |= (1 << 1);  // Left
         keys &= ~(1 << 2);
@@ -1462,7 +1269,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         keys |= (1 << 2);  // Right
         keys &= ~(1 << 1);
     }
-
     gKeyMask = (int)keys;
     rtWriteKeyFlags((int)keys);
     rtSyncUIKeys((int)keys);
@@ -1470,12 +1276,7 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         [gPanel updatePlayFrameHud:lo count:gFrameCount time:t];
     }
 }
-
 #pragma mark - UI Interface
-
-@class RCPanel;
-static RCPanel *gPanel;
-
 @interface RCPassWindow : UIWindow
 @property (nonatomic, strong) UITextField *secureTextField;
 @property (nonatomic, strong) UIView *secureContainer;
@@ -1483,16 +1284,13 @@ static RCPanel *gPanel;
 @property (nonatomic, weak) UIView *menu;
 @property (nonatomic, weak) UIView *hudPlayFrame;
 @end
-
 @implementation RCPassWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
-
     // 0. Nhận diện tương tác nếu có Popup Alert hệ thống
     if (self.rootViewController && self.rootViewController.presentedViewController) {
         return [super hitTest:point withEvent:event];
     }
-
     // 1. Chạm vào menu rời PlayFrame (+0.1 / -0.1)
     if (self.hudPlayFrame && !self.hudPlayFrame.hidden && self.hudPlayFrame.userInteractionEnabled) {
         CGPoint p = [self convertPoint:point toView:self.hudPlayFrame];
@@ -1501,7 +1299,6 @@ static RCPanel *gPanel;
             return hit ?: self.hudPlayFrame;
         }
     }
-
     // 2. Chạm vào bong bóng nổi
     if (self.bubble && !self.bubble.hidden && self.bubble.userInteractionEnabled) {
         CGPoint p = [self convertPoint:point toView:self.bubble];
@@ -1510,7 +1307,6 @@ static RCPanel *gPanel;
             return hit ?: self.bubble;
         }
     }
-
     // 3. Chạm vào menu chính
     if (self.menu && !self.menu.hidden && self.menu.userInteractionEnabled) {
         CGPoint p = [self convertPoint:point toView:self.menu];
@@ -1519,23 +1315,19 @@ static RCPanel *gPanel;
             return hit ?: self.menu;
         }
     }
-
     // 4. Xuyên thấu toàn bộ các vùng còn lại ra ngoài game
     return nil;
 }
 @end
-
-@interface RCPanel : NSObject <UIGestureRecognizerDelegate>
+@interface RCPanel ()
 @property (nonatomic, strong) RCPassWindow *win;
 @property (nonatomic, strong) UIButton *bubble;
 @property (nonatomic, strong) UIView *menu;
-
 // Menu rời PlayFrame hiện tại (+0.1 và -0.1)
 @property (nonatomic, strong) UIView *hudPlayFrame;
 @property (nonatomic, strong) UILabel *lblFrameInfo;
 @property (nonatomic, strong) UIButton *btnMinusSpeed;
 @property (nonatomic, strong) UIButton *btnPlusSpeed;
-
 // Các nút điều khiển chính (Không icon / emoji)
 @property (nonatomic, strong) UIButton *bMode;
 @property (nonatomic, strong) UIButton *bDl;
@@ -1546,13 +1338,11 @@ static RCPanel *gPanel;
 @property (nonatomic, strong) UISlider *sliderSpeed;
 @property (nonatomic, strong) UILabel *lblSpeed;
 @property (nonatomic, strong) UILabel *status;
-
 - (void)show;
 - (void)refresh;
 - (void)showPlayFrameHud:(BOOL)show;
 - (void)updatePlayFrameHud:(uint32_t)cur count:(uint32_t)total time:(float)t;
 @end
-
 static UIViewController *rtTopVC(void) {
     if (gPanel && gPanel.win && gPanel.win.rootViewController) {
         UIViewController *vc = gPanel.win.rootViewController;
@@ -1564,7 +1354,6 @@ static UIViewController *rtTopVC(void) {
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
-
 static void rtAlert(NSString *title, NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *top = rtTopVC();
@@ -1576,9 +1365,7 @@ static void rtAlert(NSString *title, NSString *msg) {
         [top presentViewController:a animated:YES completion:nil];
     });
 }
-
 @implementation RCPanel
-
 - (UIButton *)mk:(NSString *)t sel:(SEL)s {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     [b setTitle:t forState:UIControlStateNormal];
@@ -1592,18 +1379,15 @@ static void rtAlert(NSString *title, NSString *msg) {
     [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
-
 - (void)show {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.win) return;
         CGRect scr = [UIScreen mainScreen].bounds;
-
         RCPassWindow *win = [[RCPassWindow alloc] initWithFrame:scr];
         win.backgroundColor = [UIColor clearColor];
         win.windowLevel = UIWindowLevelStatusBar + 100.0;
         win.userInteractionEnabled = YES;
         win.rootViewController = [UIViewController new];
-
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
                 if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
@@ -1618,9 +1402,7 @@ static void rtAlert(NSString *title, NSString *msg) {
                 }
             }
         }
-
         self.win = win;
-
         // BẢO MẬT CHỐNG QUAY MÀN HÌNH / CHỤP MÀN HÌNH (Secure Canvas Trick)
         // Khi thêm view con vào canvas của UITextField có secureTextEntry = YES,
         // hệ thống iOS sẽ tự động làm trống / tàng hình view đó trên ảnh chụp màn hình và video quay màn hình!
@@ -1629,7 +1411,6 @@ static void rtAlert(NSString *title, NSString *msg) {
         secField.userInteractionEnabled = NO;
         [win.rootViewController.view addSubview:secField];
         win.secureTextField = secField;
-
         UIView *secCanvas = secField.subviews.firstObject;
         if (secCanvas) {
             secCanvas.userInteractionEnabled = YES;
@@ -1637,9 +1418,7 @@ static void rtAlert(NSString *title, NSString *msg) {
         } else {
             win.secureContainer = win.rootViewController.view;
         }
-
         UIView *container = win.secureContainer;
-
         // 1. Bong bóng nổi (Floating Bubble 44x44, không có icon/emoji)
         UIButton *bubble = [UIButton buttonWithType:UIButtonTypeCustom];
         bubble.frame = CGRectMake(scr.size.width - 54, scr.size.height * 0.35, 44, 44);
@@ -1655,11 +1434,9 @@ static void rtAlert(NSString *title, NSString *msg) {
         [container addSubview:bubble];
         self.bubble = bubble;
         win.bubble = bubble;
-
         UIPanGestureRecognizer *panBubble = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanBubble:)];
         panBubble.cancelsTouchesInView = NO;
         [bubble addGestureRecognizer:panBubble];
-
         // 2. Menu chính (Gọn đẹp, 205x285, không tab, không icon)
         UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 215, scr.size.height * 0.16, 205, 285)];
         menu.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.96];
@@ -1671,18 +1448,15 @@ static void rtAlert(NSString *title, NSString *msg) {
         [container addSubview:menu];
         self.menu = menu;
         win.menu = menu;
-
         UIPanGestureRecognizer *panMenu = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanMenu:)];
         panMenu.delegate = self;
         [menu addGestureRecognizer:panMenu];
-
         // Tiêu đề & Nút đóng
         UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, 140, 20)];
         t.text = @"RaceKit Pro";
         t.textColor = [UIColor colorWithRed:0.2 green:0.85 blue:1.0 alpha:1.0];
         t.font = [UIFont boldSystemFontOfSize:13];
         [menu addSubview:t];
-
         UIButton *bClose = [UIButton buttonWithType:UIButtonTypeSystem];
         bClose.frame = CGRectMake(175, 4, 24, 24);
         [bClose setTitle:@"✕" forState:UIControlStateNormal];
@@ -1690,43 +1464,35 @@ static void rtAlert(NSString *title, NSString *msg) {
         bClose.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         [bClose addTarget:self action:@selector(onToggleMenu) forControlEvents:UIControlEventTouchUpInside];
         [menu addSubview:bClose];
-
         // Danh sách các nút chức năng chính (Không icon / emoji)
         CGFloat startY = 30.0f;
         CGFloat btnH = 26.0f;
         CGFloat gap = 5.0f;
-
         self.bMode = [self mk:@"Chế độ: Replay" sel:@selector(tapModeSwitch)];
         self.bMode.frame = CGRectMake(10, startY, 185, btnH);
         [menu addSubview:self.bMode];
         startY += btnH + gap;
-
         self.bDl = [self mk:@"Tải Replay" sel:@selector(tapDownload)];
         self.bDl.frame = CGRectMake(10, startY, 185, btnH);
         [menu addSubview:self.bDl];
         startY += btnH + gap;
-
         self.bNoRep = [self mk:@"Chặn Replay: Bật" sel:@selector(tapNoRep)];
         self.bNoRep.frame = CGRectMake(10, startY, 185, btnH);
         [menu addSubview:self.bNoRep];
         startY += btnH + gap;
-
         self.bAuto = [self mk:@"Tự Động: Bật" sel:@selector(tapAuto)];
         self.bAuto.frame = CGRectMake(10, startY, 185, btnH);
         [menu addSubview:self.bAuto];
         startY += btnH + gap;
-
         self.bRecord = [self mk:@"Ghi Lại: Tắt" sel:@selector(tapRecordSelf)];
         self.bRecord.frame = CGRectMake(10, startY, 185, btnH);
         [menu addSubview:self.bRecord];
         startY += btnH + gap;
-
         self.bFixMap = [self mk:@"Báo Lỗi Map" sel:@selector(tapFixMap)];
         self.bFixMap.frame = CGRectMake(10, startY, 185, btnH);
         self.bFixMap.backgroundColor = [UIColor colorWithRed:0.65 green:0.18 blue:0.16 alpha:0.92];
         [menu addSubview:self.bFixMap];
         startY += btnH + 6.0f;
-
         UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(10, startY, 185, 20)];
         sl.minimumValue = 1.0f;
         sl.maximumValue = 5.0f;
@@ -1736,7 +1502,6 @@ static void rtAlert(NSString *title, NSString *msg) {
         [menu addSubview:sl];
         self.sliderSpeed = sl;
         startY += 20.0f;
-
         UILabel *ls = [[UILabel alloc] initWithFrame:CGRectMake(10, startY, 185, 14)];
         ls.font = [UIFont boldSystemFontOfSize:10];
         ls.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.9];
@@ -1745,13 +1510,11 @@ static void rtAlert(NSString *title, NSString *msg) {
         [menu addSubview:ls];
         self.lblSpeed = ls;
         startY += 16.0f;
-
         self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, startY, 185, 34)];
         self.status.numberOfLines = 2;
         self.status.font = [UIFont systemFontOfSize:9];
         self.status.textColor = [UIColor colorWithWhite:1 alpha:0.75];
         [menu addSubview:self.status];
-
         // 3. Menu rời PlayFrame (+0.1 và -0.1) khi bật Auto Play
         UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width * 0.5 - 90, 18, 180, 34)];
         hud.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.94];
@@ -1763,10 +1526,8 @@ static void rtAlert(NSString *title, NSString *msg) {
         [container addSubview:hud];
         self.hudPlayFrame = hud;
         win.hudPlayFrame = hud;
-
         UIPanGestureRecognizer *panHud = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanHud:)];
         [hud addGestureRecognizer:panHud];
-
         UIButton *bMinus = [UIButton buttonWithType:UIButtonTypeCustom];
         bMinus.frame = CGRectMake(4, 4, 38, 26);
         [bMinus setTitle:@"-0.1" forState:UIControlStateNormal];
@@ -1777,7 +1538,6 @@ static void rtAlert(NSString *title, NSString *msg) {
         [bMinus addTarget:self action:@selector(onMinusSpeedTap) forControlEvents:UIControlEventTouchUpInside];
         [hud addSubview:bMinus];
         self.btnMinusSpeed = bMinus;
-
         UILabel *lblF = [[UILabel alloc] initWithFrame:CGRectMake(46, 4, 88, 26)];
         lblF.font = [UIFont boldSystemFontOfSize:10];
         lblF.textColor = [UIColor colorWithRed:0.2 green:0.85 blue:1.0 alpha:1.0];
@@ -1785,7 +1545,6 @@ static void rtAlert(NSString *title, NSString *msg) {
         lblF.text = [NSString stringWithFormat:@"%.1fx | 0/0", gSpeedMultiplier];
         [hud addSubview:lblF];
         self.lblFrameInfo = lblF;
-
         UIButton *bPlus = [UIButton buttonWithType:UIButtonTypeCustom];
         bPlus.frame = CGRectMake(138, 4, 38, 26);
         [bPlus setTitle:@"+0.1" forState:UIControlStateNormal];
@@ -1796,10 +1555,8 @@ static void rtAlert(NSString *title, NSString *msg) {
         [bPlus addTarget:self action:@selector(onPlusSpeedTap) forControlEvents:UIControlEventTouchUpInside];
         [hud addSubview:bPlus];
         self.btnPlusSpeed = bPlus;
-
         win.hidden = NO;
         [win makeKeyAndVisible];
-
         dispatch_async(dispatch_get_main_queue(), ^{
             for (UIWindow *w in UIApplication.sharedApplication.windows) {
                 if ([w isKindOfClass:[RCPassWindow class]]) continue;
@@ -1809,23 +1566,19 @@ static void rtAlert(NSString *title, NSString *msg) {
         [self refresh];
     });
 }
-
 static uint32_t sCurrentPlayFrame = 0;
-
 - (void)onMinusSpeedTap {
     gSpeedMultiplier = roundf((gSpeedMultiplier - 0.1f) * 10.0f) / 10.0f;
     if (gSpeedMultiplier < 0.2f) gSpeedMultiplier = 0.2f;
     [self refreshSpeedUI];
     rtSaveSettings();
 }
-
 - (void)onPlusSpeedTap {
     gSpeedMultiplier = roundf((gSpeedMultiplier + 0.1f) * 10.0f) / 10.0f;
     if (gSpeedMultiplier > 5.0f) gSpeedMultiplier = 5.0f;
     [self refreshSpeedUI];
     rtSaveSettings();
 }
-
 - (void)refreshSpeedUI {
     if (self.sliderSpeed) self.sliderSpeed.value = gSpeedMultiplier;
     if (self.lblSpeed) self.lblSpeed.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
@@ -1833,30 +1586,26 @@ static uint32_t sCurrentPlayFrame = 0;
         self.lblFrameInfo.text = [NSString stringWithFormat:@"%.1fx | %u/%u", gSpeedMultiplier, sCurrentPlayFrame, gFrameCount];
     }
 }
-
 - (void)showPlayFrameHud:(BOOL)show {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.hudPlayFrame) {
-            self.hudPlayFrame.hidden = __omp_shell("show;")
+            self.hudPlayFrame.hidden = !show;
             if (show) [self refreshSpeedUI];
         }
     });
 }
-
 - (void)updatePlayFrameHud:(uint32_t)cur count:(uint32_t)total time:(float)t {
     sCurrentPlayFrame = cur;
     if (self.lblFrameInfo) {
         self.lblFrameInfo.text = [NSString stringWithFormat:@"%.1fx | %u/%u", gSpeedMultiplier, cur, total];
     }
 }
-
 - (void)onPanHud:(UIPanGestureRecognizer *)p {
     CGPoint trans = [p translationInView:self.win];
     self.hudPlayFrame.center = CGPointMake(self.hudPlayFrame.center.x + trans.x,
                                            self.hudPlayFrame.center.y + trans.y);
     [p setTranslation:CGPointZero inView:self.win];
 }
-
 - (void)refresh {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gRaceModeGuide) {
@@ -1866,7 +1615,6 @@ static uint32_t sCurrentPlayFrame = 0;
             self.bMode.backgroundColor = [UIColor colorWithRed:0.0 green:0.42 blue:0.70 alpha:0.95];
             [self.bMode setTitle:@"Chế độ: Replay" forState:UIControlStateNormal];
         }
-
         if (gNoReplay) {
             self.bNoRep.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
             [self.bNoRep setTitle:@"Chặn Replay: Bật" forState:UIControlStateNormal];
@@ -1874,7 +1622,6 @@ static uint32_t sCurrentPlayFrame = 0;
             self.bNoRep.backgroundColor = [UIColor colorWithRed:0.40 green:0.40 blue:0.40 alpha:0.95];
             [self.bNoRep setTitle:@"Chặn Replay: Tắt" forState:UIControlStateNormal];
         }
-
         if (gAutoArmed) {
             self.bAuto.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
             [self.bAuto setTitle:@"Tự Động: Bật" forState:UIControlStateNormal];
@@ -1882,7 +1629,6 @@ static uint32_t sCurrentPlayFrame = 0;
             self.bAuto.backgroundColor = [UIColor colorWithRed:0.40 green:0.40 blue:0.40 alpha:0.95];
             [self.bAuto setTitle:@"Tự Động: Tắt" forState:UIControlStateNormal];
         }
-
         if (gRecordSelf) {
             self.bRecord.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
             [self.bRecord setTitle:@"Ghi Lại: Bật" forState:UIControlStateNormal];
@@ -1890,10 +1636,8 @@ static uint32_t sCurrentPlayFrame = 0;
             self.bRecord.backgroundColor = [UIColor colorWithRed:0.35 green:0.35 blue:0.35 alpha:0.95];
             [self.bRecord setTitle:@"Ghi Lại: Tắt" forState:UIControlStateNormal];
         }
-
         self.sliderSpeed.value = gSpeedMultiplier;
         self.lblSpeed.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
-
         NSString *recType = @"Chưa có";
         NSString *cPath = rtPathForTrack();
         if (cPath && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
@@ -1902,48 +1646,39 @@ static uint32_t sCurrentPlayFrame = 0;
             NSString *rPath = rtFindRepFile(gMapId);
             if (rPath) recType = @"File .rep server";
         }
-
-        self.status.text = [NSString stringWithFormat:@"Map %d | Slot %d
-Nguồn: %@",
+        self.status.text = [NSString stringWithFormat:@"Map %d | Slot %d\nNguồn: %@",
                             gMapId, gMapStartSlot, recType];
     });
 }
-
 - (void)onBubbleTap {
     [self onToggleMenu];
 }
-
 - (void)onToggleMenu {
-    self.menu.hidden = __omp_shell("self.menu.hidden;")
+    self.menu.hidden = !self.menu.hidden;
     if (!self.menu.hidden) [self refresh];
 }
-
 - (void)onPanBubble:(UIPanGestureRecognizer *)p {
     CGPoint trans = [p translationInView:self.win];
     self.bubble.center = CGPointMake(self.bubble.center.x + trans.x, self.bubble.center.y + trans.y);
     [p setTranslation:CGPointZero inView:self.win];
 }
-
 - (void)onPanMenu:(UIPanGestureRecognizer *)p {
     CGPoint trans = [p translationInView:self.win];
     self.menu.center = CGPointMake(self.menu.center.x + trans.x, self.menu.center.y + trans.y);
     [p setTranslation:CGPointZero inView:self.win];
 }
-
 - (void)tapModeSwitch {
-    gRaceModeGuide = __omp_shell("gRaceModeGuide;")
+    gRaceModeGuide = !gRaceModeGuide;
     rtSaveSettings();
     [self refresh];
 }
-
 - (void)tapNoRep {
-    gNoReplay = __omp_shell("gNoReplay;")
+    gNoReplay = !gNoReplay;
     rtSaveSettings();
     [self refresh];
 }
-
 - (void)tapAuto {
-    gAutoArmed = __omp_shell("gAutoArmed;")
+    gAutoArmed = !gAutoArmed;
     if (!gAutoArmed) {
         gPlaying = NO;
         rtWriteKeyFlags(0);
@@ -1953,33 +1688,28 @@ Nguồn: %@",
     rtSaveSettings();
     [self refresh];
 }
-
 - (void)tapRecordSelf {
-    gRecordSelf = __omp_shell("gRecordSelf;")
+    gRecordSelf = !gRecordSelf;
     if (!gRecordSelf) {
         rtStopAndSaveCustomRecord();
     }
     rtSaveSettings();
     [self refresh];
 }
-
 - (void)onSpeedChange:(UISlider *)sl {
     gSpeedMultiplier = roundf(sl.value * 10.0f) / 10.0f;
     [self refreshSpeedUI];
     rtSaveSettings();
 }
-
 - (void)tapDownload {
     self.status.text = @"Đang tải replay...";
     rtDownloadAllPeakSpeedReplays(^(int done, int total, NSString *sub) {
-        self.status.text = [NSString stringWithFormat:@"Đang tải: %d/%d
-%@", done, total, sub ?: @""];
+        self.status.text = [NSString stringWithFormat:@"Đang tải: %d/%d\n%@", done, total, sub ?: @""];
     }, ^(int totalDownloaded) {
         self.status.text = [NSString stringWithFormat:@"Đã tải xong %d rep!", totalDownloaded];
         [self refresh];
     });
 }
-
 - (void)tapFixMap {
     if (gMapId <= 0) {
         rtAlert(@"Báo lỗi Map", @"Chưa vào map! Vui lòng bấm khi đang ở trong trận.");
@@ -2000,11 +1730,8 @@ Nguồn: %@",
     [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
     [rtTopVC() presentViewController:alert animated:YES completion:nil];
 }
-
 @end
-
 #pragma mark - Install
-
 static void (*orig_OperatingModeHelper_Init)(void *self, void *pub, void *inst);
 static void hook_OperatingModeHelper_Init(void *self, void *pub, void *inst) {
     if (rtPtrOk(self)) {
@@ -2013,7 +1740,6 @@ static void hook_OperatingModeHelper_Init(void *self, void *pub, void *inst) {
     }
     if (orig_OperatingModeHelper_Init) orig_OperatingModeHelper_Init(self, pub, inst);
 }
-
 static void (*orig_OperatingModeHelper_Release)(void *self);
 static void hook_OperatingModeHelper_Release(void *self) {
     if (gOperatingModeHelper == self) {
@@ -2022,7 +1748,6 @@ static void hook_OperatingModeHelper_Release(void *self) {
     }
     if (orig_OperatingModeHelper_Release) orig_OperatingModeHelper_Release(self);
 }
-
 static void rtInstallHooks(void) {
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrl_Update);
@@ -2051,7 +1776,6 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "MapDataComponent", "InitComponent", 0, (void *)hook_MapDataComponent_InitComponent);
     orig_DataCenterMdl_GetMapDataComponent = (void *(*)(void *, bool, const void *))
         rtHookMethod("", "DataCenterMdl", "GetMapDataComponent", 1, (void *)hook_DataCenterMdl_GetMapDataComponent);
-
     // No Replay Hooks (chặn game tự động mở Replay & Bóng khi tải .rep)
     orig_MatchVideoMdl_StartEnterGame = (int (*)(void *, int, void *, void *, const void *))
         rtHookMethod("", "MatchVideoMdl", "StartEnterGame", 3, (void *)hook_MatchVideoMdl_StartEnterGame);
@@ -2065,7 +1789,6 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "MatchVideoMdl", "ReplayVideo", 2, (void *)hook_MatchVideoMdl_ReplayVideo_mark);
     orig_MatchVideoMdl_ReplayTeachingVideo = (int (*)(void *, int, void *, bool, const void *))
         rtHookMethod("", "MatchVideoMdl", "ReplayTeachingVideo", 3, (void *)hook_MatchVideoMdl_ReplayTeachingVideo);
-
 // Anti-AFK Hooks (4 tầng chống treo máy & chống phạt)
     orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleInput", "UpdateVehicleNotControlMaxTime", 1, (void *)hook_SdcVehicleInput_UpdateVehicleNotControlMaxTime);
@@ -2079,7 +1802,6 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "CPR_STPVPEndGame", "FillPVPButtonUseData", 1, (void *)hook_CPR_FillPVPButtonUseData);
     orig_MatchUIMgr_Trusteeship = (BOOL (*)(void *, int, const void *))
         rtHookMethod("", "MatchUIMgr", "Trusteeship", 1, (void *)hook_MatchUIMgr_Trusteeship);
-
     // Anti-Speed-Report Hooks (chống phát hiện tốc độ / fast frame)
     orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVel_Update);
@@ -2087,19 +1809,16 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "CPR_STPVPEndGame", "FillVehicleVelData", 1, (void *)hook_CPR_FillVehicleVelData);
     orig_CPR_ReportData = (void (*)(void *, void **, const void *))
         rtHookMethod("", "CPR_STPVPEndGame", "ReportData", 1, (void *)hook_CPR_ReportData);
-
     // Hooks đồng bộ nút bấm UI bàn phím ảo
     orig_OperatingModeHelper_Init = (void (*)(void *, void *, void *))
         rtHookMethod("", "OperatingModeHelper", "Init", 2, (void *)hook_OperatingModeHelper_Init);
     orig_OperatingModeHelper_Release = (void (*)(void *))
         rtHookMethod("", "OperatingModeHelper", "Release", 0, (void *)hook_OperatingModeHelper_Release);
-
     uintptr_t base = rtGetUnityBase();
     if (base) {
         fnSetKeyState = (fn_SetKeyState_InputKey_t)(base + 0x7DB856C); // OperatingMode_OneSide.SetKeyState
     }
 }
-
 __attribute__((constructor))
 static void rcInit(void) {
     rtLogOpen();
