@@ -311,24 +311,6 @@ static void rtStopAndSaveCustomRecord(void) {
     gRecordCount = 0;
 }
 // Tính toán độ lệch vị trí
-static BOOL rtSaveRecord(void) {
-    if (!gFrameCount) return NO;
-    int mid = gMapId > 0 ? gMapId : 1;
-    NSString *path = rtPathForTrack();
-    if (!path) return NO;
-    FILE *f = fopen(path.fileSystemRepresentation, "wb");
-    if (!f) return NO;
-    RCHeader h;
-    memcpy(h.magic, RC_MAGIC, 4);
-    h.ver = 3; h.count = gFrameCount;
-    h.trackLen = gTrackLen; h.mapId = mid; h.frameSize = sizeof(RCFrame);
-    fwrite(&h, sizeof h, 1, f);
-    fwrite(gFrames, sizeof(RCFrame), gFrameCount, f);
-    fclose(f);
-    rtLog("save: %u frames (%.2fs) map=%d -> %s", gFrameCount,
-          gFrames[gFrameCount - 1].t, mid, path.UTF8String);
-    return YES;
-}
 static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
     if (!rtPtrOk(desHelper)) return NO;
     void *summary = *(void **)((char *)desHelper + 0x40); // <SummaryInfo>k__BackingField
