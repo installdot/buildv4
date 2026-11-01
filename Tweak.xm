@@ -1124,13 +1124,27 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 
 @implementation RCPassWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (self.hidden) return nil;
-    if (self.bubble && [self.bubble pointInside:[self convertPoint:point toView:self.bubble] withEvent:event]) {
-        return [super hitTest:point withEvent:event];
+    if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
+
+    // 1. Chạm vào bong bóng nổi
+    if (self.bubble && !self.bubble.hidden && self.bubble.userInteractionEnabled) {
+        CGPoint p = [self convertPoint:point toView:self.bubble];
+        if ([self.bubble pointInside:p withEvent:event]) {
+            UIView *hit = [self.bubble hitTest:p withEvent:event];
+            return hit ?: self.bubble;
+        }
     }
-    if (self.menu && !self.menu.hidden && [self.menu pointInside:[self convertPoint:point toView:self.menu] withEvent:event]) {
-        return [super hitTest:point withEvent:event];
+
+    // 2. Chạm vào menu chính
+    if (self.menu && !self.menu.hidden && self.menu.userInteractionEnabled) {
+        CGPoint p = [self convertPoint:point toView:self.menu];
+        if ([self.menu pointInside:p withEvent:event]) {
+            UIView *hit = [self.menu hitTest:p withEvent:event];
+            return hit ?: self.menu;
+        }
     }
+
+    // 3. Xuyên thấu toàn bộ các vùng còn lại ra ngoài game
     return nil;
 }
 @end
@@ -1583,18 +1597,35 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     return b;
 }
 
+static BOOL sBubbleDragged = NO;
+
 - (void)onPanBubble:(UIPanGestureRecognizer *)p {
-    CGPoint trans = [p translationInView:self.win];
-    CGRect f = self.bubble.frame;
-    f.origin.x += trans.x;
-    f.origin.y += trans.y;
-    CGRect scr = UIScreen.mainScreen.bounds;
-    if (f.origin.x < 5) f.origin.x = 5;
-    if (f.origin.y < 20) f.origin.y = 20;
-    if (f.origin.x + f.size.width  > scr.size.width  - 5) f.origin.x = scr.size.width  - f.size.width  - 5;
-    if (f.origin.y + f.size.height > scr.size.height - 20) f.origin.y = scr.size.height - f.size.height - 20;
-    self.bubble.frame = f;
-    [p setTranslation:CGPointZero inView:self.win];
+    if (p.state == UIGestureRecognizerStateBegan) {
+        sBubbleDragged = NO;
+    } else if (p.state == UIGestureRecognizerStateChanged) {
+        CGPoint trans = [p translationInView:self.win];
+        if (hypotf(trans.x, trans.y) > 2.0f) {
+            sBubbleDragged = YES;
+        }
+        CGRect f = self.bubble.frame;
+        f.origin.x += trans.x;
+        f.origin.y += trans.y;
+        CGRect scr = UIScreen.mainScreen.bounds;
+        if (f.origin.x < 5) f.origin.x = 5;
+        if (f.origin.y < 20) f.origin.y = 20;
+        if (f.origin.x + f.size.width  > scr.size.width  - 5) f.origin.x = scr.size.width  - f.size.width  - 5;
+        if (f.origin.y + f.size.height > scr.size.height - 20) f.origin.y = scr.size.height - f.size.height - 20;
+        self.bubble.frame = f;
+        [p setTranslation:CGPointZero inView:self.win];
+    }
+}
+
+- (void)onBubbleTap {
+    if (sBubbleDragged) {
+        sBubbleDragged = NO;
+        return;
+    }
+    [self onToggleMenu];
 }
 
 - (void)onPanMenu:(UIPanGestureRecognizer *)p {
@@ -1642,6 +1673,14 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 
         if (@available(iOS 13.0, *)) {
             if (!win.windowScene) {
+                for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                    if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+                        win.windowScene = scene;
+                        break;
+                    }
+                }
+            }
+            if (!win.windowScene) {
                 for (UIWindow *w in UIApplication.sharedApplication.windows) {
                     if ([w isKindOfClass:[RCPassWindow class]]) continue;
                     if (w.windowScene) { win.windowScene = w.windowScene; break; }
@@ -1649,26 +1688,26 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
             }
         }
 
-        // 1. Bong bóng nổi (Floating Bubble 46x46)
-        UIView *bubble = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 56, scr.size.height * 0.35, 46, 46)];
-        bubble.backgroundColor = [UIColor colorWithRed:0.06 green:0.12 blue:0.18 alpha:0.92];
+        self.win = win;
+
+        // 1. Bong bóng nổi (Floating Button 46x46 trực tiếp là UIButton)
+        UIButton *bubble = [UIButton buttonWithType:UIButtonTypeCustom];
+        bubble.frame = CGRectMake(scr.size.width - 56, scr.size.height * 0.35, 46, 46);
+        bubble.backgroundColor = [UIColor colorWithRed:0.06 green:0.12 blue:0.18 alpha:0.94];
         bubble.layer.cornerRadius = 23;
         bubble.layer.borderWidth = 1.5;
-        bubble.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.9].CGColor;
+        bubble.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.95].CGColor;
         bubble.clipsToBounds = YES;
-        [win addSubview:bubble];
+        [bubble setTitle:@"⚡RK" forState:UIControlStateNormal];
+        bubble.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        [bubble setTitleColor:[UIColor colorWithRed:0.2 green:0.85 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
+        [bubble addTarget:self action:@selector(onBubbleTap) forControlEvents:UIControlEventTouchUpInside];
+        [win.rootViewController.view addSubview:bubble];
         self.bubble = bubble;
         win.bubble = bubble;
 
-        UIButton *btnBubble = [UIButton buttonWithType:UIButtonTypeCustom];
-        btnBubble.frame = bubble.bounds;
-        [btnBubble setTitle:@"⚡RK" forState:UIControlStateNormal];
-        btnBubble.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-        [btnBubble setTitleColor:[UIColor colorWithRed:0.2 green:0.85 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
-        [btnBubble addTarget:self action:@selector(onToggleMenu) forControlEvents:UIControlEventTouchUpInside];
-        [bubble addSubview:btnBubble];
-
         UIPanGestureRecognizer *panBubble = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanBubble:)];
+        panBubble.cancelsTouchesInView = NO; // Không hủy touch của button
         [bubble addGestureRecognizer:panBubble];
 
         // 2. Menu chính chia Tab (215x310, mặc định ẩn, bấm bubble để mở)
@@ -1679,7 +1718,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
         menu.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.75].CGColor;
         menu.clipsToBounds = YES;
         menu.hidden = YES;
-        [win addSubview:menu];
+        [win.rootViewController.view addSubview:menu];
         self.menu = menu;
         win.menu = menu;
 
@@ -1787,7 +1826,6 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
         self.lblOffsetInfo.clipsToBounds = YES;
         [c1 addSubview:self.lblOffsetInfo];
 
-        self.win = win;
         win.hidden = NO;
         [win makeKeyAndVisible];
 
