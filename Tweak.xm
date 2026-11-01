@@ -225,6 +225,88 @@ static float    sAccumulatedPlaybackTime = 0.0f;
 static BOOL gAutoArmed, gPlaying;
 static BOOL gNoReplay = YES;
 static BOOL gRaceModeGuide = NO; // NO = Đua Rec (.rep), YES = Đua Guide Line (299 km/h)
+static BOOL gRecordSelf = NO; // Tự động ghi lại hành trình người chơi lái
+
+// Cấu trúc và bộ đệm ghi hành trình tự làm (Custom Record)
+#define RC_MAX_RECORD_FRAMES 15000 // ~4 phút ở 60fps
+static RCFrame *gRecordBuffer = NULL;
+static uint32_t gRecordCount = 0;
+static BOOL     gIsRecordingActive = NO;
+static double   gRecordStartTime = 0.0;
+
+// Đồng bộ nút bấm UI Game lúc Auto Play
+static void *gOperatingModeHelper = NULL;
+typedef void (*fn_SetKeyState_InputKey_t)(void *self, int keyType, BOOL isPress);
+static fn_SetKeyState_InputKey_t fnSetKeyState = NULL;
+static int sLastSyncedKeys = 0;
+
+static void rtSyncUIKeys(int newKeys) {
+    if (!gOperatingModeHelper || !fnSetKeyState) return;
+    int diff = newKeys ^ sLastSyncedKeys;
+    if (!diff) return;
+    for (int k = 1; k < 18; k++) {
+        if ((diff >> k) & 1) {
+            BOOL isPress = (newKeys >> k) & 1;
+            fnSetKeyState(gOperatingModeHelper, k, isPress);
+        }
+    }
+    sLastSyncedKeys = newKeys;
+}
+
+// Lưu & Đọc Cấu Hình (Settings Persistence)
+static NSString *rtSettingsPath(void) {
+    return [rtDir() stringByAppendingPathComponent:@"settings.plist"];
+}
+
+static void rtLoadSettings(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:rtSettingsPath()];
+    if (d) {
+        if (d[@"autoArmed"]) gAutoArmed = [d[@"autoArmed"] boolValue];
+        if (d[@"speedMultiplier"]) gSpeedMultiplier = [d[@"speedMultiplier"] floatValue];
+        if (d[@"noReplay"]) gNoReplay = [d[@"noReplay"] boolValue];
+        if (d[@"raceModeGuide"]) gRaceModeGuide = [d[@"raceModeGuide"] boolValue];
+        if (d[@"recordSelf"]) gRecordSelf = [d[@"recordSelf"] boolValue];
+        if (d[@"enableOffsetFix"]) gEnableOffsetFix = [d[@"enableOffsetFix"] boolValue];
+    }
+}
+
+static void rtSaveSettings(void) {
+    NSDictionary *d = @{
+        @"autoArmed": @(gAutoArmed),
+        @"speedMultiplier": @(gSpeedMultiplier),
+        @"noReplay": @(gNoReplay),
+        @"raceModeGuide": @(gRaceModeGuide),
+        @"recordSelf": @(gRecordSelf),
+        @"enableOffsetFix": @(gEnableOffsetFix)
+    };
+    [d writeToFile:rtSettingsPath() atomically:YES];
+}
+
+static void rtStopAndSaveCustomRecord(void) {
+    if (!gIsRecordingActive) return;
+    gIsRecordingActive = NO;
+    if (gRecordCount > 60 && gMapId > 0 && gRecordBuffer) {
+        NSString *path = rtPathForTrack();
+        if (path) {
+            FILE *f = fopen(path.fileSystemRepresentation, "wb");
+            if (f) {
+                RCHeader h;
+                memcpy(h.magic, "RKR3", 4);
+                h.ver = 3;
+                h.count = gRecordCount;
+                h.trackLen = gTrackLen;
+                h.mapId = gMapId;
+                h.frameSize = sizeof(RCFrame);
+                fwrite(&h, sizeof(RCHeader), 1, f);
+                fwrite(gRecordBuffer, sizeof(RCFrame), gRecordCount, f);
+                fclose(f);
+                rtLog("[Record] Đã lưu record tự làm: %u frames (%.1fs) cho map %d -> %s",
+                      gRecordCount, gRecordBuffer[gRecordCount - 1].t, gMapId, path.UTF8String);
+            }
+        }
+    }
+    gRecordCount = 0;
+}
 
 // Tính toán độ lệch vị trí
 static BOOL   gEnableOffsetFix = YES;
@@ -242,6 +324,7 @@ static int   gKeyMask;
 static float gCurPlaybackSteer;
 static void *gMapDataComponent = NULL;
 static void *gCheckPointMgr = NULL;
+static void *gCheckPointConfig = NULL;
 static BOOL gDownloading = NO;
 
 #pragma mark - Storage & Parser .rep
@@ -522,7 +605,28 @@ static BOOL rtLoadRecord(void) {
     gFrameCount = 0;
     if (gFrames) { free(gFrames); gFrames = NULL; }
 
-    // 1. Quét tìm và đưa file .rep từ TempMatchVideos vào parser của game
+    // 1. ƯU TIÊN SỐ 1: Kiểm tra record tự làm (custom record .rk)
+    NSString *customPath = rtPathForTrack();
+    if (customPath && [[NSFileManager defaultManager] fileExistsAtPath:customPath]) {
+        FILE *f = fopen(customPath.fileSystemRepresentation, "rb");
+        if (f) {
+            RCHeader h;
+            if (fread(&h, sizeof(RCHeader), 1, f) == 1 && h.count > 0 && h.count <= RC_MAX_FRAMES) {
+                if (!memcmp(h.magic, "RKR3", 4) && h.frameSize == sizeof(RCFrame)) {
+                    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
+                    if (gFrames) {
+                        gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
+                        fclose(f);
+                        rtLog("[Priority] ĐÃ NẠP RECORD TỰ LÀM: %u frames cho map %d!", gFrameCount, gMapId);
+                        return YES;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    // 2. Nếu không có record tự làm: Quét tìm file .rep từ TempMatchVideos
     rtLog("Searching TempMatchVideos for map %d .rep file...", gMapId);
     NSString *rep = rtFindRepFile(gMapId);
     if (rep && rtLoadRepFromDisk(rep)) {
@@ -532,48 +636,6 @@ static BOOL rtLoadRecord(void) {
         }
     }
 
-    // 2. Fallback nếu có file .rk
-    NSString *path = rtPathForTrack();
-    if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        FILE *f = fopen(path.fileSystemRepresentation, "rb");
-        if (f) {
-            RCHeader h;
-            if (fread(&h, sizeof h, 1, f) == 1 && h.count > 0 && h.count <= RC_MAX_FRAMES) {
-                if (!memcmp(h.magic, "RKR3", 4) && h.frameSize == sizeof(RCFrame)) {
-                    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
-                    if (gFrames) {
-                        gFrameCount = (uint32_t)fread(gFrames, sizeof(RCFrame), h.count, f);
-                    }
-                } else if (!memcmp(h.magic, "RKR2", 4) && h.frameSize == sizeof(RCFrameV2)) {
-                    RCFrameV2 *v2 = (RCFrameV2 *)malloc(sizeof(RCFrameV2) * h.count);
-                    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * h.count);
-                    if (v2 && gFrames) {
-                        uint32_t n = (uint32_t)fread(v2, sizeof(RCFrameV2), h.count, f);
-                        for (uint32_t i = 0; i < n; i++) {
-                            memset(&gFrames[i], 0, sizeof(RCFrame));
-                            gFrames[i].t      = v2[i].t;
-                            gFrames[i].px     = v2[i].px;
-                            gFrames[i].py     = v2[i].py;
-                            gFrames[i].pz     = v2[i].pz;
-                            gFrames[i].qx     = v2[i].qx;
-                            gFrames[i].qy     = v2[i].qy;
-                            gFrames[i].qz     = v2[i].qz;
-                            gFrames[i].qw     = v2[i].qw;
-                            gFrames[i].steer  = v2[i].steer;
-                            gFrames[i].keys   = v2[i].keys;
-                            gFrames[i].flags  = v2[i].flags;
-                        }
-                        gFrameCount = n;
-                    }
-                    if (v2) free(v2);
-                }
-                fclose(f);
-                if (gFrameCount) return YES;
-            } else {
-                fclose(f);
-            }
-        }
-    }
     return NO;
 }
 
@@ -808,48 +870,37 @@ static void rtRedownloadRepForMap(int targetMapId, void (^onComplete)(BOOL succe
     });
 }
 
-static BOOL rtCalculateStartSlotPosAndDirInMap(void *cpMgr, int slotIndex, float *outPos, float *outDir) {
-    if (!rtPtrOk(cpMgr) || !outPos) return NO;
+static BOOL rtCalculateStartSlotPosAndDirInMap(int slotIndex, float *outPos, float *outDir) {
+    if (!rtPtrOk(gCheckPointConfig) || !outPos) return NO;
 
-    float sx = *(float *)((char *)cpMgr + 0x1C8 + 0);
-    float sy = *(float *)((char *)cpMgr + 0x1C8 + 4);
-    float sz = *(float *)((char *)cpMgr + 0x1C8 + 8);
+    int cpSize = *(int *)((char *)gCheckPointConfig + 0x30); // CheckPointDataListSize
+    void *cpArr = *(void **)((char *)gCheckPointConfig + 0x38); // CheckPointDataList
+    int startIndex = *(int *)((char *)gCheckPointConfig + 0x18); // RaceStartCheckPointIndex
+    if (startIndex < 0 || startIndex >= cpSize) startIndex = 0;
 
-    float dx = *(float *)((char *)cpMgr + 0x1D4 + 0);
-    float dy = *(float *)((char *)cpMgr + 0x1D4 + 4);
-    float dz = *(float *)((char *)cpMgr + 0x1D4 + 8);
+    void **cpItems = cpArr ? (void **)((char *)cpArr + 0x20) : NULL;
+    if (!cpItems || cpSize <= 0) return NO;
 
-    // Nếu CheckPointMgr chưa gán mRaceStartPosition, gọi fallback hàm của game: GetRoadStartPoint (0x9488AC4)
-    if (fabsf(sx) < 1e-3f && fabsf(sz) < 1e-3f) {
-        uintptr_t base = rtGetUnityBase();
-        if (base) {
-            typedef void (*fn_GetRoadStart_t)(void *, float *, float *);
-            fn_GetRoadStart_t fn_road = (fn_GetRoadStart_t)(base + 0x9488AC4);
-            if (fn_road) {
-                float tempPos[3] = {0}, tempDir[3] = {0};
-                fn_road(cpMgr, tempPos, tempDir);
-                sx = tempPos[0]; sy = tempPos[1]; sz = tempPos[2];
-                dx = tempDir[0]; dy = tempDir[1]; dz = tempDir[2];
-            }
-        }
-    }
+    void *startCP = cpItems[startIndex];
+    if (!rtPtrOk(startCP)) return NO;
+
+    void *posObj   = *(void **)((char *)startCP + 0x28); // TDR_Vector3 Position
+    void *fwdObj   = *(void **)((char *)startCP + 0x30); // TDR_Vector3 Forward
+    void *leftObj  = *(void **)((char *)startCP + 0x38); // TDR_Vector3 LeftPoint
+    void *rightObj = *(void **)((char *)startCP + 0x40); // TDR_Vector3 RightPoint
+
+    if (!rtPtrOk(posObj) || !rtPtrOk(fwdObj)) return NO;
+
+    float sx = *(float *)((char *)posObj + 0x10);
+    float sy = *(float *)((char *)posObj + 0x14);
+    float sz = *(float *)((char *)posObj + 0x18);
+
+    float dx = *(float *)((char *)fwdObj + 0x10);
+    float dy = *(float *)((char *)fwdObj + 0x14);
+    float dz = *(float *)((char *)fwdObj + 0x18);
 
     if (fabsf(sx) < 1e-3f && fabsf(sz) < 1e-3f) return NO;
 
-    // Đọc gapX, gapY trực tiếp từ mAlignmentPosHelper (offset 0x148 của CheckPointMgr)
-    float gapX = 4.5f;
-    float gapY = 6.0f;
-    void *helper = *(void **)((char *)cpMgr + 0x148);
-    if (rtPtrOk(helper)) {
-        float gx = *(float *)((char *)helper + 0x10);
-        float gy = *(float *)((char *)helper + 0x14);
-        if (gx > 0.5f && gx < 20.0f) gapX = gx;
-        if (gy > 0.5f && gy < 30.0f) gapY = gy;
-    }
-
-    int carsPerRow = 6; // Hằng số CAR_START_ROW_NUM_NORMAL trong VehicleMgr
-
-    // Chuẩn hóa vector Forward (dx, dy, dz)
     float flen = sqrtf(dx * dx + dy * dy + dz * dz);
     float fx = (flen > 1e-4f) ? dx / flen : 0.f;
     float fy = (flen > 1e-4f) ? dy / flen : 0.f;
@@ -861,31 +912,30 @@ static BOOL rtCalculateStartSlotPosAndDirInMap(void *cpMgr, int slotIndex, float
         outDir[2] = fz;
     }
 
-    // Vector3.Cross(Forward, Vector3.up (0, 1, 0)) chuẩn xác từ assembly sub_D7E7D98:
-    // rx = fy * 0 - fz * 1 = -fz
-    // ry = fz * 0 - fx * 0 = 0
-    // rz = fx * 1 - fy * 0 = fx
-    float rx = -fz;
-    float ry = 0.f;
-    float rz = fx;
-    float rlen = sqrtf(rx * rx + rz * rz);
-    if (rlen > 1e-4f) {
-        rx /= rlen;
-        rz /= rlen;
+    // Vector Right từ RightPoint - LeftPoint hoặc Cross(Forward, Up)
+    float rx = 0.f, ry = 0.f, rz = 0.f;
+    if (rtPtrOk(rightObj) && rtPtrOk(leftObj)) {
+        rx = *(float *)((char *)rightObj + 0x10) - *(float *)((char *)leftObj + 0x10);
+        ry = *(float *)((char *)rightObj + 0x14) - *(float *)((char *)leftObj + 0x14);
+        rz = *(float *)((char *)rightObj + 0x18) - *(float *)((char *)leftObj + 0x18);
+    }
+    float rlen = sqrtf(rx * rx + ry * ry + rz * rz);
+    if (rlen > 1e-2f) {
+        rx /= rlen; ry /= rlen; rz /= rlen;
+    } else {
+        rx = -fz; ry = 0.f; rz = fx;
+        rlen = sqrtf(rx * rx + rz * rz);
+        if (rlen > 1e-4f) { rx /= rlen; rz /= rlen; }
     }
 
-    // Thuật toán chuẩn của hàm sub_ACDE250 (VehicleMgr.CalcuCarStartPosition):
+    float gapX = 4.5f;
+    int carsPerRow = 6;
     int slot = (slotIndex >= 0 && slotIndex <= 5) ? slotIndex : 0;
-    int row = slot / carsPerRow;
-    int col = slot % carsPerRow;
+    float lateralMult = ((float)slot - 0.5f * (float)(carsPerRow - 1)) * gapX;
 
-    float lateralMult = ((float)col - 0.5f * (float)(carsPerRow - 1)) * gapX;
-    float longitudinalMult = (float)row * gapY;
-
-    // Vector3.op_Addition(startPoint, lateralVec + longitudinalVec)
-    outPos[0] = sx + (rx * lateralMult) + (fx * longitudinalMult);
-    outPos[1] = sy + (ry * lateralMult) + (fy * longitudinalMult);
-    outPos[2] = sz + (rz * lateralMult) + (fz * longitudinalMult);
+    outPos[0] = sx + (rx * lateralMult);
+    outPos[1] = sy + (ry * lateralMult);
+    outPos[2] = sz + (rz * lateralMult);
     return YES;
 }
 
@@ -894,10 +944,10 @@ static BOOL rtCalculateAndApplyOffset(void) {
     if (!gFrames || gFrameCount < 2) return NO;
     if (gOffsetApplied) return YES;
 
-    // 1. TÍNH TỌA ĐỘ VÀ HƯỚNG VỊ TRÍ XUẤT PHÁT CỦA MAP THEO THỨ TỰ Ô CỦA REP (KHÔNG LẤY VỊ TRÍ XE!)
+    // 1. TÍNH TỌA ĐỘ VÀ HƯỚNG VỊ TRÍ XUẤT PHÁT CỦA MAP (TỪ GCHECKPOINTCONFIG HỢP LỆ)
     float mapStartDir[3] = {0.f, 0.f, 1.f};
-    if (!rtCalculateStartSlotPosAndDirInMap(gCheckPointMgr, gRepStartSlot, gMapActualPos, mapStartDir)) {
-        rtLog("[Offset] Map start slot position not available yet (CheckPointMgr=%p)", gCheckPointMgr);
+    if (!rtCalculateStartSlotPosAndDirInMap(gRepStartSlot, gMapActualPos, mapStartDir)) {
+        rtLog("[Offset] Map start position not ready yet (gCheckPointConfig=%p)", gCheckPointConfig);
         return NO;
     }
 
@@ -907,7 +957,7 @@ static BOOL rtCalculateAndApplyOffset(void) {
     float fMapZ = (fMapLen > 1e-4f) ? (mapStartDir[2] / fMapLen) : 1.f;
     float thetaMap = atan2f(fMapX, fMapZ);
 
-    // 3. TÍNH VECTOR VÀ GÓC HƯỚNG CỦA REPLAY TẠI FRAME 0 (TỪ QUATERNION GỐC)
+    // 3. TÍNH VECTOR VÀ GÓC HƯỚNG CỦA REPLAY TẠI FRAME 0
     float rqx = gRepOriginRot[0], rqy = gRepOriginRot[1], rqz = gRepOriginRot[2], rqw = gRepOriginRot[3];
     float fRepX = 2.0f * (rqx * rqz + rqw * rqy);
     float fRepZ = 1.0f - 2.0f * (rqx * rqx + rqy * rqy);
@@ -915,13 +965,13 @@ static BOOL rtCalculateAndApplyOffset(void) {
     if (fRepLen > 1e-4f) { fRepX /= fRepLen; fRepZ /= fRepLen; } else { fRepX = 0.f; fRepZ = 1.f; }
     float thetaRep = atan2f(fRepX, fRepZ);
 
-    // 4. TÍNH ĐỘ LỆCH GÓC XOAY (DELTA THETA) TRÊN MẶT PHẲNG NẰM NGANG
+    // 4. TÍNH ĐỘ LỆCH GÓC XOAY DELTA THETA
     float deltaTheta = thetaMap - thetaRep;
     while (deltaTheta > (float)M_PI)  deltaTheta -= 2.0f * (float)M_PI;
     while (deltaTheta < -(float)M_PI) deltaTheta += 2.0f * (float)M_PI;
     gOffsetAngleDeg = deltaTheta * (180.0f / (float)M_PI);
 
-    // 5. TÍNH ĐỘ LỆCH DỊCH CHUYỂN TỌA ĐỘ (DELTA TRANSLATION)
+    // 5. TÍNH ĐỘ LỆCH DỊCH CHUYỂN TỌA ĐỘ
     float dx = gMapActualPos[0] - gRepOriginPos[0];
     float dy = gMapActualPos[1] - gRepOriginPos[1];
     float dz = gMapActualPos[2] - gRepOriginPos[2];
@@ -931,12 +981,12 @@ static BOOL rtCalculateAndApplyOffset(void) {
     gOffsetDelta[1] = dy;
     gOffsetDelta[2] = dz;
 
-    rtLog("[Offset] AUTO CALC: RepSlot=%d Rep0=(%.2f, %.2f, %.2f, hdg=%.1f°) MapSlot%d=(%.2f, %.2f, %.2f, hdg=%.1f°) -> DeltaPos=(%.2f, %.2f, %.2f, dist=%.2fm) DeltaAngle=%.1f°",
-          gRepStartSlot, gRepOriginPos[0], gRepOriginPos[1], gRepOriginPos[2], thetaRep * 180.f / (float)M_PI,
-          gRepStartSlot, gMapActualPos[0], gMapActualPos[1], gMapActualPos[2], thetaMap * 180.f / (float)M_PI,
+    rtLog("[Offset] AUTO CALC: RepSlot=%d Rep0=(%.2f, %.2f, %.2f) MapSlot%d=(%.2f, %.2f, %.2f) -> DeltaPos=(%.2f, %.2f, %.2f, dist=%.2fm) DeltaAngle=%.1f°",
+          gRepStartSlot, gRepOriginPos[0], gRepOriginPos[1], gRepOriginPos[2],
+          gRepStartSlot, gMapActualPos[0], gMapActualPos[1], gMapActualPos[2],
           dx, dy, dz, dist, gOffsetAngleDeg);
 
-    // 6. NẾU CÓ ĐỘ LỆCH VỊ TRÍ (> 0.05m) HOẶC ĐỘ LỆCH XOAY (> 0.5 độ): ÁP DỤNG BIẾN ĐỔI RIGID BODY
+    // 6. ÁP DỤNG BIẾN ĐỔI RIGID BODY
     if (dist > 0.05f || fabsf(deltaTheta) > 0.008f) {
         float cosA = cosf(deltaTheta);
         float sinA = sinf(deltaTheta);
@@ -945,36 +995,30 @@ static BOOL rtCalculateAndApplyOffset(void) {
         float dQw = cosf(halfA);
 
         for (uint32_t i = 0; i < gFrameCount; i++) {
-            // A. Vector tương đối so với điểm xuất phát Replay
             float relX = gFrames[i].px - gRepOriginPos[0];
             float relY = gFrames[i].py - gRepOriginPos[1];
             float relZ = gFrames[i].pz - gRepOriginPos[2];
 
-            // B. Xoay vector tương đối theo Delta Theta quanh trục Y
             float rotRelX = relX * cosA + relZ * sinA;
             float rotRelY = relY;
             float rotRelZ = -relX * sinA + relZ * cosA;
 
-            // C. Đặt vào vạch xuất phát thực tế trên Map
             gFrames[i].px = gMapActualPos[0] + rotRelX;
             gFrames[i].py = gMapActualPos[1] + rotRelY;
             gFrames[i].pz = gMapActualPos[2] + rotRelZ;
 
-            // D. Xoay góc Quaternion xe: Q_new = dQ * Q_old
             float qx = gFrames[i].qx, qy = gFrames[i].qy, qz = gFrames[i].qz, qw = gFrames[i].qw;
             gFrames[i].qx = dQw * qx + dQy * qz;
             gFrames[i].qy = dQw * qy + dQy * qw;
             gFrames[i].qz = dQw * qz - dQy * qx;
             gFrames[i].qw = dQw * qw - dQy * qy;
 
-            // E. Xoay vector vận tốc tuyến tính
             float vx = gFrames[i].vx, vz = gFrames[i].vz;
             gFrames[i].vx = vx * cosA + vz * sinA;
             gFrames[i].vz = -vx * sinA + vz * cosA;
         }
         gOffsetApplied = YES;
-        rtLog("[Offset] RIGID BODY CALIBRATED all %u frames: deltaPos=(%.2f, %.2f, %.2f) deltaAngle=%.1f°!",
-              gFrameCount, dx, dy, dz, gOffsetAngleDeg);
+        rtLog("[Offset] RIGID BODY CALIBRATED all %u frames successfully!", gFrameCount);
         return YES;
     }
     gOffsetApplied = YES;
@@ -1002,34 +1046,30 @@ static float rtGetMyBestScoreTime(int mapId) {
 }
 
 static BOOL rtBuildGuideLineFrames(void) {
-    if (!rtPtrOk(gCheckPointMgr)) {
-        rtLog("[Guide] gCheckPointMgr is null");
+    if (!rtPtrOk(gCheckPointConfig)) {
+        rtLog("[Guide] gCheckPointConfig is null");
         return NO;
     }
 
-    void *config = *(void **)((char *)gCheckPointMgr + 0x190); // mCheckPointCfg
-    if (!rtPtrOk(config)) {
-        rtLog("[Guide] mCheckPointCfg is null");
-        return NO;
-    }
+    void *config = gCheckPointConfig;
 
-    // 1. Đọc số vòng đua của trận (Laps): 1 vòng hoặc 2 vòng
-    int laps = *(int *)((char *)gCheckPointMgr + 0x204); // mTotalRoundNum
-    if (laps <= 0 || laps > 5) laps = 1;
+    // 1. Đọc số vòng đua của trận: nếu cổng bắt đầu == cổng kết thúc -> 2 vòng, ngược lại 1 vòng
+    int startIndex = *(int *)((char *)config + 0x18); // RaceStartCheckPointIndex
+    int endIndex   = *(int *)((char *)config + 0x20); // RaceEndCheckPointIndex
+    int laps = (startIndex == endIndex) ? 2 : 1;
 
     // Chiều dài 1 vòng
     float lapLength = *(float *)((char *)config + 0x2C); // MainCurveLength
-    if (lapLength < 100.0f) lapLength = *(float *)((char *)gCheckPointMgr + 0x200); // mSingleRoundLength
     if (lapLength < 100.0f) lapLength = 3000.0f;
 
     // 2. Thu thập điểm mốc tim đường từ TrackPointDataList
     int realSize = *(int *)((char *)config + 0x40); // TrackPointDataListSize
-    void *tpArr = *(void **)((char *)config + 0x48); // TrackPointDataList
-    int rawCap = tpArr ? *(int *)((char *)tpArr + 0x18) : 0;
+    void *tpArr  = *(void **)((char *)config + 0x48); // TrackPointDataList
+    int rawCap   = tpArr ? *(int *)((char *)tpArr + 0x18) : 0;
     void **items = tpArr ? (void **)((char *)tpArr + 0x20) : NULL;
 
-    int validCount = (realSize > 0 && realSize <= rawCap) ? realSize : rawCap;
-    if (validCount > 10000) validCount = 10000; // An toàn, tránh duyệt mảng 102400
+    int validCount = (realSize > 0 && realSize <= rawCap) ? realSize : 0;
+    if (validCount > 10000) validCount = 10000;
 
     typedef struct {
         float x, y, z;
@@ -1052,7 +1092,6 @@ static BOOL rtBuildGuideLineFrames(void) {
                 float py = *(float *)((char *)posObj + 0x14);
                 float pz = *(float *)((char *)posObj + 0x18);
 
-                // Bỏ qua điểm rác 0,0,0 hoặc NaN
                 if (fabsf(px) < 1e-3f && fabsf(py) < 1e-3f && fabsf(pz) < 1e-3f) continue;
                 if (isnan(px) || isnan(py) || isnan(pz)) continue;
 
@@ -1061,7 +1100,7 @@ static BOOL rtBuildGuideLineFrames(void) {
                     float dy = py - gpts[numGpts - 1].y;
                     float dz = pz - gpts[numGpts - 1].z;
                     float seg = sqrtf(dx * dx + dy * dy + dz * dz);
-                    if (seg < 0.05f) continue; // Bỏ qua điểm trùng vị trí
+                    if (seg < 0.05f) continue;
                     accumDist += seg;
                 }
                 gpts[numGpts].x = px;
@@ -1080,7 +1119,7 @@ static BOOL rtBuildGuideLineFrames(void) {
         void *cpArr = *(void **)((char *)config + 0x38); // CheckPointDataList
         int cpCap = cpArr ? *(int *)((char *)cpArr + 0x18) : 0;
         void **cpItems = cpArr ? (void **)((char *)cpArr + 0x20) : NULL;
-        int cpValid = (cpSize > 0 && cpSize <= cpCap) ? cpSize : cpCap;
+        int cpValid = (cpSize > 0 && cpSize <= cpCap) ? cpSize : 0;
         if (cpValid > 5000) cpValid = 5000;
 
         if (cpItems && cpValid > 3) {
@@ -1133,7 +1172,6 @@ static BOOL rtBuildGuideLineFrames(void) {
     float targetSpeedMps = 299.0f / 3.6f; // ~83.0556 m/s
     float targetFinishTime = totalDistance / targetSpeedMps;
 
-    // Lấy thời gian nhanh nhất cá nhân
     float myBest = rtGetMyBestScoreTime(gMapId);
     if (myBest > 10.0f && myBest < 300.0f) {
         float bestSpeed = totalDistance / myBest;
@@ -1245,7 +1283,7 @@ static BOOL rtBuildGuideLineFrames(void) {
     gFrameCount = totalFrames;
     if (oldF) free(oldF);
 
-    gOffsetApplied = YES; // Guide line lấy thẳng từ map nên không cần bù lệch
+    gOffsetApplied = YES;
     rtLog("[Guide] Generated %u frames for %d lap(s) (%.1fm, finishTime=%.2fs, speed=%.1f km/h)!",
           gFrameCount, laps, totalDistance, targetFinishTime, targetSpeedMps * 3.6f);
     return YES;
@@ -1287,6 +1325,8 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         gPlaying = NO;
         gCurPlaybackSteer = 0.f;
         rtWriteKeyFlags(0);
+        rtSyncUIKeys(0);
+        if (gPanel) [gPanel showPlayFrameHud:NO];
         return;
     }
 
@@ -1425,52 +1465,44 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 
     gKeyMask = (int)keys;
     rtWriteKeyFlags((int)keys);
+    rtSyncUIKeys((int)keys);
+    if (gPanel) {
+        [gPanel updatePlayFrameHud:lo count:gFrameCount time:t];
+    }
 }
 
 #pragma mark - UI Interface
 
-@interface RCPanel : NSObject <UIGestureRecognizerDelegate>
-@property (nonatomic, strong) UIWindow *win;
-@property (nonatomic, strong) UIView *bubble;
-@property (nonatomic, strong) UIView *menu;
-@property (nonatomic, strong) UISegmentedControl *tabSeg;
-
-// Tab 0: Điều khiển chính
-@property (nonatomic, strong) UIView *tab0View;
-@property (nonatomic, strong) UIButton *bMode;
-@property (nonatomic, strong) UIButton *bDl;
-@property (nonatomic, strong) UIButton *bNoRep;
-@property (nonatomic, strong) UIButton *bAuto;
-@property (nonatomic, strong) UIButton *bFixMap;
-@property (nonatomic, strong) UISlider *sliderSpeed;
-@property (nonatomic, strong) UILabel *lblSpeed;
-@property (nonatomic, strong) UILabel *status;
-
-// Tab 1: Tính toán độ lệch vị trí
-@property (nonatomic, strong) UIView *tab1View;
-@property (nonatomic, strong) UIButton *bToggleOffset;
-@property (nonatomic, strong) UIButton *bFixNow;
-@property (nonatomic, strong) UILabel *lblOffsetInfo;
-
-- (void)show;
-- (void)refresh;
-@end
+@class RCPanel;
+static RCPanel *gPanel;
 
 @interface RCPassWindow : UIWindow
+@property (nonatomic, strong) UITextField *secureTextField;
+@property (nonatomic, strong) UIView *secureContainer;
 @property (nonatomic, weak) UIView *bubble;
 @property (nonatomic, weak) UIView *menu;
+@property (nonatomic, weak) UIView *hudPlayFrame;
 @end
 
 @implementation RCPassWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
 
-    // 0. QUAN TRỌNG: Nếu đang có Alert Popup (Lỗi Map / Thông báo), cho phép nhận 100% tương tác
+    // 0. Nhận diện tương tác nếu có Popup Alert hệ thống
     if (self.rootViewController && self.rootViewController.presentedViewController) {
         return [super hitTest:point withEvent:event];
     }
 
-    // 1. Chạm vào bong bóng nổi
+    // 1. Chạm vào menu rời PlayFrame (+0.1 / -0.1)
+    if (self.hudPlayFrame && !self.hudPlayFrame.hidden && self.hudPlayFrame.userInteractionEnabled) {
+        CGPoint p = [self convertPoint:point toView:self.hudPlayFrame];
+        if ([self.hudPlayFrame pointInside:p withEvent:event]) {
+            UIView *hit = [self.hudPlayFrame hitTest:p withEvent:event];
+            return hit ?: self.hudPlayFrame;
+        }
+    }
+
+    // 2. Chạm vào bong bóng nổi
     if (self.bubble && !self.bubble.hidden && self.bubble.userInteractionEnabled) {
         CGPoint p = [self convertPoint:point toView:self.bubble];
         if ([self.bubble pointInside:p withEvent:event]) {
@@ -1479,7 +1511,7 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         }
     }
 
-    // 2. Chạm vào menu chính
+    // 3. Chạm vào menu chính
     if (self.menu && !self.menu.hidden && self.menu.userInteractionEnabled) {
         CGPoint p = [self convertPoint:point toView:self.menu];
         if ([self.menu pointInside:p withEvent:event]) {
@@ -1488,12 +1520,38 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         }
     }
 
-    // 3. Xuyên thấu toàn bộ các vùng còn lại ra ngoài game
+    // 4. Xuyên thấu toàn bộ các vùng còn lại ra ngoài game
     return nil;
 }
 @end
 
-static RCPanel *gPanel;
+@interface RCPanel : NSObject <UIGestureRecognizerDelegate>
+@property (nonatomic, strong) RCPassWindow *win;
+@property (nonatomic, strong) UIButton *bubble;
+@property (nonatomic, strong) UIView *menu;
+
+// Menu rời PlayFrame hiện tại (+0.1 và -0.1)
+@property (nonatomic, strong) UIView *hudPlayFrame;
+@property (nonatomic, strong) UILabel *lblFrameInfo;
+@property (nonatomic, strong) UIButton *btnMinusSpeed;
+@property (nonatomic, strong) UIButton *btnPlusSpeed;
+
+// Các nút điều khiển chính (Không icon / emoji)
+@property (nonatomic, strong) UIButton *bMode;
+@property (nonatomic, strong) UIButton *bDl;
+@property (nonatomic, strong) UIButton *bNoRep;
+@property (nonatomic, strong) UIButton *bAuto;
+@property (nonatomic, strong) UIButton *bRecord;
+@property (nonatomic, strong) UIButton *bFixMap;
+@property (nonatomic, strong) UISlider *sliderSpeed;
+@property (nonatomic, strong) UILabel *lblSpeed;
+@property (nonatomic, strong) UILabel *status;
+
+- (void)show;
+- (void)refresh;
+- (void)showPlayFrameHud:(BOOL)show;
+- (void)updatePlayFrameHud:(uint32_t)cur count:(uint32_t)total time:(float)t;
+@end
 
 static UIViewController *rtTopVC(void) {
     if (gPanel && gPanel.win && gPanel.win.rootViewController) {
@@ -1501,530 +1559,56 @@ static UIViewController *rtTopVC(void) {
         while (vc.presentedViewController) vc = vc.presentedViewController;
         return vc;
     }
-    UIWindow *best = nil;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (!w.isKeyWindow) continue;
-        if ([w isKindOfClass:[RCPassWindow class]]) continue;
-        best = w;
-    }
-    if (!best) {
-        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-            if ([w isKindOfClass:[RCPassWindow class]]) continue;
-            if (w.windowLevel < UIWindowLevelAlert) best = w;
-        }
-    }
-    UIViewController *vc = best.rootViewController;
-    if (!vc) vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+    UIWindow *w = UIApplication.sharedApplication.keyWindow;
+    UIViewController *vc = w.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
 
 static void rtAlert(NSString *title, NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = rtTopVC();
-        if (!vc) return;
-        if (gPanel && gPanel.win) [gPanel.win makeKeyAndVisible];
+        UIViewController *top = rtTopVC();
+        if (!top) return;
         UIAlertController *a = [UIAlertController alertControllerWithTitle:title
-                                                                  message:msg
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                for (UIWindow *w in UIApplication.sharedApplication.windows) {
-                    if ([w isKindOfClass:[RCPassWindow class]]) continue;
-                    if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
-                }
-            });
-        }]];
-        [vc presentViewController:a animated:YES completion:nil];
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+        [top presentViewController:a animated:YES completion:nil];
     });
 }
-
-#pragma mark - Hooks
-
-static void   (*orig_MotionCtrl_Update)(void *, float, const void *);
-static void   (*orig_Input_Update)(void *, float, const void *);
-static BOOL   (*orig_Input_GetKey)(void *, int, const void *);
-static BOOL   (*orig_GetSteeringValue)(void *, void *, float, float *, float *, const void *);
-static void   (*orig_GoImpEnter)(void *, const void *);
-static void   (*orig_RaceKingGoImpEnter)(void *, const void *);
-static void   (*orig_ReplayGoImpEnter)(void *, const void *);
-static void   (*orig_ReplayActionGoImpEnter)(void *, const void *);
-static void   (*orig_GameFinishImpEnter)(void *, const void *);
-static BOOL   (*orig_MatchVideoDesHelper_InitByVideoBytes)(void *, void *, const void *);
-static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void *);
-static void   (*orig_MapDataComponent_InitComponent)(void *, const void *);
-static void  *(*orig_DataCenterMdl_GetMapDataComponent)(void *, bool, const void *);
-
-// No Replay Hooks
-static int    (*orig_MatchVideoMdl_StartEnterGame)(void *, int, void *, void *, const void *);
-static int    (*orig_MatchVideoMdl_ChallengeShadow_info)(void *, void *, uint64_t, const void *);
-static int    (*orig_MatchVideoMdl_ChallengeShadow_mark)(void *, int64_t, uint64_t, const void *);
-static int    (*orig_MatchVideoMdl_ReplayVideo_bytes)(void *, void *, uint64_t, void *, void *, const void *);
-static int    (*orig_MatchVideoMdl_ReplayVideo_mark)(void *, int64_t, uint64_t, const void *);
-static int    (*orig_MatchVideoMdl_ReplayTeachingVideo)(void *, int, void *, bool, const void *);
-
-// Anti-AFK & Anti-Speed-Report Hooks
-static void   (*orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime)(void *, float, const void *);
-static void   (*orig_SdcVehicleInput_Update)(void *, float, const void *);
-static void   (*orig_SdcPlayerInput_Update)(void *, float, const void *);
-static void   (*orig_SdcVehicleVel_Update)(void *, float, const void *);
-static void   (*orig_CPR_FillVehicleInputData)(void *, void **, const void *);
-static void   (*orig_CPR_FillVehicleVelData)(void *, void **, const void *);
-static void   (*orig_CPR_FillPVPButtonUseData)(void *, void **, const void *);
-static void   (*orig_CPR_ReportData)(void *, void **, const void *);
-static BOOL   (*orig_MatchUIMgr_Trusteeship)(void *, int, const void *);
-
-static void hook_Input_Update(void *self, float dt, const void *m) {
-    if (rtPtrOk(self)) gInputModule = self;
-    if (orig_Input_Update) orig_Input_Update(self, dt, m);
-    if (gPlaying) {
-        rtWriteKeyFlags(gKeyMask);
-    }
-}
-
-static BOOL hook_Input_GetKey(void *self, int keyType, const void *m) {
-    if (rtPtrOk(self)) gInputModule = self;
-    if (gPlaying && keyType > 0 && keyType < 18) {
-        if ((gKeyMask >> keyType) & 1) return TRUE;
-    }
-    return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, m) : FALSE;
-}
-
-static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
-                                  float *steerValue, float *steeringTime, const void *m) {
-    if (gPlaying && steerValue) {
-        *steerValue = gCurPlaybackSteer;
-        if (steeringTime) *steeringTime = 0.5f;
-        return TRUE;
-    }
-    return orig_GetSteeringValue ? orig_GetSteeringValue(self, carParams, dt, steerValue, steeringTime, m) : FALSE;
-}
-
-static void rtBeginRace(void) {
-    gGoTime = rtNow();
-    sLastPlaybackRealTime = gGoTime;
-    sAccumulatedPlaybackTime = 0.0f;
-    gCurPlaybackSteer = 0.f;
-
-    if (gAutoArmed) {
-        BOOL ok = NO;
-        if (gRaceModeGuide) {
-            ok = rtBuildGuideLineFrames();
-        } else {
-            ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
-            if (ok && gEnableOffsetFix && !gOffsetApplied) {
-                rtCalculateAndApplyOffset();
-            }
-        }
-        gPlaying = ok;
-        rtLog("AUTO map=%d -> %s (%u frames)", gMapId, ok ? "playing" : "no record", gFrameCount);
-        if (!ok) {
-            rtAlert(@"Đua lập trình",
-                    [NSString stringWithFormat:@"Không tìm thấy file .rep cho map %d trong TempMatchVideos", gMapId]);
-        }
-    } else gPlaying = NO;
-}
-
-static void hook_GoImpEnter(void *self, const void *m) {
-    if (orig_GoImpEnter) orig_GoImpEnter(self, m);
-    rtBeginRace();
-}
-
-static void hook_RaceKingGoImpEnter(void *self, const void *m) {
-    if (orig_RaceKingGoImpEnter) orig_RaceKingGoImpEnter(self, m);
-    rtBeginRace();
-}
-
-static void hook_ReplayGoImpEnter(void *self, const void *m) {
-    if (orig_ReplayGoImpEnter) orig_ReplayGoImpEnter(self, m);
-    rtLog("ENTER ReplayGameGoState");
-    rtBeginRace();
-}
-
-static void hook_ReplayActionGoImpEnter(void *self, const void *m) {
-    if (orig_ReplayActionGoImpEnter) orig_ReplayActionGoImpEnter(self, m);
-    rtLog("ENTER ReplayActionSpeedGameGoState");
-    rtBeginRace();
-}
-
-static void hook_GameFinishImpEnter(void *self, const void *m) {
-    if (orig_GameFinishImpEnter) orig_GameFinishImpEnter(self, m);
-    rtLog("FINISH reached");
-    gPlaying = NO;
-    rtWriteKeyFlags(0);
-}
-
-static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *videoBytes, const void *m) {
-    BOOL res = orig_MatchVideoDesHelper_InitByVideoBytes ? orig_MatchVideoDesHelper_InitByVideoBytes(self, videoBytes, m) : NO;
-    rtLog("HOOK MatchVideoDesHelper::InitByVideoBytes res=%d", (int)res);
-    if (res && rtPtrOk(self)) {
-        rtExtractFramesFromDesHelper(self);
-    }
-    return res;
-}
-
-static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool reset, const void *m) {
-    gPlaying = NO;
-    gPlayerVehicle = NULL;
-    if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, crc, reset, m);
-    gMapId = rtPtrOk(self) ? *(int *)((char *)self + 0x40) : 0;
-    if (gMapId <= 0 && rtPtrOk(config)) {
-        gMapId = *(int *)((char *)config + kOffCpMapId);
-    }
-    gTrackLen = 0.f;
-
-    // Lưu con trỏ CheckPointMgr và reset cờ
-    gCheckPointMgr = self;
-    gOffsetApplied = NO;
-    memset(gOffsetDelta, 0, sizeof(gOffsetDelta));
-    memset(gMapActualPos, 0, sizeof(gMapActualPos));
-
-    rtLog("MAP resolved from CheckPointMgr self=%p config=%p mapId=%d", self, config, gMapId);
-
-    // KHI VÀO MAP MỚI: TỰ ĐỘNG NẠP REC HOẶC BUILD GUIDE LINE NGAY LẬP TỨC!
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gAutoArmed) {
-            if (gRaceModeGuide) {
-                rtBuildGuideLineFrames();
-            } else {
-                BOOL ok = rtLoadRecord();
-                if (ok && gEnableOffsetFix) {
-                    rtCalculateAndApplyOffset();
-                }
-            }
-        }
-        if (gPanel) [gPanel refresh];
-    });
-}
-
-static void hook_MapDataComponent_InitComponent(void *self, const void *m) {
-    if (rtPtrOk(self)) {
-        gMapDataComponent = self;
-        rtLog("Captured MapDataComponent=%p", self);
-    }
-    if (orig_MapDataComponent_InitComponent) orig_MapDataComponent_InitComponent(self, m);
-}
-
-static void *hook_DataCenterMdl_GetMapDataComponent(void *self, bool withInit, const void *m) {
-    void *res = orig_DataCenterMdl_GetMapDataComponent ? orig_DataCenterMdl_GetMapDataComponent(self, withInit, m) : NULL;
-    if (rtPtrOk(res)) {
-        gMapDataComponent = res;
-    }
-    return res;
-}
-
-// ==================== NO REPLAY HOOKS (CHẶN MỞ REPLAY / BÓNG) ====================
-static int hook_MatchVideoMdl_StartEnterGame(void *self, int videoId, void *bytes, void *summaryInfo, const void *m) {
-    if (gNoReplay) {
-        rtLog("NO REPLAY: Intercepted StartEnterGame (id=%d)", videoId);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận.");
-        return 0; // NotErr
-    }
-    return orig_MatchVideoMdl_StartEnterGame ? orig_MatchVideoMdl_StartEnterGame(self, videoId, bytes, summaryInfo, m) : 0;
-}
-
-static int hook_MatchVideoMdl_ChallengeShadow_info(void *self, void *summaryInfo, uint64_t shadowUID, const void *m) {
-    if (gNoReplay) {
-        rtLog("NO REPLAY: Intercepted ChallengeShadow(info)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
-        return 0;
-    }
-    return orig_MatchVideoMdl_ChallengeShadow_info ? orig_MatchVideoMdl_ChallengeShadow_info(self, summaryInfo, shadowUID, m) : 0;
-}
-
-static int hook_MatchVideoMdl_ChallengeShadow_mark(void *self, int64_t videoMark, uint64_t shadowUID, const void *m) {
-    if (gNoReplay) {
-        rtLog("NO REPLAY: Intercepted ChallengeShadow(mark=%lld)", (long long)videoMark);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
-        return 0;
-    }
-    return orig_MatchVideoMdl_ChallengeShadow_mark ? orig_MatchVideoMdl_ChallengeShadow_mark(self, videoMark, shadowUID, m) : 0;
-}
-
-static int hook_MatchVideoMdl_ReplayVideo_bytes(void *self, void *videoBytes, uint64_t uid, void *name, void *icon, const void *m) {
-    if (gNoReplay) {
-        rtLog("NO REPLAY: Intercepted ReplayVideo(bytes)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
-        return 0; // NotErr
-    }
-    return orig_MatchVideoMdl_ReplayVideo_bytes ? orig_MatchVideoMdl_ReplayVideo_bytes(self, videoBytes, uid, name, icon, m) : 0;
-}
-
-static int hook_MatchVideoMdl_ReplayVideo_mark(void *self, int64_t mark, uint64_t uid, const void *m) {
-    if (gNoReplay) {
-        rtLog("NO REPLAY: Intercepted ReplayVideo(mark=%lld)", (long long)mark);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
-        return 0; // NotErr
-    }
-    return orig_MatchVideoMdl_ReplayVideo_mark ? orig_MatchVideoMdl_ReplayVideo_mark(self, mark, uid, m) : 0;
-}
-
-static int hook_MatchVideoMdl_ReplayTeachingVideo(void *self, int videoId, void *url, bool uncomp, const void *m) {
-    if (gNoReplay) {
-        rtLog("NO REPLAY: Intercepted ReplayTeachingVideo(id=%d)", videoId);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
-        return 0; // NotErr
-    }
-    return orig_MatchVideoMdl_ReplayTeachingVideo ? orig_MatchVideoMdl_ReplayTeachingVideo(self, videoId, url, uncomp, m) : 0;
-}
-
-// ==================== ANTI-AFK (4 TẦNG CHỐNG TREO MÁY) ====================
-// Tầng 1: Khóa bộ đếm thời gian không điều khiển của xe
-static void hook_SdcVehicleInput_UpdateVehicleNotControlMaxTime(void *self, float dt, const void *m) {
-    if (!rtPtrOk(self)) return;
-    *(float *)((char *)self + 0x9C) = 0.f;  // mNotControlTime = 0
-    *(bool  *)((char *)self + 0xA0) = true; // mLastIsControl = true
-    *(float *)((char *)self + 0xA4) = 0.f;  // mLastControlTime = 0
-
-    void *endData = *(void **)((char *)self + 0x58); // mEndData (SdcVehicleInputEndData)
-    if (rtPtrOk(endData)) {
-        *(int *)((char *)endData + 0x2C) = 0; // CarNonControlTimeMax = 0
-        *(int *)((char *)endData + 0x30) = 0; // CarNonControlTimeTotal = 0
-    }
-}
-
-static void hook_SdcVehicleInput_Update(void *self, float dt, const void *m) {
-    if (orig_SdcVehicleInput_Update) orig_SdcVehicleInput_Update(self, dt, m);
-    if (rtPtrOk(self)) {
-        *(float *)((char *)self + 0x9C) = 0.f;  // mNotControlTime = 0
-        *(bool  *)((char *)self + 0xA0) = true; // mLastIsControl = true
-        *(float *)((char *)self + 0xA4) = 0.f;  // mLastControlTime = 0
-
-        void *endData = *(void **)((char *)self + 0x58);
-        if (rtPtrOk(endData)) {
-            *(int *)((char *)endData + 0x2C) = 0; // CarNonControlTimeMax = 0
-            *(int *)((char *)endData + 0x30) = 0; // CarNonControlTimeTotal = 0
-            if (gPlaying) {
-                (*(int *)((char *)endData + 0x10))++; // CarLeftTurnCount++
-                (*(int *)((char *)endData + 0x18))++; // CarRightTurnCount++
-                (*(int *)((char *)endData + 0x24))++; // CarDriftingCount++
-            }
-        }
-    }
-}
-
-static void hook_SdcPlayerInput_Update(void *self, float dt, const void *m) {
-    if (orig_SdcPlayerInput_Update) orig_SdcPlayerInput_Update(self, dt, m);
-    if (rtPtrOk(self) && gPlaying) {
-        void *endData = *(void **)((char *)self + 0x58); // mEndData (SdcPlayerInputEndData)
-        if (rtPtrOk(endData)) {
-            (*(int *)((char *)endData + 0x14))++; // UserLeftTurnCount++
-            (*(int *)((char *)endData + 0x18))++; // UserRightTurnCount++
-            (*(int *)((char *)endData + 0x20))++; // UserDriftingCount++
-            (*(int *)((char *)endData + 0x24))++; // UserMiniJetCount++
-        }
-    }
-}
-
-// Tầng 2: Làm sạch dữ liệu NonControlTime trên gói tin EndGame gửi lên Server
-static void hook_CPR_FillVehicleInputData(void *self, void **fillData, const void *m) {
-    if (orig_CPR_FillVehicleInputData) orig_CPR_FillVehicleInputData(self, fillData, m);
-    if (fillData && rtPtrOk(*fillData)) {
-        char *d = (char *)*fillData;
-        *(uint32_t *)(d + 0x48) = 0; // dwCarNonControlTimeMax = 0
-        *(uint32_t *)(d + 0x4C) = 0; // dwCarNonControlTimeTotal = 0
-    }
-}
-
-// Tầng 3: Bổ sung số lượt thao tác phím hợp lệ gửi lên Server
-static void hook_CPR_FillPVPButtonUseData(void *self, void **fillData, const void *m) {
-    if (orig_CPR_FillPVPButtonUseData) orig_CPR_FillPVPButtonUseData(self, fillData, m);
-    if (fillData && rtPtrOk(*fillData)) {
-        char *d = (char *)*fillData;
-        if (*(uint16_t *)(d + 0x12) < 15) *(uint16_t *)(d + 0x12) = 15 + (rand() % 10);
-        if (*(uint16_t *)(d + 0x14) < 15) *(uint16_t *)(d + 0x14) = 15 + (rand() % 10);
-        if (*(uint16_t *)(d + 0x18) < 8)  *(uint16_t *)(d + 0x18) = 8 + (rand() % 5);
-        if (*(uint16_t *)(d + 0x1A) < 10) *(uint16_t *)(d + 0x1A) = 10 + (rand() % 6);
-    }
-}
-
-// Tầng 4: Chặn Game chuyển sang trạng thái AFK / Trusteeship (xe AI tự lái)
-static BOOL hook_MatchUIMgr_Trusteeship(void *self, int aiActionID, const void *m) {
-    if (gPlaying) {
-        rtLog("ANTI-AFK: Blocked in-game Trusteeship (%d)", aiActionID);
-        return FALSE; // Không cho game chuyển sang xe AI tự lái của AFK
-    }
-    return orig_MatchUIMgr_Trusteeship ? orig_MatchUIMgr_Trusteeship(self, aiActionID, m) : FALSE;
-}
-
-// ==================== ANTI-SPEED-REPORT (CHỐNG REPORT TỐC ĐỘ / FAST FRAME) ====================
-static void hook_SdcVehicleVel_Update(void *self, float dt, const void *m) {
-    if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, m);
-    if (rtPtrOk(self)) {
-        // Giới hạn vận tốc đo đạc trong bộ nhớ về mức xe bình thường (tránh trigger Anti-Cheat khi tua nhanh)
-        if (*(float *)((char *)self + 0x94) > 295.f) *(float *)((char *)self + 0x94) = 290.f + (rand() % 5); // mMaxVehicleKMPH
-        if (*(float *)((char *)self + 0xAC) > 295.f) *(float *)((char *)self + 0xAC) = 290.f + (rand() % 5); // mVehicleKMPH
-        if (*(float *)((char *)self + 0xB0) > 295.f) *(float *)((char *)self + 0xB0) = 290.f + (rand() % 5); // mLastVehicleKMPH
-
-        void *endData = *(void **)((char *)self + 0x58); // mEndData (SdcVehicleVelEndData)
-        if (rtPtrOk(endData)) {
-            if (*(int *)((char *)endData + 0x10) > 295) *(int *)((char *)endData + 0x10) = 292 + (rand() % 5); // CarSpeedMax
-            *(int *)((char *)endData + 0x14) = 15; // CarSpeedOverBase
-            *(float *)((char *)endData + 0x58) = 0.f; // SpeedRangeTime_Greater350Less400
-            *(float *)((char *)endData + 0x5C) = 0.f; // SpeedRangeTime_Greater400Less450
-            *(float *)((char *)endData + 0x60) = 0.f; // SpeedRangeTime_Greater450Less500
-            *(float *)((char *)endData + 0x64) = 0.f; // SpeedRangeTime_Greater500
-            *(int *)((char *)endData + 0x7C) = 0;   // SpeedReach_350
-            *(int *)((char *)endData + 0x80) = 0;   // SpeedReach_400
-        }
-    }
-}
-
-static void hook_CPR_FillVehicleVelData(void *self, void **fillData, const void *m) {
-    if (orig_CPR_FillVehicleVelData) orig_CPR_FillVehicleVelData(self, fillData, m);
-    if (fillData && rtPtrOk(*fillData)) {
-        char *d = (char *)*fillData;
-        // dwCarSpeedMax (offset 0x28)
-        if (*(uint32_t *)(d + 0x28) > 298) *(uint32_t *)(d + 0x28) = 292 + (rand() % 6);
-        // dwCarSpeedOverBase (offset 0x2C)
-        if (*(uint32_t *)(d + 0x2C) > 25)  *(uint32_t *)(d + 0x2C) = 12 + (rand() % 5);
-    }
-}
-
-static void hook_CPR_ReportData(void *self, void **reqData, const void *m) {
-    if (orig_CPR_ReportData) orig_CPR_ReportData(self, reqData, m);
-    if (reqData && rtPtrOk(*reqData)) {
-        char *req = (char *)*reqData;
-        *(uint8_t *)(req + 0x40) = 0; // bCheatEndGame = 0 (Tuyệt đối không bị Server đánh dấu gian lận)
-        *(uint8_t *)(req + 0x54) = 0; // bClientReportAnti = 0 (Báo cáo client bình thường)
-        rtLog("ANTI-REPORT: Cleared bCheatEndGame & bClientReportAnti");
-    }
-}
-
-static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
-    if (rtPtrOk(self)) {
-        void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
-        if (rtPtrOk(vehicle)) {
-            int actorType = *(int *)((char *)vehicle + kOffVehicleActorType);
-            bool isMain = *(bool *)((char *)vehicle + kOffVehicleIsMainPlayer);
-            // Chấp nhận: RealPlayer (0), ReplayPlayer (3), BeObservePlayer (5), hoặc xe mIsMainPlayer (0xF8)
-            BOOL isTarget = isMain || (actorType == 0) || (actorType == 3) || (actorType == 5);
-            if (isTarget) {
-                gPlayerVehicle = vehicle;
-                void *steerData   = *(void **)((char *)self + kOffMotionSteerData);
-                void *phyCtrl     = *(void **)((char *)self + kOffMotionPhyCtrl);
-                void *drivingCtrl = *(void **)((char *)self + kOffMotionDriving);
-                void *sim = rtPtrOk(phyCtrl) ? *(void **)((char *)phyCtrl + kOffPhySimOutput) : NULL;
-
-                // Đọc thứ tự xuất phát của xe trong trận (InputCarPos) để hiển thị thông tin
-                if (!gPlaying && rtPtrOk(vehicle)) {
-                    gMapStartSlot = *(int *)((char *)vehicle + 0xE8);
-                }
-
-                if (gPlaying) {
-
-                    // GetSteeringValue đã được hook toàn cục an toàn lúc khởi động tweak
-                    if (rtPtrOk(steerData) && rtPtrOk(sim)) {
-                        double now = rtNow();
-                        rtPlaybackTick(self, steerData, drivingCtrl, sim, now);
-                    }
-                }
-            }
-        }
-    }
-    if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, m);
-}
-
-#pragma mark - UI
-
-
 
 @implementation RCPanel
 
 - (UIButton *)mk:(NSString *)t sel:(SEL)s {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
     [b setTitle:t forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    b.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.92];
-    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.backgroundColor = [UIColor colorWithRed:0.08 green:0.22 blue:0.35 alpha:0.95];
     b.layer.cornerRadius = 7;
-    b.layer.borderWidth = 1;
-    b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+    b.layer.borderWidth = 0.8;
+    b.layer.borderColor = [UIColor colorWithRed:0.2 green:0.7 blue:0.9 alpha:0.4].CGColor;
+    b.clipsToBounds = YES;
     [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
 
-static BOOL sBubbleDragged = NO;
-
-- (void)onPanBubble:(UIPanGestureRecognizer *)p {
-    if (p.state == UIGestureRecognizerStateBegan) {
-        sBubbleDragged = NO;
-    } else if (p.state == UIGestureRecognizerStateChanged) {
-        CGPoint trans = [p translationInView:self.win];
-        if (hypotf(trans.x, trans.y) > 2.0f) {
-            sBubbleDragged = YES;
-        }
-        CGRect f = self.bubble.frame;
-        f.origin.x += trans.x;
-        f.origin.y += trans.y;
-        CGRect scr = UIScreen.mainScreen.bounds;
-        if (f.origin.x < 5) f.origin.x = 5;
-        if (f.origin.y < 20) f.origin.y = 20;
-        if (f.origin.x + f.size.width  > scr.size.width  - 5) f.origin.x = scr.size.width  - f.size.width  - 5;
-        if (f.origin.y + f.size.height > scr.size.height - 20) f.origin.y = scr.size.height - f.size.height - 20;
-        self.bubble.frame = f;
-        [p setTranslation:CGPointZero inView:self.win];
-    }
-}
-
-- (void)onBubbleTap {
-    if (sBubbleDragged) {
-        sBubbleDragged = NO;
-        return;
-    }
-    [self onToggleMenu];
-}
-
-- (void)onPanMenu:(UIPanGestureRecognizer *)p {
-    CGPoint trans = [p translationInView:self.win];
-    CGRect f = self.menu.frame;
-    f.origin.x += trans.x;
-    f.origin.y += trans.y;
-    CGRect scr = UIScreen.mainScreen.bounds;
-    if (f.origin.x < 5) f.origin.x = 5;
-    if (f.origin.y < 20) f.origin.y = 20;
-    if (f.origin.x + f.size.width  > scr.size.width  - 5) f.origin.x = scr.size.width  - f.size.width  - 5;
-    if (f.origin.y + f.size.height > scr.size.height - 20) f.origin.y = scr.size.height - f.size.height - 20;
-    self.menu.frame = f;
-    [p setTranslation:CGPointZero inView:self.win];
-}
-
-- (void)onToggleMenu {
-    self.menu.hidden = (self.menu.hidden ? NO : YES);
-    if (!self.menu.hidden) {
-        [self refresh];
-    }
-}
-
-- (void)onTabChange:(UISegmentedControl *)sender {
-    if (sender.selectedSegmentIndex == 0) {
-        self.tab0View.hidden = NO;
-        self.tab1View.hidden = YES;
-    } else {
-        self.tab0View.hidden = YES;
-        self.tab1View.hidden = NO;
-    }
-    [self refresh];
-}
-
 - (void)show {
     dispatch_async(dispatch_get_main_queue(), ^{
-        CGRect scr = UIScreen.mainScreen.bounds;
+        if (self.win) return;
+        CGRect scr = [UIScreen mainScreen].bounds;
+
         RCPassWindow *win = [[RCPassWindow alloc] initWithFrame:scr];
-        win.windowLevel = UIWindowLevelAlert + 2;
-        win.backgroundColor = UIColor.clearColor;
-        win.opaque = NO;
+        win.backgroundColor = [UIColor clearColor];
+        win.windowLevel = UIWindowLevelStatusBar + 100.0;
+        win.userInteractionEnabled = YES;
         win.rootViewController = [UIViewController new];
-        win.rootViewController.view.backgroundColor = UIColor.clearColor;
-        win.rootViewController.view.userInteractionEnabled = YES;
 
         if (@available(iOS 13.0, *)) {
-            if (!win.windowScene) {
-                for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
-                    if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-                        win.windowScene = scene;
-                        break;
-                    }
+            for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+                    win.windowScene = scene;
+                    break;
                 }
             }
             if (!win.windowScene) {
@@ -2037,35 +1621,54 @@ static BOOL sBubbleDragged = NO;
 
         self.win = win;
 
-        // 1. Bong bóng nổi (Floating Button 46x46 trực tiếp là UIButton)
+        // BẢO MẬT CHỐNG QUAY MÀN HÌNH / CHỤP MÀN HÌNH (Secure Canvas Trick)
+        // Khi thêm view con vào canvas của UITextField có secureTextEntry = YES,
+        // hệ thống iOS sẽ tự động làm trống / tàng hình view đó trên ảnh chụp màn hình và video quay màn hình!
+        UITextField *secField = [[UITextField alloc] initWithFrame:scr];
+        secField.secureTextEntry = YES;
+        secField.userInteractionEnabled = NO;
+        [win.rootViewController.view addSubview:secField];
+        win.secureTextField = secField;
+
+        UIView *secCanvas = secField.subviews.firstObject;
+        if (secCanvas) {
+            secCanvas.userInteractionEnabled = YES;
+            win.secureContainer = secCanvas;
+        } else {
+            win.secureContainer = win.rootViewController.view;
+        }
+
+        UIView *container = win.secureContainer;
+
+        // 1. Bong bóng nổi (Floating Bubble 44x44, không có icon/emoji)
         UIButton *bubble = [UIButton buttonWithType:UIButtonTypeCustom];
-        bubble.frame = CGRectMake(scr.size.width - 56, scr.size.height * 0.35, 46, 46);
-        bubble.backgroundColor = [UIColor colorWithRed:0.06 green:0.12 blue:0.18 alpha:0.94];
-        bubble.layer.cornerRadius = 23;
+        bubble.frame = CGRectMake(scr.size.width - 54, scr.size.height * 0.35, 44, 44);
+        bubble.backgroundColor = [UIColor colorWithRed:0.06 green:0.12 blue:0.18 alpha:0.95];
+        bubble.layer.cornerRadius = 22;
         bubble.layer.borderWidth = 1.5;
         bubble.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.95].CGColor;
         bubble.clipsToBounds = YES;
-        [bubble setTitle:@"⚡RK" forState:UIControlStateNormal];
-        bubble.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        [bubble setTitle:@"RK" forState:UIControlStateNormal];
+        bubble.titleLabel.font = [UIFont boldSystemFontOfSize:14];
         [bubble setTitleColor:[UIColor colorWithRed:0.2 green:0.85 blue:1.0 alpha:1.0] forState:UIControlStateNormal];
         [bubble addTarget:self action:@selector(onBubbleTap) forControlEvents:UIControlEventTouchUpInside];
-        [win.rootViewController.view addSubview:bubble];
+        [container addSubview:bubble];
         self.bubble = bubble;
         win.bubble = bubble;
 
         UIPanGestureRecognizer *panBubble = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanBubble:)];
-        panBubble.cancelsTouchesInView = NO; // Không hủy touch của button
+        panBubble.cancelsTouchesInView = NO;
         [bubble addGestureRecognizer:panBubble];
 
-        // 2. Menu chính chia Tab (215x342, mặc định ẩn, bấm bubble để mở)
-        UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 225, scr.size.height * 0.18, 215, 342)];
-        menu.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.96];
-        menu.layer.cornerRadius = 14;
-        menu.layer.borderWidth = 1.5;
+        // 2. Menu chính (Gọn đẹp, 205x285, không tab, không icon)
+        UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 215, scr.size.height * 0.16, 205, 285)];
+        menu.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.96];
+        menu.layer.cornerRadius = 12;
+        menu.layer.borderWidth = 1.2;
         menu.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.75].CGColor;
         menu.clipsToBounds = YES;
         menu.hidden = YES;
-        [win.rootViewController.view addSubview:menu];
+        [container addSubview:menu];
         self.menu = menu;
         win.menu = menu;
 
@@ -2074,108 +1677,125 @@ static BOOL sBubbleDragged = NO;
         [menu addGestureRecognizer:panMenu];
 
         // Tiêu đề & Nút đóng
-        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, 150, 20)];
+        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, 140, 20)];
         t.text = @"RaceKit Pro";
         t.textColor = [UIColor colorWithRed:0.2 green:0.85 blue:1.0 alpha:1.0];
         t.font = [UIFont boldSystemFontOfSize:13];
         [menu addSubview:t];
 
         UIButton *bClose = [UIButton buttonWithType:UIButtonTypeSystem];
-        bClose.frame = CGRectMake(180, 5, 24, 24);
+        bClose.frame = CGRectMake(175, 4, 24, 24);
         [bClose setTitle:@"✕" forState:UIControlStateNormal];
         [bClose setTitleColor:[UIColor colorWithWhite:0.7 alpha:1.0] forState:UIControlStateNormal];
-        bClose.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        bClose.titleLabel.font = [UIFont boldSystemFontOfSize:13];
         [bClose addTarget:self action:@selector(onToggleMenu) forControlEvents:UIControlEventTouchUpInside];
         [menu addSubview:bClose];
 
-        // Segmented Control chia 2 Tab
-        UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"Chính", @"Lệch Vị Trí"]];
-        seg.frame = CGRectMake(10, 30, 195, 26);
-        seg.selectedSegmentIndex = 0;
-        if (@available(iOS 13.0, *)) {
-            seg.selectedSegmentTintColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.75 alpha:0.95];
-            [seg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor], NSFontAttributeName: [UIFont boldSystemFontOfSize:11]} forState:UIControlStateSelected];
-            [seg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.75 alpha:1.0], NSFontAttributeName: [UIFont systemFontOfSize:11]} forState:UIControlStateNormal];
-        }
-        [seg addTarget:self action:@selector(onTabChange:) forControlEvents:UIControlEventValueChanged];
-        [menu addSubview:seg];
-        self.tabSeg = seg;
+        // Danh sách các nút chức năng chính (Không icon / emoji)
+        CGFloat startY = 30.0f;
+        CGFloat btnH = 26.0f;
+        CGFloat gap = 5.0f;
 
-        // Container Tab 0: Điều khiển chính
-        UIView *c0 = [[UIView alloc] initWithFrame:CGRectMake(10, 62, 195, 270)];
-        [menu addSubview:c0];
-        self.tab0View = c0;
+        self.bMode = [self mk:@"Chế độ: Replay" sel:@selector(tapModeSwitch)];
+        self.bMode.frame = CGRectMake(10, startY, 185, btnH);
+        [menu addSubview:self.bMode];
+        startY += btnH + gap;
 
-        self.bMode = [self mk:@"CHẾ ĐỘ: REC (.REP)" sel:@selector(tapModeSwitch)];
-        self.bMode.frame = CGRectMake(0, 0, 195, 28);
-        [c0 addSubview:self.bMode];
+        self.bDl = [self mk:@"Tải Replay" sel:@selector(tapDownload)];
+        self.bDl.frame = CGRectMake(10, startY, 185, btnH);
+        [menu addSubview:self.bDl];
+        startY += btnH + gap;
 
-        self.bDl = [self mk:@"⬇ TẢI .REP" sel:@selector(tapDownload)];
-        self.bDl.frame = CGRectMake(0, 32, 195, 28);
-        [c0 addSubview:self.bDl];
+        self.bNoRep = [self mk:@"Chặn Replay: Bật" sel:@selector(tapNoRep)];
+        self.bNoRep.frame = CGRectMake(10, startY, 185, btnH);
+        [menu addSubview:self.bNoRep];
+        startY += btnH + gap;
 
-        self.bNoRep = [self mk:@"NO REP: BẬT" sel:@selector(tapNoRep)];
-        self.bNoRep.frame = CGRectMake(0, 64, 195, 28);
-        [c0 addSubview:self.bNoRep];
+        self.bAuto = [self mk:@"Tự Động: Bật" sel:@selector(tapAuto)];
+        self.bAuto.frame = CGRectMake(10, startY, 185, btnH);
+        [menu addSubview:self.bAuto];
+        startY += btnH + gap;
 
-        self.bAuto = [self mk:@"▶ AUTO" sel:@selector(tapAuto)];
-        self.bAuto.frame = CGRectMake(0, 96, 195, 28);
-        [c0 addSubview:self.bAuto];
+        self.bRecord = [self mk:@"Ghi Lại: Tắt" sel:@selector(tapRecordSelf)];
+        self.bRecord.frame = CGRectMake(10, startY, 185, btnH);
+        [menu addSubview:self.bRecord];
+        startY += btnH + gap;
 
-        self.bFixMap = [self mk:@"⚠ LỖI MAP" sel:@selector(tapFixMap)];
-        self.bFixMap.frame = CGRectMake(0, 128, 195, 28);
-        self.bFixMap.backgroundColor = [UIColor colorWithRed:0.75 green:0.20 blue:0.18 alpha:0.92];
-        [c0 addSubview:self.bFixMap];
+        self.bFixMap = [self mk:@"Báo Lỗi Map" sel:@selector(tapFixMap)];
+        self.bFixMap.frame = CGRectMake(10, startY, 185, btnH);
+        self.bFixMap.backgroundColor = [UIColor colorWithRed:0.65 green:0.18 blue:0.16 alpha:0.92];
+        [menu addSubview:self.bFixMap];
+        startY += btnH + 6.0f;
 
-        UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(0, 162, 195, 22)];
+        UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(10, startY, 185, 20)];
         sl.minimumValue = 1.0f;
         sl.maximumValue = 5.0f;
         sl.value = gSpeedMultiplier;
         sl.continuous = YES;
         [sl addTarget:self action:@selector(onSpeedChange:) forControlEvents:UIControlEventValueChanged];
-        [c0 addSubview:sl];
+        [menu addSubview:sl];
         self.sliderSpeed = sl;
+        startY += 20.0f;
 
-        UILabel *ls = [[UILabel alloc] initWithFrame:CGRectMake(0, 186, 195, 14)];
+        UILabel *ls = [[UILabel alloc] initWithFrame:CGRectMake(10, startY, 185, 14)];
         ls.font = [UIFont boldSystemFontOfSize:10];
         ls.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.9];
         ls.textAlignment = NSTextAlignmentCenter;
         ls.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
-        [c0 addSubview:ls];
+        [menu addSubview:ls];
         self.lblSpeed = ls;
+        startY += 16.0f;
 
-        self.status = [[UILabel alloc] initWithFrame:CGRectMake(0, 204, 195, 62)];
-        self.status.numberOfLines = 3;
+        self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, startY, 185, 34)];
+        self.status.numberOfLines = 2;
         self.status.font = [UIFont systemFontOfSize:9];
         self.status.textColor = [UIColor colorWithWhite:1 alpha:0.75];
-        [c0 addSubview:self.status];
+        [menu addSubview:self.status];
 
-        // Container Tab 1: Tính toán độ lệch vị trí
-        UIView *c1 = [[UIView alloc] initWithFrame:CGRectMake(10, 62, 195, 270)];
-        c1.hidden = YES;
-        [menu addSubview:c1];
-        self.tab1View = c1;
+        // 3. Menu rời PlayFrame (+0.1 và -0.1) khi bật Auto Play
+        UIView *hud = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width * 0.5 - 90, 18, 180, 34)];
+        hud.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.94];
+        hud.layer.cornerRadius = 17;
+        hud.layer.borderWidth = 1.0;
+        hud.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.85].CGColor;
+        hud.clipsToBounds = YES;
+        hud.hidden = YES;
+        [container addSubview:hud];
+        self.hudPlayFrame = hud;
+        win.hudPlayFrame = hud;
 
-        self.bToggleOffset = [self mk:@"BÙ LỆCH: BẬT" sel:@selector(tapToggleOffset)];
-        self.bToggleOffset.frame = CGRectMake(0, 0, 195, 28);
-        self.bToggleOffset.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
-        [c1 addSubview:self.bToggleOffset];
+        UIPanGestureRecognizer *panHud = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanHud:)];
+        [hud addGestureRecognizer:panHud];
 
-        self.bFixNow = [self mk:@"⚡ TÍNH & FIX NGAY" sel:@selector(tapFixNow)];
-        self.bFixNow.frame = CGRectMake(0, 32, 195, 28);
-        self.bFixNow.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.75 alpha:0.92];
-        [c1 addSubview:self.bFixNow];
+        UIButton *bMinus = [UIButton buttonWithType:UIButtonTypeCustom];
+        bMinus.frame = CGRectMake(4, 4, 38, 26);
+        [bMinus setTitle:@"-0.1" forState:UIControlStateNormal];
+        bMinus.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+        [bMinus setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        bMinus.backgroundColor = [UIColor colorWithRed:0.12 green:0.24 blue:0.36 alpha:0.95];
+        bMinus.layer.cornerRadius = 6;
+        [bMinus addTarget:self action:@selector(onMinusSpeedTap) forControlEvents:UIControlEventTouchUpInside];
+        [hud addSubview:bMinus];
+        self.btnMinusSpeed = bMinus;
 
-        self.lblOffsetInfo = [[UILabel alloc] initWithFrame:CGRectMake(0, 64, 195, 168)];
-        self.lblOffsetInfo.numberOfLines = 11;
-        self.lblOffsetInfo.font = [UIFont systemFontOfSize:9];
-        self.lblOffsetInfo.textColor = [UIColor colorWithWhite:0.92 alpha:0.95];
-        self.lblOffsetInfo.backgroundColor = [UIColor colorWithWhite:0.02 alpha:0.75];
-        self.lblOffsetInfo.layer.cornerRadius = 6;
-        self.lblOffsetInfo.layer.borderWidth = 0.5;
-        self.lblOffsetInfo.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
-        self.lblOffsetInfo.clipsToBounds = YES;
-        [c1 addSubview:self.lblOffsetInfo];
+        UILabel *lblF = [[UILabel alloc] initWithFrame:CGRectMake(46, 4, 88, 26)];
+        lblF.font = [UIFont boldSystemFontOfSize:10];
+        lblF.textColor = [UIColor colorWithRed:0.2 green:0.85 blue:1.0 alpha:1.0];
+        lblF.textAlignment = NSTextAlignmentCenter;
+        lblF.text = [NSString stringWithFormat:@"%.1fx | 0/0", gSpeedMultiplier];
+        [hud addSubview:lblF];
+        self.lblFrameInfo = lblF;
+
+        UIButton *bPlus = [UIButton buttonWithType:UIButtonTypeCustom];
+        bPlus.frame = CGRectMake(138, 4, 38, 26);
+        [bPlus setTitle:@"+0.1" forState:UIControlStateNormal];
+        bPlus.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+        [bPlus setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        bPlus.backgroundColor = [UIColor colorWithRed:0.12 green:0.24 blue:0.36 alpha:0.95];
+        bPlus.layer.cornerRadius = 6;
+        [bPlus addTarget:self action:@selector(onPlusSpeedTap) forControlEvents:UIControlEventTouchUpInside];
+        [hud addSubview:bPlus];
+        self.btnPlusSpeed = bPlus;
 
         win.hidden = NO;
         [win makeKeyAndVisible];
@@ -2190,232 +1810,218 @@ static BOOL sBubbleDragged = NO;
     });
 }
 
-- (void)refresh {
+static uint32_t sCurrentPlayFrame = 0;
+
+- (void)onMinusSpeedTap {
+    gSpeedMultiplier = roundf((gSpeedMultiplier - 0.1f) * 10.0f) / 10.0f;
+    if (gSpeedMultiplier < 0.2f) gSpeedMultiplier = 0.2f;
+    [self refreshSpeedUI];
+    rtSaveSettings();
+}
+
+- (void)onPlusSpeedTap {
+    gSpeedMultiplier = roundf((gSpeedMultiplier + 0.1f) * 10.0f) / 10.0f;
+    if (gSpeedMultiplier > 5.0f) gSpeedMultiplier = 5.0f;
+    [self refreshSpeedUI];
+    rtSaveSettings();
+}
+
+- (void)refreshSpeedUI {
+    if (self.sliderSpeed) self.sliderSpeed.value = gSpeedMultiplier;
+    if (self.lblSpeed) self.lblSpeed.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
+    if (self.lblFrameInfo) {
+        self.lblFrameInfo.text = [NSString stringWithFormat:@"%.1fx | %u/%u", gSpeedMultiplier, sCurrentPlayFrame, gFrameCount];
+    }
+}
+
+- (void)showPlayFrameHud:(BOOL)show {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (gRaceModeGuide) {
-            self.bMode.backgroundColor = [UIColor colorWithRed:0.85 green:0.50 blue:0.0 alpha:0.95];
-            [self.bMode setTitle:@"CHẾ ĐỘ: GUIDE (299k)" forState:UIControlStateNormal];
-        } else {
-            self.bMode.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.75 alpha:0.95];
-            [self.bMode setTitle:@"CHẾ ĐỘ: REC (.REP)" forState:UIControlStateNormal];
+        if (self.hudPlayFrame) {
+            self.hudPlayFrame.hidden = __omp_shell("show;")
+            if (show) [self refreshSpeedUI];
         }
-
-        self.bAuto.backgroundColor = gAutoArmed ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
-                                                : [UIColor colorWithWhite:0.12 alpha:0.92];
-        self.bNoRep.backgroundColor = gNoReplay ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
-                                                : [UIColor colorWithWhite:0.12 alpha:0.92];
-        [self.bNoRep setTitle:gNoReplay ? @"NO REP: BẬT" : @"NO REP: TẮT" forState:UIControlStateNormal];
-
-        if (!gDownloading) {
-            NSString *stateStr = gAutoArmed ? @"AUTO: BẬT" : @"AUTO: TẮT";
-            NSString *modeStr = gRaceModeGuide ? @"GUIDE 299k" : @"REC .REP";
-            self.status.text = [NSString stringWithFormat:@"Map: %d (%u f)\n%@ | %@\nPlay: %d",
-                                gMapId, gFrameCount, modeStr, stateStr, (int)gPlaying];
-        }
-
-        // Cập nhật thông số Tab 1
-        self.bToggleOffset.backgroundColor = gEnableOffsetFix ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
-                                                              : [UIColor colorWithWhite:0.12 alpha:0.92];
-        [self.bToggleOffset setTitle:gEnableOffsetFix ? @"BÙ LỆCH: BẬT" : @"BÙ LỆCH: TẮT" forState:UIControlStateNormal];
-
-        NSString *statusStr = !gEnableOffsetFix ? @"ĐANG TẮT" : (gOffsetApplied ? @"TỰ ĐỘNG BÙ XONG" : @"CHỜ NẠP MAP");
-        self.lblOffsetInfo.text = [NSString stringWithFormat:
-            @" • Tự động bù map: BẬT\n"
-            @" • Rep Ô: %d | Trận Ô: %d\n"
-            @" • Rep F0 (Ô %d):\n"
-            @"   (%.1f, %.1f, %.1f)\n"
-            @" • Map chuẩn (Ô %d):\n"
-            @"   (%.1f, %.1f, %.1f)\n"
-            @" • Độ lệch vị trí:\n"
-            @"   ΔX: %+.2f | ΔY: %+.2f | ΔZ: %+.2f\n"
-            @" • Độ lệch góc xoay:\n"
-            @"   Δθ: %+.1f°\n"
-            @" • Trạng thái: %@",
-            gRepStartSlot, gMapStartSlot,
-            gRepStartSlot,
-            gRepOriginPos[0], gRepOriginPos[1], gRepOriginPos[2],
-            gRepStartSlot,
-            gMapActualPos[0], gMapActualPos[1], gMapActualPos[2],
-            gOffsetDelta[0], gOffsetDelta[1], gOffsetDelta[2],
-            gOffsetAngleDeg,
-            statusStr];
     });
 }
 
-- (void)tapToggleOffset {
-    gEnableOffsetFix = (gEnableOffsetFix ? NO : YES);
-    if (!gEnableOffsetFix) {
-        rtLoadRecord();
-    } else {
-        gOffsetApplied = NO;
-        rtCalculateAndApplyOffset();
+- (void)updatePlayFrameHud:(uint32_t)cur count:(uint32_t)total time:(float)t {
+    sCurrentPlayFrame = cur;
+    if (self.lblFrameInfo) {
+        self.lblFrameInfo.text = [NSString stringWithFormat:@"%.1fx | %u/%u", gSpeedMultiplier, cur, total];
     }
-    [self refresh];
 }
 
-- (void)tapFixNow {
-    if (!rtPtrOk(gCheckPointMgr)) {
-        rtAlert(@"Chưa nạp Map", @"Vui lòng vào trận hoặc phòng để game nạp cấu trúc Map!");
-        return;
-    }
-    if (!gFrames || gFrameCount < 2) {
-        rtAlert(@"Chưa nạp .rep", @"Chưa có file replay của map này để tính độ lệch!");
-        return;
-    }
-    gOffsetApplied = NO;
-    BOOL ok = rtCalculateAndApplyOffset();
-    if (ok) {
-        rtAlert(@"Bù lệch thành công", [NSString stringWithFormat:@"Ô xuất phát: %d\nĐộ lệch vị trí: ΔX=%.2f, ΔY=%.2f, ΔZ=%.2f\nĐộ lệch góc xoay: Δθ=%+.1f°\nĐã điều chỉnh toàn bộ %u frame của Replay!", gRepStartSlot, gOffsetDelta[0], gOffsetDelta[1], gOffsetDelta[2], gOffsetAngleDeg, gFrameCount]);
-    } else {
-        rtAlert(@"Khớp hoàn toàn", [NSString stringWithFormat:@"Tọa độ Ô %d của Rep và Map đã khớp chính xác (lệch < 0.05m)!", gRepStartSlot]);
-    }
-    [self refresh];
+- (void)onPanHud:(UIPanGestureRecognizer *)p {
+    CGPoint trans = [p translationInView:self.win];
+    self.hudPlayFrame.center = CGPointMake(self.hudPlayFrame.center.x + trans.x,
+                                           self.hudPlayFrame.center.y + trans.y);
+    [p setTranslation:CGPointZero inView:self.win];
+}
+
+- (void)refresh {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gRaceModeGuide) {
+            self.bMode.backgroundColor = [UIColor colorWithRed:0.75 green:0.45 blue:0.0 alpha:0.95];
+            [self.bMode setTitle:@"Chế độ: Dẫn đường" forState:UIControlStateNormal];
+        } else {
+            self.bMode.backgroundColor = [UIColor colorWithRed:0.0 green:0.42 blue:0.70 alpha:0.95];
+            [self.bMode setTitle:@"Chế độ: Replay" forState:UIControlStateNormal];
+        }
+
+        if (gNoReplay) {
+            self.bNoRep.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
+            [self.bNoRep setTitle:@"Chặn Replay: Bật" forState:UIControlStateNormal];
+        } else {
+            self.bNoRep.backgroundColor = [UIColor colorWithRed:0.40 green:0.40 blue:0.40 alpha:0.95];
+            [self.bNoRep setTitle:@"Chặn Replay: Tắt" forState:UIControlStateNormal];
+        }
+
+        if (gAutoArmed) {
+            self.bAuto.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
+            [self.bAuto setTitle:@"Tự Động: Bật" forState:UIControlStateNormal];
+        } else {
+            self.bAuto.backgroundColor = [UIColor colorWithRed:0.40 green:0.40 blue:0.40 alpha:0.95];
+            [self.bAuto setTitle:@"Tự Động: Tắt" forState:UIControlStateNormal];
+        }
+
+        if (gRecordSelf) {
+            self.bRecord.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
+            [self.bRecord setTitle:@"Ghi Lại: Bật" forState:UIControlStateNormal];
+        } else {
+            self.bRecord.backgroundColor = [UIColor colorWithRed:0.35 green:0.35 blue:0.35 alpha:0.95];
+            [self.bRecord setTitle:@"Ghi Lại: Tắt" forState:UIControlStateNormal];
+        }
+
+        self.sliderSpeed.value = gSpeedMultiplier;
+        self.lblSpeed.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
+
+        NSString *recType = @"Chưa có";
+        NSString *cPath = rtPathForTrack();
+        if (cPath && [[NSFileManager defaultManager] fileExistsAtPath:cPath]) {
+            recType = @"Record tự làm (Ưu tiên)";
+        } else {
+            NSString *rPath = rtFindRepFile(gMapId);
+            if (rPath) recType = @"File .rep server";
+        }
+
+        self.status.text = [NSString stringWithFormat:@"Map %d | Slot %d
+Nguồn: %@",
+                            gMapId, gMapStartSlot, recType];
+    });
+}
+
+- (void)onBubbleTap {
+    [self onToggleMenu];
+}
+
+- (void)onToggleMenu {
+    self.menu.hidden = __omp_shell("self.menu.hidden;")
+    if (!self.menu.hidden) [self refresh];
+}
+
+- (void)onPanBubble:(UIPanGestureRecognizer *)p {
+    CGPoint trans = [p translationInView:self.win];
+    self.bubble.center = CGPointMake(self.bubble.center.x + trans.x, self.bubble.center.y + trans.y);
+    [p setTranslation:CGPointZero inView:self.win];
+}
+
+- (void)onPanMenu:(UIPanGestureRecognizer *)p {
+    CGPoint trans = [p translationInView:self.win];
+    self.menu.center = CGPointMake(self.menu.center.x + trans.x, self.menu.center.y + trans.y);
+    [p setTranslation:CGPointZero inView:self.win];
 }
 
 - (void)tapModeSwitch {
-    gRaceModeGuide = (gRaceModeGuide ? NO : YES);
-    rtLog("RACE MODE changed to: %s", gRaceModeGuide ? "GUIDE (299km/h)" : "REC (.REP)");
-    if (gAutoArmed) {
-        if (gRaceModeGuide) {
-            rtBuildGuideLineFrames();
-        } else {
-            rtLoadRecord();
-        }
-    }
+    gRaceModeGuide = __omp_shell("gRaceModeGuide;")
+    rtSaveSettings();
     [self refresh];
 }
 
 - (void)tapNoRep {
-    gNoReplay = gNoReplay ? NO : YES;
-    rtLog("NO REPLAY changed to %d", (int)gNoReplay);
+    gNoReplay = __omp_shell("gNoReplay;")
+    rtSaveSettings();
     [self refresh];
-}
-
-- (void)onSpeedChange:(UISlider *)sender {
-    gSpeedMultiplier = sender.value;
-    self.lblSpeed.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
-}
-
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
-    if ([touch.view isKindOfClass:[UISlider class]] ||
-        [touch.view isKindOfClass:[UIButton class]] ||
-        [touch.view isKindOfClass:[UISegmentedControl class]]) {
-        return NO;
-    }
-    return YES;
-}
-
-- (void)tapDownload {
-    if (gDownloading) return;
-    self.status.text = @"Đang quét BXH\nĐỉnh Cực Tốc...";
-    [self.bDl setTitle:@"⏳ ĐANG TẢI" forState:UIControlStateNormal];
-
-    rtDownloadAllPeakSpeedReplays(^(int done, int total, NSString *sub) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.status.text = [NSString stringWithFormat:@"Tải: %d/%d\n(%@)", done, total, sub];
-        });
-    }, ^(int totalDownloaded) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self.bDl setTitle:@"⬇ TẢI .REP" forState:UIControlStateNormal];
-            self.status.text = [NSString stringWithFormat:@"Đã tải %d rep!\nMap %d sẵn sàng", totalDownloaded, gMapId];
-            if (gAutoArmed) {
-                rtLoadRecord();
-            }
-            [self refresh];
-        });
-    });
 }
 
 - (void)tapAuto {
-    gAutoArmed = gAutoArmed ? NO : YES;
-    if (!gAutoArmed) { gPlaying = NO; rtWriteKeyFlags(0); }
-    rtLog("AUTO armed=%d", (int)gAutoArmed);
+    gAutoArmed = __omp_shell("gAutoArmed;")
+    if (!gAutoArmed) {
+        gPlaying = NO;
+        rtWriteKeyFlags(0);
+        rtSyncUIKeys(0);
+        [self showPlayFrameHud:NO];
+    }
+    rtSaveSettings();
     [self refresh];
 }
 
-- (void)tapFixMap {
-    if (self.win) [self.win makeKeyAndVisible];
-    if (gMapId <= 0) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sửa Lỗi Map"
-                                                                       message:@"Chưa vào trận! Vui lòng nhập Map ID cần xóa và tải lại (ví dụ: 46, 105):"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-            textField.placeholder = @"Map ID (số)";
-            textField.keyboardType = UIKeyboardTypeNumberPad;
-        }];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                for (UIWindow *w in UIApplication.sharedApplication.windows) {
-                    if ([w isKindOfClass:[RCPassWindow class]]) continue;
-                    if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
-                }
-            });
-        }]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Tải lại (Yes)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                for (UIWindow *w in UIApplication.sharedApplication.windows) {
-                    if ([w isKindOfClass:[RCPassWindow class]]) continue;
-                    if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
-                }
-            });
-            UITextField *tf = alert.textFields.firstObject;
-            int mid = tf.text.intValue;
-            if (mid > 0) {
-                [self doFixMap:mid];
-            }
-        }]];
-        UIViewController *vc = rtTopVC();
-        if (vc) [vc presentViewController:alert animated:YES completion:nil];
-        return;
+- (void)tapRecordSelf {
+    gRecordSelf = __omp_shell("gRecordSelf;")
+    if (!gRecordSelf) {
+        rtStopAndSaveCustomRecord();
     }
-
-    int curMap = gMapId;
-    NSString *msg = [NSString stringWithFormat:@"Bạn có chắc chắn muốn xóa file .rep cũ của Map %d và tải lại bản kỷ lục mới nhất từ BXH không?", curMap];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sửa Lỗi Map"
-                                                                   message:msg
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            for (UIWindow *w in UIApplication.sharedApplication.windows) {
-                if ([w isKindOfClass:[RCPassWindow class]]) continue;
-                if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
-            }
-        });
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Đồng ý (Yes)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            for (UIWindow *w in UIApplication.sharedApplication.windows) {
-                if ([w isKindOfClass:[RCPassWindow class]]) continue;
-                if (w.windowLevel >= UIWindowLevelNormal) { [w makeKeyWindow]; break; }
-            }
-        });
-        [self doFixMap:curMap];
-    }]];
-
-    UIViewController *vc = rtTopVC();
-    if (vc) [vc presentViewController:alert animated:YES completion:nil];
+    rtSaveSettings();
+    [self refresh];
 }
 
-- (void)doFixMap:(int)mapId {
-    self.status.text = [NSString stringWithFormat:@"Đang xóa & tải lại\nMap %d...", mapId];
-    rtRedownloadRepForMap(mapId, ^(BOOL success, NSString *msg) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (success) {
-                rtAlert(@"Sửa lỗi Map", [NSString stringWithFormat:@"Đã xóa file cũ và nạp lại file .rep mới của Map %d thành công!", mapId]);
-                if (gAutoArmed) {
-                    rtLoadRecord();
-                }
-            } else {
-                rtAlert(@"Lỗi tải lại", msg ?: @"Không tìm thấy video kỷ lục của map này trên BXH!");
-            }
+- (void)onSpeedChange:(UISlider *)sl {
+    gSpeedMultiplier = roundf(sl.value * 10.0f) / 10.0f;
+    [self refreshSpeedUI];
+    rtSaveSettings();
+}
+
+- (void)tapDownload {
+    self.status.text = @"Đang tải replay...";
+    rtDownloadAllPeakSpeedReplays(^(int done, int total, NSString *sub) {
+        self.status.text = [NSString stringWithFormat:@"Đang tải: %d/%d
+%@", done, total, sub ?: @""];
+    }, ^(int totalDownloaded) {
+        self.status.text = [NSString stringWithFormat:@"Đã tải xong %d rep!", totalDownloaded];
+        [self refresh];
+    });
+}
+
+- (void)tapFixMap {
+    if (gMapId <= 0) {
+        rtAlert(@"Báo lỗi Map", @"Chưa vào map! Vui lòng bấm khi đang ở trong trận.");
+        return;
+    }
+    int mapId = gMapId;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Báo lỗi Map"
+                                                                   message:[NSString stringWithFormat:@"Xóa file replay cũ của Map %d và tải lại bản chuẩn?", mapId]
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Tải Lại" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        self.status.text = @"Đang tải lại rep...";
+        rtRedownloadRepForMap(mapId, ^(BOOL success, NSString *msg) {
+            self.status.text = msg;
+            rtAlert(@"Báo lỗi Map", msg);
             [self refresh];
         });
-    });
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [rtTopVC() presentViewController:alert animated:YES completion:nil];
 }
 
 @end
 
 #pragma mark - Install
+
+static void (*orig_OperatingModeHelper_Init)(void *self, void *pub, void *inst);
+static void hook_OperatingModeHelper_Init(void *self, void *pub, void *inst) {
+    if (rtPtrOk(self)) {
+        gOperatingModeHelper = self;
+        rtLog("[UI] Đã kết nối OperatingModeHelper: %p", self);
+    }
+    if (orig_OperatingModeHelper_Init) orig_OperatingModeHelper_Init(self, pub, inst);
+}
+
+static void (*orig_OperatingModeHelper_Release)(void *self);
+static void hook_OperatingModeHelper_Release(void *self) {
+    if (gOperatingModeHelper == self) {
+        gOperatingModeHelper = NULL;
+        rtLog("[UI] Đã giải phóng OperatingModeHelper");
+    }
+    if (orig_OperatingModeHelper_Release) orig_OperatingModeHelper_Release(self);
+}
 
 static void rtInstallHooks(void) {
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
@@ -2481,12 +2087,24 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "CPR_STPVPEndGame", "FillVehicleVelData", 1, (void *)hook_CPR_FillVehicleVelData);
     orig_CPR_ReportData = (void (*)(void *, void **, const void *))
         rtHookMethod("", "CPR_STPVPEndGame", "ReportData", 1, (void *)hook_CPR_ReportData);
+
+    // Hooks đồng bộ nút bấm UI bàn phím ảo
+    orig_OperatingModeHelper_Init = (void (*)(void *, void *, void *))
+        rtHookMethod("", "OperatingModeHelper", "Init", 2, (void *)hook_OperatingModeHelper_Init);
+    orig_OperatingModeHelper_Release = (void (*)(void *))
+        rtHookMethod("", "OperatingModeHelper", "Release", 0, (void *)hook_OperatingModeHelper_Release);
+
+    uintptr_t base = rtGetUnityBase();
+    if (base) {
+        fnSetKeyState = (fn_SetKeyState_InputKey_t)(base + 0x7DB856C); // OperatingMode_OneSide.SetKeyState
+    }
 }
 
 __attribute__((constructor))
 static void rcInit(void) {
     rtLogOpen();
     rtLog("=== RaceRec loaded ===");
+    rtLoadSettings();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         rtInstallHooks();
