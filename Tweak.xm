@@ -219,6 +219,9 @@ static uint32_t gFrameCount;
 static int      gMapId;
 static float    gTrackLen;
 static double   gGoTime;
+static float    gSpeedMultiplier = 1.0f;
+static double   sLastPlaybackRealTime = 0.0;
+static float    sAccumulatedPlaybackTime = 0.0f;
 static BOOL gAutoArmed, gPlaying;
 static BOOL gNoReplay = YES;
 static void *gPlayerVehicle;
@@ -661,6 +664,111 @@ static void rtDownloadAllPeakSpeedReplays(void (^onProgress)(int done, int total
     });
 }
 
+static void rtRedownloadRepForMap(int targetMapId, void (^onComplete)(BOOL success, NSString *msg)) {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
+        NSString *tempDir = [doc stringByAppendingPathComponent:@"TempMatchVideos"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        // 1. Xóa toàn bộ file .rep cũ của mapId này trong TempMatchVideos
+        NSArray *files = [fm contentsOfDirectoryAtPath:tempDir error:NULL];
+        NSString *prefix = [NSString stringWithFormat:@"%d_", targetMapId];
+        NSString *exact  = [NSString stringWithFormat:@"%d.rep", targetMapId];
+        for (NSString *name in files) {
+            if ([name.pathExtension.lowercaseString isEqualToString:@"rep"]) {
+                if ([name hasPrefix:prefix] || [name isEqualToString:exact]) {
+                    NSString *full = [tempDir stringByAppendingPathComponent:name];
+                    [fm removeItemAtPath:full error:NULL];
+                    rtLog("[FixMap] Deleted old rep: %s", full.UTF8String);
+                }
+            }
+        }
+
+        // 2. Xóa cache .rk
+        NSString *rkPath = [rtDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"rec_map%d.rk", targetMapId]];
+        [fm removeItemAtPath:rkPath error:NULL];
+
+        // 3. Giải phóng bộ nhớ RAM
+        if (gFrames) {
+            free(gFrames);
+            gFrames = NULL;
+            gFrameCount = 0;
+        }
+
+        // 4. Tìm URL tải mới trong gMapDataComponent
+        if (!rtPtrOk(gMapDataComponent)) {
+            if (onComplete) onComplete(NO, @"Chưa có dữ liệu bản đồ. Vui lòng vào màn hình Chọn Map hoặc BXH một lần!");
+            return;
+        }
+
+        void *list = *(void **)((char *)gMapDataComponent + 0x98); // ListView<VideoDetailCfg>
+        if (!rtPtrOk(list)) {
+            if (onComplete) onComplete(NO, @"Không tìm thấy danh sách VideoDetailCfg!");
+            return;
+        }
+
+        int count = *(int *)((char *)list + 0x18);
+        void *arr = *(void **)((char *)list + 0x10);
+        if (!rtPtrOk(arr) || count <= 0) {
+            if (onComplete) onComplete(NO, @"Danh sách video trống!");
+            return;
+        }
+
+        void **items = (void **)((char *)arr + 0x20);
+        NSString *bestUrlStr = nil;
+        uint8_t bestGrade = 0;
+
+        for (int i = 0; i < count; i++) {
+            void *cfg = items[i];
+            if (!rtPtrOk(cfg)) continue;
+            int mid = *(int *)((char *)cfg + 0x14);
+            if (mid != targetMapId) continue;
+
+            uint8_t gradeId = *(uint8_t *)((char *)cfg + 0x18);
+            void *urlPtr = *(void **)((char *)cfg + 0x30);
+            NSString *urlStr = rtIl2CppString(urlPtr);
+            if (!urlStr || !urlStr.length) continue;
+
+            if (!bestUrlStr || gradeId >= bestGrade) {
+                bestGrade = gradeId;
+                bestUrlStr = urlStr;
+            }
+        }
+
+        if (!bestUrlStr || !bestUrlStr.length) {
+            if (onComplete) onComplete(NO, [NSString stringWithFormat:@"Không tìm thấy video kỷ lục cho Map %d trên BXH!", targetMapId]);
+            return;
+        }
+
+        NSURL *url = [NSURL URLWithString:bestUrlStr];
+        if (!url && ![bestUrlStr hasPrefix:@"http"]) {
+            url = [NSURL URLWithString:[@"http://" stringByAppendingString:bestUrlStr]];
+        }
+        if (!url) {
+            if (onComplete) onComplete(NO, @"URL video không hợp lệ!");
+            return;
+        }
+
+        NSString *destPath = [tempDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%d_3.rep", targetMapId]];
+        NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithURL:url
+            completionHandler:^(NSURL *location, NSURLResponse *response, NSError *error) {
+                if (!error && location) {
+                    [fm removeItemAtPath:destPath error:NULL];
+                    NSError *mErr = nil;
+                    [fm moveItemAtURL:location toURL:[NSURL fileURLWithPath:destPath] error:&mErr];
+                    if (!mErr) {
+                        rtLog("[FixMap] Successfully saved new .rep for map %d to %s", targetMapId, destPath.UTF8String);
+                        if (onComplete) onComplete(YES, nil);
+                        return;
+                    }
+                }
+                if (onComplete) onComplete(NO, error.localizedDescription ?: @"Lỗi khi ghi file .rep!");
+            }];
+        [task resume];
+    });
+}
+
 #pragma mark - Key injection (đúng cơ chế game)
 
 // InputModule.mInputKeyData (0xA8) -> InputKeyData.KeyFlags (0x10)
@@ -687,7 +795,13 @@ static double rtNow(void) {
 static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl, void *sim, double now) {
     if (!gFrames || !gFrameCount) return;
 
-    float t = (float)(now - gGoTime);
+    double dt = now - sLastPlaybackRealTime;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.1) dt = 0.1; // clamp lag spike
+    sLastPlaybackRealTime = now;
+    sAccumulatedPlaybackTime += (float)dt * gSpeedMultiplier;
+    float t = sAccumulatedPlaybackTime;
+
     if (t < 0.f) return;
     if (t >= gFrames[gFrameCount - 1].t) {
         gPlaying = NO;
@@ -725,10 +839,10 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     float ql = sqrtf(qx * qx + qy * qy + qz * qz + qw * qw);
     if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
 
-    float vx = a->vx + (b->vx - a->vx) * al;
-    float vy = a->vy + (b->vy - a->vy) * al;
-    float vz = a->vz + (b->vz - a->vz) * al;
-    float kmph = a->kmph + (b->kmph - a->kmph) * al;
+    float vx = (a->vx + (b->vx - a->vx) * al) * gSpeedMultiplier;
+    float vy = (a->vy + (b->vy - a->vy) * al) * gSpeedMultiplier;
+    float vz = (a->vz + (b->vz - a->vz) * al) * gSpeedMultiplier;
+    float kmph = (a->kmph + (b->kmph - a->kmph) * al) * gSpeedMultiplier;
 
     // --- 2. TELEPORT TRỰC TIẾP THỰC THỂ VẬT LÝ PHYSX (mPhyHandle) ---
     void *phyCtrl = rtPtrOk(motionCtrl) ? *(void **)((char *)motionCtrl + kOffMotionPhyCtrl) : NULL;
@@ -831,13 +945,16 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 
 #pragma mark - UI Interface
 
-@interface RCPanel : NSObject
+@interface RCPanel : NSObject <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIWindow *win;
 @property (nonatomic, strong) UIView *host;
 @property (nonatomic, strong) UILabel *status;
 @property (nonatomic, strong) UIButton *bDl;
 @property (nonatomic, strong) UIButton *bNoRep;
 @property (nonatomic, strong) UIButton *bAuto;
+@property (nonatomic, strong) UIButton *bFixMap;
+@property (nonatomic, strong) UISlider *sliderSpeed;
+@property (nonatomic, strong) UILabel *lblSpeed;
 - (void)show;
 - (void)refresh;
 @end
@@ -951,6 +1068,8 @@ static BOOL hook_GetSteeringValue(void *self, void *carParams, float dt,
 
 static void rtBeginRace(void) {
     gGoTime = rtNow();
+    sLastPlaybackRealTime = gGoTime;
+    sAccumulatedPlaybackTime = 0.0f;
     gCurPlaybackSteer = 0.f;
 
     if (gAutoArmed) {
@@ -1271,7 +1390,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
             }
         }
 
-        UIView *host = [[UIView alloc] initWithFrame:CGRectMake(14, scr.size.height * 0.28, 132, 198)];
+        UIView *host = [[UIView alloc] initWithFrame:CGRectMake(14, scr.size.height * 0.22, 140, 276)];
         host.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.88];
         host.layer.cornerRadius = 12;
         host.layer.borderWidth = 1;
@@ -1282,27 +1401,50 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
         ((RCPassWindow *)self.win).panel = host;
 
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPan:)];
+        pan.delegate = self;
         [host addGestureRecognizer:pan];
 
-        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, 112, 18)];
+        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, 120, 18)];
         t.text = @"RaceKit Pro";
         t.textColor = [UIColor colorWithWhite:1 alpha:0.85];
         t.font = [UIFont boldSystemFontOfSize:12];
         [host addSubview:t];
 
         self.bDl = [self mk:@"⬇ TẢI .REP" sel:@selector(tapDownload)];
-        self.bDl.frame = CGRectMake(10, 28, 112, 32);
+        self.bDl.frame = CGRectMake(10, 26, 120, 30);
         [host addSubview:self.bDl];
 
         self.bNoRep = [self mk:@"NO REP: BẬT" sel:@selector(tapNoRep)];
-        self.bNoRep.frame = CGRectMake(10, 62, 112, 32);
+        self.bNoRep.frame = CGRectMake(10, 58, 120, 30);
         [host addSubview:self.bNoRep];
 
         self.bAuto = [self mk:@"▶ AUTO" sel:@selector(tapAuto)];
-        self.bAuto.frame = CGRectMake(10, 96, 112, 32);
+        self.bAuto.frame = CGRectMake(10, 90, 120, 30);
         [host addSubview:self.bAuto];
 
-        self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, 130, 112, 62)];
+        self.bFixMap = [self mk:@"⚠ LỖI MAP" sel:@selector(tapFixMap)];
+        self.bFixMap.frame = CGRectMake(10, 122, 120, 30);
+        self.bFixMap.backgroundColor = [UIColor colorWithRed:0.75 green:0.20 blue:0.18 alpha:0.92];
+        [host addSubview:self.bFixMap];
+
+        UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(10, 156, 120, 22)];
+        sl.minimumValue = 1.0f;
+        sl.maximumValue = 5.0f;
+        sl.value = gSpeedMultiplier;
+        sl.continuous = YES;
+        [sl addTarget:self action:@selector(onSpeedChange:) forControlEvents:UIControlEventValueChanged];
+        [host addSubview:sl];
+        self.sliderSpeed = sl;
+
+        UILabel *ls = [[UILabel alloc] initWithFrame:CGRectMake(10, 180, 120, 16)];
+        ls.font = [UIFont boldSystemFontOfSize:10];
+        ls.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.9];
+        ls.textAlignment = NSTextAlignmentCenter;
+        ls.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
+        [host addSubview:ls];
+        self.lblSpeed = ls;
+
+        self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, 198, 120, 68)];
         self.status.numberOfLines = 3;
         self.status.font = [UIFont systemFontOfSize:9];
         self.status.textColor = [UIColor colorWithWhite:1 alpha:0.75];
@@ -1341,6 +1483,54 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     gNoReplay = gNoReplay ? NO : YES;
     rtLog("NO REPLAY changed to %d", (int)gNoReplay);
     [self refresh];
+}
+
+- (void)tapFixMap {
+    if (gMapId <= 0) {
+        rtAlert(@"Chưa xác định Map", @"Vui lòng vào phòng hoặc trận đấu để hệ thống nhận diện Map hiện tại!");
+        return;
+    }
+    int curMap = gMapId;
+    NSString *msg = [NSString stringWithFormat:@"Bạn có chắc chắn muốn xóa file .rep cũ của Map %d và tải lại bản kỷ lục mới nhất từ BXH không?", curMap];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sửa Lỗi Map"
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Đồng ý (Yes)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        [self doFixMap:curMap];
+    }]];
+
+    UIViewController *vc = rtTopVC();
+    if (vc) [vc presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)doFixMap:(int)mapId {
+    self.status.text = [NSString stringWithFormat:@"Đang xóa & tải lại\nMap %d...", mapId];
+    rtRedownloadRepForMap(mapId, ^(BOOL success, NSString *msg) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (success) {
+                rtAlert(@"Sửa lỗi Map", [NSString stringWithFormat:@"Đã xóa file cũ và nạp lại file .rep mới của Map %d thành công!", mapId]);
+                if (gAutoArmed) {
+                    rtLoadRecord();
+                }
+            } else {
+                rtAlert(@"Lỗi tải lại", msg ?: @"Không tìm thấy video kỷ lục của map này trên BXH!");
+            }
+            [self refresh];
+        });
+    });
+}
+
+- (void)onSpeedChange:(UISlider *)sender {
+    gSpeedMultiplier = sender.value;
+    self.lblSpeed.text = [NSString stringWithFormat:@"Tốc độ: %.1fx", gSpeedMultiplier];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if ([touch.view isKindOfClass:[UISlider class]]) {
+        return NO; // Không để gesture pan cản trở slider
+    }
+    return YES;
 }
 
 - (void)tapDownload {
