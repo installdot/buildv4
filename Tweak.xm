@@ -978,6 +978,11 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 static RCPanel *gPanel;
 
 static UIViewController *rtTopVC(void) {
+    if (gPanel && gPanel.win && gPanel.win.rootViewController) {
+        UIViewController *vc = gPanel.win.rootViewController;
+        while (vc.presentedViewController) vc = vc.presentedViewController;
+        return vc;
+    }
     UIWindow *best = nil;
     for (UIWindow *w in UIApplication.sharedApplication.windows) {
         if (!w.isKeyWindow) continue;
@@ -1032,12 +1037,15 @@ static int    (*orig_MatchVideoMdl_ReplayVideo_bytes)(void *, void *, uint64_t, 
 static int    (*orig_MatchVideoMdl_ReplayVideo_mark)(void *, int64_t, uint64_t, const void *);
 static int    (*orig_MatchVideoMdl_ReplayTeachingVideo)(void *, int, void *, bool, const void *);
 
-// Anti-AFK Hooks
+// Anti-AFK & Anti-Speed-Report Hooks
 static void   (*orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime)(void *, float, const void *);
 static void   (*orig_SdcVehicleInput_Update)(void *, float, const void *);
 static void   (*orig_SdcPlayerInput_Update)(void *, float, const void *);
+static void   (*orig_SdcVehicleVel_Update)(void *, float, const void *);
 static void   (*orig_CPR_FillVehicleInputData)(void *, void **, const void *);
+static void   (*orig_CPR_FillVehicleVelData)(void *, void **, const void *);
 static void   (*orig_CPR_FillPVPButtonUseData)(void *, void **, const void *);
+static void   (*orig_CPR_ReportData)(void *, void **, const void *);
 static BOOL   (*orig_MatchUIMgr_Trusteeship)(void *, int, const void *);
 
 static void hook_Input_Update(void *self, float dt, const void *m) {
@@ -1291,6 +1299,50 @@ static BOOL hook_MatchUIMgr_Trusteeship(void *self, int aiActionID, const void *
     return orig_MatchUIMgr_Trusteeship ? orig_MatchUIMgr_Trusteeship(self, aiActionID, m) : FALSE;
 }
 
+// ==================== ANTI-SPEED-REPORT (CHỐNG REPORT TỐC ĐỘ / FAST FRAME) ====================
+static void hook_SdcVehicleVel_Update(void *self, float dt, const void *m) {
+    if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, m);
+    if (rtPtrOk(self)) {
+        // Giới hạn vận tốc đo đạc trong bộ nhớ về mức xe bình thường (tránh trigger Anti-Cheat khi tua nhanh)
+        if (*(float *)((char *)self + 0x94) > 295.f) *(float *)((char *)self + 0x94) = 290.f + (rand() % 5); // mMaxVehicleKMPH
+        if (*(float *)((char *)self + 0xAC) > 295.f) *(float *)((char *)self + 0xAC) = 290.f + (rand() % 5); // mVehicleKMPH
+        if (*(float *)((char *)self + 0xB0) > 295.f) *(float *)((char *)self + 0xB0) = 290.f + (rand() % 5); // mLastVehicleKMPH
+
+        void *endData = *(void **)((char *)self + 0x58); // mEndData (SdcVehicleVelEndData)
+        if (rtPtrOk(endData)) {
+            if (*(int *)((char *)endData + 0x10) > 295) *(int *)((char *)endData + 0x10) = 292 + (rand() % 5); // CarSpeedMax
+            *(int *)((char *)endData + 0x14) = 15; // CarSpeedOverBase
+            *(float *)((char *)endData + 0x58) = 0.f; // SpeedRangeTime_Greater350Less400
+            *(float *)((char *)endData + 0x5C) = 0.f; // SpeedRangeTime_Greater400Less450
+            *(float *)((char *)endData + 0x60) = 0.f; // SpeedRangeTime_Greater450Less500
+            *(float *)((char *)endData + 0x64) = 0.f; // SpeedRangeTime_Greater500
+            *(int *)((char *)endData + 0x7C) = 0;   // SpeedReach_350
+            *(int *)((char *)endData + 0x80) = 0;   // SpeedReach_400
+        }
+    }
+}
+
+static void hook_CPR_FillVehicleVelData(void *self, void **fillData, const void *m) {
+    if (orig_CPR_FillVehicleVelData) orig_CPR_FillVehicleVelData(self, fillData, m);
+    if (fillData && rtPtrOk(*fillData)) {
+        char *d = (char *)*fillData;
+        // dwCarSpeedMax (offset 0x28)
+        if (*(uint32_t *)(d + 0x28) > 298) *(uint32_t *)(d + 0x28) = 292 + (rand() % 6);
+        // dwCarSpeedOverBase (offset 0x2C)
+        if (*(uint32_t *)(d + 0x2C) > 25)  *(uint32_t *)(d + 0x2C) = 12 + (rand() % 5);
+    }
+}
+
+static void hook_CPR_ReportData(void *self, void **reqData, const void *m) {
+    if (orig_CPR_ReportData) orig_CPR_ReportData(self, reqData, m);
+    if (reqData && rtPtrOk(*reqData)) {
+        char *req = (char *)*reqData;
+        *(uint8_t *)(req + 0x40) = 0; // bCheatEndGame = 0 (Tuyệt đối không bị Server đánh dấu gian lận)
+        *(uint8_t *)(req + 0x54) = 0; // bClientReportAnti = 0 (Báo cáo client bình thường)
+        rtLog("ANTI-REPORT: Cleared bCheatEndGame & bClientReportAnti");
+    }
+}
+
 static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) {
         void *vehicle = *(void **)((char *)self + kOffMotionVehicle);
@@ -1487,9 +1539,27 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
 
 - (void)tapFixMap {
     if (gMapId <= 0) {
-        rtAlert(@"Chưa xác định Map", @"Vui lòng vào phòng hoặc trận đấu để hệ thống nhận diện Map hiện tại!");
+        // Cho phép người chơi tự nhập Map ID nếu chưa vào trận
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sửa Lỗi Map"
+                                                                       message:@"Chưa vào trận! Vui lòng nhập Map ID cần xóa và tải lại (ví dụ: 46, 105):"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+            textField.placeholder = @"Map ID (số)";
+            textField.keyboardType = UIKeyboardTypeNumberPad;
+        }];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Tải lại (Yes)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+            UITextField *tf = alert.textFields.firstObject;
+            int mid = tf.text.intValue;
+            if (mid > 0) {
+                [self doFixMap:mid];
+            }
+        }]];
+        UIViewController *vc = rtTopVC();
+        if (vc) [vc presentViewController:alert animated:YES completion:nil];
         return;
     }
+
     int curMap = gMapId;
     NSString *msg = [NSString stringWithFormat:@"Bạn có chắc chắn muốn xóa file .rep cũ của Map %d và tải lại bản kỷ lục mới nhất từ BXH không?", curMap];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Sửa Lỗi Map"
@@ -1620,6 +1690,14 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "CPR_STPVPEndGame", "FillPVPButtonUseData", 1, (void *)hook_CPR_FillPVPButtonUseData);
     orig_MatchUIMgr_Trusteeship = (BOOL (*)(void *, int, const void *))
         rtHookMethod("", "MatchUIMgr", "Trusteeship", 1, (void *)hook_MatchUIMgr_Trusteeship);
+
+    // Anti-Speed-Report Hooks (chống phát hiện tốc độ / fast frame)
+    orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVel_Update);
+    orig_CPR_FillVehicleVelData = (void (*)(void *, void **, const void *))
+        rtHookMethod("", "CPR_STPVPEndGame", "FillVehicleVelData", 1, (void *)hook_CPR_FillVehicleVelData);
+    orig_CPR_ReportData = (void (*)(void *, void **, const void *))
+        rtHookMethod("", "CPR_STPVPEndGame", "ReportData", 1, (void *)hook_CPR_ReportData);
 }
 
 __attribute__((constructor))
