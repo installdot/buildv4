@@ -203,14 +203,29 @@ static void *gOperatingModeHelper = NULL;
 typedef void (*fn_SetKeyState_InputKey_t)(void *self, int keyType, BOOL isPress);
 static fn_SetKeyState_InputKey_t fnSetKeyState = NULL;
 static int sLastSyncedKeys = 0;
+static void rtCallSetKeyState(void *self, int keyType, BOOL isPress) {
+    if (!rtPtrOk(self)) return;
+    void *k = *(void **)self; // Il2CppClass
+    if (!rtPtrOk(k)) return;
+    typedef void (*fn_SetKeyState_t)(void *self, int keyType, bool isPress, const void *m);
+    // Virtual Slot 36 = SetKeyState(InputKeyType type, bool isPress)
+    fn_SetKeyState_t fn = *(fn_SetKeyState_t *)((char *)k + 328 + 36 * 16);
+    if (fn) {
+        const void *mInfo = *(const void **)((char *)k + 328 + 36 * 16 + 8);
+        fn(self, keyType, isPress ? true : false, mInfo);
+    } else if (fnSetKeyState) {
+        fnSetKeyState(self, keyType, isPress);
+    }
+}
+
 static void rtSyncUIKeys(int newKeys) {
-    if (!gOperatingModeHelper || !fnSetKeyState) return;
+    if (!gOperatingModeHelper) return;
     int diff = newKeys ^ sLastSyncedKeys;
     if (!diff) return;
     for (int k = 1; k < 18; k++) {
         if ((diff >> k) & 1) {
             BOOL isPress = (newKeys >> k) & 1;
-            fnSetKeyState(gOperatingModeHelper, k, isPress);
+            rtCallSetKeyState(gOperatingModeHelper, k, isPress);
         }
     }
     sLastSyncedKeys = newKeys;
@@ -444,7 +459,7 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
             }
         }
     }
-    rtSaveRecord();
+    // Chỉ lưu file .rk khi người chơi bật ghi lại (gRecordSelf), không tự lưu ở mỗi trận
     return YES;
 }
 static BOOL rtLoadRepFromDisk(NSString *repPath) {
@@ -1522,7 +1537,7 @@ static void rtAlert(NSString *title, NSString *msg) {
         hud.layer.borderWidth = 1.0;
         hud.layer.borderColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.85].CGColor;
         hud.clipsToBounds = YES;
-        hud.hidden = YES;
+        hud.hidden = NO; // Luôn luôn hiện theo yêu cầu
         [container addSubview:hud];
         self.hudPlayFrame = hud;
         win.hudPlayFrame = hud;
@@ -1589,8 +1604,8 @@ static uint32_t sCurrentPlayFrame = 0;
 - (void)showPlayFrameHud:(BOOL)show {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.hudPlayFrame) {
-            self.hudPlayFrame.hidden = !show;
-            if (show) [self refreshSpeedUI];
+            self.hudPlayFrame.hidden = NO; // Luôn luôn hiện
+            [self refreshSpeedUI];
         }
     });
 }
@@ -1862,14 +1877,21 @@ static void hook_ReplayActionGoImpEnter(void *self, const void *m) {
     rtBeginRace();
 }
 
+static void rtStopAllMatchActivity(void) {
+    if (gPlaying) {
+        gPlaying = NO;
+        gCurPlaybackSteer = 0.f;
+        rtWriteKeyFlags(0);
+        rtSyncUIKeys(0);
+        rtLog("FINISH: Auto Play stopped");
+    }
+    rtStopAndSaveCustomRecord();
+}
+
 static void hook_GameFinishImpEnter(void *self, const void *m) {
     if (orig_GameFinishImpEnter) orig_GameFinishImpEnter(self, m);
-    rtLog("FINISH reached");
-    gPlaying = NO;
-    rtWriteKeyFlags(0);
-    rtSyncUIKeys(0);
-    if (gPanel) [gPanel showPlayFrameHud:NO];
-    rtStopAndSaveCustomRecord();
+    rtLog("FINISH reached: Stopping Auto Play & Saving Record");
+    rtStopAllMatchActivity();
 }
 
 static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *videoBytes, const void *m) {
@@ -1882,10 +1904,7 @@ static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *videoByt
 }
 
 static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool reset, const void *m) {
-    gPlaying = NO;
-    rtSyncUIKeys(0);
-    if (gPanel) [gPanel showPlayFrameHud:NO];
-    rtStopAndSaveCustomRecord();
+    rtStopAllMatchActivity();
     gPlayerVehicle = NULL;
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, crc, reset, m);
     gMapId = rtPtrOk(self) ? *(int *)((char *)self + 0x40) : 0;
@@ -1902,9 +1921,16 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
 
     rtLog("MAP resolved from CheckPointMgr self=%p config=%p mapId=%d", self, config, gMapId);
 
+    // Nạp trước dữ liệu Guide Line ngay tại đây khi config còn 100% hợp lệ trong bộ nhớ
+    if (gRaceModeGuide && rtPtrOk(config)) {
+        rtBuildGuideLineFrames();
+    }
+
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gAutoArmed) {
-            rtLoadRecord();
+            if (!gRaceModeGuide) {
+                rtLoadRecord();
+            }
         }
         if (gPanel) [gPanel refresh];
     });
@@ -2079,6 +2105,7 @@ static void hook_CPR_FillVehicleVelData(void *self, void **fillData, const void 
 
 static void hook_CPR_ReportData(void *self, void **reqData, const void *m) {
     if (orig_CPR_ReportData) orig_CPR_ReportData(self, reqData, m);
+    rtStopAllMatchActivity(); // Dừng ngay khi game gửi gói tin báo cáo kết thúc trận
     if (reqData && rtPtrOk(*reqData)) {
         char *req = (char *)*reqData;
         *(uint8_t *)(req + 0x40) = 0;
@@ -2156,6 +2183,21 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, m);
 }
 
+static void   (*orig_MatchInputMdl_Update)(void *, float, const void *);
+
+static void hook_MatchInputMdl_Update(void *self, float dt, const void *m) {
+    if (rtPtrOk(self)) {
+        void *inputSys = *(void **)((char *)self + 0xA0); // mMatchInputSystem (0xA0)
+        if (rtPtrOk(inputSys)) {
+            void *opMode = *(void **)((char *)inputSys + 0xC8); // mOperatingMode (0xC8)
+            if (rtPtrOk(opMode)) {
+                gOperatingModeHelper = opMode;
+            }
+        }
+    }
+    if (orig_MatchInputMdl_Update) orig_MatchInputMdl_Update(self, dt, m);
+}
+
 static void rtInstallHooks(void) {
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "NssPhyVehicleMotionCtrl", "Update", 1, (void *)hook_MotionCtrl_Update);
@@ -2222,6 +2264,10 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "OperatingModeHelper", "Init", 2, (void *)hook_OperatingModeHelper_Init);
     orig_OperatingModeHelper_Release = (void (*)(void *))
         rtHookMethod("", "OperatingModeHelper", "Release", 0, (void *)hook_OperatingModeHelper_Release);
+    rtHookMethod("", "OperatingMode_OneSide", "Init", 2, (void *)hook_OperatingModeHelper_Init);
+
+    orig_MatchInputMdl_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "MatchInputMdl", "Update", 1, (void *)hook_MatchInputMdl_Update);
     uintptr_t base = rtGetUnityBase();
     if (base) {
         fnSetKeyState = (fn_SetKeyState_InputKey_t)(base + 0x7DB856C); // OperatingMode_OneSide.SetKeyState
