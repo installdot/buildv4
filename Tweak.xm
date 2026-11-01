@@ -227,13 +227,6 @@ static int   gKeyMask;
 static float gCurPlaybackSteer;
 static void *gMapDataComponent = NULL;
 static BOOL gDownloading = NO;
-static void  *gQuickMatchMdl = NULL;
-static int    gAutoMatchMode = 5; // Mặc định: 5 (Rank Tốc Độ Đơn)
-static BOOL   gAutoQueue = NO;    // Tự động bấm nút ghép trận
-static double gLastFinishTime = 0.0;
-static BOOL   sWasMatching = NO;        // Trạng thái tìm trận frame trước
-static double sLastMatchCancelTime = 0.0; // Mốc thời gian khi bị game tự hủy tìm trận
-static double sLastWatchdogTime = 0.0;    // Watchdog định kỳ tự thử lại
 
 #pragma mark - Storage & Parser .rep
 
@@ -836,29 +829,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     rtWriteKeyFlags((int)keys);
 }
 
-static void rtTriggerQuickMatch(void) {
-    if (!rtPtrOk(gQuickMatchMdl)) {
-        rtLog("AUTO MATCH: gQuickMatchMdl is NULL");
-        return;
-    }
-    uintptr_t base = rtGetUnityBase();
-    if (!base) return;
-
-    typedef bool (*fn_isMatching_t)(void *);
-    fn_isMatching_t fn_isMatching = (fn_isMatching_t)(base + 0x8DCAB90);
-    if (fn_isMatching && fn_isMatching(gQuickMatchMdl)) {
-        rtLog("AUTO MATCH: Already matching!");
-        return;
-    }
-
-    typedef void (*fn_QuickMatch_t)(void *, int, bool, uint8_t, int, int);
-    fn_QuickMatch_t fn_qm = (fn_QuickMatch_t)(base + 0x8DCBD60);
-    if (fn_qm) {
-        rtLog("AUTO MATCH: Triggering QuickMatch(mode=%d)...", gAutoMatchMode);
-        fn_qm(gQuickMatchMdl, gAutoMatchMode, true, 6, -1, 0);
-    }
-}
-
 #pragma mark - UI Interface
 
 @interface RCPanel : NSObject
@@ -868,7 +838,6 @@ static void rtTriggerQuickMatch(void) {
 @property (nonatomic, strong) UIButton *bDl;
 @property (nonatomic, strong) UIButton *bNoRep;
 @property (nonatomic, strong) UIButton *bAuto;
-@property (nonatomic, strong) UIButton *bQueue;
 - (void)show;
 - (void)refresh;
 @end
@@ -938,11 +907,6 @@ static void   (*orig_CheckPointMgr_Init)(void *, void *, bool, bool, const void 
 static void   (*orig_MapDataComponent_InitComponent)(void *, const void *);
 static void  *(*orig_DataCenterMdl_GetMapDataComponent)(void *, bool, const void *);
 
-// Auto Matchmaking Hooks
-static void   (*orig_QuickMatchMdl_Update)(void *, float, const void *);
-static void   (*orig_QuickMatchMdl_CancelMatch)(void *, const void *);
-static void   (*orig_RankedEntranceButtonComponent_OnClickMatchBtn)(void *, int, const void *);
-
 // No Replay Hooks
 static int    (*orig_MatchVideoMdl_StartEnterGame)(void *, int, void *, void *, const void *);
 static int    (*orig_MatchVideoMdl_ChallengeShadow_info)(void *, void *, uint64_t, const void *);
@@ -958,72 +922,6 @@ static void   (*orig_SdcPlayerInput_Update)(void *, float, const void *);
 static void   (*orig_CPR_FillVehicleInputData)(void *, void **, const void *);
 static void   (*orig_CPR_FillPVPButtonUseData)(void *, void **, const void *);
 static BOOL   (*orig_MatchUIMgr_Trusteeship)(void *, int, const void *);
-
-static void hook_QuickMatchMdl_CancelMatch(void *self, const void *m) {
-    if (orig_QuickMatchMdl_CancelMatch) orig_QuickMatchMdl_CancelMatch(self, m);
-    if (gAutoQueue && !gPlaying) {
-        rtLog("AUTO MATCH: Intercepted CancelMatch! Scheduling auto retry in 2.5s...");
-        sLastMatchCancelTime = rtNow();
-    }
-}
-
-static void hook_QuickMatchMdl_Update(void *self, float dt, const void *m) {
-    if (rtPtrOk(self)) {
-        gQuickMatchMdl = self;
-
-        uintptr_t base = rtGetUnityBase();
-        typedef bool (*fn_isMatching_t)(void *);
-        fn_isMatching_t fn_isMatching = base ? (fn_isMatching_t)(base + 0x8DCAB90) : NULL;
-        bool isMatching = fn_isMatching ? fn_isMatching(self) : false;
-
-        double now = rtNow();
-
-        // 1. Phát hiện sự kiện game tự hủy tìm trận / timeout hàng đợi:
-        // Đang tìm trận (sWasMatching == YES) nhưng đột ngột bị hủy (isMatching == NO) và không phải do vào trận (!gPlaying)
-        if (sWasMatching && !isMatching && !gPlaying) {
-            if (gAutoQueue) {
-                rtLog("AUTO MATCH: Queue timed out / cancelled by game! Auto retrying in 2.5s...");
-                sLastMatchCancelTime = now;
-            }
-        }
-        sWasMatching = isMatching;
-
-        // 2. Tự động ghép lại (Retry):
-        // - Khi bị timeout / tự hủy ghép (sLastMatchCancelTime)
-        // - Khi kết thúc trận đua về sảnh (gLastFinishTime)
-        // - Watchdog: Định kỳ kiểm tra nếu đang bật auto queue mà ở sảnh quá 8s chưa vào hàng đợi
-        if (gAutoQueue && !gPlaying && !isMatching) {
-            if (sLastMatchCancelTime > 0.0 && (now - sLastMatchCancelTime >= 2.5)) {
-                sLastMatchCancelTime = 0.0;
-                sLastWatchdogTime = now;
-                rtLog("AUTO MATCH: Retrying match queue after timeout...");
-                rtTriggerQuickMatch();
-            } else if (gLastFinishTime > 0.0 && (now - gLastFinishTime >= 6.0)) {
-                gLastFinishTime = 0.0;
-                sLastWatchdogTime = now;
-                rtLog("AUTO MATCH: Post-race cooldown finished. Triggering next match...");
-                rtTriggerQuickMatch();
-            } else if (sLastMatchCancelTime == 0.0 && gLastFinishTime == 0.0) {
-                if (sLastWatchdogTime == 0.0) sLastWatchdogTime = now;
-                if (now - sLastWatchdogTime >= 8.0) {
-                    sLastWatchdogTime = now;
-                    rtLog("AUTO MATCH: Watchdog: Still not matching in lobby, triggering retry...");
-                    rtTriggerQuickMatch();
-                }
-            }
-        } else {
-            sLastWatchdogTime = now;
-        }
-    }
-    if (orig_QuickMatchMdl_Update) orig_QuickMatchMdl_Update(self, dt, m);
-}
-
-static void hook_RankedEntranceButtonComponent_OnClickMatchBtn(void *self, int mode, const void *m) {
-    gAutoMatchMode = mode;
-    rtLog("MATCH BUTTON CLICKED: Remembered mode %d", mode);
-    if (orig_RankedEntranceButtonComponent_OnClickMatchBtn)
-        orig_RankedEntranceButtonComponent_OnClickMatchBtn(self, mode, m);
-}
 
 static void hook_Input_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
@@ -1092,7 +990,6 @@ static void hook_GameFinishImpEnter(void *self, const void *m) {
     if (orig_GameFinishImpEnter) orig_GameFinishImpEnter(self, m);
     rtLog("FINISH reached");
     gPlaying = NO;
-    gLastFinishTime = rtNow(); // Bắt đầu đếm thời gian chuyển về sảnh để tự ghép trận tiếp
     rtWriteKeyFlags(0);
 }
 
@@ -1374,7 +1271,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
             }
         }
 
-        UIView *host = [[UIView alloc] initWithFrame:CGRectMake(14, scr.size.height * 0.25, 132, 234)];
+        UIView *host = [[UIView alloc] initWithFrame:CGRectMake(14, scr.size.height * 0.28, 132, 198)];
         host.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.88];
         host.layer.cornerRadius = 12;
         host.layer.borderWidth = 1;
@@ -1405,11 +1302,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
         self.bAuto.frame = CGRectMake(10, 96, 112, 32);
         [host addSubview:self.bAuto];
 
-        self.bQueue = [self mk:@"⚡ GHÉP TRẬN" sel:@selector(tapQueue)];
-        self.bQueue.frame = CGRectMake(10, 130, 112, 32);
-        [host addSubview:self.bQueue];
-
-        self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, 166, 112, 62)];
+        self.status = [[UILabel alloc] initWithFrame:CGRectMake(10, 130, 112, 62)];
         self.status.numberOfLines = 3;
         self.status.font = [UIFont systemFontOfSize:9];
         self.status.textColor = [UIColor colorWithWhite:1 alpha:0.75];
@@ -1436,28 +1329,12 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
                                                 : [UIColor colorWithWhite:0.12 alpha:0.92];
         [self.bNoRep setTitle:gNoReplay ? @"NO REP: BẬT" : @"NO REP: TẮT" forState:UIControlStateNormal];
 
-        self.bQueue.backgroundColor = gAutoQueue ? [UIColor colorWithRed:0.10 green:0.35 blue:0.75 alpha:0.95]
-                                                 : [UIColor colorWithWhite:0.12 alpha:0.92];
-        [self.bQueue setTitle:gAutoQueue ? @"⚡ GHÉP: BẬT" : @"⚡ GHÉP: TẮT" forState:UIControlStateNormal];
-
         if (!gDownloading) {
             NSString *stateStr = gAutoArmed ? @"AUTO: BẬT" : @"AUTO: TẮT";
-            NSString *queueStr = gAutoQueue ? @"GHÉP: TỰ ĐỘNG" : @"GHÉP: TAY";
-            self.status.text = [NSString stringWithFormat:@"Map: %d (%u f)\n%@ | %@\nPlay: %d",
-                                gMapId, gFrameCount, stateStr, queueStr, (int)gPlaying];
+            self.status.text = [NSString stringWithFormat:@"Map: %d (%u frame)\n%@\nPlay: %d",
+                                gMapId, gFrameCount, stateStr, (int)gPlaying];
         }
     });
-}
-
-- (void)tapQueue {
-    gAutoQueue = gAutoQueue ? NO : YES;
-    rtLog("AUTO QUEUE changed to %d", (int)gAutoQueue);
-    if (gAutoQueue) {
-        sLastMatchCancelTime = 0.0;
-        sLastWatchdogTime = rtNow();
-        rtTriggerQuickMatch(); // Bấm là kích hoạt ghép ngay lập tức!
-    }
-    [self refresh];
 }
 
 - (void)tapNoRep {
@@ -1525,14 +1402,6 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "MapDataComponent", "InitComponent", 0, (void *)hook_MapDataComponent_InitComponent);
     orig_DataCenterMdl_GetMapDataComponent = (void *(*)(void *, bool, const void *))
         rtHookMethod("", "DataCenterMdl", "GetMapDataComponent", 1, (void *)hook_DataCenterMdl_GetMapDataComponent);
-
-    // Auto Matchmaking Hooks (Tự động bấm nút ghép trận & Tự động Retry khi timeout)
-    orig_QuickMatchMdl_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "QuickMatchMdl", "Update", 1, (void *)hook_QuickMatchMdl_Update);
-    orig_QuickMatchMdl_CancelMatch = (void (*)(void *, const void *))
-        rtHookMethod("", "QuickMatchMdl", "CancelMatch", 0, (void *)hook_QuickMatchMdl_CancelMatch);
-    orig_RankedEntranceButtonComponent_OnClickMatchBtn = (void (*)(void *, int, const void *))
-        rtHookMethod("", "RankedEntranceButtonComponent", "OnClickMatchBtn", 1, (void *)hook_RankedEntranceButtonComponent_OnClickMatchBtn);
 
     // No Replay Hooks (chặn game tự động mở Replay & Bóng khi tải .rep)
     orig_MatchVideoMdl_StartEnterGame = (int (*)(void *, int, void *, void *, const void *))
