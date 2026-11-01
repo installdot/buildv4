@@ -224,12 +224,15 @@ static double   sLastPlaybackRealTime = 0.0;
 static float    sAccumulatedPlaybackTime = 0.0f;
 static BOOL gAutoArmed, gPlaying;
 static BOOL gNoReplay = YES;
+static BOOL gRaceModeGuide = NO; // NO = Đua Rec (.rep), YES = Đua Guide Line (299 km/h)
 
 // Tính toán độ lệch vị trí
 static BOOL   gEnableOffsetFix = YES;
 static BOOL   gOffsetApplied = NO;
 static float  gOffsetDelta[3] = {0.f, 0.f, 0.f};
+static float  gOffsetAngleDeg = 0.f;
 static float  gRepOriginPos[3] = {0.f, 0.f, 0.f};
+static float  gRepOriginRot[4] = {0.f, 0.f, 0.f, 1.f};
 static float  gMapActualPos[3] = {0.f, 0.f, 0.f};
 static int    gRepStartSlot = 0;
 static int    gMapStartSlot = 0;
@@ -399,11 +402,16 @@ static BOOL rtExtractFramesFromDesHelper(void *desHelper) {
     if (mapId > 0) gMapId = (int)mapId;
     rtLog("[Rep] SUCCESSFULLY extracted %u frames from .rep! MapId=%d", gFrameCount, gMapId);
 
-    // Ghi nhận vị trí xuất phát gốc và slot của rep
+    // Ghi nhận vị trí xuất phát gốc, góc xoay và slot của rep
     if (count > 0) {
         gRepOriginPos[0] = gFrames[0].px;
         gRepOriginPos[1] = gFrames[0].py;
         gRepOriginPos[2] = gFrames[0].pz;
+        gRepOriginRot[0] = gFrames[0].qx;
+        gRepOriginRot[1] = gFrames[0].qy;
+        gRepOriginRot[2] = gFrames[0].qz;
+        gRepOriginRot[3] = gFrames[0].qw;
+        gOffsetAngleDeg = 0.f;
         gOffsetApplied = NO;
         memset(gOffsetDelta, 0, sizeof(gOffsetDelta));
 
@@ -800,7 +808,7 @@ static void rtRedownloadRepForMap(int targetMapId, void (^onComplete)(BOOL succe
     });
 }
 
-static BOOL rtCalculateStartSlotPosInMap(void *cpMgr, int slotIndex, float *outPos) {
+static BOOL rtCalculateStartSlotPosAndDirInMap(void *cpMgr, int slotIndex, float *outPos, float *outDir) {
     if (!rtPtrOk(cpMgr) || !outPos) return NO;
 
     float sx = *(float *)((char *)cpMgr + 0x1C8 + 0);
@@ -811,7 +819,7 @@ static BOOL rtCalculateStartSlotPosInMap(void *cpMgr, int slotIndex, float *outP
     float dy = *(float *)((char *)cpMgr + 0x1D4 + 4);
     float dz = *(float *)((char *)cpMgr + 0x1D4 + 8);
 
-    // Nếu CheckPointMgr chưa khởi tạo xong mRaceStartPosition, gọi fallback hàm của game: GetRoadStartPoint (0x9488AC4)
+    // Nếu CheckPointMgr chưa gán mRaceStartPosition, gọi fallback hàm của game: GetRoadStartPoint (0x9488AC4)
     if (fabsf(sx) < 1e-3f && fabsf(sz) < 1e-3f) {
         uintptr_t base = rtGetUnityBase();
         if (base) {
@@ -847,6 +855,12 @@ static BOOL rtCalculateStartSlotPosInMap(void *cpMgr, int slotIndex, float *outP
     float fy = (flen > 1e-4f) ? dy / flen : 0.f;
     float fz = (flen > 1e-4f) ? dz / flen : 1.f;
 
+    if (outDir) {
+        outDir[0] = fx;
+        outDir[1] = fy;
+        outDir[2] = fz;
+    }
+
     // Vector3.Cross(Forward, Vector3.up (0, 1, 0)) chuẩn xác từ assembly sub_D7E7D98:
     // rx = fy * 0 - fz * 1 = -fz
     // ry = fz * 0 - fx * 0 = 0
@@ -880,39 +894,333 @@ static BOOL rtCalculateAndApplyOffset(void) {
     if (!gFrames || gFrameCount < 2) return NO;
     if (gOffsetApplied) return YES;
 
-    // TÍNH TỌA ĐỘ VỊ TRÍ XUẤT PHÁT CỦA MAP THEO THỨ TỰ Ô CỦA REP (KHÔNG LẤY TỌA ĐỘ XE!)
-    if (!rtCalculateStartSlotPosInMap(gCheckPointMgr, gRepStartSlot, gMapActualPos)) {
+    // 1. TÍNH TỌA ĐỘ VÀ HƯỚNG VỊ TRÍ XUẤT PHÁT CỦA MAP THEO THỨ TỰ Ô CỦA REP (KHÔNG LẤY VỊ TRÍ XE!)
+    float mapStartDir[3] = {0.f, 0.f, 1.f};
+    if (!rtCalculateStartSlotPosAndDirInMap(gCheckPointMgr, gRepStartSlot, gMapActualPos, mapStartDir)) {
         rtLog("[Offset] Map start slot position not available yet (CheckPointMgr=%p)", gCheckPointMgr);
         return NO;
     }
 
+    // 2. TÍNH VECTOR VÀ GÓC HƯỚNG CỦA MAP
+    float fMapLen = sqrtf(mapStartDir[0] * mapStartDir[0] + mapStartDir[2] * mapStartDir[2]);
+    float fMapX = (fMapLen > 1e-4f) ? (mapStartDir[0] / fMapLen) : 0.f;
+    float fMapZ = (fMapLen > 1e-4f) ? (mapStartDir[2] / fMapLen) : 1.f;
+    float thetaMap = atan2f(fMapX, fMapZ);
+
+    // 3. TÍNH VECTOR VÀ GÓC HƯỚNG CỦA REPLAY TẠI FRAME 0 (TỪ QUATERNION GỐC)
+    float rqx = gRepOriginRot[0], rqy = gRepOriginRot[1], rqz = gRepOriginRot[2], rqw = gRepOriginRot[3];
+    float fRepX = 2.0f * (rqx * rqz + rqw * rqy);
+    float fRepZ = 1.0f - 2.0f * (rqx * rqx + rqy * rqy);
+    float fRepLen = sqrtf(fRepX * fRepX + fRepZ * fRepZ);
+    if (fRepLen > 1e-4f) { fRepX /= fRepLen; fRepZ /= fRepLen; } else { fRepX = 0.f; fRepZ = 1.f; }
+    float thetaRep = atan2f(fRepX, fRepZ);
+
+    // 4. TÍNH ĐỘ LỆCH GÓC XOAY (DELTA THETA) TRÊN MẶT PHẲNG NẰM NGANG
+    float deltaTheta = thetaMap - thetaRep;
+    while (deltaTheta > (float)M_PI)  deltaTheta -= 2.0f * (float)M_PI;
+    while (deltaTheta < -(float)M_PI) deltaTheta += 2.0f * (float)M_PI;
+    gOffsetAngleDeg = deltaTheta * (180.0f / (float)M_PI);
+
+    // 5. TÍNH ĐỘ LỆCH DỊCH CHUYỂN TỌA ĐỘ (DELTA TRANSLATION)
     float dx = gMapActualPos[0] - gRepOriginPos[0];
     float dy = gMapActualPos[1] - gRepOriginPos[1];
     float dz = gMapActualPos[2] - gRepOriginPos[2];
-
     float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-    rtLog("[Offset] AUTO CALC: RepSlot=%d Rep0=(%.2f, %.2f, %.2f) MapSlot%d=(%.2f, %.2f, %.2f) -> Delta=(%.2f, %.2f, %.2f) dist=%.2fm",
-          gRepStartSlot, gRepOriginPos[0], gRepOriginPos[1], gRepOriginPos[2],
-          gRepStartSlot, gMapActualPos[0], gMapActualPos[1], gMapActualPos[2],
-          dx, dy, dz, dist);
 
-    if (dist > 0.05f) {
-        gOffsetDelta[0] = dx;
-        gOffsetDelta[1] = dy;
-        gOffsetDelta[2] = dz;
+    gOffsetDelta[0] = dx;
+    gOffsetDelta[1] = dy;
+    gOffsetDelta[2] = dz;
 
-        // Bù độ lệch vào từng frame của Replay
+    rtLog("[Offset] AUTO CALC: RepSlot=%d Rep0=(%.2f, %.2f, %.2f, hdg=%.1f°) MapSlot%d=(%.2f, %.2f, %.2f, hdg=%.1f°) -> DeltaPos=(%.2f, %.2f, %.2f, dist=%.2fm) DeltaAngle=%.1f°",
+          gRepStartSlot, gRepOriginPos[0], gRepOriginPos[1], gRepOriginPos[2], thetaRep * 180.f / (float)M_PI,
+          gRepStartSlot, gMapActualPos[0], gMapActualPos[1], gMapActualPos[2], thetaMap * 180.f / (float)M_PI,
+          dx, dy, dz, dist, gOffsetAngleDeg);
+
+    // 6. NẾU CÓ ĐỘ LỆCH VỊ TRÍ (> 0.05m) HOẶC ĐỘ LỆCH XOAY (> 0.5 độ): ÁP DỤNG BIẾN ĐỔI RIGID BODY
+    if (dist > 0.05f || fabsf(deltaTheta) > 0.008f) {
+        float cosA = cosf(deltaTheta);
+        float sinA = sinf(deltaTheta);
+        float halfA = deltaTheta * 0.5f;
+        float dQy = sinf(halfA);
+        float dQw = cosf(halfA);
+
         for (uint32_t i = 0; i < gFrameCount; i++) {
-            gFrames[i].px += dx;
-            gFrames[i].py += dy;
-            gFrames[i].pz += dz;
+            // A. Vector tương đối so với điểm xuất phát Replay
+            float relX = gFrames[i].px - gRepOriginPos[0];
+            float relY = gFrames[i].py - gRepOriginPos[1];
+            float relZ = gFrames[i].pz - gRepOriginPos[2];
+
+            // B. Xoay vector tương đối theo Delta Theta quanh trục Y
+            float rotRelX = relX * cosA + relZ * sinA;
+            float rotRelY = relY;
+            float rotRelZ = -relX * sinA + relZ * cosA;
+
+            // C. Đặt vào vạch xuất phát thực tế trên Map
+            gFrames[i].px = gMapActualPos[0] + rotRelX;
+            gFrames[i].py = gMapActualPos[1] + rotRelY;
+            gFrames[i].pz = gMapActualPos[2] + rotRelZ;
+
+            // D. Xoay góc Quaternion xe: Q_new = dQ * Q_old
+            float qx = gFrames[i].qx, qy = gFrames[i].qy, qz = gFrames[i].qz, qw = gFrames[i].qw;
+            gFrames[i].qx = dQw * qx + dQy * qz;
+            gFrames[i].qy = dQw * qy + dQy * qw;
+            gFrames[i].qz = dQw * qz - dQy * qx;
+            gFrames[i].qw = dQw * qw - dQy * qy;
+
+            // E. Xoay vector vận tốc tuyến tính
+            float vx = gFrames[i].vx, vz = gFrames[i].vz;
+            gFrames[i].vx = vx * cosA + vz * sinA;
+            gFrames[i].vz = -vx * sinA + vz * cosA;
         }
         gOffsetApplied = YES;
-        rtLog("[Offset] AUTO CALIBRATED all %u frames with delta (%.2f, %.2f, %.2f)!", gFrameCount, dx, dy, dz);
+        rtLog("[Offset] RIGID BODY CALIBRATED all %u frames: deltaPos=(%.2f, %.2f, %.2f) deltaAngle=%.1f°!",
+              gFrameCount, dx, dy, dz, gOffsetAngleDeg);
         return YES;
     }
     gOffsetApplied = YES;
     return NO;
+}
+
+static float rtGetMyBestScoreTime(int mapId) {
+    NSString *rkPath = rtPathForTrack();
+    if (rkPath && [[NSFileManager defaultManager] fileExistsAtPath:rkPath]) {
+        FILE *f = fopen(rkPath.fileSystemRepresentation, "rb");
+        if (f) {
+            RCHeader h;
+            if (fread(&h, sizeof h, 1, f) == 1 && h.count > 0) {
+                fclose(f);
+                float est = (float)h.count * 0.008f;
+                if (est > 5.0f && est < 300.0f) return est;
+            } else fclose(f);
+        }
+    }
+    if (gFrames && gFrameCount > 10 && gMapId == mapId) {
+        float repTime = gFrames[gFrameCount - 1].t;
+        if (repTime > 5.0f && repTime < 300.0f) return repTime;
+    }
+    return 0.0f;
+}
+
+static BOOL rtBuildGuideLineFrames(void) {
+    if (!rtPtrOk(gCheckPointMgr)) {
+        rtLog("[Guide] gCheckPointMgr is null");
+        return NO;
+    }
+
+    void *config = *(void **)((char *)gCheckPointMgr + 0x190); // mCheckPointCfg
+    if (!rtPtrOk(config)) {
+        rtLog("[Guide] mCheckPointCfg is null");
+        return NO;
+    }
+
+    // 1. Đọc số vòng đua của trận (Laps): 1 vòng hoặc 2 vòng
+    int laps = *(int *)((char *)gCheckPointMgr + 0x204); // mTotalRoundNum
+    if (laps <= 0 || laps > 5) laps = 1;
+
+    // Chiều dài 1 vòng
+    float lapLength = *(float *)((char *)config + 0x2C); // MainCurveLength
+    if (lapLength < 100.0f) lapLength = *(float *)((char *)gCheckPointMgr + 0x200); // mSingleRoundLength
+    if (lapLength < 100.0f) lapLength = 3000.0f;
+
+    float totalDistance = lapLength * (float)laps;
+
+    // 2. Thu thập các điểm tim đường từ TrackPointDataList
+    void *tpArr = *(void **)((char *)config + 0x48); // TrackPointDataList
+    int rawCount = tpArr ? *(int *)((char *)tpArr + 0x18) : 0;
+    void **items = tpArr ? (void **)((char *)tpArr + 0x20) : NULL;
+
+    typedef struct {
+        float x, y, z;
+        float dist;
+    } GuidePoint;
+
+    GuidePoint *gpts = NULL;
+    int numGpts = 0;
+
+    if (items && rawCount > 10) {
+        gpts = (GuidePoint *)malloc(sizeof(GuidePoint) * rawCount);
+        if (gpts) {
+            float accumDist = 0.0f;
+            for (int i = 0; i < rawCount; i++) {
+                void *tp = items[i];
+                if (!rtPtrOk(tp)) continue;
+                void *posObj = *(void **)((char *)tp + 0x20); // TDR_Vector3 Position
+                if (!rtPtrOk(posObj)) continue;
+                float px = *(float *)((char *)posObj + 0x10);
+                float py = *(float *)((char *)posObj + 0x14);
+                float pz = *(float *)((char *)posObj + 0x18);
+
+                if (numGpts > 0) {
+                    float dx = px - gpts[numGpts - 1].x;
+                    float dy = py - gpts[numGpts - 1].y;
+                    float dz = pz - gpts[numGpts - 1].z;
+                    accumDist += sqrtf(dx * dx + dy * dy + dz * dz);
+                }
+                gpts[numGpts].x = px;
+                gpts[numGpts].y = py;
+                gpts[numGpts].z = pz;
+                gpts[numGpts].dist = accumDist;
+                numGpts++;
+            }
+        }
+    }
+
+    // Fallback: CheckPointDataList nếu TrackPointData trống
+    if (!gpts || numGpts < 5) {
+        if (gpts) { free(gpts); gpts = NULL; }
+        void *cpArr = *(void **)((char *)config + 0x38); // CheckPointDataList
+        int cpCount = cpArr ? *(int *)((char *)cpArr + 0x18) : 0;
+        void **cpItems = cpArr ? (void **)((char *)cpArr + 0x20) : NULL;
+        if (cpItems && cpCount > 3) {
+            gpts = (GuidePoint *)malloc(sizeof(GuidePoint) * cpCount);
+            if (gpts) {
+                float accumDist = 0.0f;
+                for (int i = 0; i < cpCount; i++) {
+                    void *cp = cpItems[i];
+                    if (!rtPtrOk(cp)) continue;
+                    void *posObj = *(void **)((char *)cp + 0x28); // TDR_Vector3 Position
+                    if (!rtPtrOk(posObj)) continue;
+                    float px = *(float *)((char *)posObj + 0x10);
+                    float py = *(float *)((char *)posObj + 0x14);
+                    float pz = *(float *)((char *)posObj + 0x18);
+                    if (numGpts > 0) {
+                        float dx = px - gpts[numGpts - 1].x;
+                        float dy = py - gpts[numGpts - 1].y;
+                        float dz = pz - gpts[numGpts - 1].z;
+                        accumDist += sqrtf(dx * dx + dy * dy + dz * dz);
+                    }
+                    gpts[numGpts].x = px;
+                    gpts[numGpts].y = py;
+                    gpts[numGpts].z = pz;
+                    gpts[numGpts].dist = accumDist;
+                    numGpts++;
+                }
+            }
+        }
+    }
+
+    if (!gpts || numGpts < 3) {
+        if (gpts) free(gpts);
+        rtLog("[Guide] Failed to extract track points (count=%d)", numGpts);
+        return NO;
+    }
+
+    if (gpts[numGpts - 1].dist > 50.0f) {
+        lapLength = gpts[numGpts - 1].dist;
+        totalDistance = lapLength * (float)laps;
+    }
+
+    // 3. Tính toán thời gian hoàn thành theo tốc độ chuẩn 299 km/h:
+    float targetSpeedMps = 299.0f / 3.6f; // ~83.0556 m/s
+    float targetFinishTime = totalDistance / targetSpeedMps;
+
+    // Lấy thời gian nhanh nhất của tôi (nếu có kỷ lục trước đó)
+    float myBest = rtGetMyBestScoreTime(gMapId);
+    if (myBest > 10.0f && myBest < 300.0f) {
+        float bestSpeed = totalDistance / myBest;
+        if (bestSpeed <= targetSpeedMps) {
+            targetFinishTime = myBest;
+            targetSpeedMps = totalDistance / targetFinishTime;
+            rtLog("[Guide] Using personal best finish time: %.2fs (speed=%.1f km/h)",
+                  targetFinishTime, targetSpeedMps * 3.6f);
+        } else {
+            rtLog("[Guide] Personal best (%.2fs) exceeds 299 km/h -> Clamping to 299.0 km/h (%.2fs)",
+                  myBest, targetFinishTime);
+        }
+    } else {
+        rtLog("[Guide] Standard 299 km/h finish time: %.2fs for %d lap(s)", targetFinishTime, laps);
+    }
+
+    // 4. Chia thành chuỗi các frame (Interval = 0.010s -> 100 FPS)
+    float dt = 0.010f;
+    uint32_t totalFrames = (uint32_t)(targetFinishTime / dt) + 1;
+    if (totalFrames > RC_MAX_FRAMES) totalFrames = RC_MAX_FRAMES;
+
+    if (gFrames) { free(gFrames); gFrames = NULL; }
+    gFrames = (RCFrame *)malloc(sizeof(RCFrame) * totalFrames);
+    if (!gFrames) {
+        free(gpts);
+        return NO;
+    }
+
+    uint32_t segIdx = 0;
+    for (uint32_t i = 0; i < totalFrames; i++) {
+        float t = (float)i * dt;
+        if (t > targetFinishTime) t = targetFinishTime;
+
+        float sDist = (t / targetFinishTime) * totalDistance;
+        int curLap = (int)(sDist / lapLength);
+        if (curLap >= laps) curLap = laps - 1;
+        float sInLap = sDist - ((float)curLap * lapLength);
+
+        while (segIdx + 2 < (uint32_t)numGpts && gpts[segIdx + 1].dist < sInLap) {
+            segIdx++;
+        }
+        if (segIdx + 1 >= (uint32_t)numGpts) segIdx = (uint32_t)numGpts - 2;
+
+        GuidePoint *pA = &gpts[segIdx];
+        GuidePoint *pB = &gpts[segIdx + 1];
+        float segLen = pB->dist - pA->dist;
+        float alpha = (segLen > 1e-4f) ? ((sInLap - pA->dist) / segLen) : 0.0f;
+        if (alpha < 0.0f) alpha = 0.0f;
+        if (alpha > 1.0f) alpha = 1.0f;
+
+        float px = pA->x + (pB->x - pA->x) * alpha;
+        float py = pA->y + (pB->y - pA->y) * alpha;
+        float pz = pA->z + (pB->z - pA->z) * alpha;
+
+        float fx = pB->x - pA->x;
+        float fy = pB->y - pA->y;
+        float fz = pB->z - pA->z;
+        float flen = sqrtf(fx * fx + fy * fy + fz * fz);
+        if (flen > 1e-4f) { fx /= flen; fy /= flen; fz /= flen; }
+        else { fx = 0.f; fy = 0.f; fz = 1.f; }
+
+        float theta = atan2f(fx, fz);
+        float clampedY = -fy;
+        if (clampedY < -1.0f) clampedY = -1.0f;
+        if (clampedY > 1.0f)  clampedY = 1.0f;
+        float phi = asinf(clampedY);
+
+        float halfT = theta * 0.5f;
+        float halfP = phi * 0.5f;
+        float sinT = sinf(halfT), cosT = cosf(halfT);
+        float sinP = sinf(halfP), cosP = cosf(halfP);
+
+        float qx = cosT * sinP;
+        float qy = sinT * cosP;
+        float qz = -sinT * sinP;
+        float qw = cosT * cosP;
+        float ql = sqrtf(qx * qx + qy * qy + qz * qz + qw * qw);
+        if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
+
+        RCFrame fr;
+        memset(&fr, 0, sizeof(fr));
+        fr.t    = t;
+        fr.px   = px;
+        fr.py   = py;
+        fr.pz   = pz;
+        fr.qx   = qx;
+        fr.qy   = qy;
+        fr.qz   = qz;
+        fr.qw   = qw;
+        fr.vx   = fx * targetSpeedMps;
+        fr.vy   = fy * targetSpeedMps;
+        fr.vz   = fz * targetSpeedMps;
+        fr.kmph = targetSpeedMps * 3.6f;
+        fr.steer = 0.0f;
+        fr.keys = (1 << 3) | (1 << 5); // Full Nitro & MiniBoost
+        fr.flags = 0x08 | 0x10;
+
+        gFrames[i] = fr;
+    }
+
+    gFrameCount = totalFrames;
+    free(gpts);
+    gOffsetApplied = YES; // Tọa độ guide line đã khớp 100% map
+    rtLog("[Guide] Generated %u frames for %d lap(s) (%.1fm, finishTime=%.2fs, speed=%.1f km/h)!",
+          gFrameCount, laps, totalDistance, targetFinishTime, targetSpeedMps * 3.6f);
+    return YES;
 }
 
 #pragma mark - Key injection (đúng cơ chế game)
@@ -1099,6 +1407,7 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 
 // Tab 0: Điều khiển chính
 @property (nonatomic, strong) UIView *tab0View;
+@property (nonatomic, strong) UIButton *bMode;
 @property (nonatomic, strong) UIButton *bDl;
 @property (nonatomic, strong) UIButton *bNoRep;
 @property (nonatomic, strong) UIButton *bAuto;
@@ -1268,9 +1577,14 @@ static void rtBeginRace(void) {
     gCurPlaybackSteer = 0.f;
 
     if (gAutoArmed) {
-        BOOL ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
-        if (ok && gEnableOffsetFix && !gOffsetApplied) {
-            rtCalculateAndApplyOffset();
+        BOOL ok = NO;
+        if (gRaceModeGuide) {
+            ok = rtBuildGuideLineFrames();
+        } else {
+            ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
+            if (ok && gEnableOffsetFix && !gOffsetApplied) {
+                rtCalculateAndApplyOffset();
+            }
         }
         gPlaying = ok;
         rtLog("AUTO map=%d -> %s (%u frames)", gMapId, ok ? "playing" : "no record", gFrameCount);
@@ -1337,13 +1651,16 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
 
     rtLog("MAP resolved from CheckPointMgr self=%p config=%p mapId=%d", self, config, gMapId);
 
-    // KHI VÀO MAP MỚI: TỰ ĐỘNG NẠP .REP VÀ TỰ ĐỘNG BÙ LỆCH NGAY LẬP TỨC!
+    // KHI VÀO MAP MỚI: TỰ ĐỘNG NẠP REC HOẶC BUILD GUIDE LINE NGAY LẬP TỨC!
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gAutoArmed) {
-            BOOL ok = rtLoadRecord();
-            if (ok && gEnableOffsetFix) {
-                // TỰ ĐỘNG BÙ LỆCH VỊ TRÍ THEO Ô XUẤT PHÁT CỦA MAP (KHÔNG LẤY VỊ TRÍ XE)
-                rtCalculateAndApplyOffset();
+            if (gRaceModeGuide) {
+                rtBuildGuideLineFrames();
+            } else {
+                BOOL ok = rtLoadRecord();
+                if (ok && gEnableOffsetFix) {
+                    rtCalculateAndApplyOffset();
+                }
             }
         }
         if (gPanel) [gPanel refresh];
@@ -1723,8 +2040,8 @@ static BOOL sBubbleDragged = NO;
         panBubble.cancelsTouchesInView = NO; // Không hủy touch của button
         [bubble addGestureRecognizer:panBubble];
 
-        // 2. Menu chính chia Tab (215x310, mặc định ẩn, bấm bubble để mở)
-        UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 225, scr.size.height * 0.22, 215, 310)];
+        // 2. Menu chính chia Tab (215x342, mặc định ẩn, bấm bubble để mở)
+        UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 225, scr.size.height * 0.18, 215, 342)];
         menu.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.96];
         menu.layer.cornerRadius = 14;
         menu.layer.borderWidth = 1.5;
@@ -1768,28 +2085,32 @@ static BOOL sBubbleDragged = NO;
         self.tabSeg = seg;
 
         // Container Tab 0: Điều khiển chính
-        UIView *c0 = [[UIView alloc] initWithFrame:CGRectMake(10, 62, 195, 238)];
+        UIView *c0 = [[UIView alloc] initWithFrame:CGRectMake(10, 62, 195, 270)];
         [menu addSubview:c0];
         self.tab0View = c0;
 
+        self.bMode = [self mk:@"CHẾ ĐỘ: REC (.REP)" sel:@selector(tapModeSwitch)];
+        self.bMode.frame = CGRectMake(0, 0, 195, 28);
+        [c0 addSubview:self.bMode];
+
         self.bDl = [self mk:@"⬇ TẢI .REP" sel:@selector(tapDownload)];
-        self.bDl.frame = CGRectMake(0, 0, 195, 28);
+        self.bDl.frame = CGRectMake(0, 32, 195, 28);
         [c0 addSubview:self.bDl];
 
         self.bNoRep = [self mk:@"NO REP: BẬT" sel:@selector(tapNoRep)];
-        self.bNoRep.frame = CGRectMake(0, 32, 195, 28);
+        self.bNoRep.frame = CGRectMake(0, 64, 195, 28);
         [c0 addSubview:self.bNoRep];
 
         self.bAuto = [self mk:@"▶ AUTO" sel:@selector(tapAuto)];
-        self.bAuto.frame = CGRectMake(0, 64, 195, 28);
+        self.bAuto.frame = CGRectMake(0, 96, 195, 28);
         [c0 addSubview:self.bAuto];
 
         self.bFixMap = [self mk:@"⚠ LỖI MAP" sel:@selector(tapFixMap)];
-        self.bFixMap.frame = CGRectMake(0, 96, 195, 28);
+        self.bFixMap.frame = CGRectMake(0, 128, 195, 28);
         self.bFixMap.backgroundColor = [UIColor colorWithRed:0.75 green:0.20 blue:0.18 alpha:0.92];
         [c0 addSubview:self.bFixMap];
 
-        UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(0, 130, 195, 22)];
+        UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(0, 162, 195, 22)];
         sl.minimumValue = 1.0f;
         sl.maximumValue = 5.0f;
         sl.value = gSpeedMultiplier;
@@ -1798,7 +2119,7 @@ static BOOL sBubbleDragged = NO;
         [c0 addSubview:sl];
         self.sliderSpeed = sl;
 
-        UILabel *ls = [[UILabel alloc] initWithFrame:CGRectMake(0, 154, 195, 14)];
+        UILabel *ls = [[UILabel alloc] initWithFrame:CGRectMake(0, 186, 195, 14)];
         ls.font = [UIFont boldSystemFontOfSize:10];
         ls.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:1.0 alpha:0.9];
         ls.textAlignment = NSTextAlignmentCenter;
@@ -1806,14 +2127,14 @@ static BOOL sBubbleDragged = NO;
         [c0 addSubview:ls];
         self.lblSpeed = ls;
 
-        self.status = [[UILabel alloc] initWithFrame:CGRectMake(0, 172, 195, 62)];
+        self.status = [[UILabel alloc] initWithFrame:CGRectMake(0, 204, 195, 62)];
         self.status.numberOfLines = 3;
         self.status.font = [UIFont systemFontOfSize:9];
         self.status.textColor = [UIColor colorWithWhite:1 alpha:0.75];
         [c0 addSubview:self.status];
 
         // Container Tab 1: Tính toán độ lệch vị trí
-        UIView *c1 = [[UIView alloc] initWithFrame:CGRectMake(10, 62, 195, 238)];
+        UIView *c1 = [[UIView alloc] initWithFrame:CGRectMake(10, 62, 195, 270)];
         c1.hidden = YES;
         [menu addSubview:c1];
         self.tab1View = c1;
@@ -1854,6 +2175,14 @@ static BOOL sBubbleDragged = NO;
 
 - (void)refresh {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (gRaceModeGuide) {
+            self.bMode.backgroundColor = [UIColor colorWithRed:0.85 green:0.50 blue:0.0 alpha:0.95];
+            [self.bMode setTitle:@"CHẾ ĐỘ: GUIDE (299k)" forState:UIControlStateNormal];
+        } else {
+            self.bMode.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.75 alpha:0.95];
+            [self.bMode setTitle:@"CHẾ ĐỘ: REC (.REP)" forState:UIControlStateNormal];
+        }
+
         self.bAuto.backgroundColor = gAutoArmed ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
                                                 : [UIColor colorWithWhite:0.12 alpha:0.92];
         self.bNoRep.backgroundColor = gNoReplay ? [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95]
@@ -1862,8 +2191,9 @@ static BOOL sBubbleDragged = NO;
 
         if (!gDownloading) {
             NSString *stateStr = gAutoArmed ? @"AUTO: BẬT" : @"AUTO: TẮT";
-            self.status.text = [NSString stringWithFormat:@"Map: %d (%u frame)\n%@\nPlay: %d",
-                                gMapId, gFrameCount, stateStr, (int)gPlaying];
+            NSString *modeStr = gRaceModeGuide ? @"GUIDE 299k" : @"REC .REP";
+            self.status.text = [NSString stringWithFormat:@"Map: %d (%u f)\n%@ | %@\nPlay: %d",
+                                gMapId, gFrameCount, modeStr, stateStr, (int)gPlaying];
         }
 
         // Cập nhật thông số Tab 1
@@ -1879,8 +2209,10 @@ static BOOL sBubbleDragged = NO;
             @"   (%.1f, %.1f, %.1f)\n"
             @" • Map chuẩn (Ô %d):\n"
             @"   (%.1f, %.1f, %.1f)\n"
-            @" • Độ lệch (Map - Rep):\n"
+            @" • Độ lệch vị trí:\n"
             @"   ΔX: %+.2f | ΔY: %+.2f | ΔZ: %+.2f\n"
+            @" • Độ lệch góc xoay:\n"
+            @"   Δθ: %+.1f°\n"
             @" • Trạng thái: %@",
             gRepStartSlot, gMapStartSlot,
             gRepStartSlot,
@@ -1888,6 +2220,7 @@ static BOOL sBubbleDragged = NO;
             gRepStartSlot,
             gMapActualPos[0], gMapActualPos[1], gMapActualPos[2],
             gOffsetDelta[0], gOffsetDelta[1], gOffsetDelta[2],
+            gOffsetAngleDeg,
             statusStr];
     });
 }
@@ -1915,9 +2248,22 @@ static BOOL sBubbleDragged = NO;
     gOffsetApplied = NO;
     BOOL ok = rtCalculateAndApplyOffset();
     if (ok) {
-        rtAlert(@"Bù lệch thành công", [NSString stringWithFormat:@"Ô xuất phát: %d\nĐộ lệch: ΔX=%.2f, ΔY=%.2f, ΔZ=%.2f\nĐã điều chỉnh toàn bộ %u frame của Replay!", gRepStartSlot, gOffsetDelta[0], gOffsetDelta[1], gOffsetDelta[2], gFrameCount]);
+        rtAlert(@"Bù lệch thành công", [NSString stringWithFormat:@"Ô xuất phát: %d\nĐộ lệch vị trí: ΔX=%.2f, ΔY=%.2f, ΔZ=%.2f\nĐộ lệch góc xoay: Δθ=%+.1f°\nĐã điều chỉnh toàn bộ %u frame của Replay!", gRepStartSlot, gOffsetDelta[0], gOffsetDelta[1], gOffsetDelta[2], gOffsetAngleDeg, gFrameCount]);
     } else {
         rtAlert(@"Khớp hoàn toàn", [NSString stringWithFormat:@"Tọa độ Ô %d của Rep và Map đã khớp chính xác (lệch < 0.05m)!", gRepStartSlot]);
+    }
+    [self refresh];
+}
+
+- (void)tapModeSwitch {
+    gRaceModeGuide = (gRaceModeGuide ? NO : YES);
+    rtLog("RACE MODE changed to: %s", gRaceModeGuide ? "GUIDE (299km/h)" : "REC (.REP)");
+    if (gAutoArmed) {
+        if (gRaceModeGuide) {
+            rtBuildGuideLineFrames();
+        } else {
+            rtLoadRecord();
+        }
     }
     [self refresh];
 }
