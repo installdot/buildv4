@@ -1635,8 +1635,7 @@ static void *hook_DataCenterMdl_GetMapDataComponent(void *self, bool withInit, c
 static int hook_MatchVideoMdl_StartEnterGame(void *self, int type, void *v1, void *v2, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted StartEnterGame");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!
-Đã chặn tự động vào trận.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận.");
         return 0;
     }
     return orig_MatchVideoMdl_StartEnterGame ? orig_MatchVideoMdl_StartEnterGame(self, type, v1, v2, m) : 0;
@@ -1645,8 +1644,7 @@ static int hook_MatchVideoMdl_StartEnterGame(void *self, int type, void *v1, voi
 static int hook_MatchVideoMdl_ChallengeShadow_info(void *self, void *info, uint64_t uid, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ChallengeShadow(info)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!
-Đã chặn tự động vào trận bóng.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
         return 0;
     }
     return orig_MatchVideoMdl_ChallengeShadow_info ? orig_MatchVideoMdl_ChallengeShadow_info(self, info, uid, m) : 0;
@@ -1655,8 +1653,7 @@ static int hook_MatchVideoMdl_ChallengeShadow_info(void *self, void *info, uint6
 static int hook_MatchVideoMdl_ChallengeShadow_mark(void *self, int64_t mark, uint64_t uid, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ChallengeShadow(mark)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!
-Đã chặn tự động vào trận bóng.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
         return 0;
     }
     return orig_MatchVideoMdl_ChallengeShadow_mark ? orig_MatchVideoMdl_ChallengeShadow_mark(self, mark, uid, m) : 0;
@@ -1665,8 +1662,7 @@ static int hook_MatchVideoMdl_ChallengeShadow_mark(void *self, int64_t mark, uin
 static int hook_MatchVideoMdl_ReplayVideo_bytes(void *self, void *videoBytes, uint64_t uid, void *name, void *icon, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ReplayVideo(bytes)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!
-Đã chặn tự động mở Replay.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
         return 0;
     }
     return orig_MatchVideoMdl_ReplayVideo_bytes ? orig_MatchVideoMdl_ReplayVideo_bytes(self, videoBytes, uid, name, icon, m) : 0;
@@ -1675,8 +1671,7 @@ static int hook_MatchVideoMdl_ReplayVideo_bytes(void *self, void *videoBytes, ui
 static int hook_MatchVideoMdl_ReplayVideo_mark(void *self, int64_t mark, uint64_t uid, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ReplayVideo(mark=%lld)", (long long)mark);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!
-Đã chặn tự động mở Replay.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
         return 0;
     }
     return orig_MatchVideoMdl_ReplayVideo_mark ? orig_MatchVideoMdl_ReplayVideo_mark(self, mark, uid, m) : 0;
@@ -1685,8 +1680,7 @@ static int hook_MatchVideoMdl_ReplayVideo_mark(void *self, int64_t mark, uint64_
 static int hook_MatchVideoMdl_ReplayTeachingVideo(void *self, int videoId, void *url, bool uncomp, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ReplayTeachingVideo(id=%d)", videoId);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!
-Đã chặn tự động mở Replay.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
         return 0;
     }
     return orig_MatchVideoMdl_ReplayTeachingVideo ? orig_MatchVideoMdl_ReplayTeachingVideo(self, videoId, url, uncomp, m) : 0;
