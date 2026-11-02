@@ -190,7 +190,6 @@ static double   sLastPlaybackRealTime = 0.0;
 static float    sAccumulatedPlaybackTime = 0.0f;
 static BOOL gAutoArmed, gPlaying;
 static BOOL gNoReplay = YES;
-static BOOL gRaceModeGuide = NO; // NO = Đua Rec (.rep), YES = Đua Guide Line (299 km/h)
 static BOOL gRecordSelf = NO; // Tự động ghi lại hành trình người chơi lái
 // Cấu trúc và bộ đệm ghi hành trình tự làm (Custom Record)
 #define RC_MAX_RECORD_FRAMES 15000 // ~4 phút ở 60fps
@@ -198,38 +197,6 @@ static RCFrame *gRecordBuffer = NULL;
 static uint32_t gRecordCount = 0;
 static BOOL     gIsRecordingActive = NO;
 static double   gRecordStartTime = 0.0;
-// Đồng bộ nút bấm UI Game lúc Auto Play
-static void *gOperatingModeHelper = NULL;
-typedef void (*fn_SetKeyState_InputKey_t)(void *self, int keyType, BOOL isPress);
-static fn_SetKeyState_InputKey_t fnSetKeyState = NULL;
-static int sLastSyncedKeys = 0;
-static void rtCallSetKeyState(void *self, int keyType, BOOL isPress) {
-    if (!rtPtrOk(self)) return;
-    void *k = *(void **)self; // Il2CppClass
-    if (!rtPtrOk(k)) return;
-    typedef void (*fn_SetKeyState_t)(void *self, int keyType, bool isPress, const void *m);
-    // Virtual Slot 36 = SetKeyState(InputKeyType type, bool isPress)
-    fn_SetKeyState_t fn = *(fn_SetKeyState_t *)((char *)k + 328 + 36 * 16);
-    if (fn) {
-        const void *mInfo = *(const void **)((char *)k + 328 + 36 * 16 + 8);
-        fn(self, keyType, isPress ? true : false, mInfo);
-    } else if (fnSetKeyState) {
-        fnSetKeyState(self, keyType, isPress);
-    }
-}
-
-static void rtSyncUIKeys(int newKeys) {
-    if (!gOperatingModeHelper) return;
-    int diff = newKeys ^ sLastSyncedKeys;
-    if (!diff) return;
-    for (int k = 1; k < 18; k++) {
-        if ((diff >> k) & 1) {
-            BOOL isPress = (newKeys >> k) & 1;
-            rtCallSetKeyState(gOperatingModeHelper, k, isPress);
-        }
-    }
-    sLastSyncedKeys = newKeys;
-}
 static BOOL   gEnableOffsetFix = YES;
 static BOOL   gOffsetApplied = NO;
 static float  gOffsetDelta[3] = {0.f, 0.f, 0.f};
@@ -269,7 +236,6 @@ static void rtLoadSettings(void) {
         if (d[@"autoArmed"]) gAutoArmed = [d[@"autoArmed"] boolValue];
         if (d[@"speedMultiplier"]) gSpeedMultiplier = [d[@"speedMultiplier"] floatValue];
         if (d[@"noReplay"]) gNoReplay = [d[@"noReplay"] boolValue];
-        if (d[@"raceModeGuide"]) gRaceModeGuide = [d[@"raceModeGuide"] boolValue];
         if (d[@"recordSelf"]) gRecordSelf = [d[@"recordSelf"] boolValue];
         if (d[@"enableOffsetFix"]) gEnableOffsetFix = [d[@"enableOffsetFix"] boolValue];
     }
@@ -279,7 +245,6 @@ static void rtSaveSettings(void) {
         @"autoArmed": @(gAutoArmed),
         @"speedMultiplier": @(gSpeedMultiplier),
         @"noReplay": @(gNoReplay),
-        @"raceModeGuide": @(gRaceModeGuide),
         @"recordSelf": @(gRecordSelf),
         @"enableOffsetFix": @(gEnableOffsetFix)
     };
@@ -288,7 +253,7 @@ static void rtSaveSettings(void) {
 static void rtStopAndSaveCustomRecord(void) {
     if (!gIsRecordingActive) return;
     gIsRecordingActive = NO;
-    if (gRecordCount > 60 && gMapId > 0 && gRecordBuffer) {
+    if (gRecordSelf && gRecordCount > 60 && gMapId > 0 && gRecordBuffer) {
         NSString *path = rtPathForTrack();
         if (path) {
             FILE *f = fopen(path.fileSystemRepresentation, "wb");
@@ -757,10 +722,14 @@ static BOOL rtCalculateStartSlotPosAndDirInMap(int slotIndex, float *outPos, flo
     if (!rtPtrOk(gCheckPointConfig) || !outPos) return NO;
     int cpSize = *(int *)((char *)gCheckPointConfig + 0x30); // CheckPointDataListSize
     void *cpArr = *(void **)((char *)gCheckPointConfig + 0x38); // CheckPointDataList
+    if (!rtPtrOk(cpArr)) return NO;
+    int cpCap = *(int *)((char *)cpArr + 0x18);
+    if (cpCap <= 0 || cpSize <= 0) return NO;
     int startIndex = *(int *)((char *)gCheckPointConfig + 0x18); // RaceStartCheckPointIndex
-    if (startIndex < 0 || startIndex >= cpSize) startIndex = 0;
-    void **cpItems = cpArr ? (void **)((char *)cpArr + 0x20) : NULL;
-    if (!cpItems || cpSize <= 0) return NO;
+    if (startIndex < 0 || startIndex >= cpCap || startIndex >= cpSize) startIndex = 0;
+    if (startIndex >= cpCap) return NO;
+    void **cpItems = (void **)((char *)cpArr + 0x20);
+    if (!cpItems) return NO;
     void *startCP = cpItems[startIndex];
     if (!rtPtrOk(startCP)) return NO;
     void *posObj   = *(void **)((char *)startCP + 0x28); // TDR_Vector3 Position
@@ -880,235 +849,7 @@ static BOOL rtCalculateAndApplyOffset(void) {
     gOffsetApplied = YES;
     return NO;
 }
-static float rtGetMyBestScoreTime(int mapId) {
-    NSString *rkPath = rtPathForTrack();
-    if (rkPath && [[NSFileManager defaultManager] fileExistsAtPath:rkPath]) {
-        FILE *f = fopen(rkPath.fileSystemRepresentation, "rb");
-        if (f) {
-            RCHeader h;
-            if (fread(&h, sizeof h, 1, f) == 1 && h.count > 0) {
-                fclose(f);
-                float est = (float)h.count * 0.008f;
-                if (est > 5.0f && est < 300.0f) return est;
-            } else fclose(f);
-        }
-    }
-    if (gFrames && gFrameCount > 10 && gMapId == mapId) {
-        float repTime = gFrames[gFrameCount - 1].t;
-        if (repTime > 5.0f && repTime < 300.0f) return repTime;
-    }
-    return 0.0f;
-}
-static BOOL rtBuildGuideLineFrames(void) {
-    if (!rtPtrOk(gCheckPointConfig)) {
-        rtLog("[Guide] gCheckPointConfig is null");
-        return NO;
-    }
-    void *config = gCheckPointConfig;
-    // 1. Đọc số vòng đua của trận: nếu cổng bắt đầu == cổng kết thúc -> 2 vòng, ngược lại 1 vòng
-    int startIndex = *(int *)((char *)config + 0x18); // RaceStartCheckPointIndex
-    int endIndex   = *(int *)((char *)config + 0x20); // RaceEndCheckPointIndex
-    int laps = (startIndex == endIndex) ? 2 : 1;
-    // Chiều dài 1 vòng
-    float lapLength = *(float *)((char *)config + 0x2C); // MainCurveLength
-    if (lapLength < 100.0f) lapLength = 3000.0f;
-    // 2. Thu thập điểm mốc tim đường từ TrackPointDataList
-    int realSize = *(int *)((char *)config + 0x40); // TrackPointDataListSize
-    void *tpArr  = *(void **)((char *)config + 0x48); // TrackPointDataList
-    int rawCap   = tpArr ? *(int *)((char *)tpArr + 0x18) : 0;
-    void **items = tpArr ? (void **)((char *)tpArr + 0x20) : NULL;
-    int validCount = (realSize > 0 && realSize <= rawCap) ? realSize : 0;
-    if (validCount > 10000) validCount = 10000;
-    typedef struct {
-        float x, y, z;
-        float dist;
-    } GuidePoint;
-    GuidePoint *gpts = NULL;
-    int numGpts = 0;
-    if (items && validCount > 10) {
-        gpts = (GuidePoint *)malloc(sizeof(GuidePoint) * (validCount + 2));
-        if (gpts) {
-            float accumDist = 0.0f;
-            for (int i = 0; i < validCount; i++) {
-                void *tp = items[i];
-                if (!rtPtrOk(tp)) continue;
-                void *posObj = *(void **)((char *)tp + 0x20); // TDR_Vector3 Position
-                if (!rtPtrOk(posObj)) continue;
-                float px = *(float *)((char *)posObj + 0x10);
-                float py = *(float *)((char *)posObj + 0x14);
-                float pz = *(float *)((char *)posObj + 0x18);
-                if (fabsf(px) < 1e-3f && fabsf(py) < 1e-3f && fabsf(pz) < 1e-3f) continue;
-                if (isnan(px) || isnan(py) || isnan(pz)) continue;
-                if (numGpts > 0) {
-                    float dx = px - gpts[numGpts - 1].x;
-                    float dy = py - gpts[numGpts - 1].y;
-                    float dz = pz - gpts[numGpts - 1].z;
-                    float seg = sqrtf(dx * dx + dy * dy + dz * dz);
-                    if (seg < 0.05f) continue;
-                    accumDist += seg;
-                }
-                gpts[numGpts].x = px;
-                gpts[numGpts].y = py;
-                gpts[numGpts].z = pz;
-                gpts[numGpts].dist = accumDist;
-                numGpts++;
-            }
-        }
-    }
-    // Fallback: CheckPointDataList nếu TrackPointData trống
-    if (!gpts || numGpts < 5) {
-        if (gpts) { free(gpts); gpts = NULL; }
-        int cpSize = *(int *)((char *)config + 0x30); // CheckPointDataListSize
-        void *cpArr = *(void **)((char *)config + 0x38); // CheckPointDataList
-        int cpCap = cpArr ? *(int *)((char *)cpArr + 0x18) : 0;
-        void **cpItems = cpArr ? (void **)((char *)cpArr + 0x20) : NULL;
-        int cpValid = (cpSize > 0 && cpSize <= cpCap) ? cpSize : 0;
-        if (cpValid > 5000) cpValid = 5000;
-        if (cpItems && cpValid > 3) {
-            gpts = (GuidePoint *)malloc(sizeof(GuidePoint) * (cpValid + 2));
-            if (gpts) {
-                float accumDist = 0.0f;
-                numGpts = 0;
-                for (int i = 0; i < cpValid; i++) {
-                    void *cp = cpItems[i];
-                    if (!rtPtrOk(cp)) continue;
-                    void *posObj = *(void **)((char *)cp + 0x28); // TDR_Vector3 Position
-                    if (!rtPtrOk(posObj)) continue;
-                    float px = *(float *)((char *)posObj + 0x10);
-                    float py = *(float *)((char *)posObj + 0x14);
-                    float pz = *(float *)((char *)posObj + 0x18);
-                    if (fabsf(px) < 1e-3f && fabsf(py) < 1e-3f && fabsf(pz) < 1e-3f) continue;
-                    if (isnan(px) || isnan(py) || isnan(pz)) continue;
-                    if (numGpts > 0) {
-                        float dx = px - gpts[numGpts - 1].x;
-                        float dy = py - gpts[numGpts - 1].y;
-                        float dz = pz - gpts[numGpts - 1].z;
-                        float seg = sqrtf(dx * dx + dy * dy + dz * dz);
-                        if (seg < 0.05f) continue;
-                        accumDist += seg;
-                    }
-                    gpts[numGpts].x = px;
-                    gpts[numGpts].y = py;
-                    gpts[numGpts].z = pz;
-                    gpts[numGpts].dist = accumDist;
-                    numGpts++;
-                }
-            }
-        }
-    }
-    if (!gpts || numGpts < 3) {
-        if (gpts) free(gpts);
-        rtLog("[Guide] Failed to extract track points (count=%d)", numGpts);
-        return NO;
-    }
-    if (gpts[numGpts - 1].dist > 100.0f) {
-        lapLength = gpts[numGpts - 1].dist;
-    }
-    float totalDistance = lapLength * (float)laps;
-    if (totalDistance < 200.0f) totalDistance = 2000.0f;
-    // 3. Tính toán thời gian hoàn thành theo tốc độ chuẩn 299 km/h:
-    float targetSpeedMps = 299.0f / 3.6f; // ~83.0556 m/s
-    float targetFinishTime = totalDistance / targetSpeedMps;
-    float myBest = rtGetMyBestScoreTime(gMapId);
-    if (myBest > 10.0f && myBest < 300.0f) {
-        float bestSpeed = totalDistance / myBest;
-        if (bestSpeed <= targetSpeedMps) {
-            targetFinishTime = myBest;
-            targetSpeedMps = totalDistance / targetFinishTime;
-            rtLog("[Guide] Using personal best finish time: %.2fs (speed=%.1f km/h)",
-                  targetFinishTime, targetSpeedMps * 3.6f);
-        } else {
-            rtLog("[Guide] Personal best (%.2fs) exceeds 299 km/h -> Clamping to 299.0 km/h (%.2fs)",
-                  myBest, targetFinishTime);
-        }
-    } else {
-        rtLog("[Guide] Standard 299 km/h finish time: %.2fs for %d lap(s)", targetFinishTime, laps);
-    }
-    if (targetFinishTime < 5.0f) targetFinishTime = 30.0f;
-    // 4. Chia thành chuỗi các frame liên tục (Interval = 0.010s -> 100 FPS)
-    float dt = 0.010f;
-    uint32_t totalFrames = (uint32_t)(targetFinishTime / dt) + 1;
-    if (totalFrames > RC_MAX_FRAMES) totalFrames = RC_MAX_FRAMES;
-    if (totalFrames < 100) totalFrames = 100;
-    RCFrame *newFrames = (RCFrame *)malloc(sizeof(RCFrame) * totalFrames);
-    if (!newFrames) {
-        free(gpts);
-        return NO;
-    }
-    uint32_t segIdx = 0;
-    for (uint32_t i = 0; i < totalFrames; i++) {
-        float t = (float)i * dt;
-        if (t > targetFinishTime) t = targetFinishTime;
-        float sDist = (t / targetFinishTime) * totalDistance;
-        int curLap = (int)(sDist / lapLength);
-        if (curLap >= laps) curLap = laps - 1;
-        float sInLap = sDist - ((float)curLap * lapLength);
-        while (segIdx + 2 < (uint32_t)numGpts && gpts[segIdx + 1].dist < sInLap) {
-            segIdx++;
-        }
-        if (segIdx + 1 >= (uint32_t)numGpts) segIdx = (uint32_t)numGpts - 2;
-        GuidePoint *pA = &gpts[segIdx];
-        GuidePoint *pB = &gpts[segIdx + 1];
-        float segLen = pB->dist - pA->dist;
-        float alpha = (segLen > 1e-4f) ? ((sInLap - pA->dist) / segLen) : 0.0f;
-        if (alpha < 0.0f) alpha = 0.0f;
-        if (alpha > 1.0f) alpha = 1.0f;
-        float px = pA->x + (pB->x - pA->x) * alpha;
-        float py = pA->y + (pB->y - pA->y) * alpha;
-        float pz = pA->z + (pB->z - pA->z) * alpha;
-        float fx = pB->x - pA->x;
-        float fy = pB->y - pA->y;
-        float fz = pB->z - pA->z;
-        float flen = sqrtf(fx * fx + fy * fy + fz * fz);
-        if (flen > 1e-4f) { fx /= flen; fy /= flen; fz /= flen; }
-        else { fx = 0.f; fy = 0.f; fz = 1.f; }
-        float theta = atan2f(fx, fz);
-        float clampedY = -fy;
-        if (clampedY < -1.0f) clampedY = -1.0f;
-        if (clampedY > 1.0f)  clampedY = 1.0f;
-        float phi = asinf(clampedY);
-        float halfT = theta * 0.5f;
-        float halfP = phi * 0.5f;
-        float sinT = sinf(halfT), cosT = cosf(halfT);
-        float sinP = sinf(halfP), cosP = cosf(halfP);
-        float qx = cosT * sinP;
-        float qy = sinT * cosP;
-        float qz = -sinT * sinP;
-        float qw = cosT * cosP;
-        float ql = sqrtf(qx * qx + qy * qy + qz * qz + qw * qw);
-        if (ql > 1e-4f) { qx /= ql; qy /= ql; qz /= ql; qw /= ql; }
-        else { qx = 0.f; qy = 0.f; qz = 0.f; qw = 1.f; }
-        RCFrame fr;
-        memset(&fr, 0, sizeof(fr));
-        fr.t    = t;
-        fr.px   = px;
-        fr.py   = py;
-        fr.pz   = pz;
-        fr.qx   = qx;
-        fr.qy   = qy;
-        fr.qz   = qz;
-        fr.qw   = qw;
-        fr.vx   = fx * targetSpeedMps;
-        fr.vy   = fy * targetSpeedMps;
-        fr.vz   = fz * targetSpeedMps;
-        fr.kmph = targetSpeedMps * 3.6f;
-        fr.steer = 0.0f;
-        fr.keys = (1 << 3) | (1 << 5); // Nitro + MiniBoost
-        fr.flags = 0x08 | 0x10;
-        newFrames[i] = fr;
-    }
-    free(gpts);
-    // Gán nguyên tử an toàn để tránh xung đột luồng
-    RCFrame *oldF = gFrames;
-    gFrames = newFrames;
-    gFrameCount = totalFrames;
-    if (oldF) free(oldF);
-    gOffsetApplied = YES;
-    rtLog("[Guide] Generated %u frames for %d lap(s) (%.1fm, finishTime=%.2fs, speed=%.1f km/h)!",
-          gFrameCount, laps, totalDistance, targetFinishTime, targetSpeedMps * 3.6f);
-    return YES;
-}
-// InputModule.mInputKeyData (0xA8) -> InputKeyData.KeyFlags (0x10)
+
 static int *rtKeyFlagsPtr(void) {
     if (!rtPtrOk(gInputModule)) return NULL;
     void *kd = *(void **)((char *)gInputModule + kOffInputKeyData);
@@ -1147,7 +888,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
         gPlaying = NO;
         gCurPlaybackSteer = 0.f;
         rtWriteKeyFlags(0);
-        rtSyncUIKeys(0);
         if (gPanel) [gPanel showPlayFrameHud:NO];
         return;
     }
@@ -1268,7 +1008,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
     }
     gKeyMask = (int)keys;
     rtWriteKeyFlags((int)keys);
-    rtSyncUIKeys((int)keys);
     if (gPanel) {
         [gPanel updatePlayFrameHud:lo count:gFrameCount time:t];
     }
@@ -1326,7 +1065,6 @@ static void rtPlaybackTick(void *motionCtrl, void *steerData, void *drivingCtrl,
 @property (nonatomic, strong) UIButton *btnMinusSpeed;
 @property (nonatomic, strong) UIButton *btnPlusSpeed;
 // Các nút điều khiển chính (Không icon / emoji)
-@property (nonatomic, strong) UIButton *bMode;
 @property (nonatomic, strong) UIButton *bDl;
 @property (nonatomic, strong) UIButton *bNoRep;
 @property (nonatomic, strong) UIButton *bAuto;
@@ -1435,7 +1173,7 @@ static void rtAlert(NSString *title, NSString *msg) {
         panBubble.cancelsTouchesInView = NO;
         [bubble addGestureRecognizer:panBubble];
         // 2. Menu chính (Gọn đẹp, 205x285, không tab, không icon)
-        UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 215, scr.size.height * 0.16, 205, 285)];
+        UIView *menu = [[UIView alloc] initWithFrame:CGRectMake(scr.size.width - 215, scr.size.height * 0.16, 205, 255)];
         menu.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.96];
         menu.layer.cornerRadius = 12;
         menu.layer.borderWidth = 1.2;
@@ -1465,10 +1203,6 @@ static void rtAlert(NSString *title, NSString *msg) {
         CGFloat startY = 30.0f;
         CGFloat btnH = 26.0f;
         CGFloat gap = 5.0f;
-        self.bMode = [self mk:@"Chế độ: Replay" sel:@selector(tapModeSwitch)];
-        self.bMode.frame = CGRectMake(10, startY, 185, btnH);
-        [menu addSubview:self.bMode];
-        startY += btnH + gap;
         self.bDl = [self mk:@"Tải Replay" sel:@selector(tapDownload)];
         self.bDl.frame = CGRectMake(10, startY, 185, btnH);
         [menu addSubview:self.bDl];
@@ -1605,13 +1339,6 @@ static uint32_t sCurrentPlayFrame = 0;
 }
 - (void)refresh {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (gRaceModeGuide) {
-            self.bMode.backgroundColor = [UIColor colorWithRed:0.75 green:0.45 blue:0.0 alpha:0.95];
-            [self.bMode setTitle:@"Chế độ: Dẫn đường" forState:UIControlStateNormal];
-        } else {
-            self.bMode.backgroundColor = [UIColor colorWithRed:0.0 green:0.42 blue:0.70 alpha:0.95];
-            [self.bMode setTitle:@"Chế độ: Replay" forState:UIControlStateNormal];
-        }
         if (gNoReplay) {
             self.bNoRep.backgroundColor = [UIColor colorWithRed:0.10 green:0.55 blue:0.25 alpha:0.95];
             [self.bNoRep setTitle:@"Chặn Replay: Bật" forState:UIControlStateNormal];
@@ -1664,11 +1391,6 @@ static uint32_t sCurrentPlayFrame = 0;
     self.menu.center = CGPointMake(self.menu.center.x + trans.x, self.menu.center.y + trans.y);
     [p setTranslation:CGPointZero inView:self.win];
 }
-- (void)tapModeSwitch {
-    gRaceModeGuide = !gRaceModeGuide;
-    rtSaveSettings();
-    [self refresh];
-}
 - (void)tapNoRep {
     gNoReplay = !gNoReplay;
     rtSaveSettings();
@@ -1679,7 +1401,6 @@ static uint32_t sCurrentPlayFrame = 0;
     if (!gAutoArmed) {
         gPlaying = NO;
         rtWriteKeyFlags(0);
-        rtSyncUIKeys(0);
         [self showPlayFrameHud:NO];
     }
     rtSaveSettings();
@@ -1754,35 +1475,29 @@ static int    (*orig_MatchVideoMdl_ReplayVideo_mark)(void *, int64_t, uint64_t, 
 static int    (*orig_MatchVideoMdl_ReplayTeachingVideo)(void *, int, void *, bool, const void *);
 
 // Anti-AFK Hooks
-static void   (*orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime)(void *, float, const void *);
 static void   (*orig_SdcVehicleInput_Update)(void *, float, const void *);
 static void   (*orig_SdcPlayerInput_Update)(void *, float, const void *);
-static void   (*orig_CPR_FillVehicleInputData)(void *, void **, const void *);
-static void   (*orig_CPR_FillPVPButtonUseData)(void *, void **, const void *);
 static BOOL   (*orig_MatchUIMgr_Trusteeship)(void *, int, const void *);
-
-// Anti-Speed-Report Hooks
-static void   (*orig_SdcVehicleVel_Update)(void *, float, const void *);
-static void   (*orig_CPR_FillVehicleVelData)(void *, void **, const void *);
-static void   (*orig_CPR_ReportData)(void *, void **, const void *);
-
-// UI Button Sync Hooks
-static void   (*orig_OperatingModeHelper_Init)(void *, void *, void *);
-static void   (*orig_OperatingModeHelper_Release)(void *);
 
 static void hook_Input_Update(void *self, float dt, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
     if (orig_Input_Update) orig_Input_Update(self, dt, m);
     if (gPlaying) {
         rtWriteKeyFlags(gKeyMask);
-        rtSyncUIKeys(gKeyMask);
     }
 }
 
 static BOOL hook_Input_GetKey(void *self, int keyType, const void *m) {
     if (rtPtrOk(self)) gInputModule = self;
-    if (gPlaying && keyType > 0 && keyType < 18) {
-        if ((gKeyMask >> keyType) & 1) return TRUE;
+    if (gPlaying) {
+        // Luôn giả lập phím điều khiển đang được thao tác tích cực
+        if (keyType == 1 || keyType == 2 || keyType == 5 || keyType == 8) {
+            static int sFakeCounter = 0;
+            if (((sFakeCounter++) % 8) < 5) return TRUE;
+        }
+        if (keyType > 0 && keyType < 18) {
+            if ((gKeyMask >> keyType) & 1) return TRUE;
+        }
     }
     return orig_Input_GetKey ? orig_Input_GetKey(self, keyType, m) : FALSE;
 }
@@ -1803,7 +1518,7 @@ static void rtBeginRace(void) {
     sAccumulatedPlaybackTime = 0.0f;
     gCurPlaybackSteer = 0.f;
 
-    // Bắt đầu ghi lại hành trình nếu bật Record
+    // Bắt đầu ghi lại hành trình người chơi lái nếu bật Record
     if (gRecordSelf && gMapId > 0 && !gPlaying) {
         if (!gRecordBuffer) {
             gRecordBuffer = (RCFrame *)malloc(sizeof(RCFrame) * RC_MAX_RECORD_FRAMES);
@@ -1815,25 +1530,18 @@ static void rtBeginRace(void) {
     }
 
     if (gAutoArmed) {
-        BOOL ok = NO;
-        if (gRaceModeGuide) {
-            ok = rtBuildGuideLineFrames();
-        } else {
-            ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
-            if (ok && gEnableOffsetFix && !gOffsetApplied) {
-                rtCalculateAndApplyOffset();
-            }
+        BOOL ok = (gFrames && gFrameCount > 0) ? YES : rtLoadRecord();
+        if (ok && gEnableOffsetFix && !gOffsetApplied) {
+            rtCalculateAndApplyOffset();
         }
         gPlaying = ok;
         rtLog("AUTO map=%d -> %s (%u frames)", gMapId, ok ? "playing" : "no record", gFrameCount);
-        if (gPanel) [gPanel showPlayFrameHud:ok];
         if (!ok) {
             rtAlert(@"Đua lập trình",
                     [NSString stringWithFormat:@"Không tìm thấy file .rep cho map %d trong TempMatchVideos", gMapId]);
         }
     } else {
         gPlaying = NO;
-        if (gPanel) [gPanel showPlayFrameHud:NO];
     }
 }
 
@@ -1859,21 +1567,14 @@ static void hook_ReplayActionGoImpEnter(void *self, const void *m) {
     rtBeginRace();
 }
 
-static void rtStopAllMatchActivity(void) {
-    if (gPlaying) {
-        gPlaying = NO;
-        gCurPlaybackSteer = 0.f;
-        rtWriteKeyFlags(0);
-        rtSyncUIKeys(0);
-        rtLog("FINISH: Auto Play stopped");
-    }
-    rtStopAndSaveCustomRecord();
-}
-
 static void hook_GameFinishImpEnter(void *self, const void *m) {
     if (orig_GameFinishImpEnter) orig_GameFinishImpEnter(self, m);
-    rtLog("FINISH reached: Stopping Auto Play & Saving Record");
-    rtStopAllMatchActivity();
+    rtLog("FINISH reached: Stopping Auto Play & Stopping Record");
+    gPlaying = NO;
+    rtWriteKeyFlags(0);
+    if (gIsRecordingActive) {
+        rtStopAndSaveCustomRecord();
+    }
 }
 
 static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *videoBytes, const void *m) {
@@ -1886,12 +1587,15 @@ static BOOL hook_MatchVideoDesHelper_InitByVideoBytes(void *self, void *videoByt
 }
 
 static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool reset, const void *m) {
-    rtStopAllMatchActivity();
+    gPlaying = NO;
     gPlayerVehicle = NULL;
+    if (gIsRecordingActive) {
+        rtStopAndSaveCustomRecord();
+    }
     if (orig_CheckPointMgr_Init) orig_CheckPointMgr_Init(self, config, crc, reset, m);
     gMapId = rtPtrOk(self) ? *(int *)((char *)self + 0x40) : 0;
     if (gMapId <= 0 && rtPtrOk(config)) {
-        gMapId = *(int *)((char *)config + kOffCpMapId);
+        gMapId = *(int *)((char *)config + 0x14); // MapId is at offset 0x14
     }
     gTrackLen = 0.f;
 
@@ -1903,16 +1607,9 @@ static void hook_CheckPointMgr_Init(void *self, void *config, bool crc, bool res
 
     rtLog("MAP resolved from CheckPointMgr self=%p config=%p mapId=%d", self, config, gMapId);
 
-    // Nạp trước dữ liệu Guide Line ngay tại đây khi config còn 100% hợp lệ trong bộ nhớ
-    if (gRaceModeGuide && rtPtrOk(config)) {
-        rtBuildGuideLineFrames();
-    }
-
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gAutoArmed) {
-            if (!gRaceModeGuide) {
-                rtLoadRecord();
-            }
+            rtLoadRecord();
         }
         if (gPanel) [gPanel refresh];
     });
@@ -1938,7 +1635,8 @@ static void *hook_DataCenterMdl_GetMapDataComponent(void *self, bool withInit, c
 static int hook_MatchVideoMdl_StartEnterGame(void *self, int type, void *v1, void *v2, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted StartEnterGame");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!
+Đã chặn tự động vào trận.");
         return 0;
     }
     return orig_MatchVideoMdl_StartEnterGame ? orig_MatchVideoMdl_StartEnterGame(self, type, v1, v2, m) : 0;
@@ -1947,7 +1645,8 @@ static int hook_MatchVideoMdl_StartEnterGame(void *self, int type, void *v1, voi
 static int hook_MatchVideoMdl_ChallengeShadow_info(void *self, void *info, uint64_t uid, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ChallengeShadow(info)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!
+Đã chặn tự động vào trận bóng.");
         return 0;
     }
     return orig_MatchVideoMdl_ChallengeShadow_info ? orig_MatchVideoMdl_ChallengeShadow_info(self, info, uid, m) : 0;
@@ -1956,7 +1655,8 @@ static int hook_MatchVideoMdl_ChallengeShadow_info(void *self, void *info, uint6
 static int hook_MatchVideoMdl_ChallengeShadow_mark(void *self, int64_t mark, uint64_t uid, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ChallengeShadow(mark)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động vào trận bóng.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!
+Đã chặn tự động vào trận bóng.");
         return 0;
     }
     return orig_MatchVideoMdl_ChallengeShadow_mark ? orig_MatchVideoMdl_ChallengeShadow_mark(self, mark, uid, m) : 0;
@@ -1965,7 +1665,8 @@ static int hook_MatchVideoMdl_ChallengeShadow_mark(void *self, int64_t mark, uin
 static int hook_MatchVideoMdl_ReplayVideo_bytes(void *self, void *videoBytes, uint64_t uid, void *name, void *icon, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ReplayVideo(bytes)");
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!
+Đã chặn tự động mở Replay.");
         return 0;
     }
     return orig_MatchVideoMdl_ReplayVideo_bytes ? orig_MatchVideoMdl_ReplayVideo_bytes(self, videoBytes, uid, name, icon, m) : 0;
@@ -1974,7 +1675,8 @@ static int hook_MatchVideoMdl_ReplayVideo_bytes(void *self, void *videoBytes, ui
 static int hook_MatchVideoMdl_ReplayVideo_mark(void *self, int64_t mark, uint64_t uid, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ReplayVideo(mark=%lld)", (long long)mark);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!
+Đã chặn tự động mở Replay.");
         return 0;
     }
     return orig_MatchVideoMdl_ReplayVideo_mark ? orig_MatchVideoMdl_ReplayVideo_mark(self, mark, uid, m) : 0;
@@ -1983,22 +1685,17 @@ static int hook_MatchVideoMdl_ReplayVideo_mark(void *self, int64_t mark, uint64_
 static int hook_MatchVideoMdl_ReplayTeachingVideo(void *self, int videoId, void *url, bool uncomp, const void *m) {
     if (gNoReplay) {
         rtLog("NO REPLAY: Intercepted ReplayTeachingVideo(id=%d)", videoId);
-        rtAlert(@"No Replay", @"Đã tải xong file .rep!\nĐã chặn tự động mở Replay.");
+        rtAlert(@"No Replay", @"Đã tải xong file .rep!
+Đã chặn tự động mở Replay.");
         return 0;
     }
     return orig_MatchVideoMdl_ReplayTeachingVideo ? orig_MatchVideoMdl_ReplayTeachingVideo(self, videoId, url, uncomp, m) : 0;
 }
 
-// Anti-AFK Hooks
-static void hook_SdcVehicleInput_UpdateVehicleNotControlMaxTime(void *self, float dt, const void *m) {
-    if (gPlaying) return;
-    if (orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime) orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime(self, dt, m);
-}
-
+// Anti-AFK Hooks: Triệt tiêu bộ đếm thời gian không điều khiển & tăng số lần thao tác giả lập
 static void hook_SdcVehicleInput_Update(void *self, float dt, const void *m) {
-    if (orig_SdcVehicleInput_Update) orig_SdcVehicleInput_Update(self, dt, m);
     if (gPlaying && rtPtrOk(self)) {
-        *(float *)((char *)self + 0x9C) = 0.f;  // mNotControlTime = 0
+        *(float *)((char *)self + 0x9C) = 0.f;  // mNotControlTime = 0 (Triệt tiêu AFK)
         *(bool  *)((char *)self + 0xA0) = true; // mLastIsControl = true
         *(float *)((char *)self + 0xA4) = 0.f;  // mLastControlTime = 0
 
@@ -2006,110 +1703,32 @@ static void hook_SdcVehicleInput_Update(void *self, float dt, const void *m) {
         if (rtPtrOk(endData)) {
             *(int *)((char *)endData + 0x2C) = 0; // CarNonControlTimeMax = 0
             *(int *)((char *)endData + 0x30) = 0; // CarNonControlTimeTotal = 0
-            (*(int *)((char *)endData + 0x10))++; // CarLeftTurnCount++
-            (*(int *)((char *)endData + 0x18))++; // CarRightTurnCount++
-            (*(int *)((char *)endData + 0x24))++; // CarDriftingCount++
+            (*(int *)((char *)endData + 0x10)) += 2; // CarLeftTurnCount++
+            (*(int *)((char *)endData + 0x18)) += 2; // CarRightTurnCount++
+            (*(int *)((char *)endData + 0x24)) += 1; // CarDriftingCount++
         }
+        return; // KHÔNG CHO HÀM GỐC TÍNH TOÁN AFK KHI ĐANG ĐUA AUTO
     }
+    if (orig_SdcVehicleInput_Update) orig_SdcVehicleInput_Update(self, dt, m);
 }
 
 static void hook_SdcPlayerInput_Update(void *self, float dt, const void *m) {
-    if (orig_SdcPlayerInput_Update) orig_SdcPlayerInput_Update(self, dt, m);
     if (gPlaying && rtPtrOk(self)) {
         void *endData = *(void **)((char *)self + 0x58); // mEndData (SdcPlayerInputEndData)
         if (rtPtrOk(endData)) {
-            (*(int *)((char *)endData + 0x14))++; // UserLeftTurnCount++
-            (*(int *)((char *)endData + 0x18))++; // UserRightTurnCount++
-            (*(int *)((char *)endData + 0x20))++; // UserDriftingCount++
-            (*(int *)((char *)endData + 0x24))++; // UserMiniJetCount++
+            (*(int *)((char *)endData + 0x14)) += 2; // UserLeftTurnCount++
+            (*(int *)((char *)endData + 0x18)) += 2; // UserRightTurnCount++
+            (*(int *)((char *)endData + 0x20)) += 1; // UserDriftingCount++
+            (*(int *)((char *)endData + 0x24)) += 1; // UserMiniJetCount++
         }
+        return; // KHÔNG CHO HÀM GỐC TÍNH TOÁN AFK KHI ĐANG ĐUA AUTO
     }
-}
-
-static void hook_CPR_FillVehicleInputData(void *self, void **fillData, const void *m) {
-    if (orig_CPR_FillVehicleInputData) orig_CPR_FillVehicleInputData(self, fillData, m);
-    if (fillData && rtPtrOk(*fillData)) {
-        char *d = (char *)*fillData;
-        *(uint32_t *)(d + 0x48) = 0; // dwCarNonControlTimeMax = 0
-        *(uint32_t *)(d + 0x4C) = 0; // dwCarNonControlTimeTotal = 0
-    }
-}
-
-static void hook_CPR_FillPVPButtonUseData(void *self, void **fillData, const void *m) {
-    if (orig_CPR_FillPVPButtonUseData) orig_CPR_FillPVPButtonUseData(self, fillData, m);
-    if (fillData && rtPtrOk(*fillData)) {
-        char *d = (char *)*fillData;
-        if (*(uint16_t *)(d + 0x12) < 15) *(uint16_t *)(d + 0x12) = 15 + (rand() % 10);
-        if (*(uint16_t *)(d + 0x14) < 15) *(uint16_t *)(d + 0x14) = 15 + (rand() % 10);
-        if (*(uint16_t *)(d + 0x18) < 8)  *(uint16_t *)(d + 0x18) = 8 + (rand() % 5);
-        if (*(uint16_t *)(d + 0x1A) < 10) *(uint16_t *)(d + 0x1A) = 10 + (rand() % 6);
-    }
+    if (orig_SdcPlayerInput_Update) orig_SdcPlayerInput_Update(self, dt, m);
 }
 
 static BOOL hook_MatchUIMgr_Trusteeship(void *self, int aiActionID, const void *m) {
-    if (gPlaying) {
-        rtLog("ANTI-AFK: Blocked in-game Trusteeship (%d)", aiActionID);
-        return FALSE;
-    }
-    return orig_MatchUIMgr_Trusteeship ? orig_MatchUIMgr_Trusteeship(self, aiActionID, m) : FALSE;
-}
-
-// Anti-Speed-Report Hooks
-static void hook_SdcVehicleVel_Update(void *self, float dt, const void *m) {
-    if (orig_SdcVehicleVel_Update) orig_SdcVehicleVel_Update(self, dt, m);
-    if (rtPtrOk(self)) {
-        if (*(float *)((char *)self + 0x94) > 295.f) *(float *)((char *)self + 0x94) = 290.f + (rand() % 5);
-        if (*(float *)((char *)self + 0xAC) > 295.f) *(float *)((char *)self + 0xAC) = 290.f + (rand() % 5);
-        if (*(float *)((char *)self + 0xB0) > 295.f) *(float *)((char *)self + 0xB0) = 290.f + (rand() % 5);
-
-        void *endData = *(void **)((char *)self + 0x58);
-        if (rtPtrOk(endData)) {
-            if (*(int *)((char *)endData + 0x10) > 295) *(int *)((char *)endData + 0x10) = 292 + (rand() % 5);
-            *(int *)((char *)endData + 0x14) = 15;
-            *(float *)((char *)endData + 0x58) = 0.f;
-            *(float *)((char *)endData + 0x5C) = 0.f;
-            *(float *)((char *)endData + 0x60) = 0.f;
-            *(float *)((char *)endData + 0x64) = 0.f;
-            *(int *)((char *)endData + 0x7C) = 0;
-            *(int *)((char *)endData + 0x80) = 0;
-        }
-    }
-}
-
-static void hook_CPR_FillVehicleVelData(void *self, void **fillData, const void *m) {
-    if (orig_CPR_FillVehicleVelData) orig_CPR_FillVehicleVelData(self, fillData, m);
-    if (fillData && rtPtrOk(*fillData)) {
-        char *d = (char *)*fillData;
-        if (*(uint32_t *)(d + 0x28) > 298) *(uint32_t *)(d + 0x28) = 292 + (rand() % 6);
-        if (*(uint32_t *)(d + 0x2C) > 25)  *(uint32_t *)(d + 0x2C) = 12 + (rand() % 5);
-    }
-}
-
-static void hook_CPR_ReportData(void *self, void **reqData, const void *m) {
-    if (orig_CPR_ReportData) orig_CPR_ReportData(self, reqData, m);
-    rtStopAllMatchActivity(); // Dừng ngay khi game gửi gói tin báo cáo kết thúc trận
-    if (reqData && rtPtrOk(*reqData)) {
-        char *req = (char *)*reqData;
-        *(uint8_t *)(req + 0x40) = 0;
-        *(uint8_t *)(req + 0x54) = 0;
-        rtLog("ANTI-REPORT: Cleared bCheatEndGame & bClientReportAnti");
-    }
-}
-
-static void hook_OperatingModeHelper_Init(void *self, void *pub, void *inst) {
-    if (rtPtrOk(self)) {
-        gOperatingModeHelper = self;
-        rtLog("[UI] Captured OperatingModeHelper: %p", self);
-    }
-    if (orig_OperatingModeHelper_Init) orig_OperatingModeHelper_Init(self, pub, inst);
-}
-
-static void hook_OperatingModeHelper_Release(void *self) {
-    if (gOperatingModeHelper == self) {
-        gOperatingModeHelper = NULL;
-        rtLog("[UI] Released OperatingModeHelper");
-    }
-    if (orig_OperatingModeHelper_Release) orig_OperatingModeHelper_Release(self);
+    rtLog("ANTI-AFK: Blocked in-game Trusteeship (%d)", aiActionID);
+    return FALSE; // Luôn luôn chặn, tuyệt đối không cho game bật xe AI lái thay
 }
 
 static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
@@ -2165,20 +1784,7 @@ static void hook_MotionCtrl_Update(void *self, float dt, const void *m) {
     if (orig_MotionCtrl_Update) orig_MotionCtrl_Update(self, dt, m);
 }
 
-static void   (*orig_MatchInputMdl_Update)(void *, float, const void *);
-
-static void hook_MatchInputMdl_Update(void *self, float dt, const void *m) {
-    if (rtPtrOk(self)) {
-        void *inputSys = *(void **)((char *)self + 0xA0); // mMatchInputSystem (0xA0)
-        if (rtPtrOk(inputSys)) {
-            void *opMode = *(void **)((char *)inputSys + 0xC8); // mOperatingMode (0xC8)
-            if (rtPtrOk(opMode)) {
-                gOperatingModeHelper = opMode;
-            }
-        }
-    }
-    if (orig_MatchInputMdl_Update) orig_MatchInputMdl_Update(self, dt, m);
-}
+#pragma mark - Install
 
 static void rtInstallHooks(void) {
     orig_MotionCtrl_Update = (void (*)(void *, float, const void *))
@@ -2208,6 +1814,7 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "MapDataComponent", "InitComponent", 0, (void *)hook_MapDataComponent_InitComponent);
     orig_DataCenterMdl_GetMapDataComponent = (void *(*)(void *, bool, const void *))
         rtHookMethod("", "DataCenterMdl", "GetMapDataComponent", 1, (void *)hook_DataCenterMdl_GetMapDataComponent);
+
     // No Replay Hooks (chặn game tự động mở Replay & Bóng khi tải .rep)
     orig_MatchVideoMdl_StartEnterGame = (int (*)(void *, int, void *, void *, const void *))
         rtHookMethod("", "MatchVideoMdl", "StartEnterGame", 3, (void *)hook_MatchVideoMdl_StartEnterGame);
@@ -2221,40 +1828,16 @@ static void rtInstallHooks(void) {
         rtHookMethod("", "MatchVideoMdl", "ReplayVideo", 2, (void *)hook_MatchVideoMdl_ReplayVideo_mark);
     orig_MatchVideoMdl_ReplayTeachingVideo = (int (*)(void *, int, void *, bool, const void *))
         rtHookMethod("", "MatchVideoMdl", "ReplayTeachingVideo", 3, (void *)hook_MatchVideoMdl_ReplayTeachingVideo);
-// Anti-AFK Hooks (4 tầng chống treo máy & chống phạt)
-    orig_SdcVehicleInput_UpdateVehicleNotControlMaxTime = (void (*)(void *, float, const void *))
-        rtHookMethod("", "SdcVehicleInput", "UpdateVehicleNotControlMaxTime", 1, (void *)hook_SdcVehicleInput_UpdateVehicleNotControlMaxTime);
+
+    // Anti-AFK Hooks
     orig_SdcVehicleInput_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcVehicleInput", "Update", 1, (void *)hook_SdcVehicleInput_Update);
     orig_SdcPlayerInput_Update = (void (*)(void *, float, const void *))
         rtHookMethod("", "SdcPlayerInput", "Update", 1, (void *)hook_SdcPlayerInput_Update);
-    orig_CPR_FillVehicleInputData = (void (*)(void *, void **, const void *))
-        rtHookMethod("", "CPR_STPVPEndGame", "FillVehicleInputData", 1, (void *)hook_CPR_FillVehicleInputData);
-    orig_CPR_FillPVPButtonUseData = (void (*)(void *, void **, const void *))
-        rtHookMethod("", "CPR_STPVPEndGame", "FillPVPButtonUseData", 1, (void *)hook_CPR_FillPVPButtonUseData);
     orig_MatchUIMgr_Trusteeship = (BOOL (*)(void *, int, const void *))
         rtHookMethod("", "MatchUIMgr", "Trusteeship", 1, (void *)hook_MatchUIMgr_Trusteeship);
-    // Anti-Speed-Report Hooks (chống phát hiện tốc độ / fast frame)
-    orig_SdcVehicleVel_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "SdcVehicleVel", "Update", 1, (void *)hook_SdcVehicleVel_Update);
-    orig_CPR_FillVehicleVelData = (void (*)(void *, void **, const void *))
-        rtHookMethod("", "CPR_STPVPEndGame", "FillVehicleVelData", 1, (void *)hook_CPR_FillVehicleVelData);
-    orig_CPR_ReportData = (void (*)(void *, void **, const void *))
-        rtHookMethod("", "CPR_STPVPEndGame", "ReportData", 1, (void *)hook_CPR_ReportData);
-    // Hooks đồng bộ nút bấm UI bàn phím ảo
-    orig_OperatingModeHelper_Init = (void (*)(void *, void *, void *))
-        rtHookMethod("", "OperatingModeHelper", "Init", 2, (void *)hook_OperatingModeHelper_Init);
-    orig_OperatingModeHelper_Release = (void (*)(void *))
-        rtHookMethod("", "OperatingModeHelper", "Release", 0, (void *)hook_OperatingModeHelper_Release);
-    rtHookMethod("", "OperatingMode_OneSide", "Init", 2, (void *)hook_OperatingModeHelper_Init);
-
-    orig_MatchInputMdl_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "MatchInputMdl", "Update", 1, (void *)hook_MatchInputMdl_Update);
-    uintptr_t base = rtGetUnityBase();
-    if (base) {
-        fnSetKeyState = (fn_SetKeyState_InputKey_t)(base + 0x7DB856C); // OperatingMode_OneSide.SetKeyState
-    }
 }
+
 __attribute__((constructor))
 static void rcInit(void) {
     rtLogOpen();
