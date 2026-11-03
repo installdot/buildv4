@@ -439,7 +439,7 @@ static FloatingMenuController *gMenuCtrl = nil;
         [self.startSummonBtn setTitle:@"DỪNG" forState:UIControlStateNormal];
         self.startSummonBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.2 blue:0.2 alpha:1.0];
 
-        self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
+        self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:0.01
                                                             target:self
                                                           selector:@selector(onSummonTimerTick)
                                                           userInfo:nil
