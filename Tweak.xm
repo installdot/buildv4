@@ -1,25 +1,24 @@
-// Tweak.xm — ArenaCapture (build dylib, inject vào app)
-// Hook: NetworkController(SendPackage/Selialize/UpdateProcessReceivedPackage/HttpRequestData..ctor)
-//       + NSURLSession send/delegate (header, method, status, body)
+// Tweak.xm — ArenaCapture
 // Log: <App Sandbox>/Documents/ArenaCapture.log
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #import <substrate.h>
 #import <mach-o/dyld.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
 #import <stdarg.h>
+#import <limits.h>
+#import <unistd.h>
 #import <os/lock.h>
 
 #pragma mark - Config
 
-#define OFF_SEND_PACKAGE   0x10BBC74   // NetworkController.SendPackage(RequestData)
-#define OFF_SELIALIZE      0x10BB67C   // NetworkController.Selialize(object)
-#define OFF_UPDATE_RECV    0x10BCA3C   // NetworkController.UpdateProcessReceivedPackage()
-#define OFF_HTTPREQ_CTOR   0x105BB6C   // HttpRequestData..ctor(int,string)
+#define OFF_SEND_PACKAGE   0x10BBC74
+#define OFF_SELIALIZE      0x10BB67C
+#define OFF_UPDATE_RECV    0x10BCA3C
+#define OFF_HTTPREQ_CTOR   0x105BB6C
 
 #define LOG_NAME           "ArenaCapture.log"
 #define MAX_HEX            8192
@@ -35,7 +34,7 @@ typedef struct { void *klass; void *monitor; void *bounds; uintptr_t max_length;
 typedef struct { void *klass; void *monitor; int32_t length; uint16_t chars[]; } Il2CppStringHdr;
 typedef struct { void *klass; void *monitor; void *items; int32_t size; int32_t version; } Il2CppListHdr;
 
-#pragma mark - Path (app sandbox Documents)
+#pragma mark - Log path (app sandbox Documents)
 
 static void ResolveLogPath(void) {
     @autoreleasepool {
@@ -46,7 +45,9 @@ static void ResolveLogPath(void) {
         if (!dir.length) dir = NSTemporaryDirectory();
 
         NSString *p = [dir stringByAppendingPathComponent:@LOG_NAME];
-        p.getFileSystemRepresentation(gLogPath, sizeof(gLogPath));
+        const char *fs = [p fileSystemRepresentation];
+        if (!fs) fs = "/tmp/ArenaCapture.log";
+        strlcpy(gLogPath, fs, sizeof(gLogPath));
         gLogReady = YES;
     }
 }
@@ -59,8 +60,10 @@ static void RotateIfNeeded(void) {
     fclose(f);
     if (sz <= (long)MAX_LOG_BYTES) return;
 
-    char bak[PATH_MAX]; snprintf(bak, sizeof(bak), "%s.1", gLogPath);
-    remove(bak); rename(gLogPath, bak);
+    char bak[PATH_MAX];
+    snprintf(bak, sizeof(bak), "%s.1", gLogPath);
+    remove(bak);
+    rename(gLogPath, bak);
 }
 
 #pragma mark - Logging
@@ -182,7 +185,7 @@ static void DumpActionList(const char *tag, void *list) {
         if (!act) { AFLog(@"[%s][%d] <null>", tag, i); continue; }
 
         int32_t aid  = *(int32_t *)((uint8_t *)act + 0x10);   // PbAction.actionId
-        void   *data = *(void **)((uint8_t *)act + 0x18);     // PbAction.data (byte[])
+        void   *data = *(void **)((uint8_t *)act + 0x18);     // PbAction.data
         NSData *d    = ILBytes(data);
 
         AFLog(@"[%s][%d] id=%d (%s) len=%lu", tag, i, aid, ActionName(aid),
@@ -201,7 +204,6 @@ static void (*orig_HttpReqCtor)(void *, int32_t, void *, void *);
 static void Hook_SendPackage(void *self, void *request, void *method) {
     @autoreleasepool {
         if (request) {
-            // RequestData{ session@0x10, actions@0x18 }
             NSString *sess = ILStr(*(void **)((uint8_t *)request + 0x10));
             void *actions  = *(void **)((uint8_t *)request + 0x18);
             AFLog(@"========== [REQ] SendPackage class=%s session=%@ ==========",
@@ -224,7 +226,7 @@ static void *Hook_Selialize(void *self, void *data, void *method) {
 
 static void Hook_UpdateRecv(void *self, void *method) {
     @autoreleasepool {
-        void *recv = self ? *(void **)((uint8_t *)self + 0x38) : NULL;   // m_LstQueuedReceiveAction
+        void *recv = self ? *(void **)((uint8_t *)self + 0x38) : NULL;
         int32_t n = ILListSize(recv);
         if (n > 0) {
             AFLog(@"========== [RESP] %d action(s) ==========", n);
@@ -241,6 +243,51 @@ static void Hook_HttpReqCtor(void *self, int32_t serviceId, void *url, void *met
     }
     orig_HttpReqCtor(self, serviceId, url, method);
 }
+
+#pragma mark - ObjC per-class orig IMP map (chống đệ quy khi hook kế thừa)
+
+static NSMutableDictionary<NSString *, NSValue *> *gOrigIMPs;
+static os_unfair_lock gImpLock = OS_UNFAIR_LOCK_INIT;
+
+static NSString *ImpKey(Class c, SEL s) {
+    return [NSString stringWithFormat:@"%s|%s", class_getName(c), sel_getName(s)];
+}
+
+static void StoreOrig(Class c, SEL s, IMP imp) {
+    if (!c || !s || !imp) return;
+    NSValue *v = [NSValue valueWithPointer:(const void *)imp];
+    os_unfair_lock_lock(&gImpLock);
+    gOrigIMPs[ImpKey(c, s)] = v;
+    os_unfair_lock_unlock(&gImpLock);
+}
+
+static IMP LookupOrig(id self, SEL s) {
+    os_unfair_lock_lock(&gImpLock);
+    IMP found = NULL;
+    for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
+        NSValue *v = gOrigIMPs[ImpKey(c, s)];
+        if (v) { found = (IMP)v.pointerValue; break; }
+    }
+    os_unfair_lock_unlock(&gImpLock);
+    return found;
+}
+
+static BOOL ImplementsDirectly(Class c, SEL s) {
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < n; i++) {
+        if (sel_isEqual(method_getName(ms[i]), s)) { found = YES; break; }
+    }
+    if (ms) free(ms);
+    return found;
+}
+
+// Gọi IMP gốc an toàn: nếu chưa hook class này thì dùng class_getMethodImplementation
+#define CALL_ORIG(self, cmd, ...) ({                                      \
+    IMP _i = LookupOrig((self), (cmd));                                   \
+    if (!_i) _i = class_getMethodImplementation(object_getClass(self), (cmd)); \
+    _i; })
 
 #pragma mark - NSURLSession send side
 
@@ -259,21 +306,18 @@ static void DumpURLRequest(NSString *tag, NSURLRequest *r) {
     }
 }
 
-static NSURLSessionDataTask *(*orig_dtReq)(id, SEL, NSURLRequest *);
-static NSURLSessionDataTask *(*orig_dtReqCb)(id, SEL, NSURLRequest *,
-                                             void (^)(NSData *, NSURLResponse *, NSError *));
-static NSURLSessionUploadTask *(*orig_upData)(id, SEL, NSURLRequest *, NSData *);
-static NSURLSessionUploadTask *(*orig_upFile)(id, SEL, NSURLRequest *, NSURL *);
-
 static NSURLSessionDataTask *hook_dtReq(id self, SEL _cmd, NSURLRequest *req) {
     @autoreleasepool { DumpURLRequest(@"HTTP-REQ", req); }
-    return orig_dtReq(self, _cmd, req);
+    typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *);
+    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req);
 }
 
 static NSURLSessionDataTask *hook_dtReqCb(id self, SEL _cmd, NSURLRequest *req,
                                           void (^h)(NSData *, NSURLResponse *, NSError *)) {
     @autoreleasepool { DumpURLRequest(@"HTTP-REQ", req); }
-    return orig_dtReqCb(self, _cmd, req, h);
+    typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *,
+                                        void (^)(NSData *, NSURLResponse *, NSError *));
+    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, h);
 }
 
 static NSURLSessionUploadTask *hook_upData(id self, SEL _cmd, NSURLRequest *req, NSData *body) {
@@ -282,7 +326,8 @@ static NSURLSessionUploadTask *hook_upData(id self, SEL _cmd, NSURLRequest *req,
         AFLog(@"[HTTP-REQ] uploadFromData=%lu bytes", (unsigned long)body.length);
         if (body.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(body.bytes, body.length, MAX_HEX));
     }
-    return orig_upData(self, _cmd, req, body);
+    typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *);
+    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, body);
 }
 
 static NSURLSessionUploadTask *hook_upFile(id self, SEL _cmd, NSURLRequest *req, NSURL *file) {
@@ -292,38 +337,39 @@ static NSURLSessionUploadTask *hook_upFile(id self, SEL _cmd, NSURLRequest *req,
         NSData *d = [NSData dataWithContentsOfURL:file];
         if (d.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
     }
-    return orig_upFile(self, _cmd, req, file);
+    typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSURL *);
+    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, file);
+}
+
+static void HookOneClass(Class c, SEL s, IMP hook) {
+    if (!c || !s) return;
+    if (!ImplementsDirectly(c, s)) return;
+    IMP old = NULL;
+    if (MSHookMessageEx(c, s, hook, &old) == 0 && old) StoreOrig(c, s, old);
 }
 
 static void HookNSURLSessionSend(void) {
-    Class c = objc_getClass("NSURLSession");
-    if (!c) return;
-    SEL s;
-    s = @selector(dataTaskWithRequest:);
-    if (class_getInstanceMethod(c, s))
-        MSHookMessageEx(c, s, (IMP)hook_dtReq, (IMP *)&orig_dtReq);
+    SEL sels[4] = {
+        @selector(dataTaskWithRequest:),
+        @selector(dataTaskWithRequest:completionHandler:),
+        @selector(uploadTaskWithRequest:fromData:),
+        @selector(uploadTaskWithRequest:fromFile:),
+    };
+    IMP hooks[4] = { (IMP)hook_dtReq, (IMP)hook_dtReqCb, (IMP)hook_upData, (IMP)hook_upFile };
 
-    s = @selector(dataTaskWithRequest:completionHandler:);
-    if (class_getInstanceMethod(c, s))
-        MSHookMessageEx(c, s, (IMP)hook_dtReqCb, (IMP *)&orig_dtReqCb);
+    NSMutableArray<NSString *> *names = [NSMutableArray arrayWithObject:@"NSURLSession"];
+    if (objc_getClass("UnityNSURLSession")) [names addObject:@"UnityNSURLSession"];
 
-    s = @selector(uploadTaskWithRequest:fromData:);
-    if (class_getInstanceMethod(c, s))
-        MSHookMessageEx(c, s, (IMP)hook_upData, (IMP *)&orig_upData);
-
-    s = @selector(uploadTaskWithRequest:fromFile:);
-    if (class_getInstanceMethod(c, s))
-        MSHookMessageEx(c, s, (IMP)hook_upFile, (IMP *)&orig_upFile);
+    for (NSString *n in names) {
+        Class c = objc_getClass(n.UTF8String);
+        if (!c) continue;
+        for (int i = 0; i < 4; i++) HookOneClass(c, sels[i], hooks[i]);
+    }
 }
 
-#pragma mark - NSURLSession delegate (generic: mọi class implement)
+#pragma mark - NSURLSession delegate (chỉ class tự implement)
 
 static NSMutableDictionary<NSNumber *, NSMutableData *> *gBodies;
-
-static void (*orig_didRecvData)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *);
-static void (*orig_didRecvResp)(id, SEL, NSURLSession *, NSURLSessionDataTask *,
-                                NSURLResponse *, void (^)(NSInteger));
-static void (*orig_didComplete)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *);
 
 static void hook_didRecvData(id self, SEL _cmd, NSURLSession *s,
                              NSURLSessionDataTask *task, NSData *data) {
@@ -334,7 +380,8 @@ static void hook_didRecvData(id self, SEL _cmd, NSURLSession *s,
             [buf appendData:data];
         }
     }
-    orig_didRecvData(self, _cmd, s, task, data);
+    typedef void (*Fn)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *);
+    ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, s, task, data);
 }
 
 static void hook_didRecvResp(id self, SEL _cmd, NSURLSession *s,
@@ -348,7 +395,9 @@ static void hook_didRecvResp(id self, SEL _cmd, NSURLSession *s,
             AFLog(@"[HTTP-RESP] headers=%@", hr.allHeaderFields ?: @{});
         }
     }
-    orig_didRecvResp(self, _cmd, s, task, resp, completion);
+    typedef void (*Fn)(id, SEL, NSURLSession *, NSURLSessionDataTask *,
+                       NSURLResponse *, void (^)(NSInteger));
+    ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, s, task, resp, completion);
 }
 
 static void hook_didComplete(id self, SEL _cmd, NSURLSession *s,
@@ -359,37 +408,44 @@ static void hook_didComplete(id self, SEL _cmd, NSURLSession *s,
         [gBodies removeObjectForKey:@(task.taskIdentifier)];
     }
     @autoreleasepool {
+        long status = 0;
+        if ([task.response isKindOfClass:[NSHTTPURLResponse class]])
+            status = (long)((NSHTTPURLResponse *)task.response).statusCode;
+
         AFLog(@"[HTTP-RESP] id=%lu status=%ld len=%lu err=%@",
-              (unsigned long)task.taskIdentifier,
-              (long)((NSHTTPURLResponse *)task.response).statusCode,
+              (unsigned long)task.taskIdentifier, status,
               (unsigned long)buf.length, err ?: @"nil");
         if (buf.length) AFLog(@"[HTTP-RESP] body.hex=%@", HexStr(buf.bytes, buf.length, MAX_HEX));
     }
-    orig_didComplete(self, _cmd, s, task, err);
+    typedef void (*Fn)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *);
+    ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, s, task, err);
 }
 
 static void HookSessionDelegates(void) {
-    SEL sData = @selector(URLSession:dataTask:didReceiveData:);
-    SEL sResp = @selector(URLSession:dataTask:didReceiveResponse:completionHandler:);
-    SEL sDone = @selector(URLSession:task:didCompleteWithError:);
+    SEL sels[3] = {
+        @selector(URLSession:dataTask:didReceiveData:),
+        @selector(URLSession:dataTask:didReceiveResponse:completionHandler:),
+        @selector(URLSession:task:didCompleteWithError:),
+    };
+    IMP hooks[3] = { (IMP)hook_didRecvData, (IMP)hook_didRecvResp, (IMP)hook_didComplete };
 
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *cs = (Class *)calloc((size_t)n, sizeof(Class));
-    if (!cs) return;
-    n = objc_getClassList(cs, n);
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)calloc((size_t)count, sizeof(Class));
+    if (!classes) return;
+    count = objc_getClassList(classes, count);
 
     int hooked = 0;
-    for (int i = 0; i < n; i++) {
-        Class c = cs[i];
-        if (class_getInstanceMethod(c, sData))
-            MSHookMessageEx(c, sData, (IMP)hook_didRecvData, (IMP *)&orig_didRecvData), hooked++;
-        if (class_getInstanceMethod(c, sResp))
-            MSHookMessageEx(c, sResp, (IMP)hook_didRecvResp, (IMP *)&orig_didRecvResp), hooked++;
-        if (class_getInstanceMethod(c, sDone))
-            MSHookMessageEx(c, sDone, (IMP)hook_didComplete, (IMP *)&orig_didComplete), hooked++;
+    for (int i = 0; i < count; i++) {
+        Class c = classes[i];
+        for (int k = 0; k < 3; k++) {
+            if (ImplementsDirectly(c, sels[k])) {
+                HookOneClass(c, sels[k], hooks[k]);
+                hooked++;
+            }
+        }
     }
-    free(cs);
+    free(classes);
     AFLog(@"[INIT] NSURLSession delegate hooks=%d", hooked);
 }
 
@@ -407,23 +463,26 @@ static uintptr_t FindUnityFramework(void) {
 __attribute__((constructor))
 static void ArenaCaptureInit(void) {
     @autoreleasepool {
-        gBodies = [NSMutableDictionary new];
+        gBodies   = [NSMutableDictionary new];
+        gOrigIMPs = [NSMutableDictionary new];
         ResolveLogPath();
 
         uintptr_t base = FindUnityFramework();
-        AFLog(@"[INIT] pid=%d log=%@ base=0x%lx", getpid(), @(gLogPath),
-              (unsigned long)base);
-        if (!base) { AFLog(@"[INIT] UnityFramework NOT FOUND"); return; }
+        AFLog(@"[INIT] pid=%d log=%s base=0x%lx", getpid(), gLogPath, (unsigned long)base);
 
-        MSHookFunction((void *)(base + OFF_SEND_PACKAGE), (void *)&Hook_SendPackage,
-                       (void **)&orig_SendPackage);
-        MSHookFunction((void *)(base + OFF_SELIALIZE), (void *)&Hook_Selialize,
-                       (void **)&orig_Selialize);
-        MSHookFunction((void *)(base + OFF_UPDATE_RECV), (void *)&Hook_UpdateRecv,
-                       (void **)&orig_UpdateRecv);
-        MSHookFunction((void *)(base + OFF_HTTPREQ_CTOR), (void *)&Hook_HttpReqCtor,
-                       (void **)&orig_HttpReqCtor);
-        AFLog(@"[INIT] il2cpp hooks installed");
+        if (base) {
+            MSHookFunction((void *)(base + OFF_SEND_PACKAGE), (void *)&Hook_SendPackage,
+                           (void **)&orig_SendPackage);
+            MSHookFunction((void *)(base + OFF_SELIALIZE), (void *)&Hook_Selialize,
+                           (void **)&orig_Selialize);
+            MSHookFunction((void *)(base + OFF_UPDATE_RECV), (void *)&Hook_UpdateRecv,
+                           (void **)&orig_UpdateRecv);
+            MSHookFunction((void *)(base + OFF_HTTPREQ_CTOR), (void *)&Hook_HttpReqCtor,
+                           (void **)&orig_HttpReqCtor);
+            AFLog(@"[INIT] il2cpp hooks installed");
+        } else {
+            AFLog(@"[INIT] UnityFramework NOT FOUND");
+        }
 
         HookNSURLSessionSend();
         HookSessionDelegates();
