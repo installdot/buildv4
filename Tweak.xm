@@ -1,5 +1,8 @@
 // Tweak.xm — ArenaCapture
 // Log: <App Sandbox>/Documents/ArenaCapture.log
+//
+// Hook tầng il2cpp (UnityFramework) : payload protobuf thật
+// Hook tầng NSURLSession             : method / header / status / body on-wire
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -15,10 +18,10 @@
 
 #pragma mark - Config
 
-#define OFF_SEND_PACKAGE   0x10BBC74
-#define OFF_SELIALIZE      0x10BB67C
-#define OFF_UPDATE_RECV    0x10BCA3C
-#define OFF_HTTPREQ_CTOR   0x105BB6C
+#define OFF_SEND_PACKAGE   0x10BBC74   // NetworkController.SendPackage(RequestData)
+#define OFF_SELIALIZE      0x10BB67C   // NetworkController.Selialize(object)
+#define OFF_UPDATE_RECV    0x10BCA3C   // NetworkController.UpdateProcessReceivedPackage()
+#define OFF_HTTPREQ_CTOR   0x105BB6C   // HttpRequestData..ctor(int, string)
 
 #define LOG_NAME           "ArenaCapture.log"
 #define MAX_HEX            8192
@@ -76,7 +79,10 @@ static void AFLog(NSString *fmt, ...) {
     NSLog(@"[ArenaCap] %@", msg);
 
     static NSDateFormatter *df; static dispatch_once_t once;
-    dispatch_once(&once, ^{ df = [NSDateFormatter new]; df.dateFormat = @"HH:mm:ss.SSS"; });
+    dispatch_once(&once, ^{
+        df = [NSDateFormatter new];
+        df.dateFormat = @"HH:mm:ss.SSS";
+    });
     NSString *line = [NSString stringWithFormat:@"%@  %@\n",
                       [df stringFromDate:[NSDate date]], msg];
 
@@ -185,25 +191,27 @@ static void DumpActionList(const char *tag, void *list) {
         if (!act) { AFLog(@"[%s][%d] <null>", tag, i); continue; }
 
         int32_t aid  = *(int32_t *)((uint8_t *)act + 0x10);   // PbAction.actionId
-        void   *data = *(void **)((uint8_t *)act + 0x18);     // PbAction.data
+        void   *data = *(void **)((uint8_t *)act + 0x18);     // PbAction.data (byte[])
         NSData *d    = ILBytes(data);
 
         AFLog(@"[%s][%d] id=%d (%s) len=%lu", tag, i, aid, ActionName(aid),
               (unsigned long)d.length);
-        if (d.length) AFLog(@"[%s][%d] %d.hex=%@", tag, i, aid, HexStr(d.bytes, d.length, MAX_HEX));
+        if (d.length)
+            AFLog(@"[%s][%d] %d.hex=%@", tag, i, aid, HexStr(d.bytes, d.length, MAX_HEX));
     }
 }
 
 #pragma mark - Unity il2cpp hooks
 
-static void (*orig_SendPackage)(void *, void *, void *);
+static void  (*orig_SendPackage)(void *, void *, void *);
 static void *(*orig_Selialize)(void *, void *, void *);
-static void (*orig_UpdateRecv)(void *, void *);
-static void (*orig_HttpReqCtor)(void *, int32_t, void *, void *);
+static void  (*orig_UpdateRecv)(void *, void *);
+static void  (*orig_HttpReqCtor)(void *, int32_t, void *, void *);
 
 static void Hook_SendPackage(void *self, void *request, void *method) {
     @autoreleasepool {
         if (request) {
+            // RequestData { session@0x10, actions@0x18 }
             NSString *sess = ILStr(*(void **)((uint8_t *)request + 0x10));
             void *actions  = *(void **)((uint8_t *)request + 0x18);
             AFLog(@"========== [REQ] SendPackage class=%s session=%@ ==========",
@@ -226,7 +234,7 @@ static void *Hook_Selialize(void *self, void *data, void *method) {
 
 static void Hook_UpdateRecv(void *self, void *method) {
     @autoreleasepool {
-        void *recv = self ? *(void **)((uint8_t *)self + 0x38) : NULL;
+        void *recv = self ? *(void **)((uint8_t *)self + 0x38) : NULL;  // m_LstQueuedReceiveAction
         int32_t n = ILListSize(recv);
         if (n > 0) {
             AFLog(@"========== [RESP] %d action(s) ==========", n);
@@ -244,7 +252,7 @@ static void Hook_HttpReqCtor(void *self, int32_t serviceId, void *url, void *met
     orig_HttpReqCtor(self, serviceId, url, method);
 }
 
-#pragma mark - ObjC per-class orig IMP map (chống đệ quy khi hook kế thừa)
+#pragma mark - Per-class original IMP map (tránh đệ quy khi hook trùng lớp cha/con)
 
 static NSMutableDictionary<NSString *, NSValue *> *gOrigIMPs;
 static os_unfair_lock gImpLock = OS_UNFAIR_LOCK_INIT;
@@ -262,8 +270,8 @@ static void StoreOrig(Class c, SEL s, IMP imp) {
 }
 
 static IMP LookupOrig(id self, SEL s) {
-    os_unfair_lock_lock(&gImpLock);
     IMP found = NULL;
+    os_unfair_lock_lock(&gImpLock);
     for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
         NSValue *v = gOrigIMPs[ImpKey(c, s)];
         if (v) { found = (IMP)v.pointerValue; break; }
@@ -283,9 +291,8 @@ static BOOL ImplementsDirectly(Class c, SEL s) {
     return found;
 }
 
-// Gọi IMP gốc an toàn: nếu chưa hook class này thì dùng class_getMethodImplementation
-#define CALL_ORIG(self, cmd, ...) ({                                      \
-    IMP _i = LookupOrig((self), (cmd));                                   \
+#define CALL_ORIG(self, cmd) ({                                             \
+    IMP _i = LookupOrig((self), (cmd));                                     \
     if (!_i) _i = class_getMethodImplementation(object_getClass(self), (cmd)); \
     _i; })
 
@@ -324,7 +331,8 @@ static NSURLSessionUploadTask *hook_upData(id self, SEL _cmd, NSURLRequest *req,
     @autoreleasepool {
         DumpURLRequest(@"HTTP-REQ", req);
         AFLog(@"[HTTP-REQ] uploadFromData=%lu bytes", (unsigned long)body.length);
-        if (body.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(body.bytes, body.length, MAX_HEX));
+        if (body.length)
+            AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(body.bytes, body.length, MAX_HEX));
     }
     typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *);
     return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, body);
@@ -335,17 +343,19 @@ static NSURLSessionUploadTask *hook_upFile(id self, SEL _cmd, NSURLRequest *req,
         DumpURLRequest(@"HTTP-REQ", req);
         AFLog(@"[HTTP-REQ] uploadFromFile=%@", file.path);
         NSData *d = [NSData dataWithContentsOfURL:file];
-        if (d.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
+        if (d.length)
+            AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
     }
     typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSURL *);
     return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, file);
 }
 
 static void HookOneClass(Class c, SEL s, IMP hook) {
-    if (!c || !s) return;
+    if (!c || !s || !hook) return;
     if (!ImplementsDirectly(c, s)) return;
     IMP old = NULL;
-    if (MSHookMessageEx(c, s, hook, &old) == 0 && old) StoreOrig(c, s, old);
+    MSHookMessageEx(c, s, hook, &old);   // trả void — không so sánh
+    if (old) StoreOrig(c, s, old);
 }
 
 static void HookNSURLSessionSend(void) {
@@ -357,11 +367,9 @@ static void HookNSURLSessionSend(void) {
     };
     IMP hooks[4] = { (IMP)hook_dtReq, (IMP)hook_dtReqCb, (IMP)hook_upData, (IMP)hook_upFile };
 
-    NSMutableArray<NSString *> *names = [NSMutableArray arrayWithObject:@"NSURLSession"];
-    if (objc_getClass("UnityNSURLSession")) [names addObject:@"UnityNSURLSession"];
-
-    for (NSString *n in names) {
-        Class c = objc_getClass(n.UTF8String);
+    const char *names[2] = { "NSURLSession", "UnityNSURLSession" };
+    for (int n = 0; n < 2; n++) {
+        Class c = objc_getClass(names[n]);
         if (!c) continue;
         for (int i = 0; i < 4; i++) HookOneClass(c, sels[i], hooks[i]);
     }
@@ -415,7 +423,8 @@ static void hook_didComplete(id self, SEL _cmd, NSURLSession *s,
         AFLog(@"[HTTP-RESP] id=%lu status=%ld len=%lu err=%@",
               (unsigned long)task.taskIdentifier, status,
               (unsigned long)buf.length, err ?: @"nil");
-        if (buf.length) AFLog(@"[HTTP-RESP] body.hex=%@", HexStr(buf.bytes, buf.length, MAX_HEX));
+        if (buf.length)
+            AFLog(@"[HTTP-RESP] body.hex=%@", HexStr(buf.bytes, buf.length, MAX_HEX));
     }
     typedef void (*Fn)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *);
     ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, s, task, err);
