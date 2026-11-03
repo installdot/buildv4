@@ -1,13 +1,21 @@
-// Tweak.xm — ArenaCapture
+// Tweak.xm — ArenaCapture (Crash-proof edition)
 // Log: <App Sandbox>/Documents/ArenaCapture.log
 //
-// Hook tầng il2cpp (UnityFramework) : payload protobuf thật
-// Hook tầng NSURLSession             : method / header / status / body on-wire
+// 1. il2cpp (UnityFramework):
+//    - NetworkController.SendPackage(RequestData) @ 0x10BBC74
+//    - NetworkController.Selialize(object)        @ 0x10BB67C
+//    - NetworkController.UpdateProcessReceivedPackage() @ 0x10BCA3C
+//    - HttpRequestData..ctor(int, string)         @ 0x105BB6C
+// 2. NSURLSession:
+//    - dataTaskWithRequest: / dataTaskWithRequest:completionHandler:
+//    - uploadTaskWithRequest:fromData: / uploadTaskWithRequest:fromFile:
+//    - UnityNSURLSession delegate (nếu có)
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
@@ -16,20 +24,20 @@
 #import <unistd.h>
 #import <os/lock.h>
 
-#pragma mark - Config
+#pragma mark - RVAs in UnityFramework (arm64, imagebase 0)
 
-#define OFF_SEND_PACKAGE   0x10BBC74   // NetworkController.SendPackage(RequestData)
-#define OFF_SELIALIZE      0x10BB67C   // NetworkController.Selialize(object)
-#define OFF_UPDATE_RECV    0x10BCA3C   // NetworkController.UpdateProcessReceivedPackage()
-#define OFF_HTTPREQ_CTOR   0x105BB6C   // HttpRequestData..ctor(int, string)
+#define OFF_SEND_PACKAGE   0x10BBC74
+#define OFF_SELIALIZE      0x10BB67C
+#define OFF_UPDATE_RECV    0x10BCA3C
+#define OFF_HTTPREQ_CTOR   0x105BB6C
 
 #define LOG_NAME           "ArenaCapture.log"
 #define MAX_HEX            8192
 #define MAX_LOG_BYTES      (8u * 1024u * 1024u)
 
-static os_unfair_lock gLock = OS_UNFAIR_LOCK_INIT;
-static char  gLogPath[PATH_MAX];
-static BOOL  gLogReady = NO;
+static os_unfair_lock gFileLock = OS_UNFAIR_LOCK_INIT;
+static char gLogPath[PATH_MAX] = {0};
+static BOOL gLogReady = NO;
 
 #pragma mark - il2cpp ABI (arm64)
 
@@ -37,7 +45,11 @@ typedef struct { void *klass; void *monitor; void *bounds; uintptr_t max_length;
 typedef struct { void *klass; void *monitor; int32_t length; uint16_t chars[]; } Il2CppStringHdr;
 typedef struct { void *klass; void *monitor; void *items; int32_t size; int32_t version; } Il2CppListHdr;
 
-#pragma mark - Log path (app sandbox Documents)
+static inline BOOL IsValidPtr(const void *p) {
+    return p != NULL && ((uintptr_t)p >= 0x100000000ULL);
+}
+
+#pragma mark - Safe Log path (app sandbox Documents)
 
 static void ResolveLogPath(void) {
     @autoreleasepool {
@@ -56,6 +68,7 @@ static void ResolveLogPath(void) {
 }
 
 static void RotateIfNeeded(void) {
+    if (!gLogReady || gLogPath[0] == '\0') return;
     FILE *f = fopen(gLogPath, "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END);
@@ -68,8 +81,6 @@ static void RotateIfNeeded(void) {
     remove(bak);
     rename(gLogPath, bak);
 }
-
-#pragma mark - Logging
 
 static void AFLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -86,12 +97,12 @@ static void AFLog(NSString *fmt, ...) {
     NSString *line = [NSString stringWithFormat:@"%@  %@\n",
                       [df stringFromDate:[NSDate date]], msg];
 
-    os_unfair_lock_lock(&gLock);
+    os_unfair_lock_lock(&gFileLock);
     if (!gLogReady) ResolveLogPath();
     RotateIfNeeded();
     FILE *f = fopen(gLogPath, "a");
     if (f) { fputs(line.UTF8String, f); fclose(f); }
-    os_unfair_lock_unlock(&gLock);
+    os_unfair_lock_unlock(&gFileLock);
 }
 
 static NSString *HexStr(const void *p, NSUInteger len, NSUInteger cap) {
@@ -100,42 +111,47 @@ static NSString *HexStr(const void *p, NSUInteger len, NSUInteger cap) {
     NSUInteger n = MIN(len, cap);
     NSMutableString *s = [NSMutableString stringWithCapacity:n * 2 + 40];
     for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
-    if (n < len) [s appendFormat:@"... (truncated, total %lu)", (unsigned long)len];
+    if (n < len) [s appendFormat:@"... (total %lu)", (unsigned long)len];
     return s;
 }
 
 #pragma mark - il2cpp helpers
 
 static inline int32_t ILListSize(void *list) {
-    return list ? ((Il2CppListHdr *)list)->size : 0;
+    if (!IsValidPtr(list)) return 0;
+    Il2CppListHdr *l = (Il2CppListHdr *)list;
+    int32_t sz = l->size;
+    if (sz <= 0 || sz > 5000) return 0;
+    return sz;
 }
 
 static inline void *ILListAt(void *list, int32_t i) {
-    if (!list || i < 0) return NULL;
+    if (!IsValidPtr(list) || i < 0) return NULL;
     Il2CppListHdr *l = (Il2CppListHdr *)list;
-    if (!l->items || i >= l->size) return NULL;
+    if (!IsValidPtr(l->items) || i >= l->size) return NULL;
     return *(void **)((uint8_t *)l->items + 0x20 + (size_t)8 * (size_t)i);
 }
 
 static NSString *ILStr(void *s) {
-    if (!s) return nil;
+    if (!IsValidPtr(s)) return nil;
     Il2CppStringHdr *h = (Il2CppStringHdr *)s;
-    if (h->length < 0 || h->length > 200000) return nil;
-    return [[NSString alloc] initWithCharacters:h->chars length:(NSUInteger)h->length];
+    int32_t len = h->length;
+    if (len <= 0 || len > 200000) return nil;
+    return [[NSString alloc] initWithCharacters:h->chars length:(NSUInteger)len];
 }
 
 static NSData *ILBytes(void *arr) {
-    if (!arr) return nil;
+    if (!IsValidPtr(arr)) return nil;
     Il2CppArrayHdr *h = (Il2CppArrayHdr *)arr;
     uintptr_t len = h->max_length;
-    if (len > (64u << 20)) return nil;
-    return [NSData dataWithBytes:(uint8_t *)arr + 0x20 length:(NSUInteger)len];
+    if (len == 0 || len > (32u << 20)) return nil;
+    return [NSData dataWithBytes:(const uint8_t *)arr + 0x20 length:(NSUInteger)len];
 }
 
 static const char *ILClassName(void *obj) {
-    if (!obj) return "null";
+    if (!IsValidPtr(obj)) return "null";
     void *klass = *(void **)obj;
-    if (!klass) return "?";
+    if (!IsValidPtr(klass)) return "?";
     const char *n = *(const char **)((uint8_t *)klass + 0x10);
     return n ? n : "?";
 }
@@ -188,30 +204,33 @@ static void DumpActionList(const char *tag, void *list) {
     AFLog(@"[%s] actions=%d", tag, n);
     for (int32_t i = 0; i < n; i++) {
         void *act = ILListAt(list, i);
-        if (!act) { AFLog(@"[%s][%d] <null>", tag, i); continue; }
+        if (!IsValidPtr(act)) {
+            AFLog(@"[%s][%d] <null>", tag, i);
+            continue;
+        }
 
-        int32_t aid  = *(int32_t *)((uint8_t *)act + 0x10);   // PbAction.actionId
-        void   *data = *(void **)((uint8_t *)act + 0x18);     // PbAction.data (byte[])
+        int32_t aid  = *(int32_t *)((uint8_t *)act + 0x10);
+        void   *data = *(void **)((uint8_t *)act + 0x18);
         NSData *d    = ILBytes(data);
 
         AFLog(@"[%s][%d] id=%d (%s) len=%lu", tag, i, aid, ActionName(aid),
-              (unsigned long)d.length);
-        if (d.length)
+              (unsigned long)(d ? d.length : 0));
+        if (d && d.length > 0) {
             AFLog(@"[%s][%d] %d.hex=%@", tag, i, aid, HexStr(d.bytes, d.length, MAX_HEX));
+        }
     }
 }
 
-#pragma mark - Unity il2cpp hooks
+#pragma mark - il2cpp hooks
 
-static void  (*orig_SendPackage)(void *, void *, void *);
-static void *(*orig_Selialize)(void *, void *, void *);
-static void  (*orig_UpdateRecv)(void *, void *);
-static void  (*orig_HttpReqCtor)(void *, int32_t, void *, void *);
+static void  (*orig_SendPackage)(void *, void *, void *) = NULL;
+static void *(*orig_Selialize)(void *, void *, void *) = NULL;
+static void  (*orig_UpdateRecv)(void *, void *) = NULL;
+static void  (*orig_HttpReqCtor)(void *, int32_t, void *, void *) = NULL;
 
 static void Hook_SendPackage(void *self, void *request, void *method) {
     @autoreleasepool {
-        if (request) {
-            // RequestData { session@0x10, actions@0x18 }
+        if (IsValidPtr(request)) {
             NSString *sess = ILStr(*(void **)((uint8_t *)request + 0x10));
             void *actions  = *(void **)((uint8_t *)request + 0x18);
             AFLog(@"========== [REQ] SendPackage class=%s session=%@ ==========",
@@ -219,29 +238,33 @@ static void Hook_SendPackage(void *self, void *request, void *method) {
             DumpActionList("REQ", actions);
         }
     }
-    orig_SendPackage(self, request, method);
+    if (orig_SendPackage) orig_SendPackage(self, request, method);
 }
 
 static void *Hook_Selialize(void *self, void *data, void *method) {
-    void *ret = orig_Selialize(self, data, method);
+    void *ret = orig_Selialize ? orig_Selialize(self, data, method) : NULL;
     @autoreleasepool {
-        NSData *d = ILBytes(ret);
-        AFLog(@"[SER] class=%s retlen=%lu", ILClassName(data), (unsigned long)d.length);
-        if (d.length) AFLog(@"[SER] hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
+        if (IsValidPtr(data)) {
+            NSData *d = ILBytes(ret);
+            AFLog(@"[SER] class=%s retlen=%lu", ILClassName(data), (unsigned long)(d ? d.length : 0));
+            if (d && d.length > 0) AFLog(@"[SER] hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
+        }
     }
     return ret;
 }
 
 static void Hook_UpdateRecv(void *self, void *method) {
     @autoreleasepool {
-        void *recv = self ? *(void **)((uint8_t *)self + 0x38) : NULL;  // m_LstQueuedReceiveAction
-        int32_t n = ILListSize(recv);
-        if (n > 0) {
-            AFLog(@"========== [RESP] %d action(s) ==========", n);
-            DumpActionList("RESP", recv);
+        if (IsValidPtr(self)) {
+            void *recv = *(void **)((uint8_t *)self + 0x38);
+            int32_t n = ILListSize(recv);
+            if (n > 0) {
+                AFLog(@"========== [RESP] %d action(s) ==========", n);
+                DumpActionList("RESP", recv);
+            }
         }
     }
-    orig_UpdateRecv(self, method);
+    if (orig_UpdateRecv) orig_UpdateRecv(self, method);
 }
 
 static void Hook_HttpReqCtor(void *self, int32_t serviceId, void *url, void *method) {
@@ -249,54 +272,10 @@ static void Hook_HttpReqCtor(void *self, int32_t serviceId, void *url, void *met
         AFLog(@"[REQ-LINE] serviceId=%d (%s) url=%@",
               serviceId, ActionName(serviceId), ILStr(url) ?: @"(nil)");
     }
-    orig_HttpReqCtor(self, serviceId, url, method);
+    if (orig_HttpReqCtor) orig_HttpReqCtor(self, serviceId, url, method);
 }
 
-#pragma mark - Per-class original IMP map (tránh đệ quy khi hook trùng lớp cha/con)
-
-static NSMutableDictionary<NSString *, NSValue *> *gOrigIMPs;
-static os_unfair_lock gImpLock = OS_UNFAIR_LOCK_INIT;
-
-static NSString *ImpKey(Class c, SEL s) {
-    return [NSString stringWithFormat:@"%s|%s", class_getName(c), sel_getName(s)];
-}
-
-static void StoreOrig(Class c, SEL s, IMP imp) {
-    if (!c || !s || !imp) return;
-    NSValue *v = [NSValue valueWithPointer:(const void *)imp];
-    os_unfair_lock_lock(&gImpLock);
-    gOrigIMPs[ImpKey(c, s)] = v;
-    os_unfair_lock_unlock(&gImpLock);
-}
-
-static IMP LookupOrig(id self, SEL s) {
-    IMP found = NULL;
-    os_unfair_lock_lock(&gImpLock);
-    for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
-        NSValue *v = gOrigIMPs[ImpKey(c, s)];
-        if (v) { found = (IMP)v.pointerValue; break; }
-    }
-    os_unfair_lock_unlock(&gImpLock);
-    return found;
-}
-
-static BOOL ImplementsDirectly(Class c, SEL s) {
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(c, &n);
-    BOOL found = NO;
-    for (unsigned int i = 0; i < n; i++) {
-        if (sel_isEqual(method_getName(ms[i]), s)) { found = YES; break; }
-    }
-    if (ms) free(ms);
-    return found;
-}
-
-#define CALL_ORIG(self, cmd) ({                                             \
-    IMP _i = LookupOrig((self), (cmd));                                     \
-    if (!_i) _i = class_getMethodImplementation(object_getClass(self), (cmd)); \
-    _i; })
-
-#pragma mark - NSURLSession send side
+#pragma mark - Safe NSURLSession Hooks (No recursion, static orig)
 
 static void DumpURLRequest(NSString *tag, NSURLRequest *r) {
     if (!r) return;
@@ -313,188 +292,156 @@ static void DumpURLRequest(NSString *tag, NSURLRequest *r) {
     }
 }
 
+// 1. dataTaskWithRequest:
+static NSURLSessionDataTask *(*orig_dtReq)(id, SEL, NSURLRequest *) = NULL;
 static NSURLSessionDataTask *hook_dtReq(id self, SEL _cmd, NSURLRequest *req) {
     @autoreleasepool { DumpURLRequest(@"HTTP-REQ", req); }
-    typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *);
-    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req);
+    return orig_dtReq ? orig_dtReq(self, _cmd, req) : nil;
 }
 
+// 2. dataTaskWithRequest:completionHandler:
+static NSURLSessionDataTask *(*orig_dtReqCb)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)) = NULL;
 static NSURLSessionDataTask *hook_dtReqCb(id self, SEL _cmd, NSURLRequest *req,
                                           void (^h)(NSData *, NSURLResponse *, NSError *)) {
     @autoreleasepool { DumpURLRequest(@"HTTP-REQ", req); }
-    typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *,
-                                        void (^)(NSData *, NSURLResponse *, NSError *));
-    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, h);
+    if (!h) {
+        return orig_dtReqCb ? orig_dtReqCb(self, _cmd, req, nil) : nil;
+    }
+    void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+        @autoreleasepool {
+            long status = 0;
+            if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+                NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
+                status = (long)hr.statusCode;
+                AFLog(@"[HTTP-RESP] status=%ld url=%@ headers=%@", status, hr.URL.absoluteString, hr.allHeaderFields);
+            }
+            AFLog(@"[HTTP-RESP] len=%lu err=%@", (unsigned long)(data ? data.length : 0), err ?: @"nil");
+            if (data.length) {
+                AFLog(@"[HTTP-RESP] body.hex=%@", HexStr(data.bytes, data.length, MAX_HEX));
+            }
+        }
+        h(data, resp, err);
+    };
+    return orig_dtReqCb ? orig_dtReqCb(self, _cmd, req, wrapped) : nil;
 }
 
+// 3. uploadTaskWithRequest:fromData:
+static NSURLSessionUploadTask *(*orig_upData)(id, SEL, NSURLRequest *, NSData *) = NULL;
 static NSURLSessionUploadTask *hook_upData(id self, SEL _cmd, NSURLRequest *req, NSData *body) {
     @autoreleasepool {
         DumpURLRequest(@"HTTP-REQ", req);
         AFLog(@"[HTTP-REQ] uploadFromData=%lu bytes", (unsigned long)body.length);
-        if (body.length)
-            AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(body.bytes, body.length, MAX_HEX));
+        if (body.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(body.bytes, body.length, MAX_HEX));
     }
-    typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *);
-    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, body);
+    return orig_upData ? orig_upData(self, _cmd, req, body) : nil;
 }
 
+// 4. uploadTaskWithRequest:fromFile:
+static NSURLSessionUploadTask *(*orig_upFile)(id, SEL, NSURLRequest *, NSURL *) = NULL;
 static NSURLSessionUploadTask *hook_upFile(id self, SEL _cmd, NSURLRequest *req, NSURL *file) {
     @autoreleasepool {
         DumpURLRequest(@"HTTP-REQ", req);
         AFLog(@"[HTTP-REQ] uploadFromFile=%@", file.path);
-        NSData *d = [NSData dataWithContentsOfURL:file];
-        if (d.length)
-            AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
-    }
-    typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSURL *);
-    return ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, req, file);
-}
-
-static void HookOneClass(Class c, SEL s, IMP hook) {
-    if (!c || !s || !hook) return;
-    if (!ImplementsDirectly(c, s)) return;
-    IMP old = NULL;
-    MSHookMessageEx(c, s, hook, &old);   // trả void — không so sánh
-    if (old) StoreOrig(c, s, old);
-}
-
-static void HookNSURLSessionSend(void) {
-    SEL sels[4] = {
-        @selector(dataTaskWithRequest:),
-        @selector(dataTaskWithRequest:completionHandler:),
-        @selector(uploadTaskWithRequest:fromData:),
-        @selector(uploadTaskWithRequest:fromFile:),
-    };
-    IMP hooks[4] = { (IMP)hook_dtReq, (IMP)hook_dtReqCb, (IMP)hook_upData, (IMP)hook_upFile };
-
-    const char *names[2] = { "NSURLSession", "UnityNSURLSession" };
-    for (int n = 0; n < 2; n++) {
-        Class c = objc_getClass(names[n]);
-        if (!c) continue;
-        for (int i = 0; i < 4; i++) HookOneClass(c, sels[i], hooks[i]);
-    }
-}
-
-#pragma mark - NSURLSession delegate (chỉ class tự implement)
-
-static NSMutableDictionary<NSNumber *, NSMutableData *> *gBodies;
-
-static void hook_didRecvData(id self, SEL _cmd, NSURLSession *s,
-                             NSURLSessionDataTask *task, NSData *data) {
-    if (data.length) {
-        @synchronized (gBodies) {
-            NSMutableData *buf = gBodies[@(task.taskIdentifier)];
-            if (!buf) { buf = [NSMutableData data]; gBodies[@(task.taskIdentifier)] = buf; }
-            [buf appendData:data];
+        if (file) {
+            NSData *d = [NSData dataWithContentsOfURL:file];
+            if (d.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
         }
     }
-    typedef void (*Fn)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *);
-    ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, s, task, data);
+    return orig_upFile ? orig_upFile(self, _cmd, req, file) : nil;
 }
 
-static void hook_didRecvResp(id self, SEL _cmd, NSURLSession *s,
-                             NSURLSessionDataTask *task, NSURLResponse *resp,
-                             void (^completion)(NSInteger)) {
-    @autoreleasepool {
-        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
-            NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
-            AFLog(@"[HTTP-RESP] status=%ld url=%@", (long)hr.statusCode,
-                  hr.URL.absoluteString ?: @"?");
-            AFLog(@"[HTTP-RESP] headers=%@", hr.allHeaderFields ?: @{});
+// 5. UnityNSURLSession delegate (nếu Unity có delegate riêng)
+static void (*orig_unity_didRecvData)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *) = NULL;
+static void hook_unity_didRecvData(id self, SEL _cmd, NSURLSession *s, NSURLSessionDataTask *t, NSData *d) {
+    if (d.length) AFLog(@"[UNITY-NET] recv len=%lu", (unsigned long)d.length);
+    if (orig_unity_didRecvData) orig_unity_didRecvData(self, _cmd, s, t, d);
+}
+
+static void (*orig_unity_didRecvResp)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *, void (^)(NSInteger)) = NULL;
+static void hook_unity_didRecvResp(id self, SEL _cmd, NSURLSession *s, NSURLSessionDataTask *t, NSURLResponse *resp, void (^h)(NSInteger)) {
+    if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
+        AFLog(@"[UNITY-NET] resp status=%ld url=%@", (long)hr.statusCode, hr.URL.absoluteString);
+    }
+    if (orig_unity_didRecvResp) orig_unity_didRecvResp(self, _cmd, s, t, resp, h);
+}
+
+static void (*orig_unity_didComplete)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *) = NULL;
+static void hook_unity_didComplete(id self, SEL _cmd, NSURLSession *s, NSURLSessionTask *t, NSError *err) {
+    if (err) AFLog(@"[UNITY-NET] complete err=%@", err.localizedDescription);
+    if (orig_unity_didComplete) orig_unity_didComplete(self, _cmd, s, t, err);
+}
+
+static void InstallNSURLSessionHooks(void) {
+    // Hook NSURLSession methods
+    Class cSession = objc_getClass("NSURLSession");
+    if (cSession) {
+        MSHookMessageEx(cSession, @selector(dataTaskWithRequest:),
+                        (IMP)hook_dtReq, (IMP *)&orig_dtReq);
+        MSHookMessageEx(cSession, @selector(dataTaskWithRequest:completionHandler:),
+                        (IMP)hook_dtReqCb, (IMP *)&orig_dtReqCb);
+        MSHookMessageEx(cSession, @selector(uploadTaskWithRequest:fromData:),
+                        (IMP)hook_upData, (IMP *)&orig_upData);
+        MSHookMessageEx(cSession, @selector(uploadTaskWithRequest:fromFile:),
+                        (IMP)hook_upFile, (IMP *)&orig_upFile);
+        AFLog(@"[INIT] NSURLSession hooks installed");
+    }
+
+    // Hook UnityNSURLSession nếu có
+    Class cUnity = objc_getClass("UnityNSURLSession");
+    if (cUnity) {
+        MSHookMessageEx(cUnity, @selector(URLSession:dataTask:didReceiveData:),
+                        (IMP)hook_unity_didRecvData, (IMP *)&orig_unity_didRecvData);
+        MSHookMessageEx(cUnity, @selector(URLSession:dataTask:didReceiveResponse:completionHandler:),
+                        (IMP)hook_unity_didRecvResp, (IMP *)&orig_unity_didRecvResp);
+        MSHookMessageEx(cUnity, @selector(URLSession:task:didCompleteWithError:),
+                        (IMP)hook_unity_didComplete, (IMP *)&orig_unity_didComplete);
+        AFLog(@"[INIT] UnityNSURLSession hooks installed");
+    }
+}
+
+#pragma mark - Dynamic UnityFramework loader detection
+
+static BOOL gHookedUnity = NO;
+
+static void InstallIl2CppHooks(uintptr_t base) {
+    if (gHookedUnity || !base) return;
+    gHookedUnity = YES;
+
+    AFLog(@"[INIT] Hooking UnityFramework base=0x%lx", (unsigned long)base);
+
+    MSHookFunction((void *)(base + OFF_SEND_PACKAGE), (void *)&Hook_SendPackage, (void **)&orig_SendPackage);
+    MSHookFunction((void *)(base + OFF_SELIALIZE),    (void *)&Hook_Selialize,    (void **)&orig_Selialize);
+    MSHookFunction((void *)(base + OFF_UPDATE_RECV),   (void *)&Hook_UpdateRecv,   (void **)&orig_UpdateRecv);
+    MSHookFunction((void *)(base + OFF_HTTPREQ_CTOR),  (void *)&Hook_HttpReqCtor,  (void **)&orig_HttpReqCtor);
+
+    AFLog(@"[INIT] il2cpp hooks OK");
+}
+
+static void OnImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
+    if (gHookedUnity) return;
+    Dl_info info;
+    if (dladdr(mh, &info) && info.dli_fname) {
+        if (strstr(info.dli_fname, "UnityFramework")) {
+            InstallIl2CppHooks((uintptr_t)mh);
         }
     }
-    typedef void (*Fn)(id, SEL, NSURLSession *, NSURLSessionDataTask *,
-                       NSURLResponse *, void (^)(NSInteger));
-    ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, s, task, resp, completion);
 }
 
-static void hook_didComplete(id self, SEL _cmd, NSURLSession *s,
-                             NSURLSessionTask *task, NSError *err) {
-    NSMutableData *buf = nil;
-    @synchronized (gBodies) {
-        buf = gBodies[@(task.taskIdentifier)];
-        [gBodies removeObjectForKey:@(task.taskIdentifier)];
-    }
-    @autoreleasepool {
-        long status = 0;
-        if ([task.response isKindOfClass:[NSHTTPURLResponse class]])
-            status = (long)((NSHTTPURLResponse *)task.response).statusCode;
-
-        AFLog(@"[HTTP-RESP] id=%lu status=%ld len=%lu err=%@",
-              (unsigned long)task.taskIdentifier, status,
-              (unsigned long)buf.length, err ?: @"nil");
-        if (buf.length)
-            AFLog(@"[HTTP-RESP] body.hex=%@", HexStr(buf.bytes, buf.length, MAX_HEX));
-    }
-    typedef void (*Fn)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *);
-    ((Fn)CALL_ORIG(self, _cmd))(self, _cmd, s, task, err);
-}
-
-static void HookSessionDelegates(void) {
-    SEL sels[3] = {
-        @selector(URLSession:dataTask:didReceiveData:),
-        @selector(URLSession:dataTask:didReceiveResponse:completionHandler:),
-        @selector(URLSession:task:didCompleteWithError:),
-    };
-    IMP hooks[3] = { (IMP)hook_didRecvData, (IMP)hook_didRecvResp, (IMP)hook_didComplete };
-
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return;
-    Class *classes = (Class *)calloc((size_t)count, sizeof(Class));
-    if (!classes) return;
-    count = objc_getClassList(classes, count);
-
-    int hooked = 0;
-    for (int i = 0; i < count; i++) {
-        Class c = classes[i];
-        for (int k = 0; k < 3; k++) {
-            if (ImplementsDirectly(c, sels[k])) {
-                HookOneClass(c, sels[k], hooks[k]);
-                hooked++;
-            }
-        }
-    }
-    free(classes);
-    AFLog(@"[INIT] NSURLSession delegate hooks=%d", hooked);
-}
-
-#pragma mark - Init
-
-static uintptr_t FindUnityFramework(void) {
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *n = _dyld_get_image_name(i);
-        if (n && strstr(n, "UnityFramework"))
-            return (uintptr_t)_dyld_get_image_header(i);
-    }
-    return 0;
-}
+#pragma mark - Constructor
 
 __attribute__((constructor))
 static void ArenaCaptureInit(void) {
     @autoreleasepool {
-        gBodies   = [NSMutableDictionary new];
-        gOrigIMPs = [NSMutableDictionary new];
         ResolveLogPath();
+        AFLog(@"[INIT] pid=%d log=%s", getpid(), gLogPath);
 
-        uintptr_t base = FindUnityFramework();
-        AFLog(@"[INIT] pid=%d log=%s base=0x%lx", getpid(), gLogPath, (unsigned long)base);
+        // Hook NSURLSession an toàn (không quét class, không đệ quy)
+        InstallNSURLSessionHooks();
 
-        if (base) {
-            MSHookFunction((void *)(base + OFF_SEND_PACKAGE), (void *)&Hook_SendPackage,
-                           (void **)&orig_SendPackage);
-            MSHookFunction((void *)(base + OFF_SELIALIZE), (void *)&Hook_Selialize,
-                           (void **)&orig_Selialize);
-            MSHookFunction((void *)(base + OFF_UPDATE_RECV), (void *)&Hook_UpdateRecv,
-                           (void **)&orig_UpdateRecv);
-            MSHookFunction((void *)(base + OFF_HTTPREQ_CTOR), (void *)&Hook_HttpReqCtor,
-                           (void **)&orig_HttpReqCtor);
-            AFLog(@"[INIT] il2cpp hooks installed");
-        } else {
-            AFLog(@"[INIT] UnityFramework NOT FOUND");
-        }
+        // Đăng ký listener: hook UnityFramework dù được load trước hay sau
+        _dyld_register_func_for_add_image(OnImageAdded);
 
-        HookNSURLSessionSend();
-        HookSessionDelegates();
         AFLog(@"[INIT] ready");
     }
 }
