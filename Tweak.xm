@@ -1,9 +1,10 @@
-// Tweak.xm — Chiêu Mộ Đặc Biệt (Prophet Summon) Full Hệ & Extra Tướng SS
+// Tweak.xm — Chiêu Mộ Đặc Biệt (Prophet Summon) Full Hệ, Ô Nhập Số Delay & Extra Tướng SS
 //
 // Tính năng:
 // 1. Floating button di chuyển được trên màn hình, chạm để đóng/mở menu.
 // 2. Tab 1: Chiêu mộ đặc biệt:
-//    - ĐẦY ĐỦ TẤT CẢ CÁC HỆ: AGI, VIT, STR, DEX, DARK, LIGHT
+//    - ĐẦY ĐỦ TẤT CẢ 6 HỆ: AGI, VIT, STR, DEX, DARK, LIGHT
+//    - CÀI ĐẶT DELAY: Ô nhập số tự do (ví dụ: 0.1, 0.35, 1.0,... có bàn phím số + nút Xong)
 //    - Nút Bắt đầu / Dừng: spam gọi summon 10 thùng (Prophet Orb x10)
 //    - Đếm và hiển thị số lượng thùng đã mở trong thời gian thực
 //    - Tự động đóng popup nhận thưởng để vòng lặp spam không bị khựng
@@ -130,6 +131,8 @@ static FloatingMenuController *gMenuCtrl = nil;
 @property (nonatomic, strong) UIButton    *startSummonBtn;
 @property (nonatomic, strong) NSTimer     *summonTimer;
 @property (nonatomic, assign) NSInteger    summonBoxCount;
+@property (nonatomic, assign) NSTimeInterval summonDelay;
+@property (nonatomic, strong) UITextField *delayField;
 
 // Tab 2 state (Extra)
 @property (nonatomic, strong) UISwitch    *searchEnabledSwitch;
@@ -152,6 +155,7 @@ static FloatingMenuController *gMenuCtrl = nil;
     self.view.backgroundColor = [UIColor clearColor];
 
     self.selectedFaction = FACTION_STR; // Mặc định STR
+    self.summonDelay     = 0.35;        // Mặc định 0.35s
     self.selectedHeroNames = [NSMutableSet new];
     self.heroDropCounts = [NSMutableDictionary new];
     self.factionButtons = [NSMutableArray new];
@@ -311,39 +315,39 @@ static FloatingMenuController *gMenuCtrl = nil;
     }
 }
 
-#pragma mark - Tab 1: Chiêu Mộ Đặc Biệt (Full 6 hệ)
+#pragma mark - Tab 1: Chiêu Mộ Đặc Biệt (Full 6 hệ + Ô Nhập Số Delay)
 
 - (void)setupTabSummon {
     CGFloat w = self.tabSummonView.bounds.size.width;
 
-    UILabel *headerLbl = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, w - 28, 20)];
+    UILabel *headerLbl = [[UILabel alloc] initWithFrame:CGRectMake(14, 6, w - 28, 18)];
     headerLbl.text = @"CHỌN HỆ CHIÊU MỘ:";
-    headerLbl.font = [UIFont boldSystemFontOfSize:12];
+    headerLbl.font = [UIFont boldSystemFontOfSize:11];
     headerLbl.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
     [self.tabSummonView addSubview:headerLbl];
 
     // ĐẦY ĐỦ TẤT CẢ 6 HỆ: 2 cột x 3 dòng
     NSArray *factions = @[
-        @{@"name": @"AGI",   @"desc": @"Fortress/Tốc",  @"tag": @(FACTION_AGI),   @"col": [UIColor colorWithRed:0.1 green:0.6 blue:0.95 alpha:1]},
-        @{@"name": @"VIT",   @"desc": @"Forest/Thủ",    @"tag": @(FACTION_VIT),   @"col": [UIColor colorWithRed:0.15 green:0.75 blue:0.35 alpha:1]},
-        @{@"name": @"STR",   @"desc": @"Abyss/Công",    @"tag": @(FACTION_STR),   @"col": [UIColor colorWithRed:0.95 green:0.25 blue:0.2 alpha:1]},
-        @{@"name": @"DEX",   @"desc": @"Shadow/Khéo",   @"tag": @(FACTION_DEX),   @"col": [UIColor colorWithRed:0.65 green:0.25 blue:0.85 alpha:1]},
-        @{@"name": @"DARK",  @"desc": @"Bóng Đêm/Ám",   @"tag": @(FACTION_DARK),  @"col": [UIColor colorWithRed:0.35 green:0.35 blue:0.45 alpha:1]},
-        @{@"name": @"LIGHT", @"desc": @"Ánh Sáng/Quang",@"tag": @(FACTION_LIGHT), @"col": [UIColor colorWithRed:0.95 green:0.75 blue:0.1 alpha:1]},
+        @{@"name": @"AGI",   @"desc": @"Fortress/Tốc",  @"tag": @(FACTION_AGI)},
+        @{@"name": @"VIT",   @"desc": @"Forest/Thủ",    @"tag": @(FACTION_VIT)},
+        @{@"name": @"STR",   @"desc": @"Abyss/Công",    @"tag": @(FACTION_STR)},
+        @{@"name": @"DEX",   @"desc": @"Shadow/Khéo",   @"tag": @(FACTION_DEX)},
+        @{@"name": @"DARK",  @"desc": @"Bóng Đêm/Ám",   @"tag": @(FACTION_DARK)},
+        @{@"name": @"LIGHT", @"desc": @"Ánh Sáng/Quang",@"tag": @(FACTION_LIGHT)},
     ];
 
     CGFloat btnW = (w - 38) / 2.0;
-    CGFloat btnH = 34;
+    CGFloat btnH = 32;
     for (int i = 0; i < factions.count; i++) {
         NSDictionary *d = factions[i];
         int row = i / 2;
         int col = i % 2;
         CGFloat x = 14 + col * (btnW + 10);
-        CGFloat y = 32 + row * (btnH + 6);
+        CGFloat y = 26 + row * (btnH + 5);
 
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
         btn.frame = CGRectMake(x, y, btnW, btnH);
-        btn.layer.cornerRadius = 8;
+        btn.layer.cornerRadius = 7;
         btn.layer.borderWidth = 1.0;
         btn.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:1.0].CGColor;
         btn.backgroundColor = [UIColor colorWithWhite:0.14 alpha:0.9];
@@ -361,22 +365,67 @@ static FloatingMenuController *gMenuCtrl = nil;
 
     [self updateFactionButtonsState];
 
+    // CÀI ĐẶT DELAY: Ô nhập số tự do kèm thanh công cụ Xong
+    CGFloat delayY = 26 + 3 * (btnH + 5) + 8; // ~145
+    UIView *delayRow = [[UIView alloc] initWithFrame:CGRectMake(14, delayY, w - 28, 34)];
+    delayRow.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
+    delayRow.layer.cornerRadius = 8;
+    delayRow.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
+    delayRow.layer.borderWidth = 1.0;
+
+    UILabel *delayTitleLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 7, 130, 20)];
+    delayTitleLbl.text = @"⏱ Delay (giây):";
+    delayTitleLbl.font = [UIFont boldSystemFontOfSize:12];
+    delayTitleLbl.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
+    [delayRow addSubview:delayTitleLbl];
+
+    self.delayField = [[UITextField alloc] initWithFrame:CGRectMake(140, 4, 80, 26)];
+    self.delayField.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1.0];
+    self.delayField.layer.cornerRadius = 6;
+    self.delayField.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:0.9 alpha:0.8].CGColor;
+    self.delayField.layer.borderWidth = 1.0;
+    self.delayField.textColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:1.0];
+    self.delayField.font = [UIFont boldSystemFontOfSize:13];
+    self.delayField.textAlignment = NSTextAlignmentCenter;
+    self.delayField.keyboardType = UIKeyboardTypeDecimalPad;
+    self.delayField.text = @"0.35";
+    self.delayField.delegate = self;
+    [self.delayField addTarget:self action:@selector(onDelayFieldChanged:) forControlEvents:UIControlEventEditingChanged];
+
+    // Toolbar có nút "Xong" để đóng bàn phím số DecimalPad trên iPhone
+    UIToolbar *bar = [[UIToolbar alloc] initWithFrame:CGRectMake(0, 0, [UIScreen mainScreen].bounds.size.width, 38)];
+    bar.barStyle = UIBarStyleBlack;
+    UIBarButtonItem *flex = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
+    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"Xong" style:UIBarButtonItemStyleDone target:self.delayField action:@selector(resignFirstResponder)];
+    done.tintColor = [UIColor cyanColor];
+    bar.items = @[flex, done];
+    self.delayField.inputAccessoryView = bar;
+    [delayRow addSubview:self.delayField];
+
+    UILabel *delayUnitLbl = [[UILabel alloc] initWithFrame:CGRectMake(226, 7, 70, 20)];
+    delayUnitLbl.text = @"giây/lần";
+    delayUnitLbl.font = [UIFont systemFontOfSize:11];
+    delayUnitLbl.textColor = [UIColor lightGrayColor];
+    [delayRow addSubview:delayUnitLbl];
+
+    [self.tabSummonView addSubview:delayRow];
+
     // Stats Box
-    CGFloat statsY = 32 + 3 * (btnH + 6) + 8;
-    UIView *statsBox = [[UIView alloc] initWithFrame:CGRectMake(14, statsY, w - 28, 62)];
+    CGFloat statsY = delayY + 34 + 8; // ~187
+    UIView *statsBox = [[UIView alloc] initWithFrame:CGRectMake(14, statsY, w - 28, 54)];
     statsBox.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
     statsBox.layer.cornerRadius = 10;
     statsBox.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
     statsBox.layer.borderWidth = 1.0;
 
-    self.summonCountLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, statsBox.bounds.size.width - 20, 26)];
+    self.summonCountLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 4, statsBox.bounds.size.width - 20, 24)];
     self.summonCountLabel.text = @"Đã mở: 0 thùng";
     self.summonCountLabel.font = [UIFont boldSystemFontOfSize:16];
     self.summonCountLabel.textColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.7 alpha:1.0];
     self.summonCountLabel.textAlignment = NSTextAlignmentCenter;
     [statsBox addSubview:self.summonCountLabel];
 
-    UILabel *subStat = [[UILabel alloc] initWithFrame:CGRectMake(10, 34, statsBox.bounds.size.width - 20, 20)];
+    UILabel *subStat = [[UILabel alloc] initWithFrame:CGRectMake(10, 28, statsBox.bounds.size.width - 20, 20)];
     subStat.text = @"(Mỗi thùng = 10 quả cầu tiên tri)";
     subStat.font = [UIFont systemFontOfSize:11];
     subStat.textColor = [UIColor lightGrayColor];
@@ -386,10 +435,10 @@ static FloatingMenuController *gMenuCtrl = nil;
     [self.tabSummonView addSubview:statsBox];
 
     // Nút BẮT ĐẦU / DỪNG
-    CGFloat startY = statsY + 62 + 12;
+    CGFloat startY = statsY + 54 + 10; // ~251
     self.startSummonBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.startSummonBtn.frame = CGRectMake(14, startY, w - 28, 46);
-    self.startSummonBtn.layer.cornerRadius = 12;
+    self.startSummonBtn.frame = CGRectMake(14, startY, w - 28, 44);
+    self.startSummonBtn.layer.cornerRadius = 11;
     self.startSummonBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.72 blue:0.58 alpha:1.0];
     [self.startSummonBtn setTitle:@"BẮT ĐẦU" forState:UIControlStateNormal];
     self.startSummonBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
@@ -400,7 +449,7 @@ static FloatingMenuController *gMenuCtrl = nil;
 
     // Nút Đặt lại bộ đếm
     UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    resetBtn.frame = CGRectMake(14, startY + 46 + 6, w - 28, 26);
+    resetBtn.frame = CGRectMake(14, startY + 44 + 6, w - 28, 24);
     [resetBtn setTitle:@"Đặt lại bộ đếm" forState:UIControlStateNormal];
     resetBtn.tintColor = [UIColor grayColor];
     resetBtn.titleLabel.font = [UIFont systemFontOfSize:11];
@@ -427,6 +476,25 @@ static FloatingMenuController *gMenuCtrl = nil;
     }
 }
 
+- (void)onDelayFieldChanged:(UITextField *)tf {
+    NSString *clean = [tf.text stringByReplacingOccurrencesOfString:@"," withString:@"."];
+    double val = [clean doubleValue];
+    if (val >= 0.01 && val <= 60.0) {
+        self.summonDelay = val;
+
+        // Nếu đang bật auto spam thì restart timer ngay với tốc độ mới
+        if (gIsAutoSummoning && self.summonTimer) {
+            [self.summonTimer invalidate];
+            self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:self.summonDelay
+                                                                target:self
+                                                              selector:@selector(onSummonTimerTick)
+                                                              userInfo:nil
+                                                               repeats:YES];
+            [[NSRunLoop mainRunLoop] addTimer:self.summonTimer forMode:NSRunLoopCommonModes];
+        }
+    }
+}
+
 - (void)resetSummonCount {
     self.summonBoxCount = 0;
     self.summonCountLabel.text = @"Đã mở: 0 thùng";
@@ -434,19 +502,29 @@ static FloatingMenuController *gMenuCtrl = nil;
 
 - (void)onStartSummonToggle {
     if (!gIsAutoSummoning) {
-        // Bắt đầu
+        // Cập nhật lại delay từ ô nhập số trước khi bắt đầu
+        NSString *clean = [self.delayField.text stringByReplacingOccurrencesOfString:@"," withString:@"."];
+        double val = [clean doubleValue];
+        if (val >= 0.01 && val <= 60.0) {
+            self.summonDelay = val;
+        } else if (self.summonDelay < 0.01) {
+            self.summonDelay = 0.35;
+            self.delayField.text = @"0.35";
+        }
+        [self.delayField resignFirstResponder];
+
         gIsAutoSummoning = YES;
         [self.startSummonBtn setTitle:@"DỪNG" forState:UIControlStateNormal];
         self.startSummonBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.2 blue:0.2 alpha:1.0];
 
-        self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:0.01
+        NSTimeInterval d = (self.summonDelay >= 0.01) ? self.summonDelay : 0.35;
+        self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:d
                                                             target:self
                                                           selector:@selector(onSummonTimerTick)
                                                           userInfo:nil
                                                            repeats:YES];
         [[NSRunLoop mainRunLoop] addTimer:self.summonTimer forMode:NSRunLoopCommonModes];
     } else {
-        // Dừng
         gIsAutoSummoning = NO;
         [self.summonTimer invalidate];
         self.summonTimer = nil;
@@ -615,9 +693,10 @@ static FloatingMenuController *gMenuCtrl = nil;
         [arr addObject:it];
     }
 
+    // Sắp xếp: SSR trước, rồi SS, rồi tên A-Z (Sửa lỗi NSComparisonResult)
     [arr sortUsingComparator:^NSComparisonResult(HeroItem *a, HeroItem *b) {
         if (a.quality != b.quality) {
-            return (b.quality - a.quality);
+            return (b.quality > a.quality) ? NSOrderedAscending : NSOrderedDescending;
         }
         return [a.name localizedCaseInsensitiveCompare:b.name];
     }];
@@ -657,10 +736,10 @@ static FloatingMenuController *gMenuCtrl = nil;
     cell.textLabel.text = item.name;
 
     if (item.quality >= 7) {
-        cell.textLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.1 alpha:1.0]; // Vàng SSR
+        cell.textLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.1 alpha:1.0];
         cell.detailTextLabel.textColor = [UIColor orangeColor];
     } else {
-        cell.textLabel.textColor = [UIColor whiteColor]; // Trắng SS
+        cell.textLabel.textColor = [UIColor whiteColor];
         cell.detailTextLabel.textColor = [UIColor colorWithRed:0.6 green:0.4 blue:0.9 alpha:1.0];
     }
     cell.detailTextLabel.text = [NSString stringWithFormat:@"[%@] [%@]", item.qualityTag, item.factionTag];
@@ -694,7 +773,6 @@ static FloatingMenuController *gMenuCtrl = nil;
 - (void)handleDroppedHeroKey:(int)heroKey {
     if (!gBase) return;
 
-    // Lấy tên tướng từ DbManager.GetHeroModel(heroKey) @ 0x140C0BC
     typedef void *(*Db_GetInstance_t)(void);
     Db_GetInstance_t getDb = (Db_GetInstance_t)(gBase + OFF_DB_MANAGER_GET_INSTANCE);
     void *db = getDb ? getDb() : NULL;
