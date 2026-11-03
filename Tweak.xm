@@ -1,17 +1,22 @@
-// Tweak.xm — ArenaCapture (Crash-proof edition)
-// Log: <App Sandbox>/Documents/ArenaCapture.log
+// Tweak.xm — Chiêu Mộ Đặc Biệt (Prophet Summon) Full Hệ & Extra Tướng SS
 //
-// 1. il2cpp (UnityFramework):
-//    - NetworkController.SendPackage(RequestData) @ 0x10BBC74
-//    - NetworkController.Selialize(object)        @ 0x10BB67C
-//    - NetworkController.UpdateProcessReceivedPackage() @ 0x10BCA3C
-//    - HttpRequestData..ctor(int, string)         @ 0x105BB6C
-// 2. NSURLSession:
-//    - dataTaskWithRequest: / dataTaskWithRequest:completionHandler:
-//    - uploadTaskWithRequest:fromData: / uploadTaskWithRequest:fromFile:
-//    - UnityNSURLSession delegate (nếu có)
+// Tính năng:
+// 1. Floating button di chuyển được trên màn hình, chạm để đóng/mở menu.
+// 2. Tab 1: Chiêu mộ đặc biệt:
+//    - ĐẦY ĐỦ TẤT CẢ CÁC HỆ: AGI, VIT, STR, DEX, DARK, LIGHT
+//    - Nút Bắt đầu / Dừng: spam gọi summon 10 thùng (Prophet Orb x10)
+//    - Đếm và hiển thị số lượng thùng đã mở trong thời gian thực
+//    - Tự động đóng popup nhận thưởng để vòng lặp spam không bị khựng
+// 3. Tab 2: Extra:
+//    - Đọc trực tiếp DbManager.m_ListHeroModel trong UnityFramework
+//    - Lọc toàn bộ tướng SS (m_Quality == 6) và SSR (m_Quality == 7) kèm hệ của tướng
+//    - Thanh tìm kiếm thời gian thực
+//    - Tickbox bật/tắt chế độ "Tìm nhân vật"
+//    - Chọn nhiều nhân vật cùng lúc (multi-select checkmark)
+//    - Bắt event triệu hồi rơi tướng: hiển thị "Tên nhân vật: 1/2/..."
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #import <mach-o/dyld.h>
@@ -19,27 +24,28 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
-#import <stdarg.h>
-#import <limits.h>
-#import <unistd.h>
-#import <os/lock.h>
 
 #pragma mark - RVAs in UnityFramework (arm64, imagebase 0)
 
-#define OFF_SEND_PACKAGE   0x10BBC74
-#define OFF_SELIALIZE      0x10BB67C
-#define OFF_UPDATE_RECV    0x10BCA3C
-#define OFF_HTTPREQ_CTOR   0x105BB6C
+#define OFF_GAME_CONTEXT_GET_INSTANCE   0x14473AC  // GameContext.GetInstance()
+#define OFF_HERO_PROPHET_SUMMON         0x140437C  // DataSender.HeroProphetSummon(this, faction, count)
+#define OFF_DB_MANAGER_GET_INSTANCE     0x140C030  // DbManager.GetInstance()
+#define OFF_DB_MANAGER_GET_HERO_MODEL   0x140C0BC  // DbManager.GetHeroModel(heroKey)
+#define OFF_POPUP_BONUS_SET_MODEL       0x11C36D4  // PopupShowBonusEffect2.SetBonusModel(BonusModel)
+#define OFF_POPUP_BONUS_CLOSE_CLICK     0x11C3DC4  // PopupShowBonusEffect2.ButtonCloseClick()
 
-#define LOG_NAME           "ArenaCapture.log"
-#define MAX_HEX            8192
-#define MAX_LOG_BYTES      (8u * 1024u * 1024u)
+#pragma mark - Faction Enums (Full 6 hệ trong HeroFaction)
 
-static os_unfair_lock gFileLock = OS_UNFAIR_LOCK_INIT;
-static char gLogPath[PATH_MAX] = {0};
-static BOOL gLogReady = NO;
+typedef NS_ENUM(NSInteger, HeroFactionEnum) {
+    FACTION_DARK     = 1, // Dark (Bóng Đêm / Ám)
+    FACTION_LIGHT    = 2, // Light (Ánh Sáng / Quang)
+    FACTION_DEX      = 3, // Shadow (U Ám / Khéo / Tím)
+    FACTION_AGI      = 4, // Fortress (Thành Trì / Tốc / Xanh biển)
+    FACTION_VIT      = 5, // Forest (Rừng Xanh / Thủ / Lục)
+    FACTION_STR      = 6, // Abyss (Vực Sâu / Công / Đỏ)
+};
 
-#pragma mark - il2cpp ABI (arm64)
+#pragma mark - il2cpp ABI
 
 typedef struct { void *klass; void *monitor; void *bounds; uintptr_t max_length; } Il2CppArrayHdr;
 typedef struct { void *klass; void *monitor; int32_t length; uint16_t chars[]; } Il2CppStringHdr;
@@ -49,80 +55,11 @@ static inline BOOL IsValidPtr(const void *p) {
     return p != NULL && ((uintptr_t)p >= 0x100000000ULL);
 }
 
-#pragma mark - Safe Log path (app sandbox Documents)
-
-static void ResolveLogPath(void) {
-    @autoreleasepool {
-        NSString *dir = nil;
-        NSArray<NSString *> *docs =
-            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (docs.count) dir = docs.firstObject;
-        if (!dir.length) dir = NSTemporaryDirectory();
-
-        NSString *p = [dir stringByAppendingPathComponent:@LOG_NAME];
-        const char *fs = [p fileSystemRepresentation];
-        if (!fs) fs = "/tmp/ArenaCapture.log";
-        strlcpy(gLogPath, fs, sizeof(gLogPath));
-        gLogReady = YES;
-    }
-}
-
-static void RotateIfNeeded(void) {
-    if (!gLogReady || gLogPath[0] == '\0') return;
-    FILE *f = fopen(gLogPath, "rb");
-    if (!f) return;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fclose(f);
-    if (sz <= (long)MAX_LOG_BYTES) return;
-
-    char bak[PATH_MAX];
-    snprintf(bak, sizeof(bak), "%s.1", gLogPath);
-    remove(bak);
-    rename(gLogPath, bak);
-}
-
-static void AFLog(NSString *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-
-    NSLog(@"[ArenaCap] %@", msg);
-
-    static NSDateFormatter *df; static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        df = [NSDateFormatter new];
-        df.dateFormat = @"HH:mm:ss.SSS";
-    });
-    NSString *line = [NSString stringWithFormat:@"%@  %@\n",
-                      [df stringFromDate:[NSDate date]], msg];
-
-    os_unfair_lock_lock(&gFileLock);
-    if (!gLogReady) ResolveLogPath();
-    RotateIfNeeded();
-    FILE *f = fopen(gLogPath, "a");
-    if (f) { fputs(line.UTF8String, f); fclose(f); }
-    os_unfair_lock_unlock(&gFileLock);
-}
-
-static NSString *HexStr(const void *p, NSUInteger len, NSUInteger cap) {
-    const uint8_t *b = (const uint8_t *)p;
-    if (!b || !len) return @"";
-    NSUInteger n = MIN(len, cap);
-    NSMutableString *s = [NSMutableString stringWithCapacity:n * 2 + 40];
-    for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
-    if (n < len) [s appendFormat:@"... (total %lu)", (unsigned long)len];
-    return s;
-}
-
-#pragma mark - il2cpp helpers
-
 static inline int32_t ILListSize(void *list) {
     if (!IsValidPtr(list)) return 0;
     Il2CppListHdr *l = (Il2CppListHdr *)list;
     int32_t sz = l->size;
-    if (sz <= 0 || sz > 5000) return 0;
-    return sz;
+    return (sz > 0 && sz < 100000) ? sz : 0;
 }
 
 static inline void *ILListAt(void *list, int32_t i) {
@@ -140,286 +77,750 @@ static NSString *ILStr(void *s) {
     return [[NSString alloc] initWithCharacters:h->chars length:(NSUInteger)len];
 }
 
-static NSData *ILBytes(void *arr) {
-    if (!IsValidPtr(arr)) return nil;
-    Il2CppArrayHdr *h = (Il2CppArrayHdr *)arr;
-    uintptr_t len = h->max_length;
-    if (len == 0 || len > (32u << 20)) return nil;
-    return [NSData dataWithBytes:(const uint8_t *)arr + 0x20 length:(NSUInteger)len];
-}
+#pragma mark - Forward Declarations
 
-static const char *ILClassName(void *obj) {
-    if (!IsValidPtr(obj)) return "null";
-    void *klass = *(void **)obj;
-    if (!IsValidPtr(klass)) return "?";
-    const char *n = *(const char **)((uint8_t *)klass + 0x10);
-    return n ? n : "?";
-}
+static uintptr_t gBase = 0;
+static BOOL      gIsAutoSummoning = NO;
 
-#pragma mark - Action names
+@class FloatingMenuController;
+static FloatingMenuController *gMenuCtrl = nil;
 
-static const char *ActionName(int32_t id) {
-    switch (id) {
-        case 97:  return "BATTLE_REPLAY";
-        case 327: return "ARENA_STATUS";
-        case 328: return "CRYSTAL_STATUS";
-        case 329: return "CRYSTAL_BATTLE_RECORD";
-        case 330: return "CRYSTAL_REVENGE";
-        case 331: return "CRYSTAL_SET_DEFENSE";
-        case 332: return "CRYSTAL_BUY_TICKET";
-        case 333: return "CRYSTAL_SEARCH_RIVAL";
-        case 334: return "CRYSTAL_BATTLE";
-        case 336: return "TRIAL_STATUS";
-        case 337: return "TRIAL_BATTLE_RECORD";
-        case 338: return "TRIAL_REVENGE";
-        case 339: return "TRIAL_SET_DEFENSE";
-        case 340: return "CRYSTAL_TOP_PLAYER";
-        case 341: return "TRIAL_SEARCH_RIVAL";
-        case 342: return "TRIAL_BATTLE";
-        case 343: return "TRIAL_TOP_PLAYER";
-        case 345: return "CRYSTAL_NOTIFY_LOG";
-        case 346: return "TRIAL_NOTIFY_LOG";
-        case 347: return "CRYSTAL_TOP_LAST_SEASON";
-        case 348: return "TRIAL_TOP_LAST_SEASON";
-        case 550: return "ALLSTARS_STATUS";
-        case 551: return "ALLSTARS_BATTLE_RECORD";
-        case 552: return "ALLSTARS_SET_DEFENSE";
-        case 553: return "ALLSTARS_SEARCH_RIVAL";
-        case 554: return "ALLSTARS_BATTLE";
-        case 555: return "ALLSTARS_TOP_RANK";
-        case 556: return "ALLSTARS_NOTIFY_LOG";
-        case 558: return "ALLSTARS_PLAYOFF_PREPARE";
-        case 559: return "ALLSTARS_PLAYOFF_RESULT";
-        case 560: return "ALLSTARS_BUY_TURN";
-        case 561: return "ALLSTARS_TOP_POINT";
-        case 562: return "ALLSTARS_BET";
-        case 563: return "ALLSTARS_BET_HISTORY";
-        case 564: return "ALLSTARS_VOSONG";
-        default:  return "-";
+#pragma mark - Model for Hero Item
+
+@interface HeroItem : NSObject
+@property (nonatomic, assign) int heroKey;
+@property (nonatomic, assign) int quality;
+@property (nonatomic, assign) int faction;
+@property (nonatomic, copy)   NSString *name;
+@property (nonatomic, copy)   NSString *qualityTag;
+@property (nonatomic, copy)   NSString *factionTag;
+@end
+
+@implementation HeroItem
+@end
+
+#pragma mark - Passthrough Window (Không chặn touch game bên dưới)
+
+@interface PassthroughWindow : UIWindow
+@end
+
+@implementation PassthroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit == self || hit == self.rootViewController.view) {
+        return nil; // Bỏ qua cửa sổ trong suốt để click xuyên vào game
     }
+    return hit;
+}
+@end
+
+#pragma mark - Floating Menu Controller
+
+@interface FloatingMenuController : UIViewController <UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate>
+@property (nonatomic, strong) UIButton    *floatingBtn;
+@property (nonatomic, strong) UIView      *menuView;
+@property (nonatomic, strong) UISegmentedControl *tabSegment;
+@property (nonatomic, strong) UIView      *tabSummonView;
+@property (nonatomic, strong) UIView      *tabExtraView;
+
+// Tab 1 state
+@property (nonatomic, assign) HeroFactionEnum selectedFaction;
+@property (nonatomic, strong) NSMutableArray<UIButton *> *factionButtons;
+@property (nonatomic, strong) UILabel     *summonCountLabel;
+@property (nonatomic, strong) UIButton    *startSummonBtn;
+@property (nonatomic, strong) NSTimer     *summonTimer;
+@property (nonatomic, assign) NSInteger    summonBoxCount;
+
+// Tab 2 state (Extra)
+@property (nonatomic, strong) UISwitch    *searchEnabledSwitch;
+@property (nonatomic, strong) UITextField *searchField;
+@property (nonatomic, strong) UILabel     *selectedCountLabel;
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UITextView  *resultsTextView;
+@property (nonatomic, strong) NSArray<HeroItem *> *allHeroes;
+@property (nonatomic, strong) NSArray<HeroItem *> *filteredHeroes;
+@property (nonatomic, strong) NSMutableSet<NSString *> *selectedHeroNames;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *heroDropCounts;
+
+- (void)handleDroppedHeroKey:(int)heroKey;
+@end
+
+@implementation FloatingMenuController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor clearColor];
+
+    self.selectedFaction = FACTION_STR; // Mặc định STR
+    self.selectedHeroNames = [NSMutableSet new];
+    self.heroDropCounts = [NSMutableDictionary new];
+    self.factionButtons = [NSMutableArray new];
+
+    [self setupFloatingButton];
+    [self setupMenuView];
+    [self setupTabSummon];
+    [self setupTabExtra];
+
+    [self switchTab:0];
 }
 
-static void DumpActionList(const char *tag, void *list) {
-    int32_t n = ILListSize(list);
-    AFLog(@"[%s] actions=%d", tag, n);
-    for (int32_t i = 0; i < n; i++) {
-        void *act = ILListAt(list, i);
-        if (!IsValidPtr(act)) {
-            AFLog(@"[%s][%d] <null>", tag, i);
-            continue;
-        }
+#pragma mark - Floating Button
 
-        int32_t aid  = *(int32_t *)((uint8_t *)act + 0x10);
-        void   *data = *(void **)((uint8_t *)act + 0x18);
-        NSData *d    = ILBytes(data);
+- (void)setupFloatingButton {
+    self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.floatingBtn.frame = CGRectMake(20, 100, 56, 56);
+    self.floatingBtn.layer.cornerRadius = 28;
+    self.floatingBtn.layer.masksToBounds = NO;
+    self.floatingBtn.backgroundColor = [UIColor colorWithRed:0.12 green:0.12 blue:0.24 alpha:0.92];
+    self.floatingBtn.layer.borderColor = [UIColor colorWithRed:0.0 green:0.9 blue:0.9 alpha:0.9].CGColor;
+    self.floatingBtn.layer.borderWidth = 2.0;
 
-        AFLog(@"[%s][%d] id=%d (%s) len=%lu", tag, i, aid, ActionName(aid),
-              (unsigned long)(d ? d.length : 0));
-        if (d && d.length > 0) {
-            AFLog(@"[%s][%d] %d.hex=%@", tag, i, aid, HexStr(d.bytes, d.length, MAX_HEX));
-        }
-    }
+    self.floatingBtn.layer.shadowColor = [UIColor cyanColor].CGColor;
+    self.floatingBtn.layer.shadowOffset = CGSizeMake(0, 0);
+    self.floatingBtn.layer.shadowOpacity = 0.6;
+    self.floatingBtn.layer.shadowRadius = 8;
+
+    [self.floatingBtn setTitle:@"🔮" forState:UIControlStateNormal];
+    self.floatingBtn.titleLabel.font = [UIFont systemFontOfSize:26];
+
+    [self.floatingBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [self.floatingBtn addGestureRecognizer:pan];
+
+    [self.view addSubview:self.floatingBtn];
 }
 
-#pragma mark - il2cpp hooks
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    CGPoint trans = [pan translationInView:self.view];
+    CGPoint center = self.floatingBtn.center;
+    center.x += trans.x;
+    center.y += trans.y;
 
-static void  (*orig_SendPackage)(void *, void *, void *) = NULL;
-static void *(*orig_Selialize)(void *, void *, void *) = NULL;
-static void  (*orig_UpdateRecv)(void *, void *) = NULL;
-static void  (*orig_HttpReqCtor)(void *, int32_t, void *, void *) = NULL;
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    CGFloat r = self.floatingBtn.bounds.size.width / 2.0;
+    center.x = MAX(r + 4, MIN(scr.width - r - 4, center.x));
+    center.y = MAX(r + 20, MIN(scr.height - r - 20, center.y));
 
-static void Hook_SendPackage(void *self, void *request, void *method) {
-    @autoreleasepool {
-        if (IsValidPtr(request)) {
-            NSString *sess = ILStr(*(void **)((uint8_t *)request + 0x10));
-            void *actions  = *(void **)((uint8_t *)request + 0x18);
-            AFLog(@"========== [REQ] SendPackage class=%s session=%@ ==========",
-                  ILClassName(request), sess ?: @"(nil)");
-            DumpActionList("REQ", actions);
-        }
-    }
-    if (orig_SendPackage) orig_SendPackage(self, request, method);
-}
+    self.floatingBtn.center = center;
+    [pan setTranslation:CGPointZero inView:self.view];
 
-static void *Hook_Selialize(void *self, void *data, void *method) {
-    void *ret = orig_Selialize ? orig_Selialize(self, data, method) : NULL;
-    @autoreleasepool {
-        if (IsValidPtr(data)) {
-            NSData *d = ILBytes(ret);
-            AFLog(@"[SER] class=%s retlen=%lu", ILClassName(data), (unsigned long)(d ? d.length : 0));
-            if (d && d.length > 0) AFLog(@"[SER] hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
-        }
-    }
-    return ret;
-}
-
-static void Hook_UpdateRecv(void *self, void *method) {
-    @autoreleasepool {
-        if (IsValidPtr(self)) {
-            void *recv = *(void **)((uint8_t *)self + 0x38);
-            int32_t n = ILListSize(recv);
-            if (n > 0) {
-                AFLog(@"========== [RESP] %d action(s) ==========", n);
-                DumpActionList("RESP", recv);
+    if (pan.state == UIGestureRecognizerStateEnded) {
+        [UIView animateWithDuration:0.25 delay:0 usingSpringWithDamping:0.7 initialSpringVelocity:0.5 options:0 animations:^{
+            CGPoint snap = self.floatingBtn.center;
+            if (snap.x < scr.width / 2.0) {
+                snap.x = r + 8;
+            } else {
+                snap.x = scr.width - r - 8;
             }
+            self.floatingBtn.center = snap;
+        } completion:nil];
+    }
+}
+
+- (void)toggleMenu {
+    BOOL willShow = self.menuView.hidden;
+    if (willShow) {
+        self.menuView.transform = CGAffineTransformMakeScale(0.85, 0.85);
+        self.menuView.alpha = 0.0;
+        self.menuView.hidden = NO;
+        [UIView animateWithDuration:0.22 delay:0 usingSpringWithDamping:0.8 initialSpringVelocity:0.5 options:0 animations:^{
+            self.menuView.transform = CGAffineTransformIdentity;
+            self.menuView.alpha = 1.0;
+        } completion:nil];
+        if (!self.allHeroes.count) {
+            [self loadAllHeroesFromDb];
         }
-    }
-    if (orig_UpdateRecv) orig_UpdateRecv(self, method);
-}
-
-static void Hook_HttpReqCtor(void *self, int32_t serviceId, void *url, void *method) {
-    @autoreleasepool {
-        AFLog(@"[REQ-LINE] serviceId=%d (%s) url=%@",
-              serviceId, ActionName(serviceId), ILStr(url) ?: @"(nil)");
-    }
-    if (orig_HttpReqCtor) orig_HttpReqCtor(self, serviceId, url, method);
-}
-
-#pragma mark - Safe NSURLSession Hooks (No recursion, static orig)
-
-static void DumpURLRequest(NSString *tag, NSURLRequest *r) {
-    if (!r) return;
-    AFLog(@"[%@] %@ %@", tag, r.HTTPMethod ?: @"?", r.URL.absoluteString ?: @"?");
-    AFLog(@"[%@] headers=%@", tag, r.allHTTPHeaderFields ?: @{});
-    NSData *body = r.HTTPBody;
-    if (body.length) {
-        AFLog(@"[%@] body=%lu bytes", tag, (unsigned long)body.length);
-        AFLog(@"[%@] body.hex=%@", tag, HexStr(body.bytes, body.length, MAX_HEX));
-    } else if (r.HTTPBodyStream) {
-        AFLog(@"[%@] body=<stream>", tag);
     } else {
-        AFLog(@"[%@] body=(none)", tag);
+        [UIView animateWithDuration:0.18 animations:^{
+            self.menuView.transform = CGAffineTransformMakeScale(0.85, 0.85);
+            self.menuView.alpha = 0.0;
+        } completion:^(BOOL finished) {
+            self.menuView.hidden = YES;
+            self.menuView.transform = CGAffineTransformIdentity;
+        }];
     }
 }
 
-// 1. dataTaskWithRequest:
-static NSURLSessionDataTask *(*orig_dtReq)(id, SEL, NSURLRequest *) = NULL;
-static NSURLSessionDataTask *hook_dtReq(id self, SEL _cmd, NSURLRequest *req) {
-    @autoreleasepool { DumpURLRequest(@"HTTP-REQ", req); }
-    return orig_dtReq ? orig_dtReq(self, _cmd, req) : nil;
+#pragma mark - Menu Window Frame
+
+- (void)setupMenuView {
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    CGFloat w = MIN(350, scr.width - 20);
+    CGFloat h = MIN(480, scr.height - 30);
+
+    self.menuView = [[UIView alloc] initWithFrame:CGRectMake((scr.width - w) / 2.0, (scr.height - h) / 2.0, w, h)];
+    self.menuView.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.14 alpha:0.96];
+    self.menuView.layer.cornerRadius = 16;
+    self.menuView.layer.borderColor = [UIColor colorWithRed:0.4 green:0.2 blue:0.8 alpha:0.8].CGColor;
+    self.menuView.layer.borderWidth = 1.5;
+    self.menuView.layer.masksToBounds = YES;
+    self.menuView.hidden = YES;
+
+    // Header Bar
+    UIView *topBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 44)];
+    topBar.backgroundColor = [UIColor colorWithRed:0.14 green:0.14 blue:0.24 alpha:0.9];
+
+    UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(14, 0, w - 60, 44)];
+    titleLbl.text = @"🔮 MENU CHIÊU MỘ PROPHET";
+    titleLbl.font = [UIFont boldSystemFontOfSize:14];
+    titleLbl.textColor = [UIColor whiteColor];
+    [topBar addSubview:titleLbl];
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.frame = CGRectMake(w - 44, 0, 44, 44);
+    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    closeBtn.tintColor = [UIColor lightGrayColor];
+    [closeBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+    [topBar addSubview:closeBtn];
+
+    [self.menuView addSubview:topBar];
+
+    // Tab Segment
+    self.tabSegment = [[UISegmentedControl alloc] initWithItems:@[@"Chiêu Mộ Đặc Biệt", @"Extra (Tướng SS)"]];
+    self.tabSegment.frame = CGRectMake(12, 52, w - 24, 32);
+    self.tabSegment.selectedSegmentIndex = 0;
+    [self.tabSegment addTarget:self action:@selector(onTabChanged:) forControlEvents:UIControlEventValueChanged];
+    if (@available(iOS 13.0, *)) {
+        self.tabSegment.selectedSegmentTintColor = [UIColor colorWithRed:0.3 green:0.2 blue:0.7 alpha:1.0];
+        [self.tabSegment setTitleTextAttributes:@{NSForegroundColorAttributeName:[UIColor whiteColor], NSFontAttributeName:[UIFont boldSystemFontOfSize:12]} forState:UIControlStateSelected];
+        [self.tabSegment setTitleTextAttributes:@{NSForegroundColorAttributeName:[UIColor lightGrayColor], NSFontAttributeName:[UIFont systemFontOfSize:12]} forState:UIControlStateNormal];
+    }
+    [self.menuView addSubview:self.tabSegment];
+
+    CGFloat contentH = h - 94;
+    self.tabSummonView = [[UIView alloc] initWithFrame:CGRectMake(0, 90, w, contentH)];
+    self.tabExtraView  = [[UIView alloc] initWithFrame:CGRectMake(0, 90, w, contentH)];
+
+    [self.menuView addSubview:self.tabSummonView];
+    [self.menuView addSubview:self.tabExtraView];
+
+    [self.view addSubview:self.menuView];
 }
 
-// 2. dataTaskWithRequest:completionHandler:
-static NSURLSessionDataTask *(*orig_dtReqCb)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *)) = NULL;
-static NSURLSessionDataTask *hook_dtReqCb(id self, SEL _cmd, NSURLRequest *req,
-                                          void (^h)(NSData *, NSURLResponse *, NSError *)) {
-    @autoreleasepool { DumpURLRequest(@"HTTP-REQ", req); }
-    if (!h) {
-        return orig_dtReqCb ? orig_dtReqCb(self, _cmd, req, nil) : nil;
+- (void)onTabChanged:(UISegmentedControl *)seg {
+    [self switchTab:seg.selectedSegmentIndex];
+}
+
+- (void)switchTab:(NSInteger)idx {
+    self.tabSummonView.hidden = (idx != 0);
+    self.tabExtraView.hidden  = (idx != 1);
+    if (idx == 1 && !self.allHeroes.count) {
+        [self loadAllHeroesFromDb];
     }
-    void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        @autoreleasepool {
-            long status = 0;
-            if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
-                NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
-                status = (long)hr.statusCode;
-                AFLog(@"[HTTP-RESP] status=%ld url=%@ headers=%@", status, hr.URL.absoluteString, hr.allHeaderFields);
-            }
-            AFLog(@"[HTTP-RESP] len=%lu err=%@", (unsigned long)(data ? data.length : 0), err ?: @"nil");
-            if (data.length) {
-                AFLog(@"[HTTP-RESP] body.hex=%@", HexStr(data.bytes, data.length, MAX_HEX));
+}
+
+#pragma mark - Tab 1: Chiêu Mộ Đặc Biệt (Full 6 hệ)
+
+- (void)setupTabSummon {
+    CGFloat w = self.tabSummonView.bounds.size.width;
+
+    UILabel *headerLbl = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, w - 28, 20)];
+    headerLbl.text = @"CHỌN HỆ CHIÊU MỘ:";
+    headerLbl.font = [UIFont boldSystemFontOfSize:12];
+    headerLbl.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
+    [self.tabSummonView addSubview:headerLbl];
+
+    // ĐẦY ĐỦ TẤT CẢ 6 HỆ: 2 cột x 3 dòng
+    NSArray *factions = @[
+        @{@"name": @"AGI",   @"desc": @"Fortress/Tốc",  @"tag": @(FACTION_AGI),   @"col": [UIColor colorWithRed:0.1 green:0.6 blue:0.95 alpha:1]},
+        @{@"name": @"VIT",   @"desc": @"Forest/Thủ",    @"tag": @(FACTION_VIT),   @"col": [UIColor colorWithRed:0.15 green:0.75 blue:0.35 alpha:1]},
+        @{@"name": @"STR",   @"desc": @"Abyss/Công",    @"tag": @(FACTION_STR),   @"col": [UIColor colorWithRed:0.95 green:0.25 blue:0.2 alpha:1]},
+        @{@"name": @"DEX",   @"desc": @"Shadow/Khéo",   @"tag": @(FACTION_DEX),   @"col": [UIColor colorWithRed:0.65 green:0.25 blue:0.85 alpha:1]},
+        @{@"name": @"DARK",  @"desc": @"Bóng Đêm/Ám",   @"tag": @(FACTION_DARK),  @"col": [UIColor colorWithRed:0.35 green:0.35 blue:0.45 alpha:1]},
+        @{@"name": @"LIGHT", @"desc": @"Ánh Sáng/Quang",@"tag": @(FACTION_LIGHT), @"col": [UIColor colorWithRed:0.95 green:0.75 blue:0.1 alpha:1]},
+    ];
+
+    CGFloat btnW = (w - 38) / 2.0;
+    CGFloat btnH = 34;
+    for (int i = 0; i < factions.count; i++) {
+        NSDictionary *d = factions[i];
+        int row = i / 2;
+        int col = i % 2;
+        CGFloat x = 14 + col * (btnW + 10);
+        CGFloat y = 32 + row * (btnH + 6);
+
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.frame = CGRectMake(x, y, btnW, btnH);
+        btn.layer.cornerRadius = 8;
+        btn.layer.borderWidth = 1.0;
+        btn.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:1.0].CGColor;
+        btn.backgroundColor = [UIColor colorWithWhite:0.14 alpha:0.9];
+        btn.tag = [d[@"tag"] integerValue];
+
+        NSString *title = [NSString stringWithFormat:@"%@  (%@)", d[@"name"], d[@"desc"]];
+        [btn setTitle:title forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+
+        [btn addTarget:self action:@selector(onFactionBtnClicked:) forControlEvents:UIControlEventTouchUpInside];
+        [self.tabSummonView addSubview:btn];
+        [self.factionButtons addObject:btn];
+    }
+
+    [self updateFactionButtonsState];
+
+    // Stats Box
+    CGFloat statsY = 32 + 3 * (btnH + 6) + 8;
+    UIView *statsBox = [[UIView alloc] initWithFrame:CGRectMake(14, statsY, w - 28, 62)];
+    statsBox.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
+    statsBox.layer.cornerRadius = 10;
+    statsBox.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
+    statsBox.layer.borderWidth = 1.0;
+
+    self.summonCountLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, statsBox.bounds.size.width - 20, 26)];
+    self.summonCountLabel.text = @"Đã mở: 0 thùng";
+    self.summonCountLabel.font = [UIFont boldSystemFontOfSize:16];
+    self.summonCountLabel.textColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.7 alpha:1.0];
+    self.summonCountLabel.textAlignment = NSTextAlignmentCenter;
+    [statsBox addSubview:self.summonCountLabel];
+
+    UILabel *subStat = [[UILabel alloc] initWithFrame:CGRectMake(10, 34, statsBox.bounds.size.width - 20, 20)];
+    subStat.text = @"(Mỗi thùng = 10 quả cầu tiên tri)";
+    subStat.font = [UIFont systemFontOfSize:11];
+    subStat.textColor = [UIColor lightGrayColor];
+    subStat.textAlignment = NSTextAlignmentCenter;
+    [statsBox addSubview:subStat];
+
+    [self.tabSummonView addSubview:statsBox];
+
+    // Nút BẮT ĐẦU / DỪNG
+    CGFloat startY = statsY + 62 + 12;
+    self.startSummonBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.startSummonBtn.frame = CGRectMake(14, startY, w - 28, 46);
+    self.startSummonBtn.layer.cornerRadius = 12;
+    self.startSummonBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.72 blue:0.58 alpha:1.0];
+    [self.startSummonBtn setTitle:@"BẮT ĐẦU" forState:UIControlStateNormal];
+    self.startSummonBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [self.startSummonBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [self.startSummonBtn addTarget:self action:@selector(onStartSummonToggle) forControlEvents:UIControlEventTouchUpInside];
+
+    [self.tabSummonView addSubview:self.startSummonBtn];
+
+    // Nút Đặt lại bộ đếm
+    UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    resetBtn.frame = CGRectMake(14, startY + 46 + 6, w - 28, 26);
+    [resetBtn setTitle:@"Đặt lại bộ đếm" forState:UIControlStateNormal];
+    resetBtn.tintColor = [UIColor grayColor];
+    resetBtn.titleLabel.font = [UIFont systemFontOfSize:11];
+    [resetBtn addTarget:self action:@selector(resetSummonCount) forControlEvents:UIControlEventTouchUpInside];
+    [self.tabSummonView addSubview:resetBtn];
+}
+
+- (void)onFactionBtnClicked:(UIButton *)btn {
+    self.selectedFaction = (HeroFactionEnum)btn.tag;
+    [self updateFactionButtonsState];
+}
+
+- (void)updateFactionButtonsState {
+    for (UIButton *b in self.factionButtons) {
+        if (b.tag == self.selectedFaction) {
+            b.layer.borderColor = [UIColor cyanColor].CGColor;
+            b.layer.borderWidth = 2.0;
+            b.backgroundColor = [UIColor colorWithRed:0.2 green:0.28 blue:0.52 alpha:1.0];
+        } else {
+            b.layer.borderColor = [UIColor colorWithWhite:0.28 alpha:1.0].CGColor;
+            b.layer.borderWidth = 1.0;
+            b.backgroundColor = [UIColor colorWithWhite:0.14 alpha:0.9];
+        }
+    }
+}
+
+- (void)resetSummonCount {
+    self.summonBoxCount = 0;
+    self.summonCountLabel.text = @"Đã mở: 0 thùng";
+}
+
+- (void)onStartSummonToggle {
+    if (!gIsAutoSummoning) {
+        // Bắt đầu
+        gIsAutoSummoning = YES;
+        [self.startSummonBtn setTitle:@"DỪNG" forState:UIControlStateNormal];
+        self.startSummonBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.2 blue:0.2 alpha:1.0];
+
+        self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
+                                                            target:self
+                                                          selector:@selector(onSummonTimerTick)
+                                                          userInfo:nil
+                                                           repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:self.summonTimer forMode:NSRunLoopCommonModes];
+    } else {
+        // Dừng
+        gIsAutoSummoning = NO;
+        [self.summonTimer invalidate];
+        self.summonTimer = nil;
+        [self.startSummonBtn setTitle:@"BẮT ĐẦU" forState:UIControlStateNormal];
+        self.startSummonBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.72 blue:0.58 alpha:1.0];
+    }
+}
+
+- (void)onSummonTimerTick {
+    if (!gIsAutoSummoning || !gBase) return;
+
+    // GameContext.GetInstance() @ 0x14473AC
+    typedef void *(*GC_GetInstance_t)(void);
+    GC_GetInstance_t getGC = (GC_GetInstance_t)(gBase + OFF_GAME_CONTEXT_GET_INSTANCE);
+    void *gc = getGC ? getGC() : NULL;
+    if (!gc || (uintptr_t)gc < 0x100000000ULL) return;
+
+    // dataSender ở offset 0x1A0 (416 decimal)
+    void *dataSender = *(void **)((uint8_t *)gc + 0x1A0);
+    if (!dataSender || (uintptr_t)dataSender < 0x100000000ULL) return;
+
+    // DataSender.HeroProphetSummon(dataSender, faction, 10) @ 0x140437C
+    typedef void (*Summon_t)(void *, int, int);
+    Summon_t summon = (Summon_t)(gBase + OFF_HERO_PROPHET_SUMMON);
+    if (summon) {
+        summon(dataSender, (int)self.selectedFaction, 10);
+        self.summonBoxCount += 1;
+        self.summonCountLabel.text = [NSString stringWithFormat:@"Đã mở: %ld thùng", (long)self.summonBoxCount];
+    }
+}
+
+#pragma mark - Tab 2: Extra (Danh Sách Tướng SS)
+
+- (void)setupTabExtra {
+    CGFloat w = self.tabExtraView.bounds.size.width;
+    CGFloat h = self.tabExtraView.bounds.size.height;
+
+    // 1. Switch tìm nhân vật
+    UIView *switchBar = [[UIView alloc] initWithFrame:CGRectMake(12, 6, w - 24, 32)];
+    UILabel *swLbl = [[UILabel alloc] initWithFrame:CGRectMake(0, 4, 180, 24)];
+    swLbl.text = @"Tìm nhân vật:";
+    swLbl.font = [UIFont boldSystemFontOfSize:13];
+    swLbl.textColor = [UIColor whiteColor];
+    [switchBar addSubview:swLbl];
+
+    self.searchEnabledSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 24 - 55, 0, 50, 30)];
+    self.searchEnabledSwitch.on = YES;
+    [switchBar addSubview:self.searchEnabledSwitch];
+    [self.tabExtraView addSubview:switchBar];
+
+    // 2. Thanh tìm kiếm
+    self.searchField = [[UITextField alloc] initWithFrame:CGRectMake(12, 42, w - 24, 32)];
+    self.searchField.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
+    self.searchField.layer.cornerRadius = 8;
+    self.searchField.layer.borderColor = [UIColor grayColor].CGColor;
+    self.searchField.layer.borderWidth = 0.8;
+    self.searchField.textColor = [UIColor whiteColor];
+    self.searchField.font = [UIFont systemFontOfSize:12];
+    self.searchField.placeholder = @"🔍 Nhập tên tướng SS cần tìm...";
+    self.searchField.delegate = self;
+    self.searchField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    [self.searchField addTarget:self action:@selector(onSearchTextChanged:) forControlEvents:UIControlEventEditingChanged];
+
+    UIView *pad = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 32)];
+    self.searchField.leftView = pad;
+    self.searchField.leftViewMode = UITextFieldViewModeAlways;
+    [self.tabExtraView addSubview:self.searchField];
+
+    // 3. Label số tướng đã chọn
+    self.selectedCountLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 78, w - 24, 18)];
+    self.selectedCountLabel.text = @"Đã chọn: 0 tướng mục tiêu";
+    self.selectedCountLabel.font = [UIFont systemFontOfSize:11];
+    self.selectedCountLabel.textColor = [UIColor cyanColor];
+    [self.tabExtraView addSubview:self.selectedCountLabel];
+
+    // 4. Kết quả tìm kiếm rơi tướng
+    self.resultsTextView = [[UITextView alloc] initWithFrame:CGRectMake(12, 98, w - 24, 60)];
+    self.resultsTextView.backgroundColor = [UIColor colorWithRed:0.05 green:0.05 blue:0.1 alpha:0.95];
+    self.resultsTextView.layer.cornerRadius = 8;
+    self.resultsTextView.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:0.6 alpha:0.6].CGColor;
+    self.resultsTextView.layer.borderWidth = 1.0;
+    self.resultsTextView.textColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.4 alpha:1.0];
+    self.resultsTextView.font = [UIFont boldSystemFontOfSize:11];
+    self.resultsTextView.editable = NO;
+    self.resultsTextView.text = @"(Chưa có kết quả rơi tướng mục tiêu)";
+    [self.tabExtraView addSubview:self.resultsTextView];
+
+    // 5. TableView danh sách tướng
+    CGFloat tableY = 162;
+    CGFloat tableH = h - tableY - 8;
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(12, tableY, w - 24, tableH) style:UITableViewStylePlain];
+    self.tableView.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
+    self.tableView.layer.cornerRadius = 8;
+    self.tableView.layer.masksToBounds = YES;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    self.tableView.rowHeight = 36;
+    self.tableView.separatorColor = [UIColor colorWithWhite:0.25 alpha:1.0];
+    [self.tabExtraView addSubview:self.tableView];
+}
+
+- (void)onSearchTextChanged:(UITextField *)tf {
+    [self filterHeroes];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return YES;
+}
+
+#pragma mark - Database Loader
+
+- (void)loadAllHeroesFromDb {
+    if (!gBase) return;
+
+    // DbManager.GetInstance() @ 0x140C030
+    typedef void *(*Db_GetInstance_t)(void);
+    Db_GetInstance_t getDb = (Db_GetInstance_t)(gBase + OFF_DB_MANAGER_GET_INSTANCE);
+    void *db = getDb ? getDb() : NULL;
+    if (!db || (uintptr_t)db < 0x100000000ULL) return;
+
+    // m_ListHeroModel ở offset 0x38 (56 decimal)
+    void *list = *(void **)((uint8_t *)db + 0x38);
+    int32_t count = ILListSize(list);
+    if (count <= 0) return;
+
+    NSMutableSet<NSString *> *seen = [NSMutableSet new];
+    NSMutableArray<HeroItem *> *arr = [NSMutableArray new];
+
+    for (int i = 0; i < count; i++) {
+        void *hero = ILListAt(list, i);
+        if (!hero || (uintptr_t)hero < 0x100000000ULL) continue;
+
+        // m_Quality ở offset 0x60 (96 decimal): 6 = SS, 7 = SSR
+        int quality = *(int *)((uint8_t *)hero + 0x60);
+        if (quality < 6) continue;
+
+        // m_HeroName ở offset 0x28 (40 decimal)
+        void *namePtr = *(void **)((uint8_t *)hero + 0x28);
+        NSString *name = ILStr(namePtr);
+        if (!name.length) continue;
+
+        if ([seen containsObject:name]) continue;
+        [seen addObject:name];
+
+        int heroKey = *(int *)((uint8_t *)hero + 0x18);
+        int faction = *(int *)((uint8_t *)hero + 0x3C);
+
+        NSString *facTag = @"?";
+        switch (faction) {
+            case 1: facTag = @"Ám"; break;
+            case 2: facTag = @"Quang"; break;
+            case 3: facTag = @"DEX"; break;
+            case 4: facTag = @"AGI"; break;
+            case 5: facTag = @"VIT"; break;
+            case 6: facTag = @"STR"; break;
+        }
+
+        HeroItem *it = [HeroItem new];
+        it.heroKey = heroKey;
+        it.name = name;
+        it.quality = quality;
+        it.qualityTag = (quality >= 7) ? @"SSR" : @"SS";
+        it.faction = faction;
+        it.factionTag = facTag;
+        [arr addObject:it];
+    }
+
+    [arr sortUsingComparator:^NSComparisonResult(HeroItem *a, HeroItem *b) {
+        if (a.quality != b.quality) {
+            return (b.quality - a.quality);
+        }
+        return [a.name localizedCaseInsensitiveCompare:b.name];
+    }];
+
+    self.allHeroes = arr;
+    [self filterHeroes];
+}
+
+- (void)filterHeroes {
+    NSString *kw = [self.searchField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (!kw.length) {
+        self.filteredHeroes = [self.allHeroes copy];
+    } else {
+        NSPredicate *p = [NSPredicate predicateWithFormat:@"name CONTAINS[cd] %@", kw];
+        self.filteredHeroes = [self.allHeroes filteredArrayUsingPredicate:p];
+    }
+    [self.tableView reloadData];
+}
+
+#pragma mark - UITableViewDataSource / Delegate
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.filteredHeroes.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *cid = @"HeroCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:cid];
+        cell.backgroundColor = [UIColor clearColor];
+        cell.textLabel.font = [UIFont boldSystemFontOfSize:12];
+        cell.detailTextLabel.font = [UIFont boldSystemFontOfSize:10];
+    }
+
+    HeroItem *item = self.filteredHeroes[indexPath.row];
+    cell.textLabel.text = item.name;
+
+    if (item.quality >= 7) {
+        cell.textLabel.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.1 alpha:1.0]; // Vàng SSR
+        cell.detailTextLabel.textColor = [UIColor orangeColor];
+    } else {
+        cell.textLabel.textColor = [UIColor whiteColor]; // Trắng SS
+        cell.detailTextLabel.textColor = [UIColor colorWithRed:0.6 green:0.4 blue:0.9 alpha:1.0];
+    }
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"[%@] [%@]", item.qualityTag, item.factionTag];
+
+    if ([self.selectedHeroNames containsObject:item.name]) {
+        cell.accessoryType = UITableViewCellAccessoryCheckmark;
+        cell.tintColor = [UIColor cyanColor];
+    } else {
+        cell.accessoryType = UITableViewCellAccessoryNone;
+    }
+
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    HeroItem *item = self.filteredHeroes[indexPath.row];
+
+    if ([self.selectedHeroNames containsObject:item.name]) {
+        [self.selectedHeroNames removeObject:item.name];
+    } else {
+        [self.selectedHeroNames addObject:item.name];
+    }
+
+    self.selectedCountLabel.text = [NSString stringWithFormat:@"Đã chọn: %lu tướng mục tiêu", (unsigned long)self.selectedHeroNames.count];
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+#pragma mark - Xử lý tướng rơi ra khi summon
+
+- (void)handleDroppedHeroKey:(int)heroKey {
+    if (!gBase) return;
+
+    // Lấy tên tướng từ DbManager.GetHeroModel(heroKey) @ 0x140C0BC
+    typedef void *(*Db_GetInstance_t)(void);
+    Db_GetInstance_t getDb = (Db_GetInstance_t)(gBase + OFF_DB_MANAGER_GET_INSTANCE);
+    void *db = getDb ? getDb() : NULL;
+    if (!db) return;
+
+    typedef void *(*GetHero_t)(void *, int);
+    GetHero_t getHero = (GetHero_t)(gBase + OFF_DB_MANAGER_GET_HERO_MODEL);
+    void *hero = getHero ? getHero(db, heroKey) : NULL;
+    if (!hero || (uintptr_t)hero < 0x100000000ULL) return;
+
+    int quality = *(int *)((uint8_t *)hero + 0x60);
+    NSString *name = ILStr(*(void **)((uint8_t *)hero + 0x28));
+    if (!name.length) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BOOL isTarget = [self.selectedHeroNames containsObject:name];
+
+        if (self.searchEnabledSwitch.on) {
+            if (!isTarget) return;
+        } else {
+            if (quality < 6) return;
+        }
+
+        NSInteger cur = [self.heroDropCounts[name] integerValue];
+        self.heroDropCounts[name] = @(cur + 1);
+
+        [self updateResultsDisplay];
+    });
+}
+
+- (void)updateResultsDisplay {
+    if (!self.heroDropCounts.count) {
+        self.resultsTextView.text = @"(Chưa rơi tướng mục tiêu nào)";
+        return;
+    }
+
+    NSMutableString *s = [NSMutableString new];
+    for (NSString *name in self.heroDropCounts.allKeys) {
+        NSInteger c = [self.heroDropCounts[name] integerValue];
+        if (s.length) [s appendString:@"\n"];
+        [s appendFormat:@"%@: %ld", name, (long)c];
+    }
+    self.resultsTextView.text = s;
+}
+
+@end
+
+#pragma mark - Hooks
+
+static void (*orig_SetBonusModel)(void *, void *) = NULL;
+
+static void Hook_SetBonusModel(void *self, void *bonusModel) {
+    if (orig_SetBonusModel) orig_SetBonusModel(self, bonusModel);
+
+    // Đọc danh sách tướng nhận được trong BonusModel.m_LstBonusHero @ +0x10
+    if (bonusModel && (uintptr_t)bonusModel >= 0x100000000ULL) {
+        void *heroList = *(void **)((uint8_t *)bonusModel + 0x10);
+        int32_t count = ILListSize(heroList);
+        for (int i = 0; i < count; i++) {
+            void *bonusHero = ILListAt(heroList, i);
+            if (!bonusHero || (uintptr_t)bonusHero < 0x100000000ULL) continue;
+            int heroKey = *(int *)((uint8_t *)bonusHero + 0x14);
+            if (gMenuCtrl) {
+                [gMenuCtrl handleDroppedHeroKey:heroKey];
             }
         }
-        h(data, resp, err);
-    };
-    return orig_dtReqCb ? orig_dtReqCb(self, _cmd, req, wrapped) : nil;
-}
-
-// 3. uploadTaskWithRequest:fromData:
-static NSURLSessionUploadTask *(*orig_upData)(id, SEL, NSURLRequest *, NSData *) = NULL;
-static NSURLSessionUploadTask *hook_upData(id self, SEL _cmd, NSURLRequest *req, NSData *body) {
-    @autoreleasepool {
-        DumpURLRequest(@"HTTP-REQ", req);
-        AFLog(@"[HTTP-REQ] uploadFromData=%lu bytes", (unsigned long)body.length);
-        if (body.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(body.bytes, body.length, MAX_HEX));
     }
-    return orig_upData ? orig_upData(self, _cmd, req, body) : nil;
-}
 
-// 4. uploadTaskWithRequest:fromFile:
-static NSURLSessionUploadTask *(*orig_upFile)(id, SEL, NSURLRequest *, NSURL *) = NULL;
-static NSURLSessionUploadTask *hook_upFile(id self, SEL _cmd, NSURLRequest *req, NSURL *file) {
-    @autoreleasepool {
-        DumpURLRequest(@"HTTP-REQ", req);
-        AFLog(@"[HTTP-REQ] uploadFromFile=%@", file.path);
-        if (file) {
-            NSData *d = [NSData dataWithContentsOfURL:file];
-            if (d.length) AFLog(@"[HTTP-REQ] upload.hex=%@", HexStr(d.bytes, d.length, MAX_HEX));
+    // Nếu đang bật auto summon: tự động bấm nút đóng để game tiếp tục spam
+    if (gIsAutoSummoning && gBase) {
+        typedef void (*CloseClick_t)(void *);
+        CloseClick_t closeClick = (CloseClick_t)(gBase + OFF_POPUP_BONUS_CLOSE_CLICK);
+        if (closeClick && self) {
+            closeClick(self);
         }
     }
-    return orig_upFile ? orig_upFile(self, _cmd, req, file) : nil;
 }
 
-// 5. UnityNSURLSession delegate (nếu Unity có delegate riêng)
-static void (*orig_unity_didRecvData)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *) = NULL;
-static void hook_unity_didRecvData(id self, SEL _cmd, NSURLSession *s, NSURLSessionDataTask *t, NSData *d) {
-    if (d.length) AFLog(@"[UNITY-NET] recv len=%lu", (unsigned long)d.length);
-    if (orig_unity_didRecvData) orig_unity_didRecvData(self, _cmd, s, t, d);
+#pragma mark - UI Setup & Bootstrap
+
+static PassthroughWindow *gOverlayWindow = nil;
+
+static void SetupOverlayUI(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CGRect bounds = [UIScreen mainScreen].bounds;
+            if (@available(iOS 13.0, *)) {
+                UIWindowScene *scene = nil;
+                for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+                    if (s.activationState == UISceneActivationStateForegroundActive && [s isKindOfClass:[UIWindowScene class]]) {
+                        scene = (UIWindowScene *)s;
+                        break;
+                    }
+                }
+                if (scene) {
+                    gOverlayWindow = [[PassthroughWindow alloc] initWithWindowScene:scene];
+                } else {
+                    gOverlayWindow = [[PassthroughWindow alloc] initWithFrame:bounds];
+                }
+            } else {
+                gOverlayWindow = [[PassthroughWindow alloc] initWithFrame:bounds];
+            }
+
+            gOverlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
+            gOverlayWindow.backgroundColor = [UIColor clearColor];
+
+            gMenuCtrl = [FloatingMenuController new];
+            gOverlayWindow.rootViewController = gMenuCtrl;
+            gOverlayWindow.hidden = NO;
+        });
+    });
 }
-
-static void (*orig_unity_didRecvResp)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSURLResponse *, void (^)(NSInteger)) = NULL;
-static void hook_unity_didRecvResp(id self, SEL _cmd, NSURLSession *s, NSURLSessionDataTask *t, NSURLResponse *resp, void (^h)(NSInteger)) {
-    if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
-        NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
-        AFLog(@"[UNITY-NET] resp status=%ld url=%@", (long)hr.statusCode, hr.URL.absoluteString);
-    }
-    if (orig_unity_didRecvResp) orig_unity_didRecvResp(self, _cmd, s, t, resp, h);
-}
-
-static void (*orig_unity_didComplete)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *) = NULL;
-static void hook_unity_didComplete(id self, SEL _cmd, NSURLSession *s, NSURLSessionTask *t, NSError *err) {
-    if (err) AFLog(@"[UNITY-NET] complete err=%@", err.localizedDescription);
-    if (orig_unity_didComplete) orig_unity_didComplete(self, _cmd, s, t, err);
-}
-
-static void InstallNSURLSessionHooks(void) {
-    // Hook NSURLSession methods
-    Class cSession = objc_getClass("NSURLSession");
-    if (cSession) {
-        MSHookMessageEx(cSession, @selector(dataTaskWithRequest:),
-                        (IMP)hook_dtReq, (IMP *)&orig_dtReq);
-        MSHookMessageEx(cSession, @selector(dataTaskWithRequest:completionHandler:),
-                        (IMP)hook_dtReqCb, (IMP *)&orig_dtReqCb);
-        MSHookMessageEx(cSession, @selector(uploadTaskWithRequest:fromData:),
-                        (IMP)hook_upData, (IMP *)&orig_upData);
-        MSHookMessageEx(cSession, @selector(uploadTaskWithRequest:fromFile:),
-                        (IMP)hook_upFile, (IMP *)&orig_upFile);
-        AFLog(@"[INIT] NSURLSession hooks installed");
-    }
-
-    // Hook UnityNSURLSession nếu có
-    Class cUnity = objc_getClass("UnityNSURLSession");
-    if (cUnity) {
-        MSHookMessageEx(cUnity, @selector(URLSession:dataTask:didReceiveData:),
-                        (IMP)hook_unity_didRecvData, (IMP *)&orig_unity_didRecvData);
-        MSHookMessageEx(cUnity, @selector(URLSession:dataTask:didReceiveResponse:completionHandler:),
-                        (IMP)hook_unity_didRecvResp, (IMP *)&orig_unity_didRecvResp);
-        MSHookMessageEx(cUnity, @selector(URLSession:task:didCompleteWithError:),
-                        (IMP)hook_unity_didComplete, (IMP *)&orig_unity_didComplete);
-        AFLog(@"[INIT] UnityNSURLSession hooks installed");
-    }
-}
-
-#pragma mark - Dynamic UnityFramework loader detection
-
-static BOOL gHookedUnity = NO;
 
 static void InstallIl2CppHooks(uintptr_t base) {
-    if (gHookedUnity || !base) return;
-    gHookedUnity = YES;
+    static BOOL done = NO;
+    if (done || !base) return;
+    done = YES;
+    gBase = base;
 
-    AFLog(@"[INIT] Hooking UnityFramework base=0x%lx", (unsigned long)base);
-
-    MSHookFunction((void *)(base + OFF_SEND_PACKAGE), (void *)&Hook_SendPackage, (void **)&orig_SendPackage);
-    MSHookFunction((void *)(base + OFF_SELIALIZE),    (void *)&Hook_Selialize,    (void **)&orig_Selialize);
-    MSHookFunction((void *)(base + OFF_UPDATE_RECV),   (void *)&Hook_UpdateRecv,   (void **)&orig_UpdateRecv);
-    MSHookFunction((void *)(base + OFF_HTTPREQ_CTOR),  (void *)&Hook_HttpReqCtor,  (void **)&orig_HttpReqCtor);
-
-    AFLog(@"[INIT] il2cpp hooks OK");
+    MSHookFunction((void *)(base + OFF_POPUP_BONUS_SET_MODEL),
+                   (void *)&Hook_SetBonusModel,
+                   (void **)&orig_SetBonusModel);
 }
 
 static void OnImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
-    if (gHookedUnity) return;
     Dl_info info;
     if (dladdr(mh, &info) && info.dli_fname) {
         if (strstr(info.dli_fname, "UnityFramework")) {
@@ -431,17 +832,19 @@ static void OnImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
 #pragma mark - Constructor
 
 __attribute__((constructor))
-static void ArenaCaptureInit(void) {
+static void InitMod(void) {
     @autoreleasepool {
-        ResolveLogPath();
-        AFLog(@"[INIT] pid=%d log=%s", getpid(), gLogPath);
-
-        // Hook NSURLSession an toàn (không quét class, không đệ quy)
-        InstallNSURLSessionHooks();
-
-        // Đăng ký listener: hook UnityFramework dù được load trước hay sau
         _dyld_register_func_for_add_image(OnImageAdded);
 
-        AFLog(@"[INIT] ready");
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+            SetupOverlayUI();
+        }];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            SetupOverlayUI();
+        });
     }
 }
