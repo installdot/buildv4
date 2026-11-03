@@ -3,8 +3,8 @@
 // Tính năng:
 // 1. Nút tròn nổi (Floating Button) di chuyển tự do, chạm để bật/tắt menu.
 // 2. Chọn Faction: AGI, VIT, STR, DEX, DARK, LIGHT.
-// 3. Tùy chỉnh Delay (giây) tự do bằng ô nhập số.
-// 4. Tùy chỉnh Số call mỗi lần gọi (Burst summon: 1, 2, 5, 10, ...).
+// 3. Tùy chỉnh Delay (giây) tự do bằng ô nhập số (hỗ trợ cả dấu chấm '.' và phẩy ',').
+// 4. Mặc định spam gọi summon 10 thùng (Prophet Orb x10) trực tiếp qua DataSender.
 // 5. Nút Bắt đầu / Ngưng: gọi trực tiếp DataSender.HeroProphetSummon siêu tốc.
 // 6. Bộ đếm thời gian thực: Đã dùng X thùng (mỗi lần gọi +10 quả cầu).
 // 7. Tự động chặn và đóng sạch toàn bộ popup thưởng (PopupShowBonusEffect & 2).
@@ -69,9 +69,7 @@ static BOOL      gIsAutoSummoning = NO;
 
 // Settings
 @property (nonatomic, strong) UITextField *delayField;
-@property (nonatomic, strong) UITextField *burstField;
 @property (nonatomic, assign) NSTimeInterval summonDelay;
-@property (nonatomic, assign) NSInteger    callsPerBurst;
 
 // Stats
 @property (nonatomic, strong) UILabel     *counterLabel;
@@ -91,7 +89,6 @@ static BOOL      gIsAutoSummoning = NO;
 
     self.selectedFaction = FACTION_STR; // Mặc định STR
     self.summonDelay     = 0.35;        // Mặc định 0.35s
-    self.callsPerBurst   = 1;           // Mặc định 1 call / nhịp
     self.factionButtons  = [NSMutableArray new];
 
     [self setupFloatingButton];
@@ -181,8 +178,8 @@ static BOOL      gIsAutoSummoning = NO;
     CGFloat scrW = MAX(scr.width, scr.height);
     CGFloat scrH = MIN(scr.width, scr.height);
 
-    CGFloat w = 336;
-    CGFloat h = 266;
+    CGFloat w = 330;
+    CGFloat h = 256;
 
     self.menuView = [[UIView alloc] initWithFrame:CGRectMake((scrW - w) / 2.0, (scrH - h) / 2.0, w, h)];
     self.menuView.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.12 alpha:0.96];
@@ -256,28 +253,27 @@ static BOOL      gIsAutoSummoning = NO;
     }
     [self updateFactionButtonsState];
 
-    // 3. Settings: Delay & Số Call mỗi lần gọi (Ngang hàng)
-    CGFloat setY = 56 + 2 * (btnH + 4) + 6; // ~122
-    CGFloat halfW = (w - 24 - 8) / 2.0;
-
-    // Box Delay bên trái
-    UIView *delayBox = [[UIView alloc] initWithFrame:CGRectMake(12, setY, halfW, 30)];
+    // 3. Cài đặt Delay (giây) — Ô nhập số tự do
+    CGFloat setY = 56 + 2 * (btnH + 4) + 8; // ~124
+    UIView *delayBox = [[UIView alloc] initWithFrame:CGRectMake(12, setY, w - 24, 30)];
     delayBox.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
     delayBox.layer.cornerRadius = 6;
     delayBox.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
     delayBox.layer.borderWidth = 0.8;
 
-    UILabel *dLbl = [[UILabel alloc] initWithFrame:CGRectMake(6, 5, 46, 20)];
-    dLbl.text = @"Delay:";
-    dLbl.font = [UIFont boldSystemFontOfSize:10];
+    UILabel *dLbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 5, 110, 20)];
+    dLbl.text = @"⏱ Tốc độ Delay:";
+    dLbl.font = [UIFont boldSystemFontOfSize:11];
     dLbl.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
     [delayBox addSubview:dLbl];
 
-    self.delayField = [[UITextField alloc] initWithFrame:CGRectMake(54, 3, 56, 24)];
+    self.delayField = [[UITextField alloc] initWithFrame:CGRectMake(124, 3, 76, 24)];
     self.delayField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
     self.delayField.layer.cornerRadius = 4;
+    self.delayField.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:0.9 alpha:0.8].CGColor;
+    self.delayField.layer.borderWidth = 0.8;
     self.delayField.textColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:1.0];
-    self.delayField.font = [UIFont boldSystemFontOfSize:11];
+    self.delayField.font = [UIFont boldSystemFontOfSize:12];
     self.delayField.textAlignment = NSTextAlignmentCenter;
     self.delayField.keyboardType = UIKeyboardTypeDecimalPad;
     self.delayField.text = @"0.35";
@@ -286,64 +282,30 @@ static BOOL      gIsAutoSummoning = NO;
     [self attachDoneToolbarToField:self.delayField];
     [delayBox addSubview:self.delayField];
 
-    UILabel *dUnit = [[UILabel alloc] initWithFrame:CGRectMake(114, 5, 30, 20)];
-    dUnit.text = @"giây";
-    dUnit.font = [UIFont systemFontOfSize:9];
+    UILabel *dUnit = [[UILabel alloc] initWithFrame:CGRectMake(208, 5, 80, 20)];
+    dUnit.text = @"giây / lần";
+    dUnit.font = [UIFont systemFontOfSize:10];
     dUnit.textColor = [UIColor lightGrayColor];
     [delayBox addSubview:dUnit];
 
     [self.menuView addSubview:delayBox];
 
-    // Box Số Call bên phải
-    UIView *burstBox = [[UIView alloc] initWithFrame:CGRectMake(12 + halfW + 8, setY, halfW, 30)];
-    burstBox.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
-    burstBox.layer.cornerRadius = 6;
-    burstBox.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
-    burstBox.layer.borderWidth = 0.8;
-
-    UILabel *bLbl = [[UILabel alloc] initWithFrame:CGRectMake(6, 5, 48, 20)];
-    bLbl.text = @"Số call:";
-    bLbl.font = [UIFont boldSystemFontOfSize:10];
-    bLbl.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
-    [burstBox addSubview:bLbl];
-
-    self.burstField = [[UITextField alloc] initWithFrame:CGRectMake(56, 3, 48, 24)];
-    self.burstField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
-    self.burstField.layer.cornerRadius = 4;
-    self.burstField.textColor = [UIColor colorWithRed:0.3 green:1.0 blue:0.6 alpha:1.0];
-    self.burstField.font = [UIFont boldSystemFontOfSize:11];
-    self.burstField.textAlignment = NSTextAlignmentCenter;
-    self.burstField.keyboardType = UIKeyboardTypeNumberPad;
-    self.burstField.text = @"1";
-    self.burstField.delegate = self;
-    [self.burstField addTarget:self action:@selector(onBurstFieldChanged:) forControlEvents:UIControlEventEditingChanged];
-    [self attachDoneToolbarToField:self.burstField];
-    [burstBox addSubview:self.burstField];
-
-    UILabel *bUnit = [[UILabel alloc] initWithFrame:CGRectMake(108, 5, 36, 20)];
-    bUnit.text = @"lần/nhịp";
-    bUnit.font = [UIFont systemFontOfSize:9];
-    bUnit.textColor = [UIColor lightGrayColor];
-    [burstBox addSubview:bUnit];
-
-    [self.menuView addSubview:burstBox];
-
     // 4. Live Counter Box (Mỗi lần gọi +10 quả cầu)
-    CGFloat countY = setY + 30 + 8; // ~160
-    UIView *countBox = [[UIView alloc] initWithFrame:CGRectMake(12, countY, w - 24, 44)];
+    CGFloat countY = setY + 30 + 8; // ~162
+    UIView *countBox = [[UIView alloc] initWithFrame:CGRectMake(12, countY, w - 24, 42)];
     countBox.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.08 alpha:0.95];
     countBox.layer.cornerRadius = 8;
     countBox.layer.borderColor = [UIColor colorWithRed:0.0 green:0.75 blue:0.6 alpha:0.7].CGColor;
     countBox.layer.borderWidth = 1.0;
 
-    self.counterLabel = [[UILabel alloc] initWithFrame:CGRectMake(6, 4, countBox.bounds.size.width - 12, 22)];
+    self.counterLabel = [[UILabel alloc] initWithFrame:CGRectMake(6, 4, countBox.bounds.size.width - 12, 20)];
     self.counterLabel.text = @"ĐÃ DÙNG: 0 thùng (0 quả cầu)";
     self.counterLabel.font = [UIFont boldSystemFontOfSize:13];
     self.counterLabel.textColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.6 alpha:1.0];
     self.counterLabel.textAlignment = NSTextAlignmentCenter;
     [countBox addSubview:self.counterLabel];
 
-    UILabel *subCountLbl = [[UILabel alloc] initWithFrame:CGRectMake(6, 24, countBox.bounds.size.width - 12, 16)];
+    UILabel *subCountLbl = [[UILabel alloc] initWithFrame:CGRectMake(6, 22, countBox.bounds.size.width - 12, 16)];
     subCountLbl.text = @"(1 thùng = 10 quả cầu • Đã tự động chặn popup)";
     subCountLbl.font = [UIFont systemFontOfSize:9];
     subCountLbl.textColor = [UIColor lightGrayColor];
@@ -353,10 +315,10 @@ static BOOL      gIsAutoSummoning = NO;
     [self.menuView addSubview:countBox];
 
     // 5. Nút BẮT ĐẦU / NGƯNG & ĐẶT LẠI
-    CGFloat actY = countY + 44 + 8; // ~212
+    CGFloat actY = countY + 42 + 8; // ~212
     self.startBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.startBtn.frame = CGRectMake(12, actY, w - 24 - 88, 38);
-    self.startBtn.layer.cornerRadius = 9;
+    self.startBtn.frame = CGRectMake(12, actY, w - 24 - 84, 36);
+    self.startBtn.layer.cornerRadius = 8;
     self.startBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.72 blue:0.58 alpha:1.0];
     [self.startBtn setTitle:@"BẮT ĐẦU" forState:UIControlStateNormal];
     self.startBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
@@ -365,8 +327,8 @@ static BOOL      gIsAutoSummoning = NO;
     [self.menuView addSubview:self.startBtn];
 
     UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    resetBtn.frame = CGRectMake(w - 12 - 80, actY, 80, 38);
-    resetBtn.layer.cornerRadius = 9;
+    resetBtn.frame = CGRectMake(w - 12 - 76, actY, 76, 36);
+    resetBtn.layer.cornerRadius = 8;
     resetBtn.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
     resetBtn.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:1.0].CGColor;
     resetBtn.layer.borderWidth = 0.8;
@@ -419,13 +381,6 @@ static BOOL      gIsAutoSummoning = NO;
     }
 }
 
-- (void)onBurstFieldChanged:(UITextField *)tf {
-    NSInteger val = [tf.text integerValue];
-    if (val >= 1 && val <= 100) {
-        self.callsPerBurst = val;
-    }
-}
-
 - (void)onResetCount {
     self.summonBoxCount = 0;
     self.summonOrbCount = 0;
@@ -448,13 +403,10 @@ static BOOL      gIsAutoSummoning = NO;
 
 - (void)onStartToggle {
     if (!gIsAutoSummoning) {
-        // Đồng bộ lại cài đặt từ ô nhập số
+        // Đồng bộ lại cài đặt delay
         NSString *clean = [self.delayField.text stringByReplacingOccurrencesOfString:@"," withString:@"."];
         double dVal = [clean doubleValue];
         self.summonDelay = (dVal >= 0.01 && dVal <= 60.0) ? dVal : 0.35;
-
-        NSInteger bVal = [self.burstField.text integerValue];
-        self.callsPerBurst = (bVal >= 1 && bVal <= 100) ? bVal : 1;
 
         [self.view endEditing:YES];
 
@@ -490,19 +442,16 @@ static BOOL      gIsAutoSummoning = NO;
     void *dataSender = *(void **)((uint8_t *)gc + 0x1A0);
     if (!dataSender || (uintptr_t)dataSender < 0x100000000ULL) return;
 
-    // 3. Gọi DataSender.HeroProphetSummon siêu tốc @ 0x140437C
+    // 3. Gọi DataSender.HeroProphetSummon(dataSender, faction, 10) siêu tốc @ 0x140437C
     typedef void (*Summon_t)(void *, int, int);
     Summon_t summon = (Summon_t)(gBase + OFF_HERO_PROPHET_SUMMON);
     if (!summon) return;
 
-    NSInteger burst = (self.callsPerBurst >= 1) ? self.callsPerBurst : 1;
     int faction = (int)self.selectedFaction;
+    summon(dataSender, faction, 10); // Mỗi lần gọi mở 10 quả cầu
 
-    for (NSInteger i = 0; i < burst; i++) {
-        summon(dataSender, faction, 10);
-        self.summonBoxCount += 1;
-        self.summonOrbCount += 10;
-    }
+    self.summonBoxCount += 1;
+    self.summonOrbCount += 10;
 
     self.counterLabel.text = [NSString stringWithFormat:@"ĐÃ DÙNG: %ld thùng (%ld quả cầu)",
                               (long)self.summonBoxCount, (long)self.summonOrbCount];
