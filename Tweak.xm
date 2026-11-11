@@ -279,7 +279,7 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 20)];
     status.font = [UIFont systemFontOfSize:12];
     status.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
-    status.textAlignment = 1; // Center
+    status.textAlignment = NSTextAlignmentCenter;
     status.text = @"Status: Waiting for game...";
     self.statusLabel = status;
     [content addSubview:status];
