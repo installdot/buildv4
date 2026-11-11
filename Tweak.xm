@@ -57,14 +57,12 @@ static char g_diag[96] = "Status: Booting...";
 
 #pragma mark - Resolved Symbols
 
-static void *K_lpm, *K_camera, *K_playerCam, *K_player;
+static void *K_lpm, *K_camera, *K_player;
 static void *K_weaponProc;
 
 static void *M_lpmInstance;       // LocalPlayerManager::get_Instance()
-static void *M_fov;               // Camera::set_fieldOfView(float)
 static void *M_w2s;               // Camera::WorldToScreenPoint(Vector3)
 static void *M_camMain;           // Camera::get_main()
-static void *M_setFpCameraFov;    // PlayerCamera::SetFPCameraFieldOfView(float, float)
 static void *M_getTransform;      // Component::get_transform()
 static void *M_getPos;            // Transform::get_position()
 
@@ -96,23 +94,23 @@ static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action<uint
 //   PlayerCamera.m_RecoilAngles              0x58
 //   NetManagerBase.NetPlayerMap              0x18
 static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
-static size_t off_playerCam, off_recoilAngles;
+static size_t off_playerCam;
 
 static void *g_lcam = nullptr;
 
 #pragma mark - State
 
-static BOOL  g_norecoil = NO;
-static float g_fov = 0.0f;          // 0 = Default
 static BOOL  g_il2cppReady = NO;
 
 static BOOL  g_espOn = NO;
 static BOOL  g_silentAim = NO;
 static float g_aimFov = 35.0f;
+static BOOL  g_showAimFov = NO;
 static BOOL  g_bypassTutorial = YES;
 static BOOL  g_bypassRankLock = YES;
 
 static BOOL installSilentAim(void);   // defined below; installed lazily
+static BOOL g_fireDirPatched;
 
 static inline BOOL alive(void *obj) {
     return obj && off_cachedPtr && *(void **)((char *)obj + off_cachedPtr) != nullptr;
@@ -145,9 +143,20 @@ typedef struct {
 static EspTarget g_targets[MAX_TARGETS];
 static int g_targetCount = 0;
 
+static void scanPlayersImpl(void);
+
 static void scanPlayers(void) {
+    @try {
+        scanPlayersImpl();
+    } @catch (NSException *e) {
+        g_targetCount = 0;
+        NSLog(@"[MWM] scan: %@", e);
+    }
+}
+
+static void scanPlayersImpl(void) {
     g_targetCount = 0;
-    if (!MP(M_netInstance) || !off_netPlayerMap) return;
+    if (!g_il2cppReady || !MP(M_netInstance) || !off_netPlayerMap) return;
 
     // NetManagerBase is a plain managed class (not a UnityEngine.Object), so there is
     // no m_CachedPtr -- use a plain null check, never alive().
@@ -158,9 +167,18 @@ static void scanPlayers(void) {
     if (!dict) return;
 
     // Dictionary<ushort,NetPlayer>: buckets@0x10, entries@0x18, count@0x20
-    void **entries = (void **)readPtr(dict, 0x18);
+    // entries is an Il2CppArray OBJECT: klass@0, monitor@8, bounds@0x10,
+    // max_length@0x18, items@0x20. Reading items from +0 was the ESP/silent-aim crash.
+    void *entriesObj = readPtr(dict, 0x18);
+    if (!entriesObj) return;
     int count = *(int *)((char *)dict + 0x20);
-    if (!entries || count <= 0 || count > 512) return;
+    if (count <= 0 || count > 256) return;
+    size_t maxLength = *(size_t *)((char *)entriesObj + 0x18);
+    // The dictionary can be mutated by the network thread between the two reads
+    // above; a stale maxLength is exactly what turned ESP into a crash. Refuse to
+    // walk anything that does not look consistent.
+    if (maxLength == 0 || maxLength > 4096 || maxLength < (size_t)count) return;
+    char *entries = (char *)entriesObj + 0x20;          // inline item storage
 
     void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
     void *myPlayer = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
@@ -177,7 +195,7 @@ static void scanPlayers(void) {
     }
 
     for (int i = 0; i < count && g_targetCount < MAX_TARGETS; i++) {
-        char *e = (char *)entries + (size_t)i * 0x18;
+        char *e = entries + (size_t)i * 0x18;
         if (*(int *)e < 0) continue;            // empty slot
         void *np = readPtr(e, 0x10);            // TValue
         if (!np || !alive(np)) continue;        // NetPlayer is a NetworkBehaviour
@@ -270,7 +288,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 - (void)drawRect:(CGRect)rect {
     (void)rect;
-    if (!g_espOn || !g_targetCount || !MP(M_camMain)) return;
+    if ((!g_espOn && !g_showAimFov) || !MP(M_camMain)) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
 
@@ -278,9 +296,21 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     if (!alive(cam)) return;
 
     CGPoint snapOrigin = CGPointMake(ScreenW() * 0.5f, ScreenH());
+
+    // Silent-aim cone radius, mirrored from pickBestTargetHead() so what you see
+    // is exactly the radius the aim code searches inside.
+    if (g_showAimFov) {
+        CGFloat cx = ScreenW() * 0.5f;
+        CGFloat cy = ScreenH() * 0.5f;
+        CGFloat r = (g_aimFov / 90.0f) * cx;
+        CGContextSetLineWidth(ctx, 1.0f);
+        CGContextSetRGBStrokeColor(ctx, 1.0f, 0.4f, 0.9f, 0.85f);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(cx - r, cy - r, r * 2.0f, r * 2.0f));
+    }
+
     CGContextSetLineWidth(ctx, 1.2f);
 
-    for (int i = 0; i < g_targetCount; i++) {
+    for (int i = 0; g_espOn && i < g_targetCount; i++) {
         EspTarget *t = &g_targets[i];
         Vec3 headWorld = t->head;
         Vec3 feetWorld = { headWorld.x, headWorld.y - 1.70f, headWorld.z };
@@ -323,13 +353,11 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 @interface MWMMenuView : UIView
 @property (retain) UILabel *statusLabel;
-@property (retain) UISwitch *recoilSwitch;
 @property (retain) UISwitch *espSwitch;
 @property (retain) UISwitch *aimSwitch;
+@property (retain) UISwitch *aimFovShowSwitch;
 @property (retain) UISlider *aimFovSlider;
 @property (retain) UILabel *aimFovLabel;
-@property (retain) UISlider *fovSlider;
-@property (retain) UILabel *fovLabel;
 @end
 
 @implementation MWMMenuView
@@ -367,15 +395,13 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     [self addSubview:div];
     y += 12;
 
-    self.recoilSwitch = [self toggleAt:&y title:@"No Recoil" sel:@selector(recoilToggled:)];
     self.espSwitch = [self toggleAt:&y title:@"ESP (Box + Line + Dist)" sel:@selector(espToggled:)];
     self.aimSwitch = [self toggleAt:&y title:@"Silent Aim (Auto Head)" sel:@selector(aimToggled:)];
+    self.aimFovShowSwitch = [self toggleAt:&y title:@"Show Silent FOV" sel:@selector(aimFovShowToggled:)];
 
     self.aimFovLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov]];
     self.aimFovSlider = [self sliderAt:&y min:10 max:90 val:g_aimFov sel:@selector(aimFovChanged:)];
 
-    self.fovLabel = [self labelAt:&y text:g_fov > 0 ? [NSString stringWithFormat:@"Camera FOV: %d°", (int)g_fov] : @"Camera FOV: Default"];
-    self.fovSlider = [self sliderAt:&y min:60 max:120 val:g_fov > 0 ? g_fov : 90 sel:@selector(fovChanged:)];
 
     y += 8;
     UIButton *rst = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -438,24 +464,19 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     return sl;
 }
 
-- (void)recoilToggled:(UISwitch *)s { g_norecoil = s.isOn; }
 - (void)espToggled:(UISwitch *)s { g_espOn = s.isOn; }
+- (void)aimFovShowToggled:(UISwitch *)s { g_showAimFov = s.isOn; }
+
 - (void)aimToggled:(UISwitch *)s {
     g_silentAim = s.isOn;
-    if (g_silentAim && g_il2cppReady) installSilentAim();   // lazy: never at startup
 }
 - (void)aimFovChanged:(UISlider *)s {
     g_aimFov = s.value;
     self.aimFovLabel.text = [NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov];
 }
-- (void)fovChanged:(UISlider *)s {
-    g_fov = s.value;
-    self.fovLabel.text = [NSString stringWithFormat:@"Camera FOV: %d°", (int)g_fov];
-}
 - (void)resetTapped {
-    g_norecoil = NO; g_espOn = NO; g_silentAim = NO; g_fov = 0.0f;
-    self.recoilSwitch.on = NO; self.espSwitch.on = NO; self.aimSwitch.on = NO;
-    self.fovSlider.value = 90.0f; self.fovLabel.text = @"Camera FOV: Default";
+    g_espOn = NO; g_silentAim = NO; g_showAimFov = NO;
+    self.espSwitch.on = NO; self.aimSwitch.on = NO; self.aimFovShowSwitch.on = NO;
     self.aimFovSlider.value = 35.0f; self.aimFovLabel.text = @"Aim FOV: 35°";
 }
 - (void)closeTapped { self.hidden = YES; }
@@ -534,7 +555,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     }
 
     if (!self.menuView) {
-        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 120, 260, 380)];
+        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 120, 260, 340)];
         self.menuView.hidden = YES;
         [w addSubview:self.menuView];
     }
@@ -570,7 +591,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 }
 
 - (void)onFrame {
-    [self.espView setNeedsDisplay];
+    if (g_espOn || g_showAimFov) [self.espView setNeedsDisplay];
 
     if (!g_il2cppReady) {
         [self setStatus:g_diag color:[UIColor colorWithRed:1.0 green:0.55 blue:0.2 alpha:1.0]];
@@ -607,18 +628,14 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
     [self setStatus:"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
 
-    if (g_norecoil && off_recoilAngles)
-        *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){0.0f, 0.0f};
-
-    // FOV: FP camera component, then the real render camera (TPP + main).
-    if (g_fov > 0.0f) {
-        if (MP(M_setFpCameraFov))
-            ((void (*)(void *, float, float, void *))MP(M_setFpCameraFov))(g_lcam, g_fov, 0.0f, M_setFpCameraFov);
-
-        if (MP(M_camMain) && MP(M_fov)) {
-            void *mainCam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
-            if (alive(mainCam))
-                ((void (*)(void *, float, void *))MP(M_fov))(mainCam, g_fov, M_fov);
+    // Install the aim hook only once a match is running: hooking while the scene
+    // loads patches a function Unity may be mid-execution on, which crashed.
+    if (g_silentAim && !g_fireDirPatched && alive(g_lcam)) {
+        static double lastTry = 0;
+        double now = CFAbsoluteTimeGetCurrent();
+        if (now - lastTry > 1.0) {
+            lastTry = now;
+            installSilentAim();
         }
     }
 
@@ -748,7 +765,6 @@ static BOOL replaceMethod(void *mi, void *repl) {
 // ---------------------------------------------------------------------------
 // Silent aim. Requires a trampoline, so it only installs when ElleKit is present.
 // ---------------------------------------------------------------------------
-static BOOL g_fireDirPatched = NO;
 
 static BOOL installSilentAim(void) {
     void *fn = MP(M_fireDir);
@@ -780,7 +796,6 @@ static BOOL resolveIl2Cpp(void) {
     K_weaponProc      = i_class_from_name(game, "", "WeaponProcessBase");
 
     K_player    = i_class_from_name(game, "HQFPSTemplate", "Player");
-    K_playerCam = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
     K_lpm       = i_class_from_name(game, "", "LocalPlayerManager");
     K_camera    = i_class_from_name(core, "UnityEngine", "Camera");
 
@@ -789,13 +804,10 @@ static BOOL resolveIl2Cpp(void) {
     off_lpmPlayer    = fieldOff(K_lpm, "mLocalPlayer");       // 0x18
     off_playerType   = fieldOff(K_player, "LocalPlayerType"); // 0x4C8 (on Player)
     off_playerCam    = fieldOff(K_player, "_PlayerCamera");   // 0x4E8
-    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles"); // 0x58
 
     M_lpmInstance    = methodOf(K_lpm, "get_Instance", 0);
-    M_fov            = methodOf(K_camera, "set_fieldOfView", 1);
     M_w2s            = methodOf(K_camera, "WorldToScreenPoint", 1);
     M_camMain        = methodOf(K_camera, "get_main", 0);
-    M_setFpCameraFov = methodOf(K_playerCam, "SetFPCameraFieldOfView", 2);
 
     void *K_component = i_class_from_name(core, "UnityEngine", "Component");
     void *K_transform = i_class_from_name(core, "UnityEngine", "Transform");
@@ -841,8 +853,8 @@ static BOOL resolveIl2Cpp(void) {
         replaceMethod(M_checkFuncUnlock, (void *)&dummy_true_ic);    // bool (int, Action)
     }
 
-    NSLog(@"[MWM] armed hook=%d netMap=%zu fov=%p",
-          pMSHookFunction != nullptr, off_netPlayerMap, MP(M_fov));
+    NSLog(@"[MWM] armed hook=%d netMap=%zu",
+          pMSHookFunction != nullptr, off_netPlayerMap);
     snprintf(g_diag, sizeof(g_diag), "Status: Armed (hook=%s)",
              pMSHookFunction ? "yes" : "no");
     g_il2cppReady = YES;
