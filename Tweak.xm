@@ -259,20 +259,6 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     return shootData ? *(Vec3 *)((char *)shootData + 0x54) : (Vec3){0.0f, 0.0f, 1.0f};
 }
 
-#pragma mark - Overlay passthrough
-
-// Root view of the overlay window: only subviews that opt in receive touches,
-// everything else falls through to the game below.
-@interface MWMPassthroughView : UIView
-@end
-
-@implementation MWMPassthroughView
-- (UIView *)hitTest:(CGPoint)point withEvent:(id)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    return (hit == self) ? nil : hit;
-}
-@end
-
 #pragma mark - ESP Overlay
 
 @interface MWMEspView : UIView
@@ -484,7 +470,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 @interface MWMUIManager : NSObject
 + (instancetype)shared;
-@property (retain) UIWindow *overlay;
+@property (retain) UIWindow *host;
 @property (retain) UIButton *floatingBtn;
 @property (retain) MWMMenuView *menuView;
 @property (retain) MWMEspView *espView;
@@ -501,33 +487,34 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     return inst;
 }
 
-- (void)attachOverlay {
-    if (self.overlay) return;
-    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-    // Never reuse keyWindow: Unity recreates it, and it is frequently nil at
-    // inject time. Own a dedicated passthrough window pinned above the game.
-    UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    UIViewController *vc = [[UIViewController alloc] init];
-    // Passthrough root: keeps the game playable while the overlay is visible.
-    vc.view = [[MWMPassthroughView alloc] initWithFrame:w.bounds];
-    vc.view.backgroundColor = [UIColor clearColor];
-    w.rootViewController = vc;
-    w.windowLevel = 10000001.0;   // above Unity's window and alerts
-    w.hidden = NO;
-    self.overlay = w;
+// Host window: the game's own window. Creating a full-screen window of our own at a
+// high windowLevel swallowed every touch that hitTest returned nil for, which made
+// the game unplayable. Attaching to the existing window has no such side effect --
+// touches that miss our subviews go straight to Unity.
+- (UIWindow *)hostWindow {
+    UIWindow *w = [UIApplication sharedApplication].keyWindow;
+    if (w && !w.hidden) return w;
+
+    UIWindow *best = nil;
+    for (UIWindow *cand in [UIApplication sharedApplication].windows) {
+        if (cand.hidden) continue;
+        if (cand.windowLevel > 1.0) continue;      // skip alerts / status bar
+        if (!best || cand.windowLevel < best.windowLevel) best = cand;
+    }
+    return best;
 }
 
 - (void)setupUI {
-    [self attachOverlay];
-    UIWindow *w = self.overlay;
+    UIWindow *w = [self hostWindow];
     if (!w) return;
+    self.host = w;
 
     if (!self.espView) {
         self.espView = [[MWMEspView alloc] initWithFrame:w.bounds];
         self.espView.backgroundColor = [UIColor clearColor];
         self.espView.userInteractionEnabled = NO;
         self.espView.opaque = NO;
-        [w.rootViewController.view addSubview:self.espView];
+        [w addSubview:self.espView];
     }
 
     if (!self.floatingBtn) {
@@ -543,14 +530,22 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
         self.floatingBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
         [self.floatingBtn addTarget:self action:@selector(btnTapped) forControlEvents:UIControlEventTouchUpInside];
         [self.floatingBtn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(btnPanned:)]];
-        [w.rootViewController.view addSubview:self.floatingBtn];
+        [w addSubview:self.floatingBtn];
     }
 
     if (!self.menuView) {
         self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 120, 260, 380)];
         self.menuView.hidden = YES;
-        [w.rootViewController.view addSubview:self.menuView];
+        [w addSubview:self.menuView];
     }
+
+    // Unity may replace its window; move our views to the current one.
+    if (self.espView.superview != w) {
+        [w addSubview:self.espView];
+        [w addSubview:self.floatingBtn];
+        if (self.menuView) [w addSubview:self.menuView];
+    }
+    if (!CGRectEqualToRect(self.espView.frame, w.bounds)) self.espView.frame = w.bounds;
 
     if (!self.displayLink) {
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onFrame)];
@@ -883,7 +878,7 @@ static void pollUntilArmed(int attempt) {
         }
         // Keep going until the overlay exists: the app may still be inactive when
         // the first few ticks run, and a single early failure must not be final.
-        BOOL uiReady = [MWMUIManager shared].overlay != nil;
+        BOOL uiReady = [MWMUIManager shared].host != nil;
         if (!g_il2cppReady && attempt < 180) pollUntilArmed(attempt + 1);
         else if (!uiReady && attempt < 400) pollUntilArmed(attempt + 1);
     });
