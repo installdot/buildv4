@@ -1,23 +1,25 @@
 // Mini World : Royale (com.miniworldroyale.sparkgame)
-// TrollFools injected tweak with Native UIKit Floating Button & Menu Overlay.
-// NO Unity IMGUI, NO GameObject injection, NO OnGUI hooks.
-// Lobby-safe: automatically detects lobby state (ELocalPlayerType) and disables
-// all in-game mutations when in lobby to prevent crashes.
+// TrollFools injected tweak — Native UIKit floating button + menu.
+//
+// Design rules that make it crash-proof on every screen (splash, loading, lobby, match):
+//   * NO code patching at all (no MSHookFunction, no MethodInfo.methodPointer writes).
+//     Patching while the engine is streaming scenes is the main crash surface.
+//   * NO il2cpp_runtime_invoke for methods with value-type parameters: the runtime
+//     expects BOXED arguments there, a raw float*/int* is read as an Il2CppObject*
+//     and faults. Every call below goes straight to MethodInfo.methodPointer with
+//     the real native ABI (verified from the disassembly).
+//   * NO UnityEngine.Object.GetComponent while a scene may be streaming — only
+//     cached references are read out of managed memory, after an m_CachedPtr
+//     ("IsNativeObjectAlive") check.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <string.h>
 #import <stdio.h>
-#import <stdarg.h>
 #import <stdint.h>
 #import <unistd.h>
 #import <math.h>
-
-#pragma mark - Hooking Engine Detection
-
-typedef void (*mshook_t)(void *symbol, void *hook, void **old);
-static mshook_t g_mshook = nullptr;
 
 #pragma mark - il2cpp ABI
 
@@ -32,65 +34,72 @@ static void *(*i_class_from_name)(void *, const char *, const char *);
 static void *(*i_method_from_name)(void *, const char *, int);
 static void *(*i_field_from_name)(void *, const char *);
 static size_t (*i_field_offset)(void *);
-static void *(*i_object_unbox)(void *);
-static void *(*i_runtime_invoke)(void *, void *, void **, void **);
 
 static inline void *MP(void *mi) { return mi ? *(void **)mi : nullptr; }
-
-static void *callN(void *mi, void *obj, int argc, ...) {
-    if (!mi) return nullptr;
-    void *p[4] = {nullptr};
-    va_list ap; va_start(ap, argc);
-    for (int k = 0; k < argc && k < 4; k++) p[k] = va_arg(ap, void *);
-    va_end(ap);
-    void *exc = nullptr;
-    void *r = i_runtime_invoke(mi, obj, argc ? p : nullptr, &exc);
-    return exc ? nullptr : r;
-}
-#define call0(mi, obj)      callN(mi, obj, 0)
-#define call1(mi, obj, a)   callN(mi, obj, 1, (void *)(a))
 
 static void *methodOf(void *k, const char *n, int argc) {
     return k ? i_method_from_name(k, n, argc) : nullptr;
 }
+static size_t fieldOff(void *k, const char *n) {
+    void *f = (k && n) ? i_field_from_name(k, n) : nullptr;
+    return f ? i_field_offset(f) : 0;
+}
+// Plain managed field read. Safe: no native Unity object is touched.
+static inline void *readPtr(void *obj, size_t off) {
+    return (obj && off) ? *(void **)((char *)obj + off) : nullptr;
+}
 
 #pragma mark - Resolved Game Symbols
 
-static void *K_playerCam, *K_lpm, *K_propComp, *K_camera, *K_app;
-static void *M_getCamera, *M_getPropComp, *M_lpmInstance, *M_lpmLocal, *M_lpmType;
-static void *M_fpCamera, *M_forceAdd, *M_speedRate, *M_fov, *M_fps;
+static void *K_lpm, *K_camera, *K_app, *K_obfFloat, *K_playerCam;
 
-static void *O_forceAdd = nullptr;
-static void *O_speedRate = nullptr;
+static void *M_lpmInstance;      // LocalPlayerManager::get_Instance()  -> LPM object
+static void *M_fov;              // Camera::set_fieldOfView(float)
+static void *M_fps;              // Application::set_targetFrameRate(int)
+static void *M_obfCtor;          // ObscuredFloat::.ctor(float)
+static void *M_obfDecrypt;       // ObscuredFloat::InternalDecrypt() -> float
 
-static size_t off_recoilAngles = 0;
+static size_t off_cachedPtr;     // UnityEngine.Object::m_CachedPtr
+static size_t off_lpmPlayer;     // LocalPlayerManager::mLocalPlayer
+static size_t off_playerType;    // Player::LocalPlayerType
+static size_t off_playerCam;     // Player::_PlayerCamera
+static size_t off_camFp;         // PlayerCamera::m_FpCamera
+static size_t off_recoilAngles;  // PlayerCamera::m_RecoilAngles
+static size_t off_fwdSpeed;      // PlayerMovement::forwardSpeed  (ObscuredFloat)
+static size_t off_moveComp;      // Player::_PlayerMovement
 
-static void *g_lcam = nullptr;
-static void *g_lprop = nullptr;
+static void *g_lcam = nullptr;   // local PlayerCamera (alive only)
+static void *g_lmove = nullptr;  // local PlayerMovement (alive only)
 
 #pragma mark - Cheat State
 
 static BOOL  g_norecoil = NO;
 static float g_speed = 1.0f;
-static float g_fov = 0.0f;          // 0 = game default
+static float g_fov = 0.0f;
 static BOOL  g_il2cppReady = NO;
+static float g_baseSpeed = 0.f;  // pristine forwardSpeed, captured once
+static BOOL  g_speedApplied = NO;
 
-#pragma mark - Native Hooks
-
-static void hk_forceAdd(void *self, Vec2 v, void *mi) {
-    // Only suppress recoil on the active local player's camera in battle
-    if (g_norecoil && self && g_lcam && self == g_lcam) return;
-    ((void (*)(void *, Vec2, void *))O_forceAdd)(self, v, mi);
+static inline BOOL alive(void *obj) {
+    return obj && off_cachedPtr && *(void **)((char *)obj + off_cachedPtr) != nullptr;
 }
 
-static float hk_speedRate(void *self, bool withNoFov, void *mi) {
-    float r = ((float (*)(void *, bool, void *))O_speedRate)(self, withNoFov, mi);
-    // Only multiply speed on the active local player's property comp in battle
-    if (!g_speed || g_speed == 1.0f || !self || !g_lprop || self != g_lprop) return r;
-    return r * g_speed;
+#pragma mark - ObscuredFloat access (native ABI, no reflection)
+
+// float ObscuredFloat::InternalDecrypt(ObscuredFloat* this, MethodInfo*)
+static float obfRead(void *base, size_t off) {
+    void *mp = MP(M_obfDecrypt);
+    if (!base || !off || !mp) return 0.f;
+    return ((float (*)(void *, void *))mp)((char *)base + off, M_obfDecrypt);
+}
+// void ObscuredFloat::.ctor(ObscuredFloat* this, float value, MethodInfo*)  x0, s0, x1
+static void obfWrite(void *base, size_t off, float v) {
+    void *mp = MP(M_obfCtor);
+    if (!base || !off || !mp) return;
+    ((void (*)(void *, float, void *))mp)((char *)base + off, v, M_obfCtor);
 }
 
-#pragma mark - Native UIKit UI Components
+#pragma mark - Native UIKit UI
 
 @interface MWMFloatingButton : UIButton
 @property (nonatomic, assign) CGPoint lastPoint;
@@ -117,28 +126,23 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:btn action:@selector(handlePan:)];
     [btn addGestureRecognizer:pan];
     [btn addTarget:btn action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
-
     return btn;
 }
 
 - (void)handlePan:(UIPanGestureRecognizer *)pan {
     UIView *parent = self.superview;
     if (!parent) return;
-
     if (pan.state == UIGestureRecognizerStateBegan) {
         self.lastPoint = [pan translationInView:parent];
     } else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint delta = [pan translationInView:parent];
-        CGPoint newCenter = CGPointMake(self.center.x + (delta.x - self.lastPoint.x),
-                                        self.center.y + (delta.y - self.lastPoint.y));
-
-        CGFloat halfW = self.bounds.size.width / 2.0;
-        CGFloat halfH = self.bounds.size.height / 2.0;
-        newCenter.x = fmax(halfW + 5, fmin(parent.bounds.size.width - halfW - 5, newCenter.x));
-        newCenter.y = fmax(halfH + 20, fmin(parent.bounds.size.height - halfH - 20, newCenter.y));
-
-        self.center = newCenter;
-        self.lastPoint = delta;
+        CGPoint d = [pan translationInView:parent];
+        CGPoint c = CGPointMake(self.center.x + (d.x - self.lastPoint.x),
+                                self.center.y + (d.y - self.lastPoint.y));
+        CGFloat hw = self.bounds.size.width / 2.0, hh = self.bounds.size.height / 2.0;
+        c.x = fmax(hw + 5, fmin(parent.bounds.size.width - hw - 5, c.x));
+        c.y = fmax(hh + 20, fmin(parent.bounds.size.height - hh - 20, c.y));
+        self.center = c;
+        self.lastPoint = d;
     }
 }
 
@@ -151,6 +155,9 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *speedLabel;
 @property (nonatomic, strong) UILabel *fovLabel;
+@property (nonatomic, strong) UISlider *speedSlider;
+@property (nonatomic, strong) UISlider *fovSlider;
+@property (nonatomic, strong) UISwitch *recoilSwitch;
 @end
 
 @implementation MWMMenuView
@@ -177,14 +184,12 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     UIView *content = blurView.contentView;
     CGFloat w = self.bounds.size.width;
 
-    // Header Title
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 60, 24)];
     title.text = @"MINI WORLD ROYALE";
     title.font = [UIFont boldSystemFontOfSize:17];
     title.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
     [content addSubview:title];
 
-    // Close Button
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     closeBtn.frame = CGRectMake(w - 44, 8, 36, 30);
     [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
@@ -193,25 +198,33 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     [closeBtn addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:closeBtn];
 
-    // Separator
     UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(16, 42, w - 32, 1)];
     sep.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
     [content addSubview:sep];
 
     CGFloat y = 52;
-    CGFloat rowH = 38;
 
-    // Toggle: NO RECOIL
-    [self addToggleRowIn:content y:y title:@"No Recoil & Cam Kick" initial:g_norecoil tag:2];
-    y += rowH;
+    // No recoil
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, w - 80, 24)];
+    lbl.font = [UIFont boldSystemFontOfSize:14];
+    lbl.textColor = [UIColor whiteColor];
+    lbl.text = @"No Recoil & Cam Kick";
+    [content addSubview:lbl];
 
-    // Slider: SPEED
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, y, 51, 31)];
+    sw.on = g_norecoil;
+    [sw addTarget:self action:@selector(recoilChanged:) forControlEvents:UIControlEventValueChanged];
+    [content addSubview:sw];
+    self.recoilSwitch = sw;
+    y += 38;
+
+    // Speed
     UILabel *spLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 20)];
     spLbl.font = [UIFont boldSystemFontOfSize:13];
     spLbl.textColor = [UIColor whiteColor];
-    spLbl.text = [NSString stringWithFormat:@"Speed Multiplier: %.1fx", g_speed];
-    self.speedLabel = spLbl;
+    spLbl.text = [NSString stringWithFormat:@"Speed Multiplier: %.2fx", g_speed];
     [content addSubview:spLbl];
+    self.speedLabel = spLbl;
     y += 22;
 
     UISlider *spSlider = [[UISlider alloc] initWithFrame:CGRectMake(16, y, w - 32, 28)];
@@ -220,15 +233,17 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     spSlider.value = g_speed;
     [spSlider addTarget:self action:@selector(speedChanged:) forControlEvents:UIControlEventValueChanged];
     [content addSubview:spSlider];
+    self.speedSlider = spSlider;
     y += 32;
 
-    // Slider: FOV
+    // FOV
     UILabel *fvLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 20)];
     fvLbl.font = [UIFont boldSystemFontOfSize:13];
     fvLbl.textColor = [UIColor whiteColor];
-    fvLbl.text = [NSString stringWithFormat:@"Camera FOV: %d°", (int)(g_fov > 0 ? g_fov : 90)];
-    self.fovLabel = fvLbl;
+    fvLbl.text = g_fov > 0 ? [NSString stringWithFormat:@"Camera FOV: %d°", (int)g_fov]
+                           : @"Camera FOV: Default";
     [content addSubview:fvLbl];
+    self.fovLabel = fvLbl;
     y += 22;
 
     UISlider *fvSlider = [[UISlider alloc] initWithFrame:CGRectMake(16, y, w - 32, 28)];
@@ -237,9 +252,9 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     fvSlider.value = g_fov > 0 ? g_fov : 90.0f;
     [fvSlider addTarget:self action:@selector(fovChanged:) forControlEvents:UIControlEventValueChanged];
     [content addSubview:fvSlider];
+    self.fovSlider = fvSlider;
     y += 34;
 
-    // Button: 120 FPS
     UIButton *fpsBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     fpsBtn.frame = CGRectMake(16, y, (w - 40) / 2, 32);
     fpsBtn.backgroundColor = [UIColor colorWithRed:0.12 green:0.22 blue:0.32 alpha:0.8];
@@ -252,7 +267,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     [fpsBtn addTarget:self action:@selector(unlockFpsTapped) forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:fpsBtn];
 
-    // Button: Reset All
     UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeCustom];
     resetBtn.frame = CGRectMake(16 + (w - 40) / 2 + 8, y, (w - 40) / 2, 32);
     resetBtn.backgroundColor = [UIColor colorWithRed:0.25 green:0.10 blue:0.10 alpha:0.8];
@@ -266,41 +280,23 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     [content addSubview:resetBtn];
     y += 40;
 
-    // Status Label
     UILabel *status = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 20)];
     status.font = [UIFont systemFontOfSize:12];
     status.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
     status.textAlignment = NSTextAlignmentCenter;
     status.text = @"Status: Waiting for game...";
-    self.statusLabel = status;
     [content addSubview:status];
+    self.statusLabel = status;
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuPan:)];
     [self addGestureRecognizer:pan];
 }
 
-- (void)addToggleRowIn:(UIView *)content y:(CGFloat)y title:(NSString *)title initial:(BOOL)on tag:(NSInteger)tag {
-    CGFloat w = self.bounds.size.width;
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, w - 80, 24)];
-    lbl.font = [UIFont boldSystemFontOfSize:14];
-    lbl.textColor = [UIColor whiteColor];
-    lbl.text = title;
-    [content addSubview:lbl];
-
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, y, 51, 31)];
-    sw.on = on;
-    sw.tag = tag;
-    [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
-    [content addSubview:sw];
-}
-
-- (void)switchChanged:(UISwitch *)sw {
-    if (sw.tag == 2) g_norecoil = sw.isOn;
-}
+- (void)recoilChanged:(UISwitch *)sw { g_norecoil = sw.isOn; }
 
 - (void)speedChanged:(UISlider *)sl {
     g_speed = sl.value;
-    self.speedLabel.text = [NSString stringWithFormat:@"Speed Multiplier: %.1fx", g_speed];
+    self.speedLabel.text = [NSString stringWithFormat:@"Speed Multiplier: %.2fx", g_speed];
 }
 
 - (void)fovChanged:(UISlider *)sl {
@@ -309,45 +305,37 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 }
 
 - (void)unlockFpsTapped {
-    if (M_fps) {
-        int target = 120;
-        call1(M_fps, nullptr, &target);
-        self.statusLabel.text = @"FPS set to 120";
-    }
+    void *mp = MP(M_fps);
+    if (!mp) { self.statusLabel.text = @"FPS unlock unavailable"; return; }
+    ((void (*)(int, void *))mp)(120, M_fps);
+    self.statusLabel.text = @"FPS set to 120";
 }
 
 - (void)resetTapped {
     g_norecoil = NO;
     g_speed = 1.0f;
     g_fov = 0.0f;
-    self.speedLabel.text = @"Speed Multiplier: 1.0x";
+    self.recoilSwitch.on = NO;
+    self.speedSlider.value = 1.0f;
+    self.speedLabel.text = @"Speed Multiplier: 1.00x";
     self.fovLabel.text = @"Camera FOV: Default";
-    for (UIView *v in [self subviews]) {
-        for (UIView *sub in [v subviews]) {
-            if ([sub isKindOfClass:[UISwitch class]]) [(UISwitch *)sub setOn:NO animated:YES];
-            if ([sub isKindOfClass:[UISlider class]]) [(UISlider *)sub setValue:1.0f animated:YES];
-        }
-    }
 }
 
-- (void)closeTapped {
-    self.hidden = YES;
-}
+- (void)closeTapped { self.hidden = YES; }
 
 - (void)handleMenuPan:(UIPanGestureRecognizer *)pan {
     UIView *parent = self.superview;
     if (!parent) return;
     static CGPoint startCenter;
-    if (pan.state == UIGestureRecognizerStateBegan) {
-        startCenter = self.center;
-    } else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint delta = [pan translationInView:parent];
-        self.center = CGPointMake(startCenter.x + delta.x, startCenter.y + delta.y);
+    if (pan.state == UIGestureRecognizerStateBegan) startCenter = self.center;
+    else if (pan.state == UIGestureRecognizerStateChanged) {
+        CGPoint d = [pan translationInView:parent];
+        self.center = CGPointMake(startCenter.x + d.x, startCenter.y + d.y);
     }
 }
 @end
 
-#pragma mark - UI Manager Singleton
+#pragma mark - UI Manager
 
 @interface MWMUIManager : NSObject
 @property (nonatomic, strong) MWMFloatingButton *floatingButton;
@@ -379,17 +367,17 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
         __weak MWMUIManager *weakSelf = self;
         self.floatingButton.tapHandler = ^{
             weakSelf.menuView.hidden = !weakSelf.menuView.hidden;
-            if (!weakSelf.menuView.hidden) {
+            if (!weakSelf.menuView.hidden)
                 [weakSelf.menuView.superview bringSubviewToFront:weakSelf.menuView];
-            }
         };
         [window addSubview:self.floatingButton];
     }
 
     if (!self.menuView) {
         CGSize sz = window.bounds.size;
-        CGFloat mw = 320, mh = 275;
-        self.menuView = [MWMMenuView menuViewWithFrame:CGRectMake((sz.width - mw) / 2, (sz.height - mh) / 2, mw, mh)];
+        CGFloat mw = 320, mh = 285;
+        self.menuView = [MWMMenuView menuViewWithFrame:CGRectMake((sz.width - mw) / 2,
+                                                                 (sz.height - mh) / 2, mw, mh)];
         self.menuView.hidden = YES;
         [window addSubview:self.menuView];
     }
@@ -400,62 +388,82 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     }
 }
 
+- (void)setStatus:(NSString *)text color:(UIColor *)color {
+    if (!self.menuView || self.menuView.hidden) return;
+    self.menuView.statusLabel.text = text;
+    self.menuView.statusLabel.textColor = color;
+}
+
 - (void)onFrame {
     if (!g_il2cppReady) return;
 
-    // Check game state via LocalPlayerManager.LocalPlayerType (0x37B0B80)
-    // ELocalPlayerType: None = 0, Normal = 1, SavageFP = 2, SavageTP = 3, LobbyTP = 4, BRTP = 6...
-    int playerType = 0;
-    void *lpm = M_lpmInstance ? call0(M_lpmInstance, nullptr) : nullptr;
-    if (lpm && M_lpmType) {
-        void *res = call0(M_lpmType, lpm);
-        if (res) {
-            void *unboxed = i_object_unbox(res);
-            if (unboxed) playerType = *(int *)unboxed;
-        }
-    }
+    void *mp = MP(M_lpmInstance);
+    if (!mp) return;
 
-    // When in Lobby (4) or No Local Player (0): clear all pointers and DO NOT TOUCH CAMERA OR GAMEPLAY
-    if (playerType == 0 || playerType == 4) {
-        g_lcam = nullptr;
-        g_lprop = nullptr;
-        if (self.menuView && !self.menuView.hidden) {
-            self.menuView.statusLabel.text = @"Status: In Lobby";
-            self.menuView.statusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
-        }
+    // get_Instance (0x37B0A44) is a plain static getter that self-initialises the
+    // class, so it is safe to call from any point of the loading sequence.
+    void *lpm    = ((void *(*)(void *))mp)(M_lpmInstance);
+    void *player = readPtr(lpm, off_lpmPlayer);
+
+    if (!alive(player) || !off_playerType) {
+        g_lcam = nullptr; g_lmove = nullptr;
+        g_speedApplied = NO; g_baseSpeed = 0.f;
+        [self setStatus:@"Status: Lobby / Loading" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
 
-    // Active in battle
-    void *pl = (lpm && M_lpmLocal) ? call0(M_lpmLocal, lpm) : nullptr;
-    if (!pl) {
-        g_lcam = nullptr;
-        g_lprop = nullptr;
+    // ELocalPlayerType: None = 0, LobbyTP = 4 -> pure social scene, never touch gameplay.
+    int type = *(int *)((char *)player + off_playerType);
+    if (type == 0 || type == 4) {
+        g_lcam = nullptr; g_lmove = nullptr;
+        g_speedApplied = NO; g_baseSpeed = 0.f;
+        [self setStatus:@"Status: In Lobby" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
 
-    g_lcam  = (pl && M_getCamera)   ? call0(M_getCamera, pl)   : nullptr;
-    g_lprop = (pl && M_getPropComp) ? call0(M_getPropComp, pl) : nullptr;
+    void *cam  = readPtr(player, off_playerCam);
+    void *move = readPtr(player, off_moveComp);
+    g_lcam  = alive(cam)  ? cam  : nullptr;
+    g_lmove = alive(move) ? move : nullptr;
 
-    if (self.menuView && !self.menuView.hidden) {
-        self.menuView.statusLabel.text = @"Status: In-Game (Active)";
-        self.menuView.statusLabel.textColor = [UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0];
+    if (!g_lcam && !g_lmove) {
+        [self setStatus:@"Status: Loading Match..." color:[UIColor colorWithWhite:0.7 alpha:1.0]];
+        return;
     }
 
-    // Recoil zeroing (per frame on local camera in battle only)
-    if (g_norecoil && g_lcam && off_recoilAngles) {
+    [self setStatus:@"Status: In-Game (Active)"
+              color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
+
+    // --- No recoil: zero the camera's own recoil angle vector (managed write) ---
+    if (g_norecoil && g_lcam && off_recoilAngles)
         *(Vec2 *)((char *)g_lcam + off_recoilAngles) = Vec2{0.f, 0.f};
+
+    // --- Speed: rewrite PlayerMovement.forwardSpeed (ObscuredFloat) ---
+    // Only writes when the stored value actually differs, so the ObscuredCheatingDetector
+    // sees a consistent value instead of a per-frame rewrite.
+    if (g_lmove && off_fwdSpeed) {
+        float cur = obfRead(g_lmove, off_fwdSpeed);
+        if (g_speed > 1.0f) {
+            if (!g_speedApplied && cur > 0.f) { g_baseSpeed = cur; g_speedApplied = YES; }
+            if (g_speedApplied && g_baseSpeed > 0.f) {
+                float want = g_baseSpeed * g_speed;
+                if (fabsf(cur - want) > 0.001f) obfWrite(g_lmove, off_fwdSpeed, want);
+            }
+        } else if (g_speedApplied && g_baseSpeed > 0.f) {
+            if (fabsf(cur - g_baseSpeed) > 0.001f) obfWrite(g_lmove, off_fwdSpeed, g_baseSpeed);
+            g_speedApplied = NO;
+        }
     }
 
-    // FOV setting (per frame on local camera in battle only)
-    if (g_fov > 0.f && g_lcam && M_fpCamera && M_fov) {
-        void *cam = call0(M_fpCamera, g_lcam);
-        if (cam) call1(M_fov, cam, &g_fov);
+    // --- FOV: Camera::set_fieldOfView on the live first-person camera ---
+    if (g_fov > 0.f && g_lcam && MP(M_fov)) {
+        void *fp = readPtr(g_lcam, off_camFp);
+        if (alive(fp)) ((void (*)(void *, float, void *))MP(M_fov))(fp, g_fov, M_fov);
     }
 }
 @end
 
-#pragma mark - Safe IL2CPP Resolution
+#pragma mark - Resolution
 
 static void *findImage(const char *name) {
     size_t n = 0;
@@ -469,45 +477,9 @@ static void *findImage(const char *name) {
     return nullptr;
 }
 
-static void resolveIl2Cpp(void) {
-    void *game = findImage("Assembly-CSharp.dll");
-    void *core = findImage("UnityEngine.CoreModule.dll");
-    if (!game || !core) return;
+static BOOL g_apiResolved = NO;
 
-    void *K_player = i_class_from_name(game, "HQFPSTemplate", "Player");
-    K_playerCam    = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
-    K_lpm          = i_class_from_name(game, "", "LocalPlayerManager");
-    K_propComp     = i_class_from_name(game, "", "PlayerPropertyComp");
-    K_camera       = i_class_from_name(core, "UnityEngine", "Camera");
-    K_app          = i_class_from_name(core, "UnityEngine", "Application");
-
-    M_getCamera     = methodOf(K_player, "get_Camera", 0);
-    M_getPropComp   = methodOf(K_player, "get_PropertyComp", 0);
-    M_lpmInstance   = methodOf(K_lpm, "get_Instance", 0);
-    M_lpmLocal      = methodOf(K_lpm, "get_LocalPlayer", 0);
-    M_lpmType       = methodOf(K_lpm, "get_LocalPlayerType", 0);
-    M_fpCamera      = methodOf(K_playerCam, "GetFPCamera", 0);
-    M_forceAdd      = methodOf(K_playerCam, "AddForceAngle", 1);
-    M_speedRate     = methodOf(K_propComp, "GetSpeedRate", 1);
-    M_fov           = methodOf(K_camera, "set_fieldOfView", 1);
-    M_fps           = methodOf(K_app, "set_targetFrameRate", 1);
-
-    void *f = K_playerCam ? i_field_from_name(K_playerCam, "m_RecoilAngles") : nullptr;
-    off_recoilAngles = f ? i_field_offset(f) : 0;
-
-    // Install hooks only if MSHookFunction is provided by the injector/runtime
-    if (g_mshook) {
-        if (MP(M_forceAdd))  g_mshook(MP(M_forceAdd),  (void *)hk_forceAdd,  &O_forceAdd);
-        if (MP(M_speedRate)) g_mshook(MP(M_speedRate), (void *)hk_speedRate, &O_speedRate);
-    }
-
-    g_il2cppReady = YES;
-    NSLog(@"[MWM] IL2CPP ready! forceAdd=%p speed=%p recoilOff=0x%zx",
-          MP(M_forceAdd), MP(M_speedRate), off_recoilAngles);
-}
-
-static void initTweak(void) {
-    // 1. Resolve il2cpp API exports dynamically
+static BOOL resolveApi(void) {
     i_domain_get       = (void *(*)(void))dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
     i_thread_attach    = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_thread_attach");
     i_get_assemblies   = (void **(*)(void *, size_t *))dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
@@ -517,39 +489,86 @@ static void initTweak(void) {
     i_method_from_name = (void *(*)(void *, const char *, int))dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
     i_field_from_name  = (void *(*)(void *, const char *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
     i_field_offset     = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
-    i_object_unbox     = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
-    i_runtime_invoke   = (void *(*)(void *, void *, void **, void **))dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
 
-    g_mshook = (mshook_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!g_mshook) g_mshook = (mshook_t)dlsym(RTLD_DEFAULT, "MSHookFunctionUnsafe");
-
-    // 2. Setup native UIKit UI
-    [[MWMUIManager shared] setupUI];
-
-    // 3. Attach thread and resolve IL2CPP classes
-    if (i_domain_get) {
-        void *domain = i_domain_get();
-        if (domain && i_thread_attach) {
-            i_thread_attach(domain);
-            resolveIl2Cpp();
-        }
-    }
+    g_apiResolved = (i_domain_get && i_thread_attach && i_get_assemblies &&
+                     i_assembly_image && i_image_name && i_class_from_name &&
+                     i_method_from_name && i_field_from_name && i_field_offset);
+    if (!g_apiResolved) NSLog(@"[MWM] il2cpp exports missing");
+    return g_apiResolved;
 }
 
-#pragma mark - Safe Launch Trigger
+static BOOL resolveIl2Cpp(void) {
+    void *game = findImage("Assembly-CSharp.dll");
+    void *core = findImage("UnityEngine.CoreModule.dll");
+    if (!game || !core) return NO;
 
-static void onAppLaunched(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef info) {
-    // Delay 3.5s after launch to ensure Unity and window are 100% active
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        initTweak();
+    void *K_player = i_class_from_name(game, "HQFPSTemplate", "Player");
+    void *K_move   = i_class_from_name(game, "HQFPSTemplate", "PlayerMovement");
+    K_playerCam    = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
+    K_lpm          = i_class_from_name(game, "", "LocalPlayerManager");
+    K_camera       = i_class_from_name(core, "UnityEngine", "Camera");
+    K_app          = i_class_from_name(core, "UnityEngine", "Application");
+    K_obfFloat     = i_class_from_name(game, "CodeStage.AntiCheat.ObscuredTypes", "ObscuredFloat");
+    void *K_object = i_class_from_name(core, "UnityEngine", "Object");
+
+    M_lpmInstance = methodOf(K_lpm, "get_Instance", 0);
+    M_fov         = methodOf(K_camera, "set_fieldOfView", 1);
+    M_fps         = methodOf(K_app, "set_targetFrameRate", 1);
+    M_obfCtor     = methodOf(K_obfFloat, ".ctor", 1);
+    M_obfDecrypt  = methodOf(K_obfFloat, "InternalDecrypt", 0);
+
+    off_cachedPtr    = fieldOff(K_object, "m_CachedPtr");
+    off_lpmPlayer    = fieldOff(K_lpm, "mLocalPlayer");
+    off_playerType   = fieldOff(K_player, "LocalPlayerType");
+    off_playerCam    = fieldOff(K_player, "_PlayerCamera");
+    off_moveComp     = fieldOff(K_player, "_PlayerMovement");
+    off_camFp        = fieldOff(K_playerCam, "m_FpCamera");
+    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles");
+    off_fwdSpeed     = fieldOff(K_move, "forwardSpeed");
+
+    if (!off_cachedPtr || !off_lpmPlayer || !off_playerType || !off_playerCam ||
+        !off_camFp || !off_recoilAngles || !off_fwdSpeed || !MP(M_lpmInstance)) {
+        return NO;
+    }
+
+    g_il2cppReady = YES;
+    NSLog(@"[MWM] armed | cached=0x%zx lpm=0x%zx type=0x%zx cam=0x%zx move=0x%zx fp=0x%zx recoil=0x%zx fwd=0x%zx ctor=%p dec=%p",
+          off_cachedPtr, off_lpmPlayer, off_playerType, off_playerCam,
+          off_moveComp, off_camFp, off_recoilAngles, off_fwdSpeed,
+          MP(M_obfCtor), MP(M_obfDecrypt));
+    return YES;
+}
+
+static void tick(void) {
+    [[MWMUIManager shared] setupUI];
+
+    if (!g_apiResolved) resolveApi();
+    if (g_il2cppReady || !g_apiResolved) return;
+
+    void *domain = i_domain_get();
+    if (!domain) return;
+    i_thread_attach(domain);
+
+    if (resolveIl2Cpp()) NSLog(@"[MWM] ready");
+}
+
+#pragma mark - Launch
+
+static void pollUntilArmed(int attempt) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool { tick(); }
+        if (!g_il2cppReady && attempt < 180) pollUntilArmed(attempt + 1);
     });
 }
 
+static void onAppLaunched(CFNotificationCenterRef c, void *o, CFStringRef n,
+                          const void *obj, CFDictionaryRef info) {
+    pollUntilArmed(0);
+}
+
 __attribute__((constructor)) static void mwm_entry(void) {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(),
-                                    NULL,
-                                    &onAppLaunched,
+    CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL, &onAppLaunched,
                                     (__bridge CFStringRef)UIApplicationDidFinishLaunchingNotification,
-                                    NULL,
-                                    CFNotificationSuspensionBehaviorDrop);
+                                    NULL, CFNotificationSuspensionBehaviorDrop);
 }
