@@ -14,6 +14,7 @@
 #import <stdint.h>
 #import <unistd.h>
 #import <math.h>
+#import <sys/mman.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
 #import <mach/vm_region.h>
@@ -22,6 +23,11 @@
 
 typedef struct { float x, y; } Vec2;
 typedef struct { float x, y, z; } Vec3;
+
+static inline BOOL vec3Finite(Vec3 v) {
+    return v.x == v.x && v.y == v.y && v.z == v.z &&
+           fabsf(v.x) < 1e6f && fabsf(v.y) < 1e6f && fabsf(v.z) < 1e6f;
+}
 
 static inline CGFloat ScreenW(void) { return [UIScreen mainScreen].bounds.size.width; }
 static inline CGFloat ScreenH(void) { return [UIScreen mainScreen].bounds.size.height; }
@@ -37,6 +43,8 @@ static void *(*i_class_from_name)(void *, const char *, const char *);
 static void *(*i_method_from_name)(void *, const char *, int);
 static void *(*i_field_from_name)(void *, const char *);
 static size_t (*i_field_offset)(void *);
+
+extern void sys_icache_invalidate(void *start, size_t len);
 
 static inline void *MP(void *mi) { return mi ? *(void **)mi : nullptr; }
 
@@ -58,13 +66,13 @@ static char g_diag[96] = "Status: Booting...";
 #pragma mark - Resolved Symbols
 
 static void *K_lpm, *K_camera, *K_player;
-static void *K_weaponProc;
 
 static void *M_lpmInstance;       // LocalPlayerManager::get_Instance()
 static void *M_w2s;               // Camera::WorldToScreenPoint(Vector3)
 static void *M_camMain;           // Camera::get_main()
 static void *M_getTransform;      // Component::get_transform()
 static void *M_getPos;            // Transform::get_position()
+static void *M_setLookAngles;     // PlayerCamera::set_LookAngles(Vector2)
 
 // ESP / Aim
 static void *M_netInstance;       // NetManager::get_Instance()
@@ -77,8 +85,6 @@ static size_t off_bindNetId;      // LocalPlayerManager.curBindNetPlayerId
 static size_t off_netPlayerMap;
 
 // Silent aim
-static void *M_fireDir;           // WeaponProcessBase::computerFireDirection
-static void *O_computerFireDirection = nullptr;
 
 // Bypasses
 static void *M_guideInit;         // BattleGuideManager::Init()
@@ -111,14 +117,10 @@ static BOOL  g_showAimFov = NO;
 // Cached every frame by onFrame() on the main thread. The fire hook must never call
 // into Unity/il2cpp: doing so from inside the weapon-fire path re-enters the physics
 // update and crashed the game 1-2s after enabling silent aim.
-static Vec3  g_aimHead = {0.0f, 0.0f, 0.0f};
-static volatile BOOL g_aimHeadValid = NO;
-static volatile uint16_t g_myNetId = 0;   // written by scanPlayers, read by the hook
+static volatile uint16_t g_myNetId = 0;   // written by scanPlayers
 static BOOL  g_bypassTutorial = YES;
 static BOOL  g_bypassRankLock = YES;
 
-static BOOL installSilentAim(void);   // defined below; installed at arm time
-static BOOL g_fireDirPatched;
 
 static inline BOOL alive(void *obj) {
     return obj && off_cachedPtr && *(void **)((char *)obj + off_cachedPtr) != nullptr;
@@ -297,49 +299,30 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
     return found;
 }
 
-// Runs on the game's fire path, once per bullet/pellet.
-//
-// Rules learned from the "crash on trigger pull" report:
-//   * ALWAYS run the original body. Skipping it left shootData in a state the
-//     caller then fed to Physics.RaycastNonAlloc, which is what killed the process.
-//   * NEVER write into shootData. Only the returned direction is consumed by both
-//     callers (computerVirtualBullet reads s0-s2, computerEntityBullet forwards it).
-//   * Reject non-finite vectors. g_aimHead is published from another thread and a
-//     torn 12-byte read yields NaN, and a NaN ray direction crashes Unity physics.
-static inline BOOL vec3Finite(Vec3 v) {
-    return v.x == v.x && v.y == v.y && v.z == v.z &&
-           fabsf(v.x) < 1e6f && fabsf(v.y) < 1e6f && fabsf(v.z) < 1e6f;
-}
+// Turn the player camera toward `head` via PlayerCamera.set_LookAngles(Vector2).
+// Pitch/yaw are derived in the same convention the game uses: yaw 0 = +Z, and
+// look angles are (x = pitch, y = yaw) in degrees.
+static void aimAt(Vec3 head) {
+    if (!alive(g_lcam) || !MP(M_setLookAngles) || !MP(M_getTransform) || !MP(M_getPos))
+        return;
 
-static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) {
-    Vec3 dir = { 0.0f, 0.0f, 1.0f };
+    void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(g_lcam, M_getTransform);
+    if (!alive(tr)) return;
+    Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
+    if (!vec3Finite(eye)) return;
 
-    // The hook is only ever installed when a usable trampoline exists, so this
-    // branch is always taken. If it is not, returning a fabricated vector would
-    // hand the caller a direction the original never produced -> crash on fire.
-    if (!O_computerFireDirection) return dir;
+    float dx = head.x - eye.x;
+    float dy = head.y - eye.y;
+    float dz = head.z - eye.z;
+    float horiz = sqrtf(dx * dx + dz * dz);
+    if (!(horiz > 0.01f)) return;
 
-    // Original first, unconditionally: identical side effects every time.
-    dir = ((Vec3 (*)(void *, void *, void *))O_computerFireDirection)(self, shootData, method);
+    Vec2 angles;
+    angles.x = -atan2f(dy, horiz) * (180.0f / 3.14159265f);   // pitch
+    angles.y = atan2f(dx, dz) * (180.0f / 3.14159265f);       // yaw
+    if (angles.x != angles.x || angles.y != angles.y) return;
 
-    if (!shootData) return dir;
-    if (!g_silentAim || !g_aimHeadValid) return dir;
-    if (!vec3Finite(dir)) return (Vec3){ 0.0f, 0.0f, 1.0f };
-
-    // Only steer OUR bullets: ModelShotData.shooterId at +0x4.
-    uint16_t shooter = *(uint16_t *)((char *)shootData + 0x4);
-    if (!g_myNetId || shooter != g_myNetId) return dir;
-
-    Vec3 head = g_aimHead;
-    Vec3 sp = *(Vec3 *)((char *)shootData + 0x48);   // shootPos
-    if (!vec3Finite(head) || !vec3Finite(sp)) return dir;
-
-    Vec3 aimed = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
-    float len = sqrtf(aimed.x * aimed.x + aimed.y * aimed.y + aimed.z * aimed.z);
-    if (!(len > 0.01f) || len != len || len > 1e6f) return dir;
-
-    aimed.x /= len; aimed.y /= len; aimed.z /= len;
-    return aimed;                      // return only -- no write into shootData
+    ((void (*)(void *, Vec2, void *))MP(M_setLookAngles))(g_lcam, angles, M_setLookAngles);
 }
 
 #pragma mark - ESP Overlay
@@ -657,7 +640,6 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 - (void)onFrame {
     if (g_espOn || g_showAimFov) [self.espView setNeedsDisplay];
-    g_aimHeadValid = NO;   // re-set below only while a target is actually visible
 
     if (!g_il2cppReady) {
         [self setStatus:g_diag color:[UIColor colorWithRed:1.0 green:0.55 blue:0.2 alpha:1.0]];
@@ -674,7 +656,6 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
     if (!alive(player)) {
         g_lcam = nullptr;
-        g_aimHeadValid = NO;
         g_myNetId = 0;
         [self setStatus:"Status: Lobby / Loading" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
@@ -683,7 +664,6 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     int type = off_playerType ? *(int *)((char *)player + off_playerType) : 1;
     if (type == 0 || type == 4) {
         g_lcam = nullptr;
-        g_aimHeadValid = NO;
         [self setStatus:"Status: In Lobby" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
@@ -691,7 +671,6 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     void *cam = readPtr(player, off_playerCam);
     g_lcam = alive(cam) ? cam : nullptr;
     if (!g_lcam) {
-        g_aimHeadValid = NO;
         [self setStatus:"Status: Loading Match..." color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
@@ -700,14 +679,12 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
     if (g_espOn || g_silentAim) scanPlayers();
 
-    // Publish the aim point for the fire hook. All Unity calls stay on this thread.
-    g_aimHeadValid = NO;              // publish gate: invalid while we mutate
+    // Aim: rotate the player camera toward the chosen head. This runs on the main
+    // thread from a CADisplayLink, exactly like a finger drag, so the game's own
+    // rotation path produces the shot direction -- no code patching involved.
     if (g_silentAim && g_targetCount > 0) {
         Vec3 head;
-        if (pickBestTargetHead(&head) && vec3Finite(head)) {
-            g_aimHead = head;
-            g_aimHeadValid = YES;     // only now is the snapshot readable
-        }
+        if (pickBestTargetHead(&head) && vec3Finite(head)) aimAt(head);
     }
 }
 @end
@@ -747,37 +724,6 @@ static BOOL resolveApi(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Hook provider.
-// NO in-place __TEXT patching: TrollFools/TrollStore builds are ad-hoc signed, and
-// vm_protect()+memcpy on a code page gets the process killed by the codesign
-// monitor the moment the page is executed. Only two safe mechanisms are used:
-//   1. MSHookFunction (ElleKit, shipped inside the TrollFools injection) for the
-//      one hook that needs a trampoline.
-//   2. MethodInfo->methodPointer replacement for plain return-value overrides.
-//      That is a write to writable il2cpp metadata, never to executable pages.
-// Anything unavailable is skipped: a missing feature must never be a crash.
-// ---------------------------------------------------------------------------
-static void (*pMSHookFunction)(void *, void *, void **) = nullptr;
-
-static void resolveHookProvider(void) {
-    static const char *libs[] = {
-        NULL,
-        "@executable_path/Frameworks/libellekit.dylib",
-        "@executable_path/libellekit.dylib",
-        "@executable_path/Frameworks/libsubstrate.dylib",
-        "/usr/lib/libellekit.dylib",
-        "/usr/lib/libsubstrate.dylib",
-        "/usr/lib/libhooker.dylib",
-        "/usr/lib/libsubstitute.dylib",
-    };
-    for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]) && !pMSHookFunction; i++) {
-        if (libs[i]) dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
-        pMSHookFunction = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
-    }
-    NSLog(@"[MWM] hook provider: %s", pMSHookFunction ? "yes" : "no");
-}
-
-// ---------------------------------------------------------------------------
 // MethodInfo replacement (writable metadata only, no code patching).
 // Takes effect for virtual / delegate / reflection dispatch. A direct BL call
 // inside the same assembly still reaches the original body -- the feature then
@@ -792,20 +738,6 @@ static bool dummy_true_ic(int32_t a, void *cb, void *mi) { (void)a; (void)cb; (v
 // Executable pages are never touched: vm_protect()+write on __TEXT makes the
 // codesign monitor kill the process on the next page-in. A skipped patch is a
 // disabled feature; a bad patch is a crash.
-static BOOL addrIsExecutable(void *addr) {
-    if (!addr || (uintptr_t)addr < 0x1000) return NO;
-    vm_address_t q = (vm_address_t)addr;
-    vm_size_t qsize = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr = vm_region_64(mach_task_self(), &q, &qsize, VM_REGION_BASIC_INFO_64,
-                                    (vm_region_info_t)&info, &count, &obj);
-    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-    if (kr != KERN_SUCCESS) return NO;
-    return (info.protection & VM_PROT_EXECUTE) != 0;
-}
-
 static BOOL safeWritePtr(void *addr, void *value) {
     if (!addr) return NO;
 
@@ -845,35 +777,6 @@ static BOOL replaceMethod(void *mi, void *repl) {
     return safeWritePtr(mi, repl);   // MethodInfo.methodPointer is field 0
 }
 
-// ---------------------------------------------------------------------------
-// Silent aim. Requires a trampoline, so it only installs when ElleKit is present.
-// ---------------------------------------------------------------------------
-
-static BOOL installSilentAim(void) {
-    void *fn = MP(M_fireDir);
-    if (!fn || g_fireDirPatched) return g_fireDirPatched;
-    if (!pMSHookFunction) {
-        NSLog(@"[MWM] silent aim skipped: no MSHookFunction");
-        return NO;
-    }
-    pMSHookFunction(fn, (void *)&hk_computerFireDirection, (void **)&O_computerFireDirection);
-
-    // A hook library that is not really a hook library hands back the original
-    // address (or garbage) as the "trampoline". Calling it re-enters the patched
-    // entry and recurses until the stack dies -- which is exactly "crash on fire".
-    void *tramp = O_computerFireDirection;
-    if (tramp == fn || !addrIsExecutable(tramp)) {
-        NSLog(@"[MWM] fireDir trampoline rejected: %p (fn=%p)", tramp, fn);
-        O_computerFireDirection = nullptr;
-    }
-    g_fireDirPatched = (O_computerFireDirection != nullptr);
-    if (!g_fireDirPatched) {
-        NSLog(@"[MWM] silent aim disabled: unusable trampoline");
-        return NO;
-    }
-    return YES;
-}
-
 static BOOL resolveIl2Cpp(void) {
     void *game = findImage("Assembly-CSharp.dll");
     void *core = findImage("UnityEngine.CoreModule.dll");
@@ -888,7 +791,6 @@ static BOOL resolveIl2Cpp(void) {
     // il2cpp_class_get_field_from_name only sees fields declared on the class itself,
     // so NetPlayerMap must be looked up on its declaring class NetManagerBase.
     void *K_netMgrBase = i_class_from_name(game, "WildWest.NetControllers", "NetManagerBase");
-    K_weaponProc      = i_class_from_name(game, "", "WeaponProcessBase");
 
     K_player    = i_class_from_name(game, "HQFPSTemplate", "Player");
     K_lpm       = i_class_from_name(game, "", "LocalPlayerManager");
@@ -918,7 +820,6 @@ static BOOL resolveIl2Cpp(void) {
     off_bindNetId  = fieldOff(K_lpm, "curBindNetPlayerId");
     off_netPlayerMap = fieldOff(K_netMgrBase, "NetPlayerMap"); // 0x18
 
-    M_fireDir = methodOf(K_weaponProc, "computerFireDirection", 1);
 
     void *K_sceneHelper = i_class_from_name(game, "", "LogicSceneHelper");
     void *K_guideMgr    = i_class_from_name(game, "", "BattleGuideManager");
@@ -937,13 +838,9 @@ static BOOL resolveIl2Cpp(void) {
     if (!MP(M_lpmInstance)) { snprintf(g_diag, sizeof(g_diag), "Status: no get_Instance"); return NO; }
     if (!MP(M_w2s) || !MP(M_camMain)) { snprintf(g_diag, sizeof(g_diag), "Status: no Camera API"); return NO; }
 
-    resolveHookProvider();
-
-    // Install the fire hook HERE, while still in the lobby. In a match the game
-    // thread is inside computerFireDirection constantly (bots shoot), and patching
-    // its first bytes under a running thread is what crashed 2-3s after enabling.
-    // The body is inert until g_silentAim is set, so arming early costs nothing.
-    BOOL aimOk = installSilentAim();
+    // Aim turns the player camera through its own setter -- no code patching, no hook.
+    void *K_playerCam = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
+    M_setLookAngles = methodOf(K_playerCam, "set_LookAngles", 1);
 
     if (g_bypassTutorial) {
         replaceMethod(M_guideInit, (void *)&dummy_ret);              // Init(): no step machine
@@ -955,10 +852,8 @@ static BOOL resolveIl2Cpp(void) {
         replaceMethod(M_checkFuncUnlock, (void *)&dummy_true_ic);    // bool (int, Action)
     }
 
-    NSLog(@"[MWM] armed hook=%d aim=%d netMap=%zu",
-          pMSHookFunction != nullptr, aimOk, off_netPlayerMap);
-    snprintf(g_diag, sizeof(g_diag), "Status: Armed (hook=%s aim=%s)",
-             pMSHookFunction ? "yes" : "no", aimOk ? "yes" : "no");
+    NSLog(@"[MWM] armed netMap=%zu", off_netPlayerMap);
+    snprintf(g_diag, sizeof(g_diag), "Status: Armed");
     g_il2cppReady = YES;
     return YES;
 }
