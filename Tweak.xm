@@ -1,6 +1,8 @@
 // Mini World : Royale (com.miniworldroyale.sparkgame)
 // TrollFools injected tweak with Native UIKit Floating Button & Menu Overlay.
-// NO Unity IMGUI, NO GameObject injection, NO OnGUI hooks -> Completely Crash-Proof.
+// NO Unity IMGUI, NO GameObject injection, NO OnGUI hooks.
+// Lobby-safe: automatically detects lobby state (ELocalPlayerType) and disables
+// all in-game mutations when in lobby to prevent crashes.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -30,6 +32,7 @@ static void *(*i_class_from_name)(void *, const char *, const char *);
 static void *(*i_method_from_name)(void *, const char *, int);
 static void *(*i_field_from_name)(void *, const char *);
 static size_t (*i_field_offset)(void *);
+static void *(*i_object_unbox)(void *);
 static void *(*i_runtime_invoke)(void *, void *, void **, void **);
 
 static inline void *MP(void *mi) { return mi ? *(void **)mi : nullptr; }
@@ -53,23 +56,20 @@ static void *methodOf(void *k, const char *n, int argc) {
 
 #pragma mark - Resolved Game Symbols
 
-static void *K_playerCam, *K_dmgPlayer, *K_lpm, *K_propComp, *K_camera, *K_app;
-static void *M_getCamera, *M_getDamageable, *M_getPropComp, *M_lpmInstance, *M_lpmLocal;
-static void *M_fpCamera, *M_forceAdd, *M_canDamage, *M_speedRate, *M_fov, *M_fps;
+static void *K_playerCam, *K_lpm, *K_propComp, *K_camera, *K_app;
+static void *M_getCamera, *M_getPropComp, *M_lpmInstance, *M_lpmLocal, *M_lpmType;
+static void *M_fpCamera, *M_forceAdd, *M_speedRate, *M_fov, *M_fps;
 
 static void *O_forceAdd = nullptr;
-static void *O_canDamage = nullptr;
 static void *O_speedRate = nullptr;
 
 static size_t off_recoilAngles = 0;
 
 static void *g_lcam = nullptr;
-static void *g_ldmg = nullptr;
 static void *g_lprop = nullptr;
 
 #pragma mark - Cheat State
 
-static BOOL  g_god = NO;
 static BOOL  g_norecoil = NO;
 static float g_speed = 1.0f;
 static float g_fov = 0.0f;          // 0 = game default
@@ -78,18 +78,15 @@ static BOOL  g_il2cppReady = NO;
 #pragma mark - Native Hooks
 
 static void hk_forceAdd(void *self, Vec2 v, void *mi) {
-    if (g_norecoil && self && self == g_lcam) return;
+    // Only suppress recoil on the active local player's camera in battle
+    if (g_norecoil && self && g_lcam && self == g_lcam) return;
     ((void (*)(void *, Vec2, void *))O_forceAdd)(self, v, mi);
-}
-
-static bool hk_canDamage(void *self, uint64_t lo, uint64_t hi, void *mi) {
-    if (g_god && self && self == g_ldmg) return false;
-    return ((bool (*)(void *, uint64_t, uint64_t, void *))O_canDamage)(self, lo, hi, mi);
 }
 
 static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     float r = ((float (*)(void *, bool, void *))O_speedRate)(self, withNoFov, mi);
-    if (!g_speed || g_speed == 1.0f || !self || self != g_lprop) return r;
+    // Only multiply speed on the active local player's property comp in battle
+    if (!g_speed || g_speed == 1.0f || !self || !g_lprop || self != g_lprop) return r;
     return r * g_speed;
 }
 
@@ -135,7 +132,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
         CGPoint newCenter = CGPointMake(self.center.x + (delta.x - self.lastPoint.x),
                                         self.center.y + (delta.y - self.lastPoint.y));
 
-        // Clamp to screen edges
         CGFloat halfW = self.bounds.size.width / 2.0;
         CGFloat halfH = self.bounds.size.height / 2.0;
         newCenter.x = fmax(halfW + 5, fmin(parent.bounds.size.width - halfW - 5, newCenter.x));
@@ -169,7 +165,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     self.layer.cornerRadius = 16;
     self.layer.masksToBounds = YES;
 
-    // Dark Blur Background
     UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     UIVisualEffectView *blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
     blurView.frame = self.bounds;
@@ -205,10 +200,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 
     CGFloat y = 52;
     CGFloat rowH = 38;
-
-    // Toggle: GOD MODE
-    [self addToggleRowIn:content y:y title:@"God Mode (Invincible)" initial:g_god tag:1];
-    y += rowH;
 
     // Toggle: NO RECOIL
     [self addToggleRowIn:content y:y title:@"No Recoil & Cam Kick" initial:g_norecoil tag:2];
@@ -284,7 +275,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
     self.statusLabel = status;
     [content addSubview:status];
 
-    // Enable dragging on header
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuPan:)];
     [self addGestureRecognizer:pan];
 }
@@ -305,7 +295,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 }
 
 - (void)switchChanged:(UISwitch *)sw {
-    if (sw.tag == 1) g_god = sw.isOn;
     if (sw.tag == 2) g_norecoil = sw.isOn;
 }
 
@@ -328,7 +317,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 }
 
 - (void)resetTapped {
-    g_god = NO;
     g_norecoil = NO;
     g_speed = 1.0f;
     g_fov = 0.0f;
@@ -380,7 +368,6 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 - (void)setupUI {
     UIWindow *window = [UIApplication sharedApplication].keyWindow;
     if (!window) {
-        // Fallback for scene-based iOS 13+
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
             if (w.isKeyWindow) { window = w; break; }
         }
@@ -401,7 +388,7 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 
     if (!self.menuView) {
         CGSize sz = window.bounds.size;
-        CGFloat mw = 320, mh = 310;
+        CGFloat mw = 320, mh = 275;
         self.menuView = [MWMMenuView menuViewWithFrame:CGRectMake((sz.width - mw) / 2, (sz.height - mh) / 2, mw, mh)];
         self.menuView.hidden = YES;
         [window addSubview:self.menuView];
@@ -416,32 +403,51 @@ static float hk_speedRate(void *self, bool withNoFov, void *mi) {
 - (void)onFrame {
     if (!g_il2cppReady) return;
 
-    // Per-frame player refresh
-    if (M_lpmInstance && M_lpmLocal) {
-        void *lpm = call0(M_lpmInstance, nullptr);
-        void *pl  = lpm ? call0(M_lpmLocal, lpm) : nullptr;
-        g_lcam  = (pl && M_getCamera)     ? call0(M_getCamera, pl)     : nullptr;
-        g_ldmg  = (pl && M_getDamageable) ? call0(M_getDamageable, pl) : nullptr;
-        g_lprop = (pl && M_getPropComp)   ? call0(M_getPropComp, pl)   : nullptr;
-    }
-
-    // Update status indicator
-    if (self.menuView && !self.menuView.hidden) {
-        if (g_lprop || g_lcam) {
-            self.menuView.statusLabel.text = @"Status: In-Game (Player Active)";
-            self.menuView.statusLabel.textColor = [UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0];
-        } else {
-            self.menuView.statusLabel.text = @"Status: In Lobby / Waiting for Match";
-            self.menuView.statusLabel.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    // Check game state via LocalPlayerManager.LocalPlayerType (0x37B0B80)
+    // ELocalPlayerType: None = 0, Normal = 1, SavageFP = 2, SavageTP = 3, LobbyTP = 4, BRTP = 6...
+    int playerType = 0;
+    void *lpm = M_lpmInstance ? call0(M_lpmInstance, nullptr) : nullptr;
+    if (lpm && M_lpmType) {
+        void *res = call0(M_lpmType, lpm);
+        if (res) {
+            void *unboxed = i_object_unbox(res);
+            if (unboxed) playerType = *(int *)unboxed;
         }
     }
 
-    // Recoil zeroing (per frame on local camera)
+    // When in Lobby (4) or No Local Player (0): clear all pointers and DO NOT TOUCH CAMERA OR GAMEPLAY
+    if (playerType == 0 || playerType == 4) {
+        g_lcam = nullptr;
+        g_lprop = nullptr;
+        if (self.menuView && !self.menuView.hidden) {
+            self.menuView.statusLabel.text = @"Status: In Lobby";
+            self.menuView.statusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
+        }
+        return;
+    }
+
+    // Active in battle
+    void *pl = (lpm && M_lpmLocal) ? call0(M_lpmLocal, lpm) : nullptr;
+    if (!pl) {
+        g_lcam = nullptr;
+        g_lprop = nullptr;
+        return;
+    }
+
+    g_lcam  = (pl && M_getCamera)   ? call0(M_getCamera, pl)   : nullptr;
+    g_lprop = (pl && M_getPropComp) ? call0(M_getPropComp, pl) : nullptr;
+
+    if (self.menuView && !self.menuView.hidden) {
+        self.menuView.statusLabel.text = @"Status: In-Game (Active)";
+        self.menuView.statusLabel.textColor = [UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0];
+    }
+
+    // Recoil zeroing (per frame on local camera in battle only)
     if (g_norecoil && g_lcam && off_recoilAngles) {
         *(Vec2 *)((char *)g_lcam + off_recoilAngles) = Vec2{0.f, 0.f};
     }
 
-    // FOV setting
+    // FOV setting (per frame on local camera in battle only)
     if (g_fov > 0.f && g_lcam && M_fpCamera && M_fov) {
         void *cam = call0(M_fpCamera, g_lcam);
         if (cam) call1(M_fov, cam, &g_fov);
@@ -470,20 +476,18 @@ static void resolveIl2Cpp(void) {
 
     void *K_player = i_class_from_name(game, "HQFPSTemplate", "Player");
     K_playerCam    = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
-    K_dmgPlayer    = i_class_from_name(game, "", "DamageablePlayer");
     K_lpm          = i_class_from_name(game, "", "LocalPlayerManager");
     K_propComp     = i_class_from_name(game, "", "PlayerPropertyComp");
     K_camera       = i_class_from_name(core, "UnityEngine", "Camera");
     K_app          = i_class_from_name(core, "UnityEngine", "Application");
 
     M_getCamera     = methodOf(K_player, "get_Camera", 0);
-    M_getDamageable = methodOf(K_player, "get_DamageablePlayer", 0);
     M_getPropComp   = methodOf(K_player, "get_PropertyComp", 0);
     M_lpmInstance   = methodOf(K_lpm, "get_Instance", 0);
     M_lpmLocal      = methodOf(K_lpm, "get_LocalPlayer", 0);
+    M_lpmType       = methodOf(K_lpm, "get_LocalPlayerType", 0);
     M_fpCamera      = methodOf(K_playerCam, "GetFPCamera", 0);
     M_forceAdd      = methodOf(K_playerCam, "AddForceAngle", 1);
-    M_canDamage     = methodOf(K_dmgPlayer, "CheckCanDamage", 1);
     M_speedRate     = methodOf(K_propComp, "GetSpeedRate", 1);
     M_fov           = methodOf(K_camera, "set_fieldOfView", 1);
     M_fps           = methodOf(K_app, "set_targetFrameRate", 1);
@@ -493,14 +497,13 @@ static void resolveIl2Cpp(void) {
 
     // Install hooks only if MSHookFunction is provided by the injector/runtime
     if (g_mshook) {
-        if (MP(M_canDamage)) g_mshook(MP(M_canDamage), (void *)hk_canDamage, &O_canDamage);
         if (MP(M_forceAdd))  g_mshook(MP(M_forceAdd),  (void *)hk_forceAdd,  &O_forceAdd);
         if (MP(M_speedRate)) g_mshook(MP(M_speedRate), (void *)hk_speedRate, &O_speedRate);
     }
 
     g_il2cppReady = YES;
-    NSLog(@"[MWM] IL2CPP ready! hooks=(%p,%p,%p) recoilOff=0x%zx",
-          MP(M_canDamage), MP(M_forceAdd), MP(M_speedRate), off_recoilAngles);
+    NSLog(@"[MWM] IL2CPP ready! forceAdd=%p speed=%p recoilOff=0x%zx",
+          MP(M_forceAdd), MP(M_speedRate), off_recoilAngles);
 }
 
 static void initTweak(void) {
@@ -514,6 +517,7 @@ static void initTweak(void) {
     i_method_from_name = (void *(*)(void *, const char *, int))dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
     i_field_from_name  = (void *(*)(void *, const char *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
     i_field_offset     = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
+    i_object_unbox     = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
     i_runtime_invoke   = (void *(*)(void *, void *, void **, void **))dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
 
     g_mshook = (mshook_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
