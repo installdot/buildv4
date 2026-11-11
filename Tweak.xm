@@ -63,6 +63,8 @@ static inline void *readPtr(void *obj, size_t off) {
 
 static char g_diag[96] = "Status: Booting...";
 
+static BOOL safeWritePtr(void *addr, void *value);   // defined in the patch section
+
 #pragma mark - Resolved Symbols
 
 static void *K_lpm, *K_camera, *K_player;
@@ -72,7 +74,7 @@ static void *M_w2s;               // Camera::WorldToScreenPoint(Vector3)
 static void *M_camMain;           // Camera::get_main()
 static void *M_getTransform;      // Component::get_transform()
 static void *M_getPos;            // Transform::get_position()
-static void *M_setLookAngles;     // PlayerCamera::set_LookAngles(Vector2)
+static void *M_createShootData;   // ProjectileWeapon::CreateShootData(bool)
 
 // ESP / Aim
 static void *M_netInstance;       // NetManager::get_Instance()
@@ -118,6 +120,14 @@ static BOOL  g_showAimFov = NO;
 // into Unity/il2cpp: doing so from inside the weapon-fire path re-enters the physics
 // update and crashed the game 1-2s after enabling silent aim.
 static volatile uint16_t g_myNetId = 0;   // written by scanPlayers
+static Vec3  g_aimHead = {0.0f, 0.0f, 0.0f};
+static volatile BOOL g_aimHeadValid = NO;
+static BOOL  g_aimHookOk = NO;            // true once CreateShootData is swapped
+
+// Original compiled body, saved before the MethodInfo swap. Calling it is a plain
+// C call -- no trampoline, no code patching, which is exactly what MSHookFunction
+// could not provide on this TrollFools build.
+static void *O_createShootData = nullptr;
 static BOOL  g_bypassTutorial = YES;
 static BOOL  g_bypassRankLock = YES;
 
@@ -299,30 +309,100 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
     return found;
 }
 
-// Turn the player camera toward `head` via PlayerCamera.set_LookAngles(Vector2).
-// Pitch/yaw are derived in the same convention the game uses: yaw 0 = +Z, and
-// look angles are (x = pitch, y = yaw) in degrees.
-static void aimAt(Vec3 head) {
-    if (!alive(g_lcam) || !MP(M_setLookAngles) || !MP(M_getTransform) || !MP(M_getPos))
-        return;
+// ---------------------------------------------------------------------------
+// Silent aim via il2cpp MethodInfo swap.
+//
+// CreateShootData() has data-only xrefs (0x85a9220 / 0x85a9228), i.e. the game
+// dispatches it through the class vtable. So replacing the compiled pointer works
+// and -- unlike an inline hook -- needs no trampoline: the original body is still a
+// plain callable C function whose address we saved before the swap.
+//
+// ABI: ModelShotData is returned through a hidden sret pointer (x8), then
+// this (x0), bool isTransform (w1), MethodInfo* (x2).
+// ---------------------------------------------------------------------------
 
-    void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(g_lcam, M_getTransform);
-    if (!alive(tr)) return;
-    Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
-    if (!vec3Finite(eye)) return;
+// MethodInfo layout (il2cpp.h):
+//   methodPointer @0x00, invoker_method @0x08, name @0x10, klass @0x18,
+//   ..., token @0x40, flags @0x44, iflags @0x46, slot @0x48
+#define MI_NAME  0x10
+#define MI_KLASS 0x18
 
-    float dx = head.x - eye.x;
-    float dy = head.y - eye.y;
-    float dz = head.z - eye.z;
-    float horiz = sqrtf(dx * dx + dz * dz);
-    if (!(horiz > 0.01f)) return;
+#define VTABLE_STRIDE 0x10        // VirtualInvokeData { methodPtr; method; }
+#define VTABLE_SCAN_LO 0x80
+#define VTABLE_SCAN_HI 0x400
 
-    Vec2 angles;
-    angles.x = -atan2f(dy, horiz) * (180.0f / 3.14159265f);   // pitch
-    angles.y = atan2f(dx, dz) * (180.0f / 3.14159265f);       // yaw
-    if (angles.x != angles.x || angles.y != angles.y) return;
+static BOOL miNameIs(void *mi, const char *want) {
+    if (!mi) return NO;
+    const char *n = *(const char **)((char *)mi + MI_NAME);
+    return n && strcmp(n, want) == 0;
+}
 
-    ((void (*)(void *, Vec2, void *))MP(M_setLookAngles))(g_lcam, angles, M_setLookAngles);
+// Locate the vtable entry that dispatches this method. The header offset depends
+// on the il2cpp version, so it is searched rather than assumed: an entry counts
+// only when its target equals the original AND its MethodInfo names the method.
+// Anything else is skipped -- a wrong guess must be a no-op, never a wrong write.
+static char *findVtableEntry(void *klass, void *orig, const char *name) {
+    if (!klass || !orig) return nullptr;
+    for (size_t off = VTABLE_SCAN_LO; off < VTABLE_SCAN_HI; off += VTABLE_STRIDE) {
+        char *e = (char *)klass + off;
+        if (*(void **)e != orig) continue;
+        if (!miNameIs(*(void **)(e + 8), name)) continue;
+        return e;
+    }
+    return nullptr;
+}
+
+static void hk_createShootData(void *retstr, void *self, bool isTransform, void *method) {
+    if (!O_createShootData) return;
+    ((void (*)(void *, void *, bool, void *))O_createShootData)(retstr, self, isTransform, method);
+
+    if (!retstr || !g_silentAim || !g_aimHeadValid) return;
+    if (!g_myNetId || !alive(self)) return;         // not bound / weapon destroyed
+
+    Vec3 head = g_aimHead;                          // snapshot published by onFrame
+    Vec3 sp = *(Vec3 *)((char *)retstr + 0x48);     // ModelShotData.shootPos
+    if (!vec3Finite(head) || !vec3Finite(sp)) return;
+
+    Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
+    float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (!(len > 0.01f) || len != len || len > 1e6f) return;
+
+    dir.x /= len; dir.y /= len; dir.z /= len;
+    *(Vec3 *)((char *)retstr + 0x54) = dir;         // ModelShotData.shootDir
+}
+
+static BOOL patchVtableSlot(void *mi, void *orig, void *repl, const char *name) {
+    if (!mi || !orig) return NO;
+    void *klass = *(void **)((char *)mi + MI_KLASS);
+    if (!klass) return NO;
+
+    char *entry = findVtableEntry(klass, orig, name);
+    if (!entry) {
+        NSLog(@"[MWM] vtable entry for %s not found (klass=%p)", name, klass);
+        return NO;
+    }
+    if (!safeWritePtr(entry, repl)) return NO;
+    NSLog(@"[MWM] vtable entry %p patched for %s", entry, name);
+    return YES;
+}
+
+static BOOL installAimHook(void) {
+    void *mi = M_createShootData;
+    if (!mi) return NO;
+
+    void *orig = *(void **)mi;                      // MethodInfo.methodPointer
+    if (!orig || (uintptr_t)orig < 0x1000) return NO;
+
+    O_createShootData = orig;
+    BOOL miOk = safeWritePtr(mi, (void *)&hk_createShootData);
+    BOOL vtOk = patchVtableSlot(mi, orig, (void *)&hk_createShootData, "CreateShootData");
+
+    if (!miOk && !vtOk) {
+        O_createShootData = nullptr;
+        return NO;
+    }
+    NSLog(@"[MWM] aim hook mi=%d vtable=%d", miOk, vtOk);
+    return YES;
 }
 
 #pragma mark - ESP Overlay
@@ -679,12 +759,15 @@ static void aimAt(Vec3 head) {
 
     if (g_espOn || g_silentAim) scanPlayers();
 
-    // Aim: rotate the player camera toward the chosen head. This runs on the main
-    // thread from a CADisplayLink, exactly like a finger drag, so the game's own
-    // rotation path produces the shot direction -- no code patching involved.
+    // Publish the aim point for the swapped CreateShootData. Computed here on the
+    // main thread so the weapon path only ever reads a plain float snapshot.
+    g_aimHeadValid = NO;
     if (g_silentAim && g_targetCount > 0) {
         Vec3 head;
-        if (pickBestTargetHead(&head) && vec3Finite(head)) aimAt(head);
+        if (pickBestTargetHead(&head) && vec3Finite(head)) {
+            g_aimHead = head;
+            g_aimHeadValid = YES;
+        }
     }
 }
 @end
@@ -840,7 +923,9 @@ static BOOL resolveIl2Cpp(void) {
 
     // Aim turns the player camera through its own setter -- no code patching, no hook.
     void *K_playerCam = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
-    M_setLookAngles = methodOf(K_playerCam, "set_LookAngles", 1);
+
+    void *K_projWeapon = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
+    M_createShootData = methodOf(K_projWeapon, "CreateShootData", 1);
 
     if (g_bypassTutorial) {
         replaceMethod(M_guideInit, (void *)&dummy_ret);              // Init(): no step machine
@@ -852,8 +937,12 @@ static BOOL resolveIl2Cpp(void) {
         replaceMethod(M_checkFuncUnlock, (void *)&dummy_true_ic);    // bool (int, Action)
     }
 
-    NSLog(@"[MWM] armed netMap=%zu", off_netPlayerMap);
-    snprintf(g_diag, sizeof(g_diag), "Status: Armed");
+    // Swap happens while still in the lobby: the game is not inside Shoot() yet,
+    // so no thread can be executing the pointer being replaced.
+    g_aimHookOk = installAimHook();
+
+    NSLog(@"[MWM] armed netMap=%zu aim=%d", off_netPlayerMap, g_aimHookOk);
+    snprintf(g_diag, sizeof(g_diag), "Status: Armed (aim=%s)", g_aimHookOk ? "yes" : "no");
     g_il2cppReady = YES;
     return YES;
 }
