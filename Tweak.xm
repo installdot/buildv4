@@ -113,10 +113,11 @@ static BOOL  g_showAimFov = NO;
 // update and crashed the game 1-2s after enabling silent aim.
 static Vec3  g_aimHead = {0.0f, 0.0f, 0.0f};
 static volatile BOOL g_aimHeadValid = NO;
+static volatile uint16_t g_myNetId = 0;   // written by scanPlayers, read by the hook
 static BOOL  g_bypassTutorial = YES;
 static BOOL  g_bypassRankLock = YES;
 
-static BOOL installSilentAim(void);   // defined below; installed lazily
+static BOOL installSilentAim(void);   // defined below; installed at arm time
 static BOOL g_fireDirPatched;
 
 static inline BOOL alive(void *obj) {
@@ -203,6 +204,7 @@ static void scanPlayersImpl(void) {
     // never matches -- exclude self by net id instead.
     uint16_t myNetId = 0;
     if (lpm && off_bindNetId) myNetId = *(uint16_t *)((char *)lpm + off_bindNetId);
+    g_myNetId = myNetId;
 
     // Player is a MonoBehaviour (not a NetPlayer), so its position comes from Transform.
     Vec3 myPos = {0.0f, 0.0f, 0.0f};
@@ -301,7 +303,13 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     Vec3 orig;
     if (!shootData) return (Vec3){0.0f, 0.0f, 1.0f};
 
-    if (g_silentAim && g_aimHeadValid) {
+    // Only steer OUR bullets. ModelShotData.shooterId is at +0x4; redirecting AI or
+    // other players' shots re-enters damage resolution for entities we do not own,
+    // which crashed the game a couple of seconds after enabling silent aim.
+    uint16_t shooter = *(uint16_t *)((char *)shootData + 0x4);
+    BOOL mine = (g_myNetId != 0) ? (shooter == g_myNetId) : NO;
+
+    if (g_silentAim && g_aimHeadValid && mine) {
         Vec3 head = g_aimHead;          // snapshot; written by onFrame ()
         Vec3 sp = *(Vec3 *)((char *)shootData + 0x48);
         Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
@@ -313,7 +321,8 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
         }
     }
 
-    if (O_computerFireDirection)
+    if (O_computerFireDirection &&
+        (uintptr_t)O_computerFireDirection > 0x1000)
         return ((Vec3 (*)(void *, void *, void *))O_computerFireDirection)(self, shootData, method);
     orig = *(Vec3 *)((char *)shootData + 0x54);
     return orig;
@@ -652,6 +661,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     if (!alive(player)) {
         g_lcam = nullptr;
         g_aimHeadValid = NO;
+        g_myNetId = 0;
         [self setStatus:"Status: Lobby / Loading" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
@@ -673,17 +683,6 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     }
 
     [self setStatus:"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
-
-    // Install the aim hook only once a match is running: hooking while the scene
-    // loads patches a function Unity may be mid-execution on, which crashed.
-    if (g_silentAim && !g_fireDirPatched && alive(g_lcam)) {
-        static double lastTry = 0;
-        double now = CFAbsoluteTimeGetCurrent();
-        if (now - lastTry > 1.0) {
-            lastTry = now;
-            installSilentAim();
-        }
-    }
 
     if (g_espOn || g_silentAim) scanPlayers();
 
@@ -900,6 +899,12 @@ static BOOL resolveIl2Cpp(void) {
 
     resolveHookProvider();
 
+    // Install the fire hook HERE, while still in the lobby. In a match the game
+    // thread is inside computerFireDirection constantly (bots shoot), and patching
+    // its first bytes under a running thread is what crashed 2-3s after enabling.
+    // The body is inert until g_silentAim is set, so arming early costs nothing.
+    BOOL aimOk = installSilentAim();
+
     if (g_bypassTutorial) {
         replaceMethod(M_guideInit, (void *)&dummy_ret);              // Init(): no step machine
         replaceMethod(M_checkGuideScene, (void *)&dummy_false);      // static bool
@@ -910,10 +915,10 @@ static BOOL resolveIl2Cpp(void) {
         replaceMethod(M_checkFuncUnlock, (void *)&dummy_true_ic);    // bool (int, Action)
     }
 
-    NSLog(@"[MWM] armed hook=%d netMap=%zu",
-          pMSHookFunction != nullptr, off_netPlayerMap);
-    snprintf(g_diag, sizeof(g_diag), "Status: Armed (hook=%s)",
-             pMSHookFunction ? "yes" : "no");
+    NSLog(@"[MWM] armed hook=%d aim=%d netMap=%zu",
+          pMSHookFunction != nullptr, aimOk, off_netPlayerMap);
+    snprintf(g_diag, sizeof(g_diag), "Status: Armed (hook=%s aim=%s)",
+             pMSHookFunction ? "yes" : "no", aimOk ? "yes" : "no");
     g_il2cppReady = YES;
     return YES;
 }
