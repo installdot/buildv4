@@ -15,8 +15,8 @@
 #import <unistd.h>
 #import <math.h>
 #import <mach/mach.h>
+#import <mach/vm_map.h>
 #import <mach/vm_region.h>
-#import <mach/mach_vm.h>
 
 #pragma mark - Geometry & Screen Helpers
 
