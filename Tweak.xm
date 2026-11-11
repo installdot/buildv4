@@ -1,570 +1,294 @@
-// Tweak.xm — Prophet Auto Summon Menu (Siêu Tốc)
-//
-// Tính năng:
-// 1. Nút tròn nổi (Floating Button) di chuyển tự do, chạm để bật/tắt menu.
-// 2. Chọn Faction: AGI, VIT, STR, DEX, DARK, LIGHT.
-// 3. Tùy chỉnh Delay (giây) tự do bằng ô nhập số (hỗ trợ cả dấu chấm '.' và phẩy ',').
-// 4. Mặc định spam gọi summon 10 thùng (Prophet Orb x10) trực tiếp qua DataSender.
-// 5. Nút Bắt đầu / Ngưng: gọi trực tiếp DataSender.HeroProphetSummon siêu tốc.
-// 6. Bộ đếm thời gian thực: Đã dùng X thùng (mỗi lần gọi +10 quả cầu).
-// 7. Tự động chặn và đóng sạch toàn bộ popup thưởng (PopupShowBonusEffect & 2).
+// Mini World : Royale — com.miniworldroyale.sparkgame
+// TrollFools-injected dylib. Target: UnityFramework (Mach-O arm64, imagebase 0).
+// All classes/methods/fields verified in UnityFramework.i64 via IDA MCP.
 
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
-#import <objc/runtime.h>
-#import <substrate.h>
-#import <mach-o/dyld.h>
 #import <dlfcn.h>
-#import <stdio.h>
-#import <stdlib.h>
 #import <string.h>
+#import <stdio.h>
+#import <stdarg.h>
+#import <stdint.h>
+#import <unistd.h>
 
-#pragma mark - RVAs in UnityFramework (arm64, imagebase 0)
+// Substrate/ElleKit. TrollFools injects into a process that already has one of them;
+// when neither is present this declaration simply stays unused (see hook() below).
+extern "C" void MSHookFunction(void *symbol, void *hook, void **old);
 
-#define OFF_GAME_CONTEXT_GET_INSTANCE   0x14473AC  // GameContext.GetInstance()
-#define OFF_HERO_PROPHET_SUMMON         0x140437C  // DataSender.HeroProphetSummon(this, faction, count)
-#define OFF_POPUP1_SET_MODEL            0x11C23A0  // PopupShowBonusEffect.SetBonusModel(BonusModel)
-#define OFF_POPUP1_CLOSE_CLICK          0x11C2D54  // PopupShowBonusEffect.ButtonCloseClick()
-#define OFF_POPUP2_SET_MODEL            0x11C36D4  // PopupShowBonusEffect2.SetBonusModel(BonusModel)
-#define OFF_POPUP2_CLOSE_CLICK          0x11C3DC4  // PopupShowBonusEffect2.ButtonCloseClick()
+#pragma mark - il2cpp ABI (UnityFramework exports 232 _il2cpp_* symbols)
 
-#pragma mark - Faction Enums (HeroFaction)
+typedef struct { float x, y, w, h; } UIRect;   // UnityEngine.Rect
+typedef struct { float x, y; } Vec2;           // UnityEngine.Vector2 (HFA -> s0,s1)
 
-typedef NS_ENUM(NSInteger, HeroFactionEnum) {
-    FACTION_DARK     = 1, // Bóng Đêm (Ám)
-    FACTION_LIGHT    = 2, // Ánh Sáng (Quang)
-    FACTION_DEX      = 3, // Shadow (U Ám / Khéo)
-    FACTION_AGI      = 4, // Fortress (Thành Trì / Tốc)
-    FACTION_VIT      = 5, // Forest (Rừng Xanh / Thủ)
-    FACTION_STR      = 6, // Abyss (Vực Sâu / Công)
-};
+static void *(*i_domain_get)(void);
+static void *(*i_thread_attach)(void *);
+static void **(*i_get_assemblies)(void *, size_t *);
+static void *(*i_assembly_image)(void *);
+static const char *(*i_image_name)(void *);
+static void *(*i_class_from_name)(void *, const char *, const char *);
+static void *(*i_method_from_name)(void *, const char *, int);
+static void *(*i_field_from_name)(void *, const char *);
+static size_t (*i_field_offset)(void *);
+static void *(*i_class_get_type)(void *);
+static void *(*i_type_get_object)(void *);
+static void *(*i_string_new)(const char *);
+static void *(*i_object_new)(void *);
+static void *(*i_object_unbox)(void *);
+static void *(*i_runtime_invoke)(void *, void *, void **, void **);
 
-static uintptr_t gBase = 0;
-static BOOL      gIsAutoSummoning = NO;
+typedef void (*mshook_t)(void *, void *, void **);
+static mshook_t g_mshook;
 
-#pragma mark - Passthrough Window (Không chặn touch game bên dưới)
+static inline void *MP(void *mi) { return mi ? *(void **)mi : nullptr; }
 
-@interface PassthroughWindow : UIWindow
-@end
-
-@implementation PassthroughWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self || hit == self.rootViewController.view) {
-        return nil; // Cho phép click xuyên vào game
-    }
-    return hit;
-}
-@end
-
-#pragma mark - Menu Controller
-
-@interface AutoSummonMenuController : UIViewController <UITextFieldDelegate>
-@property (nonatomic, strong) UIButton    *floatingBtn;
-@property (nonatomic, strong) UIView      *menuView;
-
-// Faction
-@property (nonatomic, assign) HeroFactionEnum selectedFaction;
-@property (nonatomic, strong) NSMutableArray<UIButton *> *factionButtons;
-
-// Settings
-@property (nonatomic, strong) UITextField *delayField;
-@property (nonatomic, assign) NSTimeInterval summonDelay;
-
-// Stats
-@property (nonatomic, strong) UILabel     *counterLabel;
-@property (nonatomic, assign) NSInteger    summonBoxCount;
-@property (nonatomic, assign) NSInteger    summonOrbCount;
-
-// Action
-@property (nonatomic, strong) UIButton    *startBtn;
-@property (nonatomic, strong) NSTimer     *summonTimer;
-@end
-
-@implementation AutoSummonMenuController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [UIColor clearColor];
-
-    self.selectedFaction = FACTION_STR; // Mặc định STR
-    self.summonDelay     = 0.35;        // Mặc định 0.35s
-    self.factionButtons  = [NSMutableArray new];
-
-    [self setupFloatingButton];
-    [self setupMenuUI];
+static void hookMethod(void *mi, void *hook, void **orig) {
+    if (MP(mi) && g_mshook) g_mshook(MP(mi), hook, orig);
 }
 
-#pragma mark - Floating Button
+static void *callN(void *mi, void *obj, int argc, ...) {
+    if (!mi) return nullptr;
+    void *p[3] = {nullptr};
+    va_list ap; va_start(ap, argc);
+    for (int k = 0; k < argc && k < 3; k++) p[k] = va_arg(ap, void *);
+    va_end(ap);
+    void *exc = nullptr;
+    void *r = i_runtime_invoke(mi, obj, argc ? p : nullptr, &exc);
+    return exc ? nullptr : r;
+}
+#define call0(mi, obj) callN(mi, obj, 0)
+#define call1(mi, obj, a) callN(mi, obj, 1, (void *)(a))
 
-- (void)setupFloatingButton {
-    self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.floatingBtn.frame = CGRectMake(16, 70, 50, 50);
-    self.floatingBtn.layer.cornerRadius = 25;
-    self.floatingBtn.layer.masksToBounds = NO;
-    self.floatingBtn.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.18 alpha:0.92];
-    self.floatingBtn.layer.borderColor = [UIColor colorWithRed:0.0 green:0.85 blue:1.0 alpha:0.9].CGColor;
-    self.floatingBtn.layer.borderWidth = 1.8;
-
-    self.floatingBtn.layer.shadowColor = [UIColor cyanColor].CGColor;
-    self.floatingBtn.layer.shadowOffset = CGSizeMake(0, 0);
-    self.floatingBtn.layer.shadowOpacity = 0.6;
-    self.floatingBtn.layer.shadowRadius = 8;
-
-    [self.floatingBtn setTitle:@"⚡" forState:UIControlStateNormal];
-    self.floatingBtn.titleLabel.font = [UIFont systemFontOfSize:24];
-
-    [self.floatingBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [self.floatingBtn addGestureRecognizer:pan];
-
-    [self.view addSubview:self.floatingBtn];
+static void *methodOf(void *k, const char *n, int argc) {
+    return k ? i_method_from_name(k, n, argc) : nullptr;
 }
 
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint trans = [pan translationInView:self.view];
-    CGPoint center = self.floatingBtn.center;
-    center.x += trans.x;
-    center.y += trans.y;
+#pragma mark - resolved symbols
 
-    CGSize scr = [UIScreen mainScreen].bounds.size;
-    CGFloat r = self.floatingBtn.bounds.size.width / 2.0;
-    center.x = MAX(r + 4, MIN(scr.width - r - 4, center.x));
-    center.y = MAX(r + 10, MIN(scr.height - r - 10, center.y));
+static void *K_playerCam, *K_dmgPlayer, *K_lpm, *K_debugInfo, *K_propComp;
+static void *K_gameObject, *K_gui, *K_camera;
 
-    self.floatingBtn.center = center;
-    [pan setTranslation:CGPointZero inView:self.view];
+static void *M_getCamera, *M_getDamageable, *M_getPropComp, *M_lpmInstance, *M_lpmLocal;
+static void *M_fpCamera, *M_forceAdd, *M_canDamage, *M_gmUpdate, *M_ongui, *M_speedRate;
+static void *M_goCtor, *M_goAdd, *M_lbl, *M_btn, *M_fov;
 
-    if (pan.state == UIGestureRecognizerStateEnded) {
-        [UIView animateWithDuration:0.2 delay:0 usingSpringWithDamping:0.75 initialSpringVelocity:0.5 options:0 animations:^{
-            CGPoint snap = self.floatingBtn.center;
-            if (snap.x < scr.width / 2.0) {
-                snap.x = r + 8;
-            } else {
-                snap.x = scr.width - r - 8;
-            }
-            self.floatingBtn.center = snap;
-        } completion:nil];
-    }
+static void *O_forceAdd, *O_canDamage, *O_gmUpdate, *O_ongui, *O_speedRate;
+
+static size_t off_recoilAngles;
+
+static void *g_ui, *g_lcam, *g_ldmg, *g_lprop;
+static BOOL   spawned = NO, menuOpen = NO;
+static BOOL   c_god = NO, c_norecoil = NO;
+static float  c_speed = 1.0f, c_fov = 0.f;
+
+#pragma mark - hooks
+
+static void hk_forceAdd(void *self, Vec2 v, void *mi) {
+    if (c_norecoil && self == g_lcam) return;
+    ((void (*)(void *, Vec2, void *))O_forceAdd)(self, v, mi);
 }
 
-- (void)toggleMenu {
-    BOOL willShow = self.menuView.hidden;
-    if (willShow) {
-        self.menuView.transform = CGAffineTransformMakeScale(0.88, 0.88);
-        self.menuView.alpha = 0.0;
-        self.menuView.hidden = NO;
-        [UIView animateWithDuration:0.2 delay:0 usingSpringWithDamping:0.8 initialSpringVelocity:0.5 options:0 animations:^{
-            self.menuView.transform = CGAffineTransformIdentity;
-            self.menuView.alpha = 1.0;
-        } completion:nil];
-    } else {
-        [self.view endEditing:YES];
-        [UIView animateWithDuration:0.16 animations:^{
-            self.menuView.transform = CGAffineTransformMakeScale(0.88, 0.88);
-            self.menuView.alpha = 0.0;
-        } completion:^(BOOL finished) {
-            self.menuView.hidden = YES;
-            self.menuView.transform = CGAffineTransformIdentity;
-        }];
+// ModelCheckCanDamage is 12 bytes -> x1:x2 (AAPCS64 C.10 composite).
+// CheckCanDamage(0x32AE040) is the funnel every incoming damage packet passes.
+static bool hk_canDamage(void *self, uint64_t lo, uint64_t hi, void *mi) {
+    if (c_god && self == g_ldmg) return false;
+    return ((bool (*)(void *, uint64_t, uint64_t, void *))O_canDamage)(self, lo, hi, mi);
+}
+
+// PlayerPropertyComp::GetSpeedRate (0x3A460D0) is the computed move-speed rate for
+// one player, not a cached field, so a multiplier here survives config refreshes.
+// PlayerMovement::getCurSpeedRate feeds it into calcTargetVelocitySpeed.
+static float hk_speedRate(void *self, bool withNoFov, void *mi) {
+    float r = ((float (*)(void *, bool, void *))O_speedRate)(self, withNoFov, mi);
+    if (c_speed == 1.f || !self || self != g_lprop) return r;
+    return r * c_speed;
+}
+
+#pragma mark - menu (game SDK IMGUI)
+
+static const float ROW = 30.f;
+
+static void lbl(float x, float y, float w, const char *text) {
+    void *s = i_string_new(text);
+    UIRect r = { x, y, w, ROW - 8 };
+    callN(M_lbl, nullptr, 2, &r, &s);
+}
+static BOOL btn(float x, float y, float w, float h, const char *text) {
+    void *s = i_string_new(text);
+    UIRect r = { x, y, w, h };
+    void *res = callN(M_btn, nullptr, 2, &r, &s);
+    void *u = res ? i_object_unbox(res) : nullptr;
+    return u ? *(bool *)u : NO;
+}
+static void toggleRow(float x, float y, float w, const char *name, BOOL *flag) {
+    char buf[80];
+    snprintf(buf, sizeof buf, "%s %s", *flag ? "[X]" : "[ ]", name);
+    if (btn(x, y, w, ROW - 8, buf)) *flag = !*flag;
+}
+static void stepRow(float x, float y, const char *name, float *v, float step, float lo, float hi) {
+    char buf[32];
+    lbl(x, y + 3, 110, name);
+    if (btn(x + 112, y, 34, ROW - 10, "-")) { *v -= step; if (*v < lo) *v = lo; }
+    snprintf(buf, sizeof buf, "%.2f", *v);
+    lbl(x + 150, y + 3, 60, buf);
+    if (btn(x + 200, y, 34, ROW - 10, "+")) { *v += step; if (*v > hi) *v = hi; }
+}
+
+static void refreshLocal(void) {
+    void *lpm = call0(M_lpmInstance, nullptr);
+    void *pl  = lpm ? call0(M_lpmLocal, lpm) : nullptr;
+    g_lcam  = pl ? call0(M_getCamera, pl)     : nullptr;
+    g_ldmg  = pl ? call0(M_getDamageable, pl) : nullptr;
+    g_lprop = pl ? call0(M_getPropComp, pl)   : nullptr;
+}
+
+// Runs inside the Update hook, i.e. before PlayerCamera::LateUpdate consumes
+// m_RecoilAngles, so the zeroed value is what the camera actually applies.
+static void applyPerFrame(void) {
+    if (c_norecoil && g_lcam && off_recoilAngles)
+        *(Vec2 *)((char *)g_lcam + off_recoilAngles) = Vec2{0.f, 0.f};
+}
+
+// IMGUI events run after LateUpdate — the only phase where writing the FP
+// camera's fieldOfView survives the camera's own LateUpdate.
+static void applyFov(void) {
+    if (c_fov > 0.f && g_lcam) {
+        void *cam = call0(M_fpCamera, g_lcam);
+        if (cam) call1(M_fov, cam, &c_fov);
     }
 }
 
-#pragma mark - Menu UI (Gọn gàng, vừa khít mọi màn hình)
+static void drawMenu(void) {
+    if (btn(10, 60, 74, 40, menuOpen ? "CLOSE" : "MENU")) menuOpen = !menuOpen;
+    if (!menuOpen) return;
 
-- (void)setupMenuUI {
-    CGSize scr = [UIScreen mainScreen].bounds.size;
-    CGFloat scrW = MAX(scr.width, scr.height);
-    CGFloat scrH = MIN(scr.width, scr.height);
+    float px = 96, py = 60, pw = 300, y = py + 30;
+    lbl(px, py, pw, "-- MINI WORLD ROYALE --");
+    toggleRow(px, y, pw, "GOD MODE", &c_god);             y += ROW;
+    toggleRow(px, y, pw, "NO RECOIL", &c_norecoil);       y += ROW;
+    stepRow(px, y, "SPEED", &c_speed, 0.25f, 0.25f, 8.f); y += ROW;
+    stepRow(px, y, "FOV", &c_fov, 5.f, 0.f, 120.f);       y += ROW;
+    lbl(px, y + 4, pw, g_lprop ? "status: in-game" : "status: waiting player");
+}
 
-    CGFloat w = 330;
-    CGFloat h = 256;
+static void hk_ongui(void *self, void *mi) {
+    if (self != g_ui) { ((void (*)(void *, void *))O_ongui)(self, mi); return; }
+    @autoreleasepool { applyFov(); drawMenu(); }
+}
 
-    self.menuView = [[UIView alloc] initWithFrame:CGRectMake((scrW - w) / 2.0, (scrH - h) / 2.0, w, h)];
-    self.menuView.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.12 alpha:0.96];
-    self.menuView.layer.cornerRadius = 14;
-    self.menuView.layer.borderColor = [UIColor colorWithRed:0.0 green:0.85 blue:1.0 alpha:0.85].CGColor;
-    self.menuView.layer.borderWidth = 1.5;
-    self.menuView.layer.masksToBounds = YES;
-    self.menuView.hidden = YES;
+#pragma mark - bootstrap
 
-    // 1. Top Bar
-    UIView *topBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 34)];
-    topBar.backgroundColor = [UIColor colorWithRed:0.11 green:0.11 blue:0.19 alpha:0.95];
-
-    UILabel *titleLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 0, w - 46, 34)];
-    titleLbl.text = @"⚡ PROPHET AUTO SUMMON";
-    titleLbl.font = [UIFont boldSystemFontOfSize:13];
-    titleLbl.textColor = [UIColor whiteColor];
-    [topBar addSubview:titleLbl];
-
-    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.frame = CGRectMake(w - 36, 0, 36, 34);
-    [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
-    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    closeBtn.tintColor = [UIColor lightGrayColor];
-    [closeBtn addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
-    [topBar addSubview:closeBtn];
-
-    [self.menuView addSubview:topBar];
-
-    // 2. Faction Selection (2 dòng x 3 cột)
-    UILabel *facTitleLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 38, w - 24, 16)];
-    facTitleLbl.text = @"HỆ CHIÊU MỘ:";
-    facTitleLbl.font = [UIFont boldSystemFontOfSize:10];
-    facTitleLbl.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
-    [self.menuView addSubview:facTitleLbl];
-
-    NSArray *factions = @[
-        @{@"name": @"AGI",   @"desc": @"Tốc",   @"tag": @(FACTION_AGI)},
-        @{@"name": @"VIT",   @"desc": @"Thủ",   @"tag": @(FACTION_VIT)},
-        @{@"name": @"STR",   @"desc": @"Công",  @"tag": @(FACTION_STR)},
-        @{@"name": @"DEX",   @"desc": @"Khéo",  @"tag": @(FACTION_DEX)},
-        @{@"name": @"DARK",  @"desc": @"Ám",    @"tag": @(FACTION_DARK)},
-        @{@"name": @"LIGHT", @"desc": @"Quang", @"tag": @(FACTION_LIGHT)},
-    ];
-
-    CGFloat btnW = (w - 24 - 12) / 3.0;
-    CGFloat btnH = 26;
-    for (int i = 0; i < factions.count; i++) {
-        NSDictionary *d = factions[i];
-        int row = i / 3;
-        int col = i % 3;
-        CGFloat x = 12 + col * (btnW + 6);
-        CGFloat y = 56 + row * (btnH + 4);
-
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.frame = CGRectMake(x, y, btnW, btnH);
-        btn.layer.cornerRadius = 6;
-        btn.layer.borderWidth = 1.0;
-        btn.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
-        btn.backgroundColor = [UIColor colorWithWhite:0.13 alpha:0.9];
-        btn.tag = [d[@"tag"] integerValue];
-
-        NSString *title = [NSString stringWithFormat:@"%@ (%@)", d[@"name"], d[@"desc"]];
-        [btn setTitle:title forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont boldSystemFontOfSize:10];
-        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-
-        [btn addTarget:self action:@selector(onFactionBtnClicked:) forControlEvents:UIControlEventTouchUpInside];
-        [self.menuView addSubview:btn];
-        [self.factionButtons addObject:btn];
+static void *findImage(const char *name) {
+    size_t n = 0;
+    void **asms = i_get_assemblies(i_domain_get(), &n);
+    if (!asms) return nullptr;
+    for (size_t k = 0; k < n; k++) {
+        void *img = i_assembly_image(asms[k]);
+        const char *in = img ? i_image_name(img) : (const char *)0;
+        if (in && !strcmp(in, name)) return img;
     }
-    [self updateFactionButtonsState];
-
-    // 3. Cài đặt Delay (giây) — Ô nhập số tự do
-    CGFloat setY = 56 + 2 * (btnH + 4) + 8; // ~124
-    UIView *delayBox = [[UIView alloc] initWithFrame:CGRectMake(12, setY, w - 24, 30)];
-    delayBox.backgroundColor = [UIColor colorWithWhite:0.12 alpha:0.95];
-    delayBox.layer.cornerRadius = 6;
-    delayBox.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
-    delayBox.layer.borderWidth = 0.8;
-
-    UILabel *dLbl = [[UILabel alloc] initWithFrame:CGRectMake(8, 5, 110, 20)];
-    dLbl.text = @"⏱ Tốc độ Delay:";
-    dLbl.font = [UIFont boldSystemFontOfSize:11];
-    dLbl.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
-    [delayBox addSubview:dLbl];
-
-    self.delayField = [[UITextField alloc] initWithFrame:CGRectMake(124, 3, 76, 24)];
-    self.delayField.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
-    self.delayField.layer.cornerRadius = 4;
-    self.delayField.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:0.9 alpha:0.8].CGColor;
-    self.delayField.layer.borderWidth = 0.8;
-    self.delayField.textColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:1.0];
-    self.delayField.font = [UIFont boldSystemFontOfSize:12];
-    self.delayField.textAlignment = NSTextAlignmentCenter;
-    self.delayField.keyboardType = UIKeyboardTypeDecimalPad;
-    self.delayField.text = @"0.35";
-    self.delayField.delegate = self;
-    [self.delayField addTarget:self action:@selector(onDelayFieldChanged:) forControlEvents:UIControlEventEditingChanged];
-    [self attachDoneToolbarToField:self.delayField];
-    [delayBox addSubview:self.delayField];
-
-    UILabel *dUnit = [[UILabel alloc] initWithFrame:CGRectMake(208, 5, 80, 20)];
-    dUnit.text = @"giây / lần";
-    dUnit.font = [UIFont systemFontOfSize:10];
-    dUnit.textColor = [UIColor lightGrayColor];
-    [delayBox addSubview:dUnit];
-
-    [self.menuView addSubview:delayBox];
-
-    // 4. Live Counter Box (Mỗi lần gọi +10 quả cầu)
-    CGFloat countY = setY + 30 + 8; // ~162
-    UIView *countBox = [[UIView alloc] initWithFrame:CGRectMake(12, countY, w - 24, 42)];
-    countBox.backgroundColor = [UIColor colorWithRed:0.04 green:0.04 blue:0.08 alpha:0.95];
-    countBox.layer.cornerRadius = 8;
-    countBox.layer.borderColor = [UIColor colorWithRed:0.0 green:0.75 blue:0.6 alpha:0.7].CGColor;
-    countBox.layer.borderWidth = 1.0;
-
-    self.counterLabel = [[UILabel alloc] initWithFrame:CGRectMake(6, 4, countBox.bounds.size.width - 12, 20)];
-    self.counterLabel.text = @"ĐÃ DÙNG: 0 thùng (0 quả cầu)";
-    self.counterLabel.font = [UIFont boldSystemFontOfSize:13];
-    self.counterLabel.textColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.6 alpha:1.0];
-    self.counterLabel.textAlignment = NSTextAlignmentCenter;
-    [countBox addSubview:self.counterLabel];
-
-    UILabel *subCountLbl = [[UILabel alloc] initWithFrame:CGRectMake(6, 22, countBox.bounds.size.width - 12, 16)];
-    subCountLbl.text = @"(1 thùng = 10 quả cầu • Đã tự động chặn popup)";
-    subCountLbl.font = [UIFont systemFontOfSize:9];
-    subCountLbl.textColor = [UIColor lightGrayColor];
-    subCountLbl.textAlignment = NSTextAlignmentCenter;
-    [countBox addSubview:subCountLbl];
-
-    [self.menuView addSubview:countBox];
-
-    // 5. Nút BẮT ĐẦU / NGƯNG & ĐẶT LẠI
-    CGFloat actY = countY + 42 + 8; // ~212
-    self.startBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.startBtn.frame = CGRectMake(12, actY, w - 24 - 84, 36);
-    self.startBtn.layer.cornerRadius = 8;
-    self.startBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.72 blue:0.58 alpha:1.0];
-    [self.startBtn setTitle:@"BẮT ĐẦU" forState:UIControlStateNormal];
-    self.startBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [self.startBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    [self.startBtn addTarget:self action:@selector(onStartToggle) forControlEvents:UIControlEventTouchUpInside];
-    [self.menuView addSubview:self.startBtn];
-
-    UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    resetBtn.frame = CGRectMake(w - 12 - 76, actY, 76, 36);
-    resetBtn.layer.cornerRadius = 8;
-    resetBtn.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
-    resetBtn.layer.borderColor = [UIColor colorWithWhite:0.3 alpha:1.0].CGColor;
-    resetBtn.layer.borderWidth = 0.8;
-    [resetBtn setTitle:@"Đặt lại" forState:UIControlStateNormal];
-    resetBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    [resetBtn setTitleColor:[UIColor lightGrayColor] forState:UIControlStateNormal];
-    [resetBtn addTarget:self action:@selector(onResetCount) forControlEvents:UIControlEventTouchUpInside];
-    [self.menuView addSubview:resetBtn];
-
-    [self.view addSubview:self.menuView];
+    return nullptr;
 }
 
-- (void)attachDoneToolbarToField:(UITextField *)tf {
-    UIToolbar *bar = [[UIToolbar alloc] initWithFrame:CGRectMake(0, 0, [UIScreen mainScreen].bounds.size.width, 36)];
-    bar.barStyle = UIBarStyleBlack;
-    UIBarButtonItem *flex = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace target:nil action:nil];
-    UIBarButtonItem *done = [[UIBarButtonItem alloc] initWithTitle:@"Xong" style:UIBarButtonItemStyleDone target:tf action:@selector(resignFirstResponder)];
-    done.tintColor = [UIColor cyanColor];
-    bar.items = @[flex, done];
-    tf.inputAccessoryView = bar;
+static void spawnUI(void) {
+    void *go = i_object_new(K_gameObject);
+    if (!go) return;
+    call0(M_goCtor, go);                    // GameObject.ctor() -> Internal_CreateGameObject
+
+    void *ktype = i_class_get_type(K_debugInfo);
+    void *type = ktype ? i_type_get_object(ktype) : nullptr;
+    if (!type) return;
+    g_ui = call1(M_goAdd, go, &type);       // DebugInfo::Start() calls DontDestroyOnLoad
+    NSLog(@"[MWM] ui=%p", g_ui);
 }
 
-#pragma mark - Faction & Settings Handlers
-
-- (void)onFactionBtnClicked:(UIButton *)btn {
-    self.selectedFaction = (HeroFactionEnum)btn.tag;
-    [self updateFactionButtonsState];
+// GameMain::Update is the per-frame tick: resolve the local player and apply
+// continuous tweaks here, so nothing depends on the menu being visible.
+static void hk_gmUpdate(void *self, void *mi) {
+    ((void (*)(void *, void *))O_gmUpdate)(self, mi);
+    if (!spawned) { spawned = YES; @autoreleasepool { spawnUI(); } }
+    refreshLocal();
+    applyPerFrame();
 }
 
-- (void)updateFactionButtonsState {
-    for (UIButton *b in self.factionButtons) {
-        if (b.tag == self.selectedFaction) {
-            b.layer.borderColor = [UIColor cyanColor].CGColor;
-            b.layer.borderWidth = 1.8;
-            b.backgroundColor = [UIColor colorWithRed:0.2 green:0.3 blue:0.55 alpha:1.0];
-        } else {
-            b.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
-            b.layer.borderWidth = 1.0;
-            b.backgroundColor = [UIColor colorWithWhite:0.13 alpha:0.9];
-        }
-    }
-}
+static void *sym(const char *n) { return dlsym(RTLD_DEFAULT, n); }
 
-- (void)onDelayFieldChanged:(UITextField *)tf {
-    NSString *clean = [tf.text stringByReplacingOccurrencesOfString:@"," withString:@"."];
-    double val = [clean doubleValue];
-    if (val >= 0.01 && val <= 60.0) {
-        self.summonDelay = val;
-        [self restartTimerIfRunning];
-    }
-}
-
-- (void)onResetCount {
-    self.summonBoxCount = 0;
-    self.summonOrbCount = 0;
-    self.counterLabel.text = @"ĐÃ DÙNG: 0 thùng (0 quả cầu)";
-}
-
-- (void)restartTimerIfRunning {
-    if (gIsAutoSummoning && self.summonTimer) {
-        [self.summonTimer invalidate];
-        self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:self.summonDelay
-                                                            target:self
-                                                          selector:@selector(onSummonTimerTick)
-                                                          userInfo:nil
-                                                           repeats:YES];
-        [[NSRunLoop mainRunLoop] addTimer:self.summonTimer forMode:NSRunLoopCommonModes];
-    }
-}
-
-#pragma mark - Start / Stop Summon Loop (Call DataSender trực tiếp)
-
-- (void)onStartToggle {
-    if (!gIsAutoSummoning) {
-        // Đồng bộ lại cài đặt delay
-        NSString *clean = [self.delayField.text stringByReplacingOccurrencesOfString:@"," withString:@"."];
-        double dVal = [clean doubleValue];
-        self.summonDelay = (dVal >= 0.01 && dVal <= 60.0) ? dVal : 0.35;
-
-        [self.view endEditing:YES];
-
-        gIsAutoSummoning = YES;
-        [self.startBtn setTitle:@"NGƯNG" forState:UIControlStateNormal];
-        self.startBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.2 blue:0.2 alpha:1.0];
-
-        self.summonTimer = [NSTimer scheduledTimerWithTimeInterval:self.summonDelay
-                                                            target:self
-                                                          selector:@selector(onSummonTimerTick)
-                                                          userInfo:nil
-                                                           repeats:YES];
-        [[NSRunLoop mainRunLoop] addTimer:self.summonTimer forMode:NSRunLoopCommonModes];
-    } else {
-        gIsAutoSummoning = NO;
-        [self.summonTimer invalidate];
-        self.summonTimer = nil;
-        [self.startBtn setTitle:@"BẮT ĐẦU" forState:UIControlStateNormal];
-        self.startBtn.backgroundColor = [UIColor colorWithRed:0.0 green:0.72 blue:0.58 alpha:1.0];
-    }
-}
-
-- (void)onSummonTimerTick {
-    if (!gIsAutoSummoning || !gBase) return;
-
-    // 1. Lấy GameContext.GetInstance() @ 0x14473AC
-    typedef void *(*GC_GetInstance_t)(void);
-    GC_GetInstance_t getGC = (GC_GetInstance_t)(gBase + OFF_GAME_CONTEXT_GET_INSTANCE);
-    void *gc = getGC ? getGC() : NULL;
-    if (!gc || (uintptr_t)gc < 0x100000000ULL) return;
-
-    // 2. dataSender ở offset 0x1A0 (416 decimal)
-    void *dataSender = *(void **)((uint8_t *)gc + 0x1A0);
-    if (!dataSender || (uintptr_t)dataSender < 0x100000000ULL) return;
-
-    // 3. Gọi DataSender.HeroProphetSummon(dataSender, faction, 10) siêu tốc @ 0x140437C
-    typedef void (*Summon_t)(void *, int, int);
-    Summon_t summon = (Summon_t)(gBase + OFF_HERO_PROPHET_SUMMON);
-    if (!summon) return;
-
-    int faction = (int)self.selectedFaction;
-    summon(dataSender, faction, 10); // Mỗi lần gọi mở 10 quả cầu
-
-    self.summonBoxCount += 1;
-    self.summonOrbCount += 10;
-
-    self.counterLabel.text = [NSString stringWithFormat:@"ĐÃ DÙNG: %ld thùng (%ld quả cầu)",
-                              (long)self.summonBoxCount, (long)self.summonOrbCount];
-}
-
-@end
-
-#pragma mark - Tự động chặn & đóng sạch Popup thưởng (Popup 1 & 2)
-
-static void (*orig_Popup1_SetBonusModel)(void *, void *) = NULL;
-static void Hook_Popup1_SetBonusModel(void *self, void *bonusModel) {
-    if (gIsAutoSummoning && gBase) {
-        typedef void (*CloseClick_t)(void *);
-        CloseClick_t closeClick = (CloseClick_t)(gBase + OFF_POPUP1_CLOSE_CLICK);
-        if (closeClick && self) {
-            closeClick(self);
-            return; // Chặn đứng popup 1
-        }
-    }
-    if (orig_Popup1_SetBonusModel) orig_Popup1_SetBonusModel(self, bonusModel);
-}
-
-static void (*orig_Popup2_SetBonusModel)(void *, void *) = NULL;
-static void Hook_Popup2_SetBonusModel(void *self, void *bonusModel) {
-    if (gIsAutoSummoning && gBase) {
-        typedef void (*CloseClick_t)(void *);
-        CloseClick_t closeClick = (CloseClick_t)(gBase + OFF_POPUP2_CLOSE_CLICK);
-        if (closeClick && self) {
-            closeClick(self);
-            return; // Chặn đứng popup 2
-        }
-    }
-    if (orig_Popup2_SetBonusModel) orig_Popup2_SetBonusModel(self, bonusModel);
-}
-
-#pragma mark - UI Setup & Bootstrap
-
-static PassthroughWindow *gOverlayWindow = nil;
-
-static void SetupOverlayUI(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CGRect bounds = [UIScreen mainScreen].bounds;
-            if (@available(iOS 13.0, *)) {
-                UIWindowScene *scene = nil;
-                for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                    if (s.activationState == UISceneActivationStateForegroundActive && [s isKindOfClass:[UIWindowScene class]]) {
-                        scene = (UIWindowScene *)s;
-                        break;
-                    }
-                }
-                if (scene) {
-                    gOverlayWindow = [[PassthroughWindow alloc] initWithWindowScene:scene];
-                } else {
-                    gOverlayWindow = [[PassthroughWindow alloc] initWithFrame:bounds];
-                }
-            } else {
-                gOverlayWindow = [[PassthroughWindow alloc] initWithFrame:bounds];
-            }
-
-            gOverlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
-            gOverlayWindow.backgroundColor = [UIColor clearColor];
-
-            AutoSummonMenuController *ctrl = [AutoSummonMenuController new];
-            gOverlayWindow.rootViewController = ctrl;
-            gOverlayWindow.hidden = NO;
-        });
-    });
-}
-
-static void InstallIl2CppHooks(uintptr_t base) {
-    static BOOL done = NO;
-    if (done || !base) return;
-    done = YES;
-    gBase = base;
-
-    // Chặn Popup 1
-    MSHookFunction((void *)(base + OFF_POPUP1_SET_MODEL),
-                   (void *)&Hook_Popup1_SetBonusModel,
-                   (void **)&orig_Popup1_SetBonusModel);
-
-    // Chặn Popup 2
-    MSHookFunction((void *)(base + OFF_POPUP2_SET_MODEL),
-                   (void *)&Hook_Popup2_SetBonusModel,
-                   (void **)&orig_Popup2_SetBonusModel);
-}
-
-static void OnImageAdded(const struct mach_header *mh, intptr_t vmaddr_slide) {
-    Dl_info info;
-    if (dladdr(mh, &info) && info.dli_fname) {
-        if (strstr(info.dli_fname, "UnityFramework")) {
-            InstallIl2CppHooks((uintptr_t)mh);
-        }
-    }
-}
-
-#pragma mark - Constructor
-
-__attribute__((constructor))
-static void InitAutoSummon(void) {
+static void bootstrap(void) {
     @autoreleasepool {
-        _dyld_register_func_for_add_image(OnImageAdded);
+        g_mshook = (mshook_t)sym("MSHookFunction");
+        if (!g_mshook) g_mshook = (mshook_t)sym("MSHookFunctionUnsafe");
 
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *note) {
-            SetupOverlayUI();
-        }];
+        i_domain_get      = (void *(*)(void))sym("il2cpp_domain_get");
+        i_thread_attach   = (void *(*)(void *))sym("il2cpp_thread_attach");
+        i_get_assemblies  = (void **(*)(void *, size_t *))sym("il2cpp_domain_get_assemblies");
+        i_assembly_image  = (void *(*)(void *))sym("il2cpp_assembly_get_image");
+        i_image_name      = (const char *(*)(void *))sym("il2cpp_image_get_name");
+        i_class_from_name = (void *(*)(void *, const char *, const char *))sym("il2cpp_class_from_name");
+        i_method_from_name= (void *(*)(void *, const char *, int))sym("il2cpp_class_get_method_from_name");
+        i_field_from_name = (void *(*)(void *, const char *))sym("il2cpp_class_get_field_from_name");
+        i_field_offset    = (size_t (*)(void *))sym("il2cpp_field_get_offset");
+        i_class_get_type  = (void *(*)(void *))sym("il2cpp_class_get_type");
+        i_type_get_object = (void *(*)(void *))sym("il2cpp_type_get_object");
+        i_string_new      = (void *(*)(const char *))sym("il2cpp_string_new");
+        i_object_new      = (void *(*)(void *))sym("il2cpp_object_new");
+        i_object_unbox    = (void *(*)(void *))sym("il2cpp_object_unbox");
+        i_runtime_invoke  = (void *(*)(void *, void *, void **, void **))sym("il2cpp_runtime_invoke");
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            SetupOverlayUI();
-        });
+        if (!i_domain_get || !i_runtime_invoke || !g_mshook) {
+            NSLog(@"[MWM] prerequisites missing (mshook=%p il2cpp=%p)", g_mshook, i_runtime_invoke);
+            return;
+        }
+        while (!i_domain_get() || !findImage("mscorlib.dll")) usleep(50000);
+        i_thread_attach(i_domain_get());
+        while (!findImage("Assembly-CSharp.dll")) usleep(100000);
+
+        void *game = findImage("Assembly-CSharp.dll");
+        void *core = findImage("UnityEngine.CoreModule.dll");
+        if (!game || !core) { NSLog(@"[MWM] image lookup failed"); return; }
+
+        void *K_player = i_class_from_name(game, "HQFPSTemplate", "Player");
+        void *K_gm     = i_class_from_name(game, "", "GameMain");
+        K_playerCam    = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
+        K_dmgPlayer    = i_class_from_name(game, "", "DamageablePlayer");
+        K_lpm          = i_class_from_name(game, "", "LocalPlayerManager");
+        K_debugInfo    = i_class_from_name(game, "", "DebugInfo");
+        K_propComp     = i_class_from_name(game, "", "PlayerPropertyComp");
+        K_gameObject   = i_class_from_name(core, "UnityEngine", "GameObject");
+        K_gui          = i_class_from_name(core, "UnityEngine", "GUI");
+        K_camera       = i_class_from_name(core, "UnityEngine", "Camera");
+
+        M_getCamera     = methodOf(K_player, "get_Camera", 0);
+        M_getDamageable = methodOf(K_player, "get_DamageablePlayer", 0);
+        M_getPropComp   = methodOf(K_player, "get_PropertyComp", 0);
+        M_lpmInstance   = methodOf(K_lpm, "get_Instance", 0);
+        M_lpmLocal      = methodOf(K_lpm, "get_LocalPlayer", 0);
+        M_fpCamera      = methodOf(K_playerCam, "GetFPCamera", 0);
+        M_forceAdd      = methodOf(K_playerCam, "AddForceAngle", 1);
+        M_canDamage     = methodOf(K_dmgPlayer, "CheckCanDamage", 1);
+        M_speedRate     = methodOf(K_propComp, "GetSpeedRate", 1);
+        M_gmUpdate      = methodOf(K_gm, "Update", 0);
+        M_ongui         = methodOf(K_debugInfo, "OnGUI", 0);
+        M_goCtor        = methodOf(K_gameObject, ".ctor", 0);
+        M_goAdd         = methodOf(K_gameObject, "AddComponent", 1);
+        M_lbl           = methodOf(K_gui, "Label", 2);
+        M_btn           = methodOf(K_gui, "Button", 2);
+        M_fov           = methodOf(K_camera, "set_fieldOfView", 1);
+
+        void *f = K_playerCam ? i_field_from_name(K_playerCam, "m_RecoilAngles") : nullptr;
+        off_recoilAngles = f ? i_field_offset(f) : 0;
+
+        hookMethod(M_gmUpdate,  (void *)hk_gmUpdate,  &O_gmUpdate);
+        hookMethod(M_ongui,     (void *)hk_ongui,     &O_ongui);
+        hookMethod(M_canDamage, (void *)hk_canDamage, &O_canDamage);
+        hookMethod(M_forceAdd,  (void *)hk_forceAdd,  &O_forceAdd);
+        hookMethod(M_speedRate, (void *)hk_speedRate, &O_speedRate);
+
+        NSLog(@"[MWM] ready update=%p ongui=%p canDamage=%p forceAdd=%p speed=%p recoilOff=0x%zx",
+              MP(M_gmUpdate), MP(M_ongui), MP(M_canDamage), MP(M_forceAdd),
+              MP(M_speedRate), off_recoilAngles);
     }
+}
+
+__attribute__((constructor)) static void mwm_init(void) {
+    NSThread *t = [[NSThread alloc] initWithBlock:^{ bootstrap(); }];
+    t.name = @"MWM";
+    [t start];
 }
