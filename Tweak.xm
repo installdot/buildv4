@@ -15,8 +15,8 @@
 #import <unistd.h>
 #import <math.h>
 #import <mach/mach.h>
-#import <mach/vm_page_size.h>
-#import <sys/mman.h>
+#import <mach/vm_region.h>
+#import <mach/mach_vm.h>
 
 #pragma mark - Geometry & Screen Helpers
 
@@ -111,6 +111,8 @@ static BOOL  g_silentAim = NO;
 static float g_aimFov = 35.0f;
 static BOOL  g_bypassTutorial = YES;
 static BOOL  g_bypassRankLock = YES;
+
+static BOOL installSilentAim(void);   // defined below; installed lazily
 
 static inline BOOL alive(void *obj) {
     return obj && off_cachedPtr && *(void **)((char *)obj + off_cachedPtr) != nullptr;
@@ -452,7 +454,10 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 - (void)recoilToggled:(UISwitch *)s { g_norecoil = s.isOn; }
 - (void)espToggled:(UISwitch *)s { g_espOn = s.isOn; }
-- (void)aimToggled:(UISwitch *)s { g_silentAim = s.isOn; }
+- (void)aimToggled:(UISwitch *)s {
+    g_silentAim = s.isOn;
+    if (g_silentAim && g_il2cppReady) installSilentAim();   // lazy: never at startup
+}
 - (void)aimFovChanged:(UISlider *)s {
     g_aimFov = s.value;
     self.aimFovLabel.text = [NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov];
@@ -498,6 +503,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 - (void)attachOverlay {
     if (self.overlay) return;
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
     // Never reuse keyWindow: Unity recreates it, and it is frequently nil at
     // inject time. Own a dedicated passthrough window pinned above the game.
     UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -661,10 +667,14 @@ static BOOL resolveApi(void) {
 
 // ---------------------------------------------------------------------------
 // Hook provider.
-// TrollFools ships ElleKit inside the injected bundle, so MSHookFunction is the
-// primary path (it gives a real trampoline for silent aim). If it is missing we
-// fall back to patching the entry point with vm_protect; that path cannot give a
-// trampoline, so silent aim degrades while the constant-return bypasses still work.
+// NO in-place __TEXT patching: TrollFools/TrollStore builds are ad-hoc signed, and
+// vm_protect()+memcpy on a code page gets the process killed by the codesign
+// monitor the moment the page is executed. Only two safe mechanisms are used:
+//   1. MSHookFunction (ElleKit, shipped inside the TrollFools injection) for the
+//      one hook that needs a trampoline.
+//   2. MethodInfo->methodPointer replacement for plain return-value overrides.
+//      That is a write to writable il2cpp metadata, never to executable pages.
+// Anything unavailable is skipped: a missing feature must never be a crash.
 // ---------------------------------------------------------------------------
 static void (*pMSHookFunction)(void *, void *, void **) = nullptr;
 
@@ -673,6 +683,7 @@ static void resolveHookProvider(void) {
         NULL,
         "@executable_path/Frameworks/libellekit.dylib",
         "@executable_path/libellekit.dylib",
+        "@executable_path/Frameworks/libsubstrate.dylib",
         "/usr/lib/libellekit.dylib",
         "/usr/lib/libsubstrate.dylib",
         "/usr/lib/libhooker.dylib",
@@ -685,104 +696,76 @@ static void resolveHookProvider(void) {
     NSLog(@"[MWM] hook provider: %s", pMSHookFunction ? "yes" : "no");
 }
 
-// arm64 encodings used by the fallback patcher.
-#define INSN_RET       0xD65F03C0u
-#define INSN_MOV_W0_0  0x52800000u
-#define INSN_MOV_W0_1  0x52800020u
-#define INSN_LDR_X16   0x58000050u   // LDR X16, #8
-#define INSN_BR_X16    0xD61F0200u   // BR  X16
-#define PATCH_LEN      16            // 4 instructions: enough for the jump
+// ---------------------------------------------------------------------------
+// MethodInfo replacement (writable metadata only, no code patching).
+// Takes effect for virtual / delegate / reflection dispatch. A direct BL call
+// inside the same assembly still reaches the original body -- the feature then
+// simply does nothing, which is the intended failure mode.
+// ---------------------------------------------------------------------------
+static void dummy_ret(void *self, void *mi) { (void)self; (void)mi; }
+static bool dummy_false(void *mi) { (void)mi; return false; }
+static bool dummy_true_i(int32_t a, void *mi) { (void)a; (void)mi; return true; }
+static bool dummy_true_ic(int32_t a, void *cb, void *mi) { (void)a; (void)cb; (void)mi; return true; }
 
-extern void sys_icache_invalidate(void *start, size_t len);
+// Write to a MethodInfo/methodSlot that may sit on a read-only data page.
+// Executable pages are never touched: vm_protect()+write on __TEXT makes the
+// codesign monitor kill the process on the next page-in. A skipped patch is a
+// disabled feature; a bad patch is a crash.
+static BOOL safeWritePtr(void *addr, void *value) {
+    if (!addr) return NO;
 
-static BOOL makeWritable(void *dst, size_t len) {
-    uintptr_t pageSize = 0x4000;
-    uintptr_t base = (uintptr_t)dst & ~(pageSize - 1);
-    uintptr_t span = (((uintptr_t)dst + len - base) + pageSize - 1) & ~(pageSize - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), base, span, false,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    vm_address_t page = (vm_address_t)addr & ~(vm_address_t)0x3FFF;
+    vm_size_t span = 0x4000;
+
+    // Refuse executable pages: patching __TEXT is what killed the process before.
+    vm_address_t q = page;
+    vm_size_t qsize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = vm_region_64(mach_task_self(), &q, &qsize, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &count, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
     if (kr != KERN_SUCCESS) {
-        NSLog(@"[MWM] vm_protect(%p) failed: %d", dst, kr);
+        NSLog(@"[MWM] skip patch: vm_region(%p) failed %d", addr, kr);
         return NO;
     }
+    if (info.protection & VM_PROT_EXECUTE) {
+        NSLog(@"[MWM] skip patch: executable page %p", addr);
+        return NO;
+    }
+
+    // il2cpp metadata is read-only after init; make the single page writable.
+    kr = vm_protect(mach_task_self(), page, span, false, VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        NSLog(@"[MWM] skip patch: vm_protect(%p) failed %d", addr, kr);
+        return NO;
+    }
+    *(void **)addr = value;
     return YES;
 }
 
-// Absolute jump: LDR X16,#8 ; BR X16 ; <64-bit target>
-static void writeJump(uint32_t *p, const void *target) {
-    p[0] = INSN_LDR_X16;
-    p[1] = INSN_BR_X16;
-    uint64_t a = (uint64_t)target;
-    memcpy(&p[2], &a, sizeof(a));
-}
-
-static BOOL patchCopy(void *dst, const void *src, size_t len) {
-    if (!dst || !src || !len) return NO;
-    if (!makeWritable(dst, len)) return NO;
-    memcpy(dst, src, len);
-    sys_icache_invalidate(dst, len);
-    return YES;
-}
-
-// Constant-return patches: MOV W0,#imm ; RET  (BOOL)  or  RET  (void)
-static void patchReturnBool(void *mi, BOOL value) {
-    void *fn = MP(mi);
-    if (!fn) return;
-    uint32_t ins[2] = { value ? INSN_MOV_W0_1 : INSN_MOV_W0_0, INSN_RET };
-    patchCopy(fn, ins, sizeof(ins));
-}
-
-static void patchReturnVoid(void *mi) {
-    void *fn = MP(mi);
-    if (!fn) return;
-    uint32_t ins[1] = { INSN_RET };
-    patchCopy(fn, ins, sizeof(ins));
+static BOOL replaceMethod(void *mi, void *repl) {
+    if (!MP(mi)) return NO;
+    return safeWritePtr(mi, repl);   // MethodInfo.methodPointer is field 0
 }
 
 // ---------------------------------------------------------------------------
-// Silent aim: needs a trampoline so the original body still runs.
+// Silent aim. Requires a trampoline, so it only installs when ElleKit is present.
 // ---------------------------------------------------------------------------
 static BOOL g_fireDirPatched = NO;
-
-// Trampoline: original 4 instructions, then jump back to fn+16.
-static void *makeTrampoline(void *fn, void **outBack) {
-    const size_t need = PATCH_LEN + PATCH_LEN;
-    void *page = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (page == MAP_FAILED) {
-        NSLog(@"[MWM] trampoline mmap failed");
-        return nullptr;
-    }
-    memcpy(page, fn, PATCH_LEN);
-    writeJump((uint32_t *)((char *)page + PATCH_LEN), (char *)fn + PATCH_LEN);
-    sys_icache_invalidate(page, need);
-    if (outBack) *outBack = page;
-    return page;
-}
 
 static BOOL installSilentAim(void) {
     void *fn = MP(M_fireDir);
     if (!fn || g_fireDirPatched) return g_fireDirPatched;
-
-    if (pMSHookFunction) {
-        pMSHookFunction(fn, (void *)&hk_computerFireDirection, (void **)&O_computerFireDirection);
-        g_fireDirPatched = (O_computerFireDirection != nullptr);
-        return g_fireDirPatched;
-    }
-
-    // Fallback: hand-rolled inline hook.
-    void *tramp = makeTrampoline(fn, nullptr);
-    if (!tramp) return NO;
-    O_computerFireDirection = tramp;
-
-    uint32_t stub[4];
-    writeJump(stub, (void *)&hk_computerFireDirection);
-    if (!patchCopy(fn, stub, sizeof(stub))) {
-        O_computerFireDirection = nullptr;
+    if (!pMSHookFunction) {
+        NSLog(@"[MWM] silent aim skipped: no MSHookFunction");
         return NO;
     }
-    g_fireDirPatched = YES;
-    return YES;
+    pMSHookFunction(fn, (void *)&hk_computerFireDirection, (void **)&O_computerFireDirection);
+    g_fireDirPatched = (O_computerFireDirection != nullptr);
+    if (!g_fireDirPatched) NSLog(@"[MWM] MSHookFunction failed for fireDir");
+    return g_fireDirPatched;
 }
 
 static BOOL resolveIl2Cpp(void) {
@@ -852,22 +835,21 @@ static BOOL resolveIl2Cpp(void) {
     if (!MP(M_w2s) || !MP(M_camMain)) { snprintf(g_diag, sizeof(g_diag), "Status: no Camera API"); return NO; }
 
     resolveHookProvider();
-    BOOL aimOk = installSilentAim();
 
     if (g_bypassTutorial) {
-        patchReturnVoid(M_guideInit);           // Init(): return immediately
-        patchReturnBool(M_checkGuideScene, NO); // not a guide scene
-        patchReturnBool(M_isNewbieGame, NO);    // not a newbie game
+        replaceMethod(M_guideInit, (void *)&dummy_ret);              // Init(): no step machine
+        replaceMethod(M_checkGuideScene, (void *)&dummy_false);      // static bool
+        replaceMethod(M_isNewbieGame, (void *)&dummy_false);         // static bool
     }
     if (g_bypassRankLock) {
-        patchReturnBool(M_checkFuncOpen, YES);
-        patchReturnBool(M_checkFuncUnlock, YES);
+        replaceMethod(M_checkFuncOpen, (void *)&dummy_true_i);       // bool (int)
+        replaceMethod(M_checkFuncUnlock, (void *)&dummy_true_ic);    // bool (int, Action)
     }
 
-    NSLog(@"[MWM] armed hook=%d aim=%d netMap=%zu fov=%p",
-          pMSHookFunction != nullptr, aimOk, off_netPlayerMap, MP(M_fov));
-    snprintf(g_diag, sizeof(g_diag), "Status: Armed (hook=%s aim=%s)",
-             pMSHookFunction ? "yes" : "no", aimOk ? "yes" : "no");
+    NSLog(@"[MWM] armed hook=%d netMap=%zu fov=%p",
+          pMSHookFunction != nullptr, off_netPlayerMap, MP(M_fov));
+    snprintf(g_diag, sizeof(g_diag), "Status: Armed (hook=%s)",
+             pMSHookFunction ? "yes" : "no");
     g_il2cppReady = YES;
     return YES;
 }
@@ -875,13 +857,16 @@ static BOOL resolveIl2Cpp(void) {
 #pragma mark - Lifecycle
 
 static void tick(void) {
-    [[MWMUIManager shared] setupUI];
-    if (!g_apiResolved && !resolveApi()) return;
+    if (!g_apiResolved && !resolveApi()) {
+        @try { [[MWMUIManager shared] setupUI]; } @catch (NSException *e) { NSLog(@"[MWM] UI: %@", e); }
+        return;
+    }
     if (g_il2cppReady) return;
     void *d = i_domain_get();
     if (!d) { snprintf(g_diag, sizeof(g_diag), "Status: domain null"); return; }
     i_thread_attach(d);
     if (resolveIl2Cpp()) NSLog(@"[MWM] ready");
+    @try { [[MWMUIManager shared] setupUI]; } @catch (NSException *e) { NSLog(@"[MWM] UI: %@", e); }
 }
 
 static void pollUntilArmed(int attempt) {
@@ -890,10 +875,17 @@ static void pollUntilArmed(int attempt) {
         if (running) return;
         running = YES;
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+    int64_t delay = (attempt == 0) ? 2 * (int64_t)NSEC_PER_SEC : (int64_t)NSEC_PER_SEC;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay),
                    dispatch_get_main_queue(), ^{
-        @autoreleasepool { tick(); }
+        @autoreleasepool {
+            @try { tick(); } @catch (NSException *e) { NSLog(@"[MWM] tick: %@", e); }
+        }
+        // Keep going until the overlay exists: the app may still be inactive when
+        // the first few ticks run, and a single early failure must not be final.
+        BOOL uiReady = [MWMUIManager shared].overlay != nil;
         if (!g_il2cppReady && attempt < 180) pollUntilArmed(attempt + 1);
+        else if (!uiReady && attempt < 400) pollUntilArmed(attempt + 1);
     });
 }
 
