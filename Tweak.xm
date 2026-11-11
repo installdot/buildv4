@@ -72,6 +72,7 @@ static void *M_playerName;        // NetPlayer::GetPlayerName()
 static void *M_playerIsAi;        // NetPlayer::IsAiPlayer()
 static void *M_playerPos;         // NetPlayer::GetPosition()
 static void *M_netPlayerId;       // NetPlayer::GetNetPlayerId()
+static void *M_netTeamId;         // NetPlayer::GetTeamId()
 static size_t off_bindNetId;      // LocalPlayerManager.curBindNetPlayerId
 static size_t off_netPlayerMap;
 
@@ -106,6 +107,12 @@ static BOOL  g_espOn = NO;
 static BOOL  g_silentAim = NO;
 static float g_aimFov = 35.0f;
 static BOOL  g_showAimFov = NO;
+
+// Cached every frame by onFrame() on the main thread. The fire hook must never call
+// into Unity/il2cpp: doing so from inside the weapon-fire path re-enters the physics
+// update and crashed the game 1-2s after enabling silent aim.
+static Vec3  g_aimHead = {0.0f, 0.0f, 0.0f};
+static volatile BOOL g_aimHeadValid = NO;
 static BOOL  g_bypassTutorial = YES;
 static BOOL  g_bypassRankLock = YES;
 
@@ -142,6 +149,16 @@ typedef struct {
 #define MAX_TARGETS 32
 static EspTarget g_targets[MAX_TARGETS];
 static int g_targetCount = 0;
+
+// Il2CppString: klass@0, monitor@8, length@0x10, utf16 chars@0x14
+static BOOL il2cppStrEqual(void *a, void *b) {
+    if (a == b) return YES;
+    if (!a || !b) return NO;
+    int la = *(int *)((char *)a + 0x10);
+    int lb = *(int *)((char *)b + 0x10);
+    if (la != lb || la <= 0 || la > 64) return NO;
+    return memcmp((char *)a + 0x14, (char *)b + 0x14, (size_t)la * 2) == 0;
+}
 
 static void scanPlayersImpl(void);
 
@@ -194,6 +211,21 @@ static void scanPlayersImpl(void) {
         if (alive(tr)) myPos = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
     }
 
+    // Pass 1: locate our own NetPlayer so its team id can be compared.
+    void *myTeam = nullptr;
+    if (myNetId && MP(M_netPlayerId) && MP(M_netTeamId)) {
+        for (int i = 0; i < count; i++) {
+            char *e = entries + (size_t)i * 0x18;
+            if (*(int *)e < 0) continue;
+            void *np = readPtr(e, 0x10);
+            if (!np || !alive(np)) continue;
+            if (((uint16_t (*)(void *, void *))MP(M_netPlayerId))(np, M_netPlayerId) != myNetId) continue;
+            myTeam = ((void *(*)(void *, void *))MP(M_netTeamId))(np, M_netTeamId);
+            break;
+        }
+    }
+
+    // Pass 2: build targets, skipping ourselves and (when known) our own team.
     for (int i = 0; i < count && g_targetCount < MAX_TARGETS; i++) {
         char *e = entries + (size_t)i * 0x18;
         if (*(int *)e < 0) continue;            // empty slot
@@ -201,6 +233,12 @@ static void scanPlayersImpl(void) {
         if (!np || !alive(np)) continue;        // NetPlayer is a NetworkBehaviour
         if (myNetId && MP(M_netPlayerId) &&
             ((uint16_t (*)(void *, void *))MP(M_netPlayerId))(np, M_netPlayerId) == myNetId) continue;
+        // Teammate: same non-empty team id as ours. Solo modes expose no team id,
+        // so the compare simply never matches there.
+        if (myTeam && MP(M_netTeamId)) {
+            void *theirTeam = ((void *(*)(void *, void *))MP(M_netTeamId))(np, M_netTeamId);
+            if (il2cppStrEqual(myTeam, theirTeam)) continue;
+        }
 
         Vec3 pos = {0.0f, 0.0f, 0.0f};
         if (MP(M_playerPos)) pos = ((Vec3 (*)(void *, void *))MP(M_playerPos))(np, M_playerPos);
@@ -257,24 +295,28 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
     return found;
 }
 
+// Runs on the game's fire path. Only touches shootData and cached floats -- no
+// il2cpp call, no Unity call, no ObjC. Anything heavier here crashes the game.
 static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) {
-    if (g_silentAim && shootData && g_targetCount > 0) {
-        Vec3 head;
-        if (pickBestTargetHead(&head)) {
-            // ModelShotData: shootPos @0x48, shootDir @0x54
-            Vec3 sp = *(Vec3 *)((char *)shootData + 0x48);
-            Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
-            float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-            if (len > 0.0001f) {
-                dir.x /= len; dir.y /= len; dir.z /= len;
-                *(Vec3 *)((char *)shootData + 0x54) = dir;
-                return dir;
-            }
+    Vec3 orig;
+    if (!shootData) return (Vec3){0.0f, 0.0f, 1.0f};
+
+    if (g_silentAim && g_aimHeadValid) {
+        Vec3 head = g_aimHead;          // snapshot; written by onFrame ()
+        Vec3 sp = *(Vec3 *)((char *)shootData + 0x48);
+        Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
+        float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+        if (len > 0.0001f) {
+            dir.x /= len; dir.y /= len; dir.z /= len;
+            *(Vec3 *)((char *)shootData + 0x54) = dir;
+            return dir;
         }
     }
+
     if (O_computerFireDirection)
         return ((Vec3 (*)(void *, void *, void *))O_computerFireDirection)(self, shootData, method);
-    return shootData ? *(Vec3 *)((char *)shootData + 0x54) : (Vec3){0.0f, 0.0f, 1.0f};
+    orig = *(Vec3 *)((char *)shootData + 0x54);
+    return orig;
 }
 
 #pragma mark - ESP Overlay
@@ -592,6 +634,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 - (void)onFrame {
     if (g_espOn || g_showAimFov) [self.espView setNeedsDisplay];
+    g_aimHeadValid = NO;   // re-set below only while a target is actually visible
 
     if (!g_il2cppReady) {
         [self setStatus:g_diag color:[UIColor colorWithRed:1.0 green:0.55 blue:0.2 alpha:1.0]];
@@ -608,6 +651,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
     if (!alive(player)) {
         g_lcam = nullptr;
+        g_aimHeadValid = NO;
         [self setStatus:"Status: Lobby / Loading" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
@@ -615,6 +659,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     int type = off_playerType ? *(int *)((char *)player + off_playerType) : 1;
     if (type == 0 || type == 4) {
         g_lcam = nullptr;
+        g_aimHeadValid = NO;
         [self setStatus:"Status: In Lobby" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
@@ -622,6 +667,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     void *cam = readPtr(player, off_playerCam);
     g_lcam = alive(cam) ? cam : nullptr;
     if (!g_lcam) {
+        g_aimHeadValid = NO;
         [self setStatus:"Status: Loading Match..." color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
@@ -640,6 +686,16 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     }
 
     if (g_espOn || g_silentAim) scanPlayers();
+
+    // Publish the aim point for the fire hook. All Unity calls stay on this thread.
+    g_aimHeadValid = NO;
+    if (g_silentAim && g_targetCount > 0) {
+        Vec3 head;
+        if (pickBestTargetHead(&head)) {
+            g_aimHead = head;
+            g_aimHeadValid = YES;
+        }
+    }
 }
 @end
 
@@ -819,6 +875,7 @@ static BOOL resolveIl2Cpp(void) {
     M_playerIsAi   = methodOf(K_netPlayer, "IsAiPlayer", 0);
     M_playerPos    = methodOf(K_netPlayer, "GetPosition", 0);
     M_netPlayerId  = methodOf(K_netPlayer, "GetNetPlayerId", 0);
+    M_netTeamId    = methodOf(K_netPlayer, "GetTeamId", 0);
     off_bindNetId  = fieldOff(K_lpm, "curBindNetPlayerId");
     off_netPlayerMap = fieldOff(K_netMgrBase, "NetPlayerMap"); // 0x18
 
