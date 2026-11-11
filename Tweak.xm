@@ -297,35 +297,49 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
     return found;
 }
 
-// Runs on the game's fire path. Only touches shootData and cached floats -- no
-// il2cpp call, no Unity call, no ObjC. Anything heavier here crashes the game.
+// Runs on the game's fire path, once per bullet/pellet.
+//
+// Rules learned from the "crash on trigger pull" report:
+//   * ALWAYS run the original body. Skipping it left shootData in a state the
+//     caller then fed to Physics.RaycastNonAlloc, which is what killed the process.
+//   * NEVER write into shootData. Only the returned direction is consumed by both
+//     callers (computerVirtualBullet reads s0-s2, computerEntityBullet forwards it).
+//   * Reject non-finite vectors. g_aimHead is published from another thread and a
+//     torn 12-byte read yields NaN, and a NaN ray direction crashes Unity physics.
+static inline BOOL vec3Finite(Vec3 v) {
+    return v.x == v.x && v.y == v.y && v.z == v.z &&
+           fabsf(v.x) < 1e6f && fabsf(v.y) < 1e6f && fabsf(v.z) < 1e6f;
+}
+
 static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) {
-    Vec3 orig;
-    if (!shootData) return (Vec3){0.0f, 0.0f, 1.0f};
+    Vec3 dir = { 0.0f, 0.0f, 1.0f };
 
-    // Only steer OUR bullets. ModelShotData.shooterId is at +0x4; redirecting AI or
-    // other players' shots re-enters damage resolution for entities we do not own,
-    // which crashed the game a couple of seconds after enabling silent aim.
+    // The hook is only ever installed when a usable trampoline exists, so this
+    // branch is always taken. If it is not, returning a fabricated vector would
+    // hand the caller a direction the original never produced -> crash on fire.
+    if (!O_computerFireDirection) return dir;
+
+    // Original first, unconditionally: identical side effects every time.
+    dir = ((Vec3 (*)(void *, void *, void *))O_computerFireDirection)(self, shootData, method);
+
+    if (!shootData) return dir;
+    if (!g_silentAim || !g_aimHeadValid) return dir;
+    if (!vec3Finite(dir)) return (Vec3){ 0.0f, 0.0f, 1.0f };
+
+    // Only steer OUR bullets: ModelShotData.shooterId at +0x4.
     uint16_t shooter = *(uint16_t *)((char *)shootData + 0x4);
-    BOOL mine = (g_myNetId != 0) ? (shooter == g_myNetId) : NO;
+    if (!g_myNetId || shooter != g_myNetId) return dir;
 
-    if (g_silentAim && g_aimHeadValid && mine) {
-        Vec3 head = g_aimHead;          // snapshot; written by onFrame ()
-        Vec3 sp = *(Vec3 *)((char *)shootData + 0x48);
-        Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
-        float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-        if (len > 0.0001f) {
-            dir.x /= len; dir.y /= len; dir.z /= len;
-            *(Vec3 *)((char *)shootData + 0x54) = dir;
-            return dir;
-        }
-    }
+    Vec3 head = g_aimHead;
+    Vec3 sp = *(Vec3 *)((char *)shootData + 0x48);   // shootPos
+    if (!vec3Finite(head) || !vec3Finite(sp)) return dir;
 
-    if (O_computerFireDirection &&
-        (uintptr_t)O_computerFireDirection > 0x1000)
-        return ((Vec3 (*)(void *, void *, void *))O_computerFireDirection)(self, shootData, method);
-    orig = *(Vec3 *)((char *)shootData + 0x54);
-    return orig;
+    Vec3 aimed = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
+    float len = sqrtf(aimed.x * aimed.x + aimed.y * aimed.y + aimed.z * aimed.z);
+    if (!(len > 0.01f) || len != len || len > 1e6f) return dir;
+
+    aimed.x /= len; aimed.y /= len; aimed.z /= len;
+    return aimed;                      // return only -- no write into shootData
 }
 
 #pragma mark - ESP Overlay
@@ -687,12 +701,12 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     if (g_espOn || g_silentAim) scanPlayers();
 
     // Publish the aim point for the fire hook. All Unity calls stay on this thread.
-    g_aimHeadValid = NO;
+    g_aimHeadValid = NO;              // publish gate: invalid while we mutate
     if (g_silentAim && g_targetCount > 0) {
         Vec3 head;
-        if (pickBestTargetHead(&head)) {
+        if (pickBestTargetHead(&head) && vec3Finite(head)) {
             g_aimHead = head;
-            g_aimHeadValid = YES;
+            g_aimHeadValid = YES;     // only now is the snapshot readable
         }
     }
 }
@@ -778,6 +792,20 @@ static bool dummy_true_ic(int32_t a, void *cb, void *mi) { (void)a; (void)cb; (v
 // Executable pages are never touched: vm_protect()+write on __TEXT makes the
 // codesign monitor kill the process on the next page-in. A skipped patch is a
 // disabled feature; a bad patch is a crash.
+static BOOL addrIsExecutable(void *addr) {
+    if (!addr || (uintptr_t)addr < 0x1000) return NO;
+    vm_address_t q = (vm_address_t)addr;
+    vm_size_t qsize = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = vm_region_64(mach_task_self(), &q, &qsize, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &count, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    if (kr != KERN_SUCCESS) return NO;
+    return (info.protection & VM_PROT_EXECUTE) != 0;
+}
+
 static BOOL safeWritePtr(void *addr, void *value) {
     if (!addr) return NO;
 
@@ -829,9 +857,21 @@ static BOOL installSilentAim(void) {
         return NO;
     }
     pMSHookFunction(fn, (void *)&hk_computerFireDirection, (void **)&O_computerFireDirection);
+
+    // A hook library that is not really a hook library hands back the original
+    // address (or garbage) as the "trampoline". Calling it re-enters the patched
+    // entry and recurses until the stack dies -- which is exactly "crash on fire".
+    void *tramp = O_computerFireDirection;
+    if (tramp == fn || !addrIsExecutable(tramp)) {
+        NSLog(@"[MWM] fireDir trampoline rejected: %p (fn=%p)", tramp, fn);
+        O_computerFireDirection = nullptr;
+    }
     g_fireDirPatched = (O_computerFireDirection != nullptr);
-    if (!g_fireDirPatched) NSLog(@"[MWM] MSHookFunction failed for fireDir");
-    return g_fireDirPatched;
+    if (!g_fireDirPatched) {
+        NSLog(@"[MWM] silent aim disabled: unusable trampoline");
+        return NO;
+    }
+    return YES;
 }
 
 static BOOL resolveIl2Cpp(void) {
