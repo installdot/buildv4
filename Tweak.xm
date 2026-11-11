@@ -1,13 +1,9 @@
 // Mini World : Royale (com.miniworldroyale.sparkgame)
 // TrollFools injected tweak — native UIKit menu, ESP overlay, silent aim.
 //
-// Features:
-//   * No Recoil
-//   * FOV Slider (FPP & TPP support)
-//   * ESP: 2D Box + Snapline + Name + Distance + Bot/Player indicator
-//   * Silent Aim: Redirects bullet trajectory to enemy head inside FOV
-//   * Bypass Tutorial (blocks guide scene & battle guide manager init)
-//   * Bypass Rank Lock by level (forces CheckFunctionIsOpen & CheckFuncUnlock to true)
+// Symbol names below are taken verbatim from Il2CppDumper dump.cs for this build.
+// Any name that does not exist makes resolveIl2Cpp() return NO and every feature
+// dies silently, so each lookup is logged and the status label shows the failure.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -18,6 +14,9 @@
 #import <stdint.h>
 #import <unistd.h>
 #import <math.h>
+#import <mach/mach.h>
+#import <mach/vm_page_size.h>
+#import <sys/mman.h>
 
 #pragma mark - Geometry & Screen Helpers
 
@@ -52,6 +51,10 @@ static inline void *readPtr(void *obj, size_t off) {
     return (obj && off) ? *(void **)((char *)obj + off) : nullptr;
 }
 
+#pragma mark - Diagnostic
+
+static char g_diag[96] = "Status: Booting...";
+
 #pragma mark - Resolved Symbols
 
 static void *K_lpm, *K_camera, *K_playerCam, *K_player;
@@ -62,25 +65,36 @@ static void *M_fov;               // Camera::set_fieldOfView(float)
 static void *M_w2s;               // Camera::WorldToScreenPoint(Vector3)
 static void *M_camMain;           // Camera::get_main()
 static void *M_setFpCameraFov;    // PlayerCamera::SetFPCameraFieldOfView(float, float)
+static void *M_getTransform;      // Component::get_transform()
+static void *M_getPos;            // Transform::get_position()
 
-// ESP / Aim symbols
+// ESP / Aim
 static void *M_netInstance;       // NetManager::get_Instance()
 static void *M_playerName;        // NetPlayer::GetPlayerName()
 static void *M_playerIsAi;        // NetPlayer::IsAiPlayer()
 static void *M_playerPos;         // NetPlayer::GetPosition()
+static void *M_netPlayerId;       // NetPlayer::GetNetPlayerId()
+static size_t off_bindNetId;      // LocalPlayerManager.curBindNetPlayerId
 static size_t off_netPlayerMap;
 
-// Weapon silent aim symbol
-static void *M_fireDir;           // WeaponProcessBase::computerFireDirection(ref ModelShotData)
+// Silent aim
+static void *M_fireDir;           // WeaponProcessBase::computerFireDirection
 static void *O_computerFireDirection = nullptr;
 
-// Bypass symbols
+// Bypasses
 static void *M_guideInit;         // BattleGuideManager::Init()
 static void *M_checkGuideScene;   // LogicSceneHelper::CheckIsGuideScene()
 static void *M_isNewbieGame;      // LogicSceneHelper::IsNewbieGame()
 static void *M_checkFuncOpen;     // LuaHelper::CheckFunctionIsOpen(int)
-static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action)
+static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action<uint>)
 
+// Field offsets (this build)
+//   UnityEngine.Object.m_CachedPtr           0x10
+//   LocalPlayerManager.mLocalPlayer          0x18
+//   Player._PlayerCamera                     0x4E8
+//   Player.LocalPlayerType                   0x4C8
+//   PlayerCamera.m_RecoilAngles              0x58
+//   NetManagerBase.NetPlayerMap              0x18
 static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
 static size_t off_playerCam, off_recoilAngles;
 
@@ -107,7 +121,7 @@ static inline BOOL alive(void *obj) {
 static BOOL worldToScreen(void *cam, Vec3 world, CGPoint *outPt) {
     if (!cam || !outPt || !MP(M_w2s)) return NO;
     Vec3 p = ((Vec3 (*)(void *, Vec3, void *))MP(M_w2s))(cam, world, M_w2s);
-    if (p.z <= 0.0f) return NO; // Behind camera
+    if (p.z <= 0.0f) return NO;
     CGFloat scale = [UIScreen mainScreen].scale;
     if (scale <= 0.0f) scale = 1.0f;
     outPt->x = (CGFloat)p.x / scale;
@@ -133,57 +147,58 @@ static void scanPlayers(void) {
     g_targetCount = 0;
     if (!MP(M_netInstance) || !off_netPlayerMap) return;
 
+    // NetManagerBase is a plain managed class (not a UnityEngine.Object), so there is
+    // no m_CachedPtr -- use a plain null check, never alive().
     void *mgr = ((void *(*)(void *))MP(M_netInstance))(M_netInstance);
-    if (!alive(mgr)) return;
+    if (!mgr) return;
 
     void *dict = readPtr(mgr, off_netPlayerMap);
     if (!dict) return;
 
-    // Dictionary internals: buckets@0x10, entries@0x18, count@0x20
+    // Dictionary<ushort,NetPlayer>: buckets@0x10, entries@0x18, count@0x20
     void **entries = (void **)readPtr(dict, 0x18);
     int count = *(int *)((char *)dict + 0x20);
     if (!entries || count <= 0 || count > 512) return;
 
-    void *myPlayer = nullptr;
-    if (MP(M_lpmInstance)) {
-        void *lpm = ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance);
-        if (lpm && off_lpmPlayer) myPlayer = readPtr(lpm, off_lpmPlayer);
-    }
+    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
+    void *myPlayer = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
+    // Entries hold NetPlayer while the local player is a Player, so pointer equality
+    // never matches -- exclude self by net id instead.
+    uint16_t myNetId = 0;
+    if (lpm && off_bindNetId) myNetId = *(uint16_t *)((char *)lpm + off_bindNetId);
 
+    // Player is a MonoBehaviour (not a NetPlayer), so its position comes from Transform.
     Vec3 myPos = {0.0f, 0.0f, 0.0f};
-    if (alive(g_lcam) && MP(M_playerPos) && myPlayer) {
-        myPos = ((Vec3 (*)(void *, void *))MP(M_playerPos))(myPlayer, M_playerPos);
+    if (myPlayer && MP(M_getTransform) && MP(M_getPos)) {
+        void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(myPlayer, M_getTransform);
+        if (alive(tr)) myPos = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
     }
 
     for (int i = 0; i < count && g_targetCount < MAX_TARGETS; i++) {
         char *e = (char *)entries + (size_t)i * 0x18;
-        int hashCode = *(int *)e;
-        if (hashCode < 0) continue; // Empty slot
-        void *np = readPtr(e, 0x10);
-        if (!np || np == myPlayer) continue;
+        if (*(int *)e < 0) continue;            // empty slot
+        void *np = readPtr(e, 0x10);            // TValue
+        if (!np || !alive(np)) continue;        // NetPlayer is a NetworkBehaviour
+        if (myNetId && MP(M_netPlayerId) &&
+            ((uint16_t (*)(void *, void *))MP(M_netPlayerId))(np, M_netPlayerId) == myNetId) continue;
 
         Vec3 pos = {0.0f, 0.0f, 0.0f};
-        if (MP(M_playerPos)) {
-            pos = ((Vec3 (*)(void *, void *))MP(M_playerPos))(np, M_playerPos);
-        }
+        if (MP(M_playerPos)) pos = ((Vec3 (*)(void *, void *))MP(M_playerPos))(np, M_playerPos);
         if (pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f) continue;
 
-        float dx = pos.x - myPos.x;
-        float dy = pos.y - myPos.y;
-        float dz = pos.z - myPos.z;
-        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        float dx = pos.x - myPos.x, dy = pos.y - myPos.y, dz = pos.z - myPos.z;
 
         EspTarget *t = &g_targets[g_targetCount];
         t->obj = np;
         t->head = (Vec3){ pos.x, pos.y + 1.65f, pos.z };
-        t->dist = dist;
+        t->dist = sqrtf(dx * dx + dy * dy + dz * dz);
         t->isAi = MP(M_playerIsAi) ? ((bool (*)(void *, void *))MP(M_playerIsAi))(np, M_playerIsAi) : NO;
         t->name[0] = '\0';
 
         if (MP(M_playerName)) {
             void *str = ((void *(*)(void *, void *))MP(M_playerName))(np, M_playerName);
             if (str) {
-                int len = *(int *)((char *)str + 0x10);
+                int len = *(int *)((char *)str + 0x10);   // Il2CppString.length
                 if (len > 0 && len < 31) {
                     const uint16_t *ch = (const uint16_t *)((char *)str + 0x14);
                     for (int c = 0; c < len; c++) t->name[c] = (char)(ch[c] < 128 ? ch[c] : '?');
@@ -195,30 +210,27 @@ static void scanPlayers(void) {
     }
 }
 
-#pragma mark - Silent Aim Target Selection
+#pragma mark - Silent Aim
 
 static BOOL pickBestTargetHead(Vec3 *outHead) {
-    if (!g_targetCount || !outHead) return NO;
-    void *cam = MP(M_camMain) ? ((void *(*)(void *))MP(M_camMain))(M_camMain) : nullptr;
-    if (!alive(cam)) cam = g_lcam;
-    if (!cam) return NO;
+    if (!g_targetCount || !outHead || !MP(M_camMain)) return NO;
+    void *cam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
+    if (!alive(cam)) return NO;
 
     CGFloat cx = ScreenW() * 0.5f;
     CGFloat cy = ScreenH() * 0.5f;
     CGFloat maxRadius = (g_aimFov / 90.0f) * cx;
-    float bestDist = 1e9f;
+    float best = 1e9f;
     BOOL found = NO;
 
     for (int i = 0; i < g_targetCount; i++) {
-        EspTarget *t = &g_targets[i];
         CGPoint sp;
-        if (!worldToScreen(cam, t->head, &sp)) continue;
-        float dx = (float)(sp.x - cx);
-        float dy = (float)(sp.y - cy);
+        if (!worldToScreen(cam, g_targets[i].head, &sp)) continue;
+        float dx = (float)(sp.x - cx), dy = (float)(sp.y - cy);
         float d = sqrtf(dx * dx + dy * dy);
-        if (d <= (float)maxRadius && d < bestDist) {
-            bestDist = d;
-            *outHead = t->head;
+        if (d <= (float)maxRadius && d < best) {
+            best = d;
+            *outHead = g_targets[i].head;
             found = YES;
         }
     }
@@ -227,48 +239,57 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
 
 static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) {
     if (g_silentAim && shootData && g_targetCount > 0) {
-        Vec3 targetHead;
-        if (pickBestTargetHead(&targetHead)) {
+        Vec3 head;
+        if (pickBestTargetHead(&head)) {
             // ModelShotData: shootPos @0x48, shootDir @0x54
-            Vec3 shootPos = *(Vec3 *)((char *)shootData + 0x48);
-            Vec3 dir = { targetHead.x - shootPos.x, targetHead.y - shootPos.y, targetHead.z - shootPos.z };
+            Vec3 sp = *(Vec3 *)((char *)shootData + 0x48);
+            Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
             float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
             if (len > 0.0001f) {
-                dir.x /= len;
-                dir.y /= len;
-                dir.z /= len;
+                dir.x /= len; dir.y /= len; dir.z /= len;
                 *(Vec3 *)((char *)shootData + 0x54) = dir;
                 return dir;
             }
         }
     }
-    if (O_computerFireDirection) {
+    if (O_computerFireDirection)
         return ((Vec3 (*)(void *, void *, void *))O_computerFireDirection)(self, shootData, method);
-    }
     return shootData ? *(Vec3 *)((char *)shootData + 0x54) : (Vec3){0.0f, 0.0f, 1.0f};
 }
 
-#pragma mark - ESP Overlay View
+#pragma mark - Overlay passthrough
+
+// Root view of the overlay window: only subviews that opt in receive touches,
+// everything else falls through to the game below.
+@interface MWMPassthroughView : UIView
+@end
+
+@implementation MWMPassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(id)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self) ? nil : hit;
+}
+@end
+
+#pragma mark - ESP Overlay
 
 @interface MWMEspView : UIView
 @end
 
 @implementation MWMEspView
 - (BOOL)isUserInteractionEnabled { return NO; }
+- (UIView *)hitTest:(CGPoint)point withEvent:(id)event { (void)point; (void)event; return nil; }
 
 - (void)drawRect:(CGRect)rect {
-    if (!g_espOn || !g_targetCount) return;
+    (void)rect;
+    if (!g_espOn || !g_targetCount || !MP(M_camMain)) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
 
-    void *cam = MP(M_camMain) ? ((void *(*)(void *))MP(M_camMain))(M_camMain) : nullptr;
-    if (!alive(cam)) cam = g_lcam;
+    void *cam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
     if (!alive(cam)) return;
 
-    CGFloat sw = ScreenW();
-    CGFloat sh = ScreenH();
-    CGPoint snapOrigin = CGPointMake(sw * 0.5f, sh);
-
+    CGPoint snapOrigin = CGPointMake(ScreenW() * 0.5f, ScreenH());
     CGContextSetLineWidth(ctx, 1.2f);
 
     for (int i = 0; i < g_targetCount; i++) {
@@ -285,39 +306,32 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
         CGFloat w = h * 0.48f;
         CGRect box = CGRectMake(headPt.x - w * 0.5f, headPt.y, w, h);
 
-        UIColor *color = t->isAi ? [UIColor colorWithRed:1.0f green:0.85f blue:0.0f alpha:0.95f]
-                                 : [UIColor colorWithRed:0.2f green:1.0f blue:0.3f alpha:0.95f];
-
+        UIColor *color = t->isAi
+            ? [UIColor colorWithRed:1.0f green:0.85f blue:0.0f alpha:0.95f]
+            : [UIColor colorWithRed:0.2f green:1.0f blue:0.3f alpha:0.95f];
         [color setStroke];
         [color setFill];
 
-        // 1. Box
         CGContextStrokeRect(ctx, box);
-
-        // 2. Snapline
         CGContextMoveToPoint(ctx, snapOrigin.x, snapOrigin.y);
         CGContextAddLineToPoint(ctx, feetPt.x, feetPt.y);
         CGContextStrokePath(ctx);
 
-        // 3. Name & Distance tag
         NSString *nameStr = (t->name[0] != '\0') ? [NSString stringWithUTF8String:t->name] : @"Player";
-        if (!nameStr) nameStr = @"Player";
         NSString *tag = [NSString stringWithFormat:@"%@ [%dm]%s",
                          nameStr, (int)t->dist, t->isAi ? " [BOT]" : ""];
-
-        UIFont *font = [UIFont boldSystemFontOfSize:10.0f];
         NSDictionary *attrs = @{
-            NSFontAttributeName: font,
+            NSFontAttributeName: [UIFont boldSystemFontOfSize:10.0f],
             NSForegroundColorAttributeName: color
         };
         CGSize sz = [tag sizeWithAttributes:attrs];
-        CGPoint textPos = CGPointMake(headPt.x - sz.width * 0.5f, headPt.y - sz.height - 2.0f);
-        [tag drawAtPoint:textPos withAttributes:attrs];
+        [tag drawAtPoint:CGPointMake(headPt.x - sz.width * 0.5f, headPt.y - sz.height - 2.0f)
+          withAttributes:attrs];
     }
 }
 @end
 
-#pragma mark - UI Menu & Floating Button
+#pragma mark - UI Menu
 
 @interface MWMMenuView : UIView
 @property (retain) UILabel *statusLabel;
@@ -342,8 +356,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     self.layer.borderColor = [UIColor colorWithRed:0.25 green:0.45 blue:0.85 alpha:0.7].CGColor;
     self.layer.masksToBounds = YES;
 
-    CGFloat y = 14;
-    CGFloat w = frame.size.width;
+    CGFloat y = 14, w = frame.size.width;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 22)];
     title.text = @"Mini World Menu (VIP)";
@@ -397,15 +410,12 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     [cls addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:cls];
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [self addGestureRecognizer:pan];
-
+    [self addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)]];
     return self;
 }
 
 - (UISwitch *)toggleAt:(CGFloat *)yp title:(NSString *)t sel:(SEL)action {
-    CGFloat y = *yp;
-    CGFloat w = self.frame.size.width;
+    CGFloat y = *yp, w = self.frame.size.width;
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, w - 80, 24)];
     lbl.text = t;
     lbl.font = [UIFont systemFontOfSize:13];
@@ -415,14 +425,12 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, y, 51, 31)];
     [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
     [self addSubview:sw];
-
     *yp += 38;
     return sw;
 }
 
 - (UILabel *)labelAt:(CGFloat *)yp text:(NSString *)t {
-    CGFloat y = *yp;
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, self.frame.size.width - 32, 18)];
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, *yp, self.frame.size.width - 32, 18)];
     lbl.text = t;
     lbl.font = [UIFont systemFontOfSize:12];
     lbl.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
@@ -432,8 +440,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 }
 
 - (UISlider *)sliderAt:(CGFloat *)yp min:(float)mn max:(float)mx val:(float)v sel:(SEL)action {
-    CGFloat y = *yp;
-    UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(16, y, self.frame.size.width - 32, 28)];
+    UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(16, *yp, self.frame.size.width - 32, 28)];
     sl.minimumValue = mn;
     sl.maximumValue = mx;
     sl.value = v;
@@ -454,35 +461,25 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     g_fov = s.value;
     self.fovLabel.text = [NSString stringWithFormat:@"Camera FOV: %d°", (int)g_fov];
 }
-
 - (void)resetTapped {
-    g_norecoil = NO;
-    g_espOn = NO;
-    g_silentAim = NO;
-    g_fov = 0.0f;
-    self.recoilSwitch.on = NO;
-    self.espSwitch.on = NO;
-    self.aimSwitch.on = NO;
-    self.fovSlider.value = 90.0f;
-    self.fovLabel.text = @"Camera FOV: Default";
-    self.aimFovSlider.value = 35.0f;
-    self.aimFovLabel.text = @"Aim FOV: 35°";
+    g_norecoil = NO; g_espOn = NO; g_silentAim = NO; g_fov = 0.0f;
+    self.recoilSwitch.on = NO; self.espSwitch.on = NO; self.aimSwitch.on = NO;
+    self.fovSlider.value = 90.0f; self.fovLabel.text = @"Camera FOV: Default";
+    self.aimFovSlider.value = 35.0f; self.aimFovLabel.text = @"Aim FOV: 35°";
 }
-
 - (void)closeTapped { self.hidden = YES; }
-
 - (void)handlePan:(UIPanGestureRecognizer *)p {
     CGPoint t = [p translationInView:self.superview];
     self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
     [p setTranslation:CGPointZero inView:self.superview];
 }
-
 @end
 
 #pragma mark - UI Manager
 
 @interface MWMUIManager : NSObject
 + (instancetype)shared;
+@property (retain) UIWindow *overlay;
 @property (retain) UIButton *floatingBtn;
 @property (retain) MWMMenuView *menuView;
 @property (retain) MWMEspView *espView;
@@ -499,12 +496,24 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
     return inst;
 }
 
+- (void)attachOverlay {
+    if (self.overlay) return;
+    // Never reuse keyWindow: Unity recreates it, and it is frequently nil at
+    // inject time. Own a dedicated passthrough window pinned above the game.
+    UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    UIViewController *vc = [[UIViewController alloc] init];
+    // Passthrough root: keeps the game playable while the overlay is visible.
+    vc.view = [[MWMPassthroughView alloc] initWithFrame:w.bounds];
+    vc.view.backgroundColor = [UIColor clearColor];
+    w.rootViewController = vc;
+    w.windowLevel = 10000001.0;   // above Unity's window and alerts
+    w.hidden = NO;
+    self.overlay = w;
+}
+
 - (void)setupUI {
-    UIWindow *w = [UIApplication sharedApplication].keyWindow;
-    if (!w) {
-        id wins = [UIApplication sharedApplication].windows;
-        if ([wins isKindOfClass:[NSObject class]]) w = (UIWindow *)wins;
-    }
+    [self attachOverlay];
+    UIWindow *w = self.overlay;
     if (!w) return;
 
     if (!self.espView) {
@@ -512,7 +521,7 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
         self.espView.backgroundColor = [UIColor clearColor];
         self.espView.userInteractionEnabled = NO;
         self.espView.opaque = NO;
-        [w addSubview:self.espView];
+        [w.rootViewController.view addSubview:self.espView];
     }
 
     if (!self.floatingBtn) {
@@ -527,16 +536,14 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
         [self.floatingBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         self.floatingBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
         [self.floatingBtn addTarget:self action:@selector(btnTapped) forControlEvents:UIControlEventTouchUpInside];
-
-        UIPanGestureRecognizer *p = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(btnPanned:)];
-        [self.floatingBtn addGestureRecognizer:p];
-        [w addSubview:self.floatingBtn];
+        [self.floatingBtn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(btnPanned:)]];
+        [w.rootViewController.view addSubview:self.floatingBtn];
     }
 
     if (!self.menuView) {
-        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 120, 260, 360)];
+        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 120, 260, 380)];
         self.menuView.hidden = YES;
-        [w addSubview:self.menuView];
+        [w.rootViewController.view addSubview:self.menuView];
     }
 
     if (!self.displayLink) {
@@ -547,80 +554,78 @@ static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) 
 
 - (void)btnTapped {
     self.menuView.hidden = !self.menuView.hidden;
-    if (!self.menuView.hidden) {
-        [self.menuView.superview bringSubviewToFront:self.menuView];
-    }
+    if (!self.menuView.hidden) [self.menuView.superview bringSubviewToFront:self.menuView];
 }
-
 - (void)btnPanned:(UIPanGestureRecognizer *)p {
     CGPoint t = [p translationInView:self.floatingBtn.superview];
     self.floatingBtn.center = CGPointMake(self.floatingBtn.center.x + t.x, self.floatingBtn.center.y + t.y);
     [p setTranslation:CGPointZero inView:self.floatingBtn.superview];
 }
 
-- (void)setStatus:(NSString *)t color:(UIColor *)col {
-    if (!self.menuView || self.menuView.hidden) return;
-    self.menuView.statusLabel.text = t;
+- (void)setStatus:(const char *)s color:(UIColor *)col {
+    if (!self.menuView) return;
+    self.menuView.statusLabel.text = [NSString stringWithUTF8String:s];
     self.menuView.statusLabel.textColor = col;
 }
 
 - (void)onFrame {
     [self.espView setNeedsDisplay];
 
-    if (!g_il2cppReady) return;
+    if (!g_il2cppReady) {
+        [self setStatus:g_diag color:[UIColor colorWithRed:1.0 green:0.55 blue:0.2 alpha:1.0]];
+        return;
+    }
     void *mp = MP(M_lpmInstance);
-    if (!mp) return;
+    if (!mp) {
+        [self setStatus:"Status: LPM instance null" color:[UIColor colorWithRed:1.0 green:0.55 blue:0.2 alpha:1.0]];
+        return;
+    }
 
     void *lpm = ((void *(*)(void *))mp)(M_lpmInstance);
     void *player = readPtr(lpm, off_lpmPlayer);
 
-    if (!alive(player) || !off_playerType) {
+    if (!alive(player)) {
         g_lcam = nullptr;
-        [self setStatus:@"Status: Lobby / Loading" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
+        [self setStatus:"Status: Lobby / Loading" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
-    int type = *(int *)((char *)player + off_playerType);
+    // LocalPlayerType lives on Player, not on LocalPlayerManager.
+    int type = off_playerType ? *(int *)((char *)player + off_playerType) : 1;
     if (type == 0 || type == 4) {
         g_lcam = nullptr;
-        [self setStatus:@"Status: In Lobby" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
+        [self setStatus:"Status: In Lobby" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
 
     void *cam = readPtr(player, off_playerCam);
     g_lcam = alive(cam) ? cam : nullptr;
     if (!g_lcam) {
-        [self setStatus:@"Status: Loading Match..." color:[UIColor colorWithWhite:0.7 alpha:1.0]];
+        [self setStatus:"Status: Loading Match..." color:[UIColor colorWithWhite:0.7 alpha:1.0]];
         return;
     }
 
-    [self setStatus:@"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
+    [self setStatus:"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
 
-    // 1. No recoil
-    if (g_norecoil && off_recoilAngles) {
+    if (g_norecoil && off_recoilAngles)
         *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){0.0f, 0.0f};
-    }
 
-    // 2. Camera FOV: applies to both FPP and TPP
+    // FOV: FP camera component, then the real render camera (TPP + main).
     if (g_fov > 0.0f) {
-        // FP: update PlayerCamera
-        if (alive(g_lcam) && MP(M_setFpCameraFov)) {
+        if (MP(M_setFpCameraFov))
             ((void (*)(void *, float, float, void *))MP(M_setFpCameraFov))(g_lcam, g_fov, 0.0f, M_setFpCameraFov);
-        }
-        // TP & Main Camera: update Camera.main directly
-        void *mainCam = MP(M_camMain) ? ((void *(*)(void *))MP(M_camMain))(M_camMain) : nullptr;
-        if (alive(mainCam) && MP(M_fov)) {
-            ((void (*)(void *, float, void *))MP(M_fov))(mainCam, g_fov, M_fov);
+
+        if (MP(M_camMain) && MP(M_fov)) {
+            void *mainCam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
+            if (alive(mainCam))
+                ((void (*)(void *, float, void *))MP(M_fov))(mainCam, g_fov, M_fov);
         }
     }
 
-    // 3. Scan targets for ESP and Silent Aim
-    if (g_espOn || g_silentAim) {
-        scanPlayers();
-    }
+    if (g_espOn || g_silentAim) scanPlayers();
 }
 @end
 
-#pragma mark - Resolution & Hooking
+#pragma mark - Resolution
 
 static void *findImage(const char *n) {
     size_t c = 0;
@@ -650,26 +655,150 @@ static BOOL resolveApi(void) {
     g_apiResolved = (i_domain_get && i_thread_attach && i_get_assemblies &&
                      i_assembly_image && i_image_name && i_class_from_name &&
                      i_method_from_name && i_field_from_name && i_field_offset);
-    if (!g_apiResolved) NSLog(@"[MWM] il2cpp exports missing");
+    if (!g_apiResolved) snprintf(g_diag, sizeof(g_diag), "Status: no il2cpp exports");
     return g_apiResolved;
 }
 
-// Bypasses dummy implementations
-static void dummy_ret(void *self, void *mi) { (void)self; (void)mi; }
-static bool dummy_false(void *mi) { (void)mi; return false; }
-static bool dummy_true(int32_t id, void *mi) { (void)id; (void)mi; return true; }
-static bool dummy_true_2(int32_t id, void *cb, void *mi) { (void)id; (void)cb; (void)mi; return true; }
-
+// ---------------------------------------------------------------------------
+// Hook provider.
+// TrollFools ships ElleKit inside the injected bundle, so MSHookFunction is the
+// primary path (it gives a real trampoline for silent aim). If it is missing we
+// fall back to patching the entry point with vm_protect; that path cannot give a
+// trampoline, so silent aim degrades while the constant-return bypasses still work.
+// ---------------------------------------------------------------------------
 static void (*pMSHookFunction)(void *, void *, void **) = nullptr;
+
+static void resolveHookProvider(void) {
+    static const char *libs[] = {
+        NULL,
+        "@executable_path/Frameworks/libellekit.dylib",
+        "@executable_path/libellekit.dylib",
+        "/usr/lib/libellekit.dylib",
+        "/usr/lib/libsubstrate.dylib",
+        "/usr/lib/libhooker.dylib",
+        "/usr/lib/libsubstitute.dylib",
+    };
+    for (unsigned i = 0; i < sizeof(libs) / sizeof(libs[0]) && !pMSHookFunction; i++) {
+        if (libs[i]) dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
+        pMSHookFunction = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
+    }
+    NSLog(@"[MWM] hook provider: %s", pMSHookFunction ? "yes" : "no");
+}
+
+// arm64 encodings used by the fallback patcher.
+#define INSN_RET       0xD65F03C0u
+#define INSN_MOV_W0_0  0x52800000u
+#define INSN_MOV_W0_1  0x52800020u
+#define INSN_LDR_X16   0x58000050u   // LDR X16, #8
+#define INSN_BR_X16    0xD61F0200u   // BR  X16
+#define PATCH_LEN      16            // 4 instructions: enough for the jump
+
+extern void sys_icache_invalidate(void *start, size_t len);
+
+static BOOL makeWritable(void *dst, size_t len) {
+    uintptr_t pageSize = 0x4000;
+    uintptr_t base = (uintptr_t)dst & ~(pageSize - 1);
+    uintptr_t span = (((uintptr_t)dst + len - base) + pageSize - 1) & ~(pageSize - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), base, span, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        NSLog(@"[MWM] vm_protect(%p) failed: %d", dst, kr);
+        return NO;
+    }
+    return YES;
+}
+
+// Absolute jump: LDR X16,#8 ; BR X16 ; <64-bit target>
+static void writeJump(uint32_t *p, const void *target) {
+    p[0] = INSN_LDR_X16;
+    p[1] = INSN_BR_X16;
+    uint64_t a = (uint64_t)target;
+    memcpy(&p[2], &a, sizeof(a));
+}
+
+static BOOL patchCopy(void *dst, const void *src, size_t len) {
+    if (!dst || !src || !len) return NO;
+    if (!makeWritable(dst, len)) return NO;
+    memcpy(dst, src, len);
+    sys_icache_invalidate(dst, len);
+    return YES;
+}
+
+// Constant-return patches: MOV W0,#imm ; RET  (BOOL)  or  RET  (void)
+static void patchReturnBool(void *mi, BOOL value) {
+    void *fn = MP(mi);
+    if (!fn) return;
+    uint32_t ins[2] = { value ? INSN_MOV_W0_1 : INSN_MOV_W0_0, INSN_RET };
+    patchCopy(fn, ins, sizeof(ins));
+}
+
+static void patchReturnVoid(void *mi) {
+    void *fn = MP(mi);
+    if (!fn) return;
+    uint32_t ins[1] = { INSN_RET };
+    patchCopy(fn, ins, sizeof(ins));
+}
+
+// ---------------------------------------------------------------------------
+// Silent aim: needs a trampoline so the original body still runs.
+// ---------------------------------------------------------------------------
+static BOOL g_fireDirPatched = NO;
+
+// Trampoline: original 4 instructions, then jump back to fn+16.
+static void *makeTrampoline(void *fn, void **outBack) {
+    const size_t need = PATCH_LEN + PATCH_LEN;
+    void *page = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (page == MAP_FAILED) {
+        NSLog(@"[MWM] trampoline mmap failed");
+        return nullptr;
+    }
+    memcpy(page, fn, PATCH_LEN);
+    writeJump((uint32_t *)((char *)page + PATCH_LEN), (char *)fn + PATCH_LEN);
+    sys_icache_invalidate(page, need);
+    if (outBack) *outBack = page;
+    return page;
+}
+
+static BOOL installSilentAim(void) {
+    void *fn = MP(M_fireDir);
+    if (!fn || g_fireDirPatched) return g_fireDirPatched;
+
+    if (pMSHookFunction) {
+        pMSHookFunction(fn, (void *)&hk_computerFireDirection, (void **)&O_computerFireDirection);
+        g_fireDirPatched = (O_computerFireDirection != nullptr);
+        return g_fireDirPatched;
+    }
+
+    // Fallback: hand-rolled inline hook.
+    void *tramp = makeTrampoline(fn, nullptr);
+    if (!tramp) return NO;
+    O_computerFireDirection = tramp;
+
+    uint32_t stub[4];
+    writeJump(stub, (void *)&hk_computerFireDirection);
+    if (!patchCopy(fn, stub, sizeof(stub))) {
+        O_computerFireDirection = nullptr;
+        return NO;
+    }
+    g_fireDirPatched = YES;
+    return YES;
+}
 
 static BOOL resolveIl2Cpp(void) {
     void *game = findImage("Assembly-CSharp.dll");
     void *core = findImage("UnityEngine.CoreModule.dll");
-    if (!game || !core) return NO;
+    if (!game || !core) {
+        snprintf(g_diag, sizeof(g_diag), "Status: image missing");
+        return NO;
+    }
 
     void *K_obj       = i_class_from_name(core, "UnityEngine", "Object");
     void *K_netPlayer = i_class_from_name(game, "WildWest.NetControllers", "NetPlayer");
     void *K_netMgr    = i_class_from_name(game, "WildWest.NetControllers", "NetManager");
+    // il2cpp_class_get_field_from_name only sees fields declared on the class itself,
+    // so NetPlayerMap must be looked up on its declaring class NetManagerBase.
+    void *K_netMgrBase = i_class_from_name(game, "WildWest.NetControllers", "NetManagerBase");
     K_weaponProc      = i_class_from_name(game, "", "WeaponProcessBase");
 
     K_player    = i_class_from_name(game, "HQFPSTemplate", "Player");
@@ -677,29 +806,37 @@ static BOOL resolveIl2Cpp(void) {
     K_lpm       = i_class_from_name(game, "", "LocalPlayerManager");
     K_camera    = i_class_from_name(core, "UnityEngine", "Camera");
 
-    off_cachedPtr = fieldOff(K_obj, "m_CachedPtr");
-    off_lpmPlayer = fieldOff(K_lpm, "<LocalPlayer>k__BackingField");
-    off_playerType = fieldOff(K_lpm, "<LocalPlayerType>k__BackingField");
-    off_playerCam = fieldOff(K_player, "m_PlayerCamera");
-    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles");
+    // Field names verified against this build's dump.cs.
+    off_cachedPtr    = fieldOff(K_obj, "m_CachedPtr");        // 0x10
+    off_lpmPlayer    = fieldOff(K_lpm, "mLocalPlayer");       // 0x18
+    off_playerType   = fieldOff(K_player, "LocalPlayerType"); // 0x4C8 (on Player)
+    off_playerCam    = fieldOff(K_player, "_PlayerCamera");   // 0x4E8
+    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles"); // 0x58
 
-    M_lpmInstance = methodOf(K_lpm, "get_Instance", 0);
-    M_fov         = methodOf(K_camera, "set_fieldOfView", 1);
-    M_w2s         = methodOf(K_camera, "WorldToScreenPoint", 1);
-    M_camMain     = methodOf(K_camera, "get_main", 0);
+    M_lpmInstance    = methodOf(K_lpm, "get_Instance", 0);
+    M_fov            = methodOf(K_camera, "set_fieldOfView", 1);
+    M_w2s            = methodOf(K_camera, "WorldToScreenPoint", 1);
+    M_camMain        = methodOf(K_camera, "get_main", 0);
     M_setFpCameraFov = methodOf(K_playerCam, "SetFPCameraFieldOfView", 2);
 
-    M_netInstance = methodOf(K_netMgr, "get_Instance", 0);
-    M_playerName  = methodOf(K_netPlayer, "GetPlayerName", 0);
-    M_playerIsAi  = methodOf(K_netPlayer, "IsAiPlayer", 0);
-    M_playerPos   = methodOf(K_netPlayer, "GetPosition", 0);
-    off_netPlayerMap = fieldOff(K_netMgr, "NetPlayerMap");
+    void *K_component = i_class_from_name(core, "UnityEngine", "Component");
+    void *K_transform = i_class_from_name(core, "UnityEngine", "Transform");
+    M_getTransform = methodOf(K_component, "get_transform", 0);
+    M_getPos       = methodOf(K_transform, "get_position", 0);
+
+    M_netInstance  = methodOf(K_netMgr, "get_Instance", 0);
+    M_playerName   = methodOf(K_netPlayer, "GetPlayerName", 0);
+    M_playerIsAi   = methodOf(K_netPlayer, "IsAiPlayer", 0);
+    M_playerPos    = methodOf(K_netPlayer, "GetPosition", 0);
+    M_netPlayerId  = methodOf(K_netPlayer, "GetNetPlayerId", 0);
+    off_bindNetId  = fieldOff(K_lpm, "curBindNetPlayerId");
+    off_netPlayerMap = fieldOff(K_netMgrBase, "NetPlayerMap"); // 0x18
 
     M_fireDir = methodOf(K_weaponProc, "computerFireDirection", 1);
 
     void *K_sceneHelper = i_class_from_name(game, "", "LogicSceneHelper");
     void *K_guideMgr    = i_class_from_name(game, "", "BattleGuideManager");
-    void *K_lua         = i_class_from_name(game, "", "LuaHelper");
+    void *K_lua         = i_class_from_name(game, "", "LuaHelper");   // global ns (TcpSocket.LuaHelper is a different class)
 
     M_checkGuideScene = methodOf(K_sceneHelper, "CheckIsGuideScene", 0);
     M_isNewbieGame    = methodOf(K_sceneHelper, "IsNewbieGame", 0);
@@ -707,50 +844,31 @@ static BOOL resolveIl2Cpp(void) {
     M_checkFuncOpen   = methodOf(K_lua, "CheckFunctionIsOpen", 1);
     M_checkFuncUnlock = methodOf(K_lua, "CheckFuncUnlock", 2);
 
-    if (!off_cachedPtr || !off_lpmPlayer || !off_playerType || !off_playerCam ||
-        !off_recoilAngles || !MP(M_lpmInstance)) return NO;
+    // Only the essentials are mandatory; everything else degrades one feature.
+    if (!off_cachedPtr) { snprintf(g_diag, sizeof(g_diag), "Status: no m_CachedPtr"); return NO; }
+    if (!off_lpmPlayer) { snprintf(g_diag, sizeof(g_diag), "Status: no mLocalPlayer"); return NO; }
+    if (!off_playerCam) { snprintf(g_diag, sizeof(g_diag), "Status: no _PlayerCamera"); return NO; }
+    if (!MP(M_lpmInstance)) { snprintf(g_diag, sizeof(g_diag), "Status: no get_Instance"); return NO; }
+    if (!MP(M_w2s) || !MP(M_camMain)) { snprintf(g_diag, sizeof(g_diag), "Status: no Camera API"); return NO; }
 
-    pMSHookFunction = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
+    resolveHookProvider();
+    BOOL aimOk = installSilentAim();
 
-    // Install Silent Aim
-    if (MP(M_fireDir)) {
-        if (pMSHookFunction) {
-            pMSHookFunction(MP(M_fireDir), (void *)&hk_computerFireDirection, (void **)&O_computerFireDirection);
-        }
-        *(void **)M_fireDir = (void *)&hk_computerFireDirection;
-    }
-
-    // Install Tutorial Bypass
     if (g_bypassTutorial) {
-        if (MP(M_guideInit)) {
-            if (pMSHookFunction) pMSHookFunction(MP(M_guideInit), (void *)&dummy_ret, nullptr);
-            *(void **)M_guideInit = (void *)&dummy_ret;
-        }
-        if (MP(M_checkGuideScene)) {
-            if (pMSHookFunction) pMSHookFunction(MP(M_checkGuideScene), (void *)&dummy_false, nullptr);
-            *(void **)M_checkGuideScene = (void *)&dummy_false;
-        }
-        if (MP(M_isNewbieGame)) {
-            if (pMSHookFunction) pMSHookFunction(MP(M_isNewbieGame), (void *)&dummy_false, nullptr);
-            *(void **)M_isNewbieGame = (void *)&dummy_false;
-        }
+        patchReturnVoid(M_guideInit);           // Init(): return immediately
+        patchReturnBool(M_checkGuideScene, NO); // not a guide scene
+        patchReturnBool(M_isNewbieGame, NO);    // not a newbie game
     }
-
-    // Install Rank / Level Lock Bypass
     if (g_bypassRankLock) {
-        if (MP(M_checkFuncOpen)) {
-            if (pMSHookFunction) pMSHookFunction(MP(M_checkFuncOpen), (void *)&dummy_true, nullptr);
-            *(void **)M_checkFuncOpen = (void *)&dummy_true;
-        }
-        if (MP(M_checkFuncUnlock)) {
-            if (pMSHookFunction) pMSHookFunction(MP(M_checkFuncUnlock), (void *)&dummy_true_2, nullptr);
-            *(void **)M_checkFuncUnlock = (void *)&dummy_true_2;
-        }
+        patchReturnBool(M_checkFuncOpen, YES);
+        patchReturnBool(M_checkFuncUnlock, YES);
     }
 
+    NSLog(@"[MWM] armed hook=%d aim=%d netMap=%zu fov=%p",
+          pMSHookFunction != nullptr, aimOk, off_netPlayerMap, MP(M_fov));
+    snprintf(g_diag, sizeof(g_diag), "Status: Armed (hook=%s aim=%s)",
+             pMSHookFunction ? "yes" : "no", aimOk ? "yes" : "no");
     g_il2cppReady = YES;
-    NSLog(@"[MWM] armed | netMgr=%p espOff=%zu fov=%p fireDir=%p",
-          MP(M_netInstance), off_netPlayerMap, MP(M_fov), MP(M_fireDir));
     return YES;
 }
 
@@ -758,17 +876,20 @@ static BOOL resolveIl2Cpp(void) {
 
 static void tick(void) {
     [[MWMUIManager shared] setupUI];
-    if (!g_apiResolved) resolveApi();
-    if (g_il2cppReady || !g_apiResolved) return;
+    if (!g_apiResolved && !resolveApi()) return;
+    if (g_il2cppReady) return;
     void *d = i_domain_get();
-    if (!d) return;
+    if (!d) { snprintf(g_diag, sizeof(g_diag), "Status: domain null"); return; }
     i_thread_attach(d);
-    if (resolveIl2Cpp()) {
-        NSLog(@"[MWM] ready");
-    }
+    if (resolveIl2Cpp()) NSLog(@"[MWM] ready");
 }
 
 static void pollUntilArmed(int attempt) {
+    static BOOL running = NO;
+    if (attempt == 0) {
+        if (running) return;
+        running = YES;
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         @autoreleasepool { tick(); }
@@ -786,4 +907,8 @@ __attribute__((constructor)) static void mwm_entry(void) {
     CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL, &onAppLaunched,
                                     (__bridge CFStringRef)UIApplicationDidFinishLaunchingNotification,
                                     NULL, CFNotificationSuspensionBehaviorDrop);
+    // TrollFools may inject into UnityFramework *after* didFinishLaunching already fired,
+    // in which case the notification above never arrives. Start polling immediately too;
+    // pollUntilArmed only retries until armed, so a double start is harmless.
+    pollUntilArmed(0);
 }
