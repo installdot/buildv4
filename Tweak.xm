@@ -106,7 +106,14 @@ static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action<uint
 //   PlayerCamera.m_RecoilAngles              0x58
 //   NetManagerBase.NetPlayerMap              0x18
 static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
-static size_t off_playerCam;
+static size_t off_playerCam, off_playerMovement, off_playerEquip;
+static size_t off_recoilAngles, off_forceAngle, off_downFire;
+static size_t off_parachuteState;    // PlayerMovementFP.m_ParachuteState (0x1C8)
+// ParachuteStateModule (constant offsets inside the module object)
+#define PS_ENABLED      0x10
+#define PS_FREEFALLSPD  0x1C
+#define PS_MOVESPEED    0x20
+#define PS_FALLMULTI    0x28
 
 static void *g_lcam = nullptr;
 
@@ -115,7 +122,13 @@ static void *g_lcam = nullptr;
 static BOOL  g_il2cppReady = NO;
 
 static BOOL  g_espOn = NO;
-static BOOL  g_silentAim = NO;
+static BOOL  g_aimlock = NO;
+static BOOL  g_noRecoil = NO;
+static BOOL  g_noSpread = NO;
+static BOOL  g_paraCtl = NO;
+static BOOL  g_glide = NO;
+static int   g_paraDir = 0;          // 0 = neutral, +1 up, -1 down
+static float g_glideSpeed = 3.0f;    // MoveSpeed multiplier, user configurable
 static float g_aimFov = 35.0f;
 static BOOL  g_showAimFov = NO;
 
@@ -355,15 +368,94 @@ static char *findVtableEntry(void *klass, void *orig, const char *name) {
     return nullptr;
 }
 
+#pragma mark - Aimlock / recoil / parachute
+
+// ModelShotData offsets (verified against dump.cs)
+#define MSD_SHOOTER   0x04
+#define MSD_SHOOTPOS  0x48
+#define MSD_SHOOTDIR  0x54
+#define MSD_ACCURATE  0x80
+
+// Fires only while the fire button is held: PlayerEquipmentController.downFireCache.
+// The flag lives on the local player's equipment controller, so a plain read from
+// the main thread is enough -- the weapon path never touches il2cpp itself.
+static BOOL fireButtonDown(void) {
+    if (!off_downFire || !off_playerEquip) return NO;
+    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
+    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
+    if (!alive(player)) return NO;
+    void *eq = readPtr(player, off_playerEquip);
+    if (!eq) return NO;
+    return *(bool *)((char *)eq + off_downFire);
+}
+
+// ParachuteStateModule of the local player, or null when not parachuting.
+static void *parachuteModule(void) {
+    if (!off_parachuteState || !off_playerMovement) return nullptr;
+    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
+    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
+    if (!alive(player)) return nullptr;
+    void *mv = readPtr(player, off_playerMovement);
+    if (!mv) return nullptr;
+    void *mod = readPtr(mv, off_parachuteState);
+    if (!mod) return nullptr;
+    if (!*(bool *)((char *)mod + PS_ENABLED)) return nullptr;
+    return mod;
+}
+
+// Vertical motion is:  desiredY = (desiredLocalY - FreeFallSpeed) * dt
+// (see PlayerMovementTPCommon.updateParachuteVelocity). So FreeFallSpeed is the
+// sink rate, and a negative value makes the player rise. FallSpeedMulti scales
+// FreeFallSpeed further whenever there is horizontal input, so it is pinned to 1.
+static void applyParachuteControl(void) {
+    if (!g_paraCtl) return;
+    void *mod = parachuteModule();
+    if (!mod) return;
+
+    float *freefall  = (float *)((char *)mod + PS_FREEFALLSPD);
+    float *movespeed = (float *)((char *)mod + PS_MOVESPEED);
+    float *fallmulti = (float *)((char *)mod + PS_FALLMULTI);
+
+    *fallmulti = 1.0f;
+
+    if (g_glide) {
+        // Glide on: no sink by default, Up lifts, Down sinks gently.
+        *movespeed = 8.0f * g_glideSpeed;
+        *freefall  = -(float)g_paraDir * 6.0f;
+    } else {
+        // Glide off: drop hard (this is what the original module does on release).
+        *movespeed = 8.0f;
+        *freefall  = 22.0f;
+    }
+}
+
+#pragma mark - Silent aim / recoil
+
+// Recoil angles sit on PlayerCamera and feed the camera every frame; zeroing them
+// from the display link is enough -- no hook, no code patching.
+static void applyNoRecoil(void) {
+    if (!g_noRecoil || !off_recoilAngles || !alive(g_lcam)) return;
+    *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){ 0.0f, 0.0f };
+    if (off_forceAngle)
+        *(Vec2 *)((char *)g_lcam + off_forceAngle) = (Vec2){ 0.0f, 0.0f };
+}
+
 static void hk_createShootData(void *retstr, void *self, bool isTransform, void *method) {
     if (!O_createShootData) return;
     ((void (*)(void *, void *, bool, void *))O_createShootData)(retstr, self, isTransform, method);
 
-    if (!retstr || !g_silentAim || !g_aimHeadValid) return;
-    if (!g_myNetId || !alive(self)) return;         // not bound / weapon destroyed
+    if (!retstr || !g_myNetId || !alive(self)) return;
 
-    Vec3 head = g_aimHead;                          // snapshot published by onFrame
-    Vec3 sp = *(Vec3 *)((char *)retstr + 0x48);     // ModelShotData.shootPos
+    // No bullet spread: `accurate` feeds Random.Range(-acc, acc) around shootDir.
+    // Zeroing it here removes the cone for every shot.
+    if (g_noSpread) *(float *)((char *)retstr + MSD_ACCURATE) = 0.0f;
+
+    // Aimlock only while the fire button is actually held down.
+    if (!g_aimlock || !g_aimHeadValid) return;
+    if (!fireButtonDown()) return;
+
+    Vec3 head = g_aimHead;                              // snapshot from onFrame
+    Vec3 sp = *(Vec3 *)((char *)retstr + MSD_SHOOTPOS);
     if (!vec3Finite(head) || !vec3Finite(sp)) return;
 
     Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
@@ -371,7 +463,7 @@ static void hk_createShootData(void *retstr, void *self, bool isTransform, void 
     if (!(len > 0.01f) || len != len || len > 1e6f) return;
 
     dir.x /= len; dir.y /= len; dir.z /= len;
-    *(Vec3 *)((char *)retstr + 0x54) = dir;         // ModelShotData.shootDir
+    *(Vec3 *)((char *)retstr + MSD_SHOOTDIR) = dir;
 }
 
 static BOOL patchVtableSlot(void *mi, void *orig, void *repl, const char *name) {
@@ -489,6 +581,12 @@ static BOOL installAimHook(void) {
 @property (retain) UISwitch *aimFovShowSwitch;
 @property (retain) UISlider *aimFovSlider;
 @property (retain) UILabel *aimFovLabel;
+@property (retain) UISwitch *recoilSwitch;
+@property (retain) UISwitch *spreadSwitch;
+@property (retain) UISwitch *paraSwitch;
+@property (retain) UISwitch *glideSwitch;
+@property (retain) UISlider *glideSpeedSlider;
+@property (retain) UILabel *glideSpeedLabel;
 @end
 
 @implementation MWMMenuView
@@ -527,8 +625,14 @@ static BOOL installAimHook(void) {
     y += 12;
 
     self.espSwitch = [self toggleAt:&y title:@"ESP (Box + Line + Dist)" sel:@selector(espToggled:)];
-    self.aimSwitch = [self toggleAt:&y title:@"Silent Aim (Auto Head)" sel:@selector(aimToggled:)];
-    self.aimFovShowSwitch = [self toggleAt:&y title:@"Show Silent FOV" sel:@selector(aimFovShowToggled:)];
+    self.aimSwitch = [self toggleAt:&y title:@"Aimlock (hold fire)" sel:@selector(aimToggled:)];
+    self.aimFovShowSwitch = [self toggleAt:&y title:@"Show Aim FOV" sel:@selector(aimFovShowToggled:)];
+    self.recoilSwitch = [self toggleAt:&y title:@"No Recoil" sel:@selector(recoilToggled:)];
+    self.spreadSwitch = [self toggleAt:&y title:@"No Bullet Spread" sel:@selector(spreadToggled:)];
+    self.paraSwitch = [self toggleAt:&y title:@"Parachute Control" sel:@selector(paraToggled:)];
+    self.glideSwitch = [self toggleAt:&y title:@"Glide" sel:@selector(glideToggled:)];
+    self.glideSpeedLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed]];
+    self.glideSpeedSlider = [self sliderAt:&y min:1.0f max:6.0f val:g_glideSpeed sel:@selector(glideSpeedChanged:)];
 
     self.aimFovLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov]];
     self.aimFovSlider = [self sliderAt:&y min:10 max:90 val:g_aimFov sel:@selector(aimFovChanged:)];
@@ -597,16 +701,27 @@ static BOOL installAimHook(void) {
 
 - (void)espToggled:(UISwitch *)s { g_espOn = s.isOn; }
 - (void)aimFovShowToggled:(UISwitch *)s { g_showAimFov = s.isOn; }
+- (void)recoilToggled:(UISwitch *)s { g_noRecoil = s.isOn; }
+- (void)spreadToggled:(UISwitch *)s { g_noSpread = s.isOn; }
+- (void)paraToggled:(UISwitch *)s { g_paraCtl = s.isOn; }
+- (void)glideToggled:(UISwitch *)s { g_glide = s.isOn; }
+- (void)glideSpeedChanged:(UISlider *)s {
+    g_glideSpeed = s.value;
+    self.glideSpeedLabel.text = [NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed];
+}
 
 - (void)aimToggled:(UISwitch *)s {
-    g_silentAim = s.isOn;
+    g_aimlock = s.isOn;
 }
 - (void)aimFovChanged:(UISlider *)s {
     g_aimFov = s.value;
     self.aimFovLabel.text = [NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov];
 }
 - (void)resetTapped {
-    g_espOn = NO; g_silentAim = NO; g_showAimFov = NO;
+    g_espOn = NO; g_aimlock = NO; g_showAimFov = NO;
+    g_noRecoil = NO; g_noSpread = NO; g_paraCtl = NO; g_glide = NO;
+    self.recoilSwitch.on = NO; self.spreadSwitch.on = NO;
+    self.paraSwitch.on = NO; self.glideSwitch.on = NO; g_paraDir = 0;
     self.espSwitch.on = NO; self.aimSwitch.on = NO; self.aimFovShowSwitch.on = NO;
     self.aimFovSlider.value = 35.0f; self.aimFovLabel.text = @"Aim FOV: 35°";
 }
@@ -618,6 +733,21 @@ static BOOL installAimHook(void) {
 }
 @end
 
+#pragma mark - Parachute panel
+
+// Three floating buttons, shown only while Parachute Control is on.
+static UIButton *mkBtn(NSString *t, SEL act, id target) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = CGRectMake(0, 0, 54, 34);
+    b.backgroundColor = [UIColor colorWithRed:0.1f green:0.35f blue:0.8f alpha:0.85f];
+    b.layer.cornerRadius = 8;
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [b addTarget:target action:act forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
 #pragma mark - UI Manager
 
 @interface MWMUIManager : NSObject
@@ -625,6 +755,10 @@ static BOOL installAimHook(void) {
 @property (retain) UIWindow *host;
 @property (retain) UIButton *floatingBtn;
 @property (retain) MWMMenuView *menuView;
+@property (retain) UIView *paraPanel;
+@property (retain) UIButton *paraGlideBtn;
+@property (retain) UIButton *paraUpBtn;
+@property (retain) UIButton *paraDownBtn;
 @property (retain) MWMEspView *espView;
 @property (retain) CADisplayLink *displayLink;
 - (void)setupUI;
@@ -686,7 +820,7 @@ static BOOL installAimHook(void) {
     }
 
     if (!self.menuView) {
-        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 120, 260, 340)];
+        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 110, 260, 500)];
         self.menuView.hidden = YES;
         [w addSubview:self.menuView];
     }
@@ -698,6 +832,27 @@ static BOOL installAimHook(void) {
         if (self.menuView) [w addSubview:self.menuView];
     }
     if (!CGRectEqualToRect(self.espView.frame, w.bounds)) self.espView.frame = w.bounds;
+
+    if (!self.paraPanel) {
+        self.paraPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 170, 62, 122)];
+        self.paraPanel.backgroundColor = [UIColor clearColor];
+
+        self.paraGlideBtn = mkBtn(@"Glide", @selector(paraGlideTapped), self);
+        self.paraGlideBtn.frame = CGRectMake(4, 0, 54, 34);
+        [self.paraPanel addSubview:self.paraGlideBtn];
+
+        self.paraUpBtn = mkBtn(@"Up", @selector(paraUpTapped), self);
+        self.paraUpBtn.frame = CGRectMake(4, 42, 54, 34);
+        [self.paraPanel addSubview:self.paraUpBtn];
+
+        self.paraDownBtn = mkBtn(@"Down", @selector(paraDownTapped), self);
+        self.paraDownBtn.frame = CGRectMake(4, 84, 54, 34);
+        [self.paraPanel addSubview:self.paraDownBtn];
+
+        self.paraPanel.hidden = YES;
+        [w addSubview:self.paraPanel];
+    }
+    [self refreshParaPanel];
 
     if (!self.displayLink) {
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onFrame)];
@@ -714,6 +869,29 @@ static BOOL installAimHook(void) {
     self.floatingBtn.center = CGPointMake(self.floatingBtn.center.x + t.x, self.floatingBtn.center.y + t.y);
     [p setTranslation:CGPointZero inView:self.floatingBtn.superview];
 }
+
+- (void)refreshParaPanel {
+    if (!self.paraPanel) return;
+    self.paraPanel.hidden = !g_paraCtl;
+    self.paraGlideBtn.backgroundColor = g_glide
+        ? [UIColor colorWithRed:0.15f green:0.75f blue:0.35f alpha:0.9f]
+        : [UIColor colorWithRed:0.1f green:0.35f blue:0.8f alpha:0.85f];
+    [self.paraGlideBtn setTitle:(g_glide ? @"Glide ON" : @"Glide") forState:UIControlStateNormal];
+
+    UIColor *dim = [UIColor colorWithRed:0.1f green:0.35f blue:0.8f alpha:0.85f];
+    UIColor *lit = [UIColor colorWithRed:0.15f green:0.75f blue:0.35f alpha:0.9f];
+    self.paraUpBtn.backgroundColor = (g_paraDir > 0) ? lit : dim;
+    self.paraDownBtn.backgroundColor = (g_paraDir < 0) ? lit : dim;
+}
+
+- (void)paraGlideTapped {
+    g_glide = !g_glide;
+    [self.menuView.glideSwitch setOn:g_glide animated:YES];
+    [self refreshParaPanel];
+}
+// Panel must not be reachable while Parachute Control is off.
+- (void)paraUpTapped   { g_paraDir = (g_paraDir > 0) ? 0 : 1;  [self refreshParaPanel]; }
+- (void)paraDownTapped { g_paraDir = (g_paraDir < 0) ? 0 : -1; [self refreshParaPanel]; }
 
 - (void)setStatus:(const char *)s color:(UIColor *)col {
     if (!self.menuView) return;
@@ -760,12 +938,17 @@ static BOOL installAimHook(void) {
 
     [self setStatus:"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
 
-    if (g_espOn || g_silentAim) scanPlayers();
+    applyNoRecoil();
+    applyParachuteControl();
+    if (self.menuView) [self.menuView.glideSwitch setOn:g_glide animated:NO];
+    [self refreshParaPanel];
+
+    if (g_espOn || g_aimlock) scanPlayers();
 
     // Publish the aim point for the swapped CreateShootData. Computed here on the
     // main thread so the weapon path only ever reads a plain float snapshot.
     g_aimHeadValid = NO;
-    if (g_silentAim && g_targetCount > 0) {
+    if (g_aimlock && g_targetCount > 0) {
         Vec3 head;
         if (pickBestTargetHead(&head) && vec3Finite(head)) {
             g_aimHead = head;
@@ -887,6 +1070,8 @@ static BOOL resolveIl2Cpp(void) {
     off_lpmPlayer    = fieldOff(K_lpm, "mLocalPlayer");       // 0x18
     off_playerType   = fieldOff(K_player, "LocalPlayerType"); // 0x4C8 (on Player)
     off_playerCam    = fieldOff(K_player, "_PlayerCamera");   // 0x4E8
+    off_playerMovement = fieldOff(K_player, "_PlayerMovement"); // 0x4D8
+    off_playerEquip  = fieldOff(K_player, "_PlayerEquipmentControllerComp"); // 0x520
 
     M_lpmInstance    = methodOf(K_lpm, "get_Instance", 0);
     M_w2s            = methodOf(K_camera, "WorldToScreenPoint", 1);
@@ -923,6 +1108,17 @@ static BOOL resolveIl2Cpp(void) {
     if (!off_playerCam) { snprintf(g_diag, sizeof(g_diag), "Status: no _PlayerCamera"); return NO; }
     if (!MP(M_lpmInstance)) { snprintf(g_diag, sizeof(g_diag), "Status: no get_Instance"); return NO; }
     if (!MP(M_w2s) || !MP(M_camMain)) { snprintf(g_diag, sizeof(g_diag), "Status: no Camera API"); return NO; }
+
+    // Recoil / force angle live on PlayerCamera; the parachute module on PlayerMovementFP.
+    void *K_playerCam = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
+    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles");   // 0x58
+    off_forceAngle   = fieldOff(K_playerCam, "m_ForceAngle");     // 0x64
+
+    void *K_moveFP = i_class_from_name(game, "HQFPSTemplate", "PlayerMovementFP");
+    off_parachuteState = fieldOff(K_moveFP, "m_ParachuteState");  // 0x1C8
+
+    void *K_equipCtl = i_class_from_name(game, "HQFPSTemplate.Equipment", "PlayerEquipmentController");
+    off_downFire = fieldOff(K_equipCtl, "downFireCache");         // 0x50
 
     void *K_projWeapon = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
     M_createShootData = methodOf(K_projWeapon, "CreateShootData", 1);
