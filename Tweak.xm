@@ -1,12 +1,13 @@
 // Mini World : Royale (com.miniworldroyale.sparkgame)
 // TrollFools injected tweak — native UIKit menu, ESP overlay, silent aim.
 //
-// Crash-safety rules (learned from the loading-screen crashes):
-//   * No MethodInfo patching while scenes stream.
-//   * No il2cpp_runtime_invoke for value-type params (raw args, not boxed).
-//   * Never call UnityEngine.Object.GetComponent on a possibly-destroyed object;
-//     read cached refs and validate with m_CachedPtr (!= 0).
-//   * Everything gated on LocalPlayerManager.LocalPlayerType.
+// Features:
+//   * No Recoil
+//   * FOV Slider (FPP & TPP support)
+//   * ESP: 2D Box + Snapline + Name + Distance + Bot/Player indicator
+//   * Silent Aim: Redirects bullet trajectory to enemy head inside FOV
+//   * Bypass Tutorial (blocks guide scene & battle guide manager init)
+//   * Bypass Rank Lock by level (forces CheckFunctionIsOpen & CheckFuncUnlock to true)
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -18,10 +19,15 @@
 #import <unistd.h>
 #import <math.h>
 
-#pragma mark - il2cpp ABI
+#pragma mark - Geometry & Screen Helpers
 
 typedef struct { float x, y; } Vec2;
 typedef struct { float x, y, z; } Vec3;
+
+static inline CGFloat ScreenW(void) { return [UIScreen mainScreen].bounds.size.width; }
+static inline CGFloat ScreenH(void) { return [UIScreen mainScreen].bounds.size.height; }
+
+#pragma mark - il2cpp ABI
 
 static void *(*i_domain_get)(void);
 static void *(*i_thread_attach)(void *);
@@ -32,7 +38,6 @@ static void *(*i_class_from_name)(void *, const char *, const char *);
 static void *(*i_method_from_name)(void *, const char *, int);
 static void *(*i_field_from_name)(void *, const char *);
 static size_t (*i_field_offset)(void *);
-static void *(*i_object_unbox)(void *);
 
 static inline void *MP(void *mi) { return mi ? *(void **)mi : nullptr; }
 
@@ -47,51 +52,49 @@ static inline void *readPtr(void *obj, size_t off) {
     return (obj && off) ? *(void **)((char *)obj + off) : nullptr;
 }
 
-#pragma mark - Resolved symbols
+#pragma mark - Resolved Symbols
 
-static void *K_lpm, *K_camera, *K_app, *K_playerCam, *K_player;
+static void *K_lpm, *K_camera, *K_playerCam, *K_player;
+static void *K_weaponProc;
 
-static void *M_lpmInstance;   // LocalPlayerManager::get_Instance()
-static void *M_fps;           // Application::set_targetFrameRate(int)
-static void *M_fov;           // Camera::set_fieldOfView(float)
-static void *M_fovGet;        // Camera::get_fieldOfView()
-static void *M_w2s;           // Camera::WorldToScreenPoint(Vector3)
-static void *M_w2s3;          // Camera::WorldToScreenPoint(Vector3,eye)
-static void *M_camMain;       // Camera::get_main()
+static void *M_lpmInstance;       // LocalPlayerManager::get_Instance()
+static void *M_fov;               // Camera::set_fieldOfView(float)
+static void *M_w2s;               // Camera::WorldToScreenPoint(Vector3)
+static void *M_camMain;           // Camera::get_main()
+static void *M_setFpCameraFov;    // PlayerCamera::SetFPCameraFieldOfView(float, float)
 
-// CameraTypeFPS::onLaterUpdate — the function that overwrites our FOV each frame.
-static void *M_camTypeLateUpdate;
-static void *O_camTypeLateUpdate = nullptr;
-
-// ESP / aim
-static void *M_netInstance;   // NetManager::get_Instance()
-static void *M_playerName;    // NetPlayer::GetPlayerName()
-static void *M_playerIsAi;    // NetPlayer::IsAiPlayer()
-static void *M_playerPos;     // NetPlayer::GetPosition()
-static void *M_netId;         // NetPlayer::GetNetPlayerId()
+// ESP / Aim symbols
+static void *M_netInstance;       // NetManager::get_Instance()
+static void *M_playerName;        // NetPlayer::GetPlayerName()
+static void *M_playerIsAi;        // NetPlayer::IsAiPlayer()
+static void *M_playerPos;         // NetPlayer::GetPosition()
 static size_t off_netPlayerMap;
 
-// Tutorial / rank gates
-static void *M_checkGuideScene;
-static void *M_guideInit;
-static void *M_checkFuncOpen;
-static void *M_rankLockGet;
+// Weapon silent aim symbol
+static void *M_fireDir;           // WeaponProcessBase::computerFireDirection(ref ModelShotData)
+static void *O_computerFireDirection = nullptr;
+
+// Bypass symbols
+static void *M_guideInit;         // BattleGuideManager::Init()
+static void *M_checkGuideScene;   // LogicSceneHelper::CheckIsGuideScene()
+static void *M_isNewbieGame;      // LogicSceneHelper::IsNewbieGame()
+static void *M_checkFuncOpen;     // LuaHelper::CheckFunctionIsOpen(int)
+static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action)
 
 static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
-static size_t off_playerCam, off_camFp, off_recoilAngles;
+static size_t off_playerCam, off_recoilAngles;
 
 static void *g_lcam = nullptr;
-static void *g_netMgr = nullptr;
 
 #pragma mark - State
 
 static BOOL  g_norecoil = NO;
-static float g_fov = 0.0f;          // 0 = untouched
+static float g_fov = 0.0f;          // 0 = Default
 static BOOL  g_il2cppReady = NO;
 
 static BOOL  g_espOn = NO;
 static BOOL  g_silentAim = NO;
-static float g_aimFov = 25.0f;
+static float g_aimFov = 35.0f;
 static BOOL  g_bypassTutorial = YES;
 static BOOL  g_bypassRankLock = YES;
 
@@ -99,42 +102,44 @@ static inline BOOL alive(void *obj) {
     return obj && off_cachedPtr && *(void **)((char *)obj + off_cachedPtr) != nullptr;
 }
 
-#pragma mark - FOV hook
+#pragma mark - WorldToScreen
 
-// CameraTypeFPS::onLaterUpdate copies PlayerCamera's FOV onto the real Camera at the
-// very end of the frame, which is why a plain write from the display link never
-// stuck. Re-applying our value immediately after the original body wins.
-static void hk_camTypeLateUpdate(void *self, void *mi) {
-    ((void (*)(void *, void *))O_camTypeLateUpdate)(self, mi);
-    if (g_fov > 0.f) {
-        // CameraTypeBase::mCamera lives at +0x20 (CameraTypeBase field order).
-        void *cam = readPtr(self, 0x20);
-        if (alive(cam) && MP(M_fov)) ((void (*)(void *, float, void *))MP(M_fov))(cam, g_fov, M_fov);
-    }
+static BOOL worldToScreen(void *cam, Vec3 world, CGPoint *outPt) {
+    if (!cam || !outPt || !MP(M_w2s)) return NO;
+    Vec3 p = ((Vec3 (*)(void *, Vec3, void *))MP(M_w2s))(cam, world, M_w2s);
+    if (p.z <= 0.0f) return NO; // Behind camera
+    CGFloat scale = [UIScreen mainScreen].scale;
+    if (scale <= 0.0f) scale = 1.0f;
+    outPt->x = (CGFloat)p.x / scale;
+    outPt->y = ScreenH() - ((CGFloat)p.y / scale);
+    return YES;
 }
 
-#pragma mark - ESP scan
+#pragma mark - ESP Target Scan
 
-typedef struct { void *obj; Vec3 head; float dist; char name[40]; BOOL isAi; } EspTarget;
+typedef struct {
+    void *obj;
+    Vec3 head;
+    float dist;
+    char name[32];
+    BOOL isAi;
+} EspTarget;
+
 #define MAX_TARGETS 32
 static EspTarget g_targets[MAX_TARGETS];
 static int g_targetCount = 0;
 
-// Dictionary<ushort,NetPlayer> raw walk. Entries[] layout (Mono/IL2CPP corelib):
-// int hashCode @0, int next @4, TKey key @8, TValue value @0x10 (padded).
-// Iterating by count and skipping hashCode < 0 matches the managed enumerator.
 static void scanPlayers(void) {
     g_targetCount = 0;
-    if (!MP(M_netInstance)) return;
+    if (!MP(M_netInstance) || !off_netPlayerMap) return;
 
     void *mgr = ((void *(*)(void *))MP(M_netInstance))(M_netInstance);
     if (!alive(mgr)) return;
-    g_netMgr = mgr;
 
     void *dict = readPtr(mgr, off_netPlayerMap);
-    if (!alive(dict)) return;
+    if (!dict) return;
 
-    // Dictionary internals: buckets@0x10, entries@0x18, count@0x20, freeList@0x24.
+    // Dictionary internals: buckets@0x10, entries@0x18, count@0x20
     void **entries = (void **)readPtr(dict, 0x18);
     int count = *(int *)((char *)dict + 0x20);
     if (!entries || count <= 0 || count > 512) return;
@@ -142,54 +147,47 @@ static void scanPlayers(void) {
     void *myPlayer = nullptr;
     if (MP(M_lpmInstance)) {
         void *lpm = ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance);
-        myPlayer = readPtr(lpm, off_lpmPlayer);
-    }
-    void *myTransform = nullptr;
-    if (alive(myPlayer)) {
-        void *cam = readPtr(myPlayer, off_playerCam);
-        if (alive(cam)) myTransform = readPtr(cam, off_camFp);
+        if (lpm && off_lpmPlayer) myPlayer = readPtr(lpm, off_lpmPlayer);
     }
 
-    Vec3 origin = {0, 0, 0};
-    if (g_lcam && MP(M_fovGet) == nullptr) { /* fallthrough */ }
-    if (myPlayer) {
-        Vec3 p = {0, 0, 0};
-        (void)p;
+    Vec3 myPos = {0.0f, 0.0f, 0.0f};
+    if (alive(g_lcam) && MP(M_playerPos) && myPlayer) {
+        myPos = ((Vec3 (*)(void *, void *))MP(M_playerPos))(myPlayer, M_playerPos);
     }
-    (void)myTransform;
-    (void)origin;
 
     for (int i = 0; i < count && g_targetCount < MAX_TARGETS; i++) {
-        // Entry stride for this generic instantiation: 4+4+2(+2 pad)+8 = 0x18.
         char *e = (char *)entries + (size_t)i * 0x18;
         int hashCode = *(int *)e;
-        if (hashCode < 0) continue;                  // empty slot
-        void *np = readPtr(e, 0x10);                 // TValue (NetPlayer)
-        if (!alive(np)) continue;
-        if (np == myPlayer) continue;
+        if (hashCode < 0) continue; // Empty slot
+        void *np = readPtr(e, 0x10);
+        if (!np || np == myPlayer) continue;
 
-        Vec3 pos = {0, 0, 0};
+        Vec3 pos = {0.0f, 0.0f, 0.0f};
         if (MP(M_playerPos)) {
-            Vec3 *r = (Vec3 *)((void *(*)(void *, void *))MP(M_playerPos))(np, M_playerPos);
-            if (r) pos = *r;
+            pos = ((Vec3 (*)(void *, void *))MP(M_playerPos))(np, M_playerPos);
         }
-        if (pos.x == 0.f && pos.y == 0.f && pos.z == 0.f) continue;
+        if (pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f) continue;
+
+        float dx = pos.x - myPos.x;
+        float dy = pos.y - myPos.y;
+        float dz = pos.z - myPos.z;
+        float dist = sqrtf(dx * dx + dy * dy + dz * dz);
 
         EspTarget *t = &g_targets[g_targetCount];
         t->obj = np;
-        t->head = Vec3{pos.x, pos.y + 1.65f, pos.z};
-        t->dist = sqrtf((pos.x - 0) * (pos.x - 0) + pos.y * pos.y + pos.z * pos.z);
+        t->head = (Vec3){ pos.x, pos.y + 1.65f, pos.z };
+        t->dist = dist;
         t->isAi = MP(M_playerIsAi) ? ((bool (*)(void *, void *))MP(M_playerIsAi))(np, M_playerIsAi) : NO;
-        t->name[0] = 0;
+        t->name[0] = '\0';
+
         if (MP(M_playerName)) {
             void *str = ((void *(*)(void *, void *))MP(M_playerName))(np, M_playerName);
-            // Il2CppString: klass@0, monitor@8, length@0x10, utf16 chars@0x14
             if (str) {
                 int len = *(int *)((char *)str + 0x10);
-                if (len > 0 && len < 32) {
+                if (len > 0 && len < 31) {
                     const uint16_t *ch = (const uint16_t *)((char *)str + 0x14);
                     for (int c = 0; c < len; c++) t->name[c] = (char)(ch[c] < 128 ? ch[c] : '?');
-                    t->name[len] = 0;
+                    t->name[len] = '\0';
                 }
             }
         }
@@ -197,332 +195,316 @@ static void scanPlayers(void) {
     }
 }
 
-#pragma mark - Silent aim
+#pragma mark - Silent Aim Target Selection
 
-// Picks the closest head inside the aim cone and returns the screen point.
-static BOOL pickAimPoint(Vec3 *outScreen) {
-    if (!g_targetCount || !alive(g_lcam) || !MP(M_w2s)) return NO;
-    void *cam = nullptr;
-    if (MP(M_camMain)) cam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
+static BOOL pickBestTargetHead(Vec3 *outHead) {
+    if (!g_targetCount || !outHead) return NO;
+    void *cam = MP(M_camMain) ? ((void *(*)(void *))MP(M_camMain))(M_camMain) : nullptr;
     if (!alive(cam)) cam = g_lcam;
+    if (!cam) return NO;
 
-    float bestDot = 0.f;
-    Vec3 best = {0, 0, 0};
+    CGFloat cx = ScreenW() * 0.5f;
+    CGFloat cy = ScreenH() * 0.5f;
+    CGFloat maxRadius = (g_aimFov / 90.0f) * cx;
+    float bestDist = 1e9f;
     BOOL found = NO;
-    Vec3 center = {0.5f, 0.5f, 0.f};
-    (void)center;
 
     for (int i = 0; i < g_targetCount; i++) {
         EspTarget *t = &g_targets[i];
-        Vec3 sp = ((Vec3 (*)(void *, Vec3, void *))MP(M_w2s))(cam, t->head, M_w2s);
-        if (sp.z <= 0.f) continue;                       // behind camera
-        float dx = sp.x - (float)(ScreenW() * 0.5f);
-        float dy = sp.y - (float)(ScreenH() * 0.5f);
-        float d2 = dx * dx + dy * dy;
-        float nd = d2 / (g_aimFov * g_aimFov * 100.f + 1.f);
-        if (nd > 1.f) continue;
-        float score = 1.f / (d2 + 1.f);
-        if (!found || score > bestDot) { bestDot = score; best = sp; found = YES; }
+        CGPoint sp;
+        if (!worldToScreen(cam, t->head, &sp)) continue;
+        float dx = (float)(sp.x - cx);
+        float dy = (float)(sp.y - cy);
+        float d = sqrtf(dx * dx + dy * dy);
+        if (d <= (float)maxRadius && d < bestDist) {
+            bestDist = d;
+            *outHead = t->head;
+            found = YES;
+        }
     }
-    if (found) *outScreen = best;
     return found;
 }
 
-#pragma mark - UI
+static Vec3 hk_computerFireDirection(void *self, void *shootData, void *method) {
+    if (g_silentAim && shootData && g_targetCount > 0) {
+        Vec3 targetHead;
+        if (pickBestTargetHead(&targetHead)) {
+            // ModelShotData: shootPos @0x48, shootDir @0x54
+            Vec3 shootPos = *(Vec3 *)((char *)shootData + 0x48);
+            Vec3 dir = { targetHead.x - shootPos.x, targetHead.y - shootPos.y, targetHead.z - shootPos.z };
+            float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+            if (len > 0.0001f) {
+                dir.x /= len;
+                dir.y /= len;
+                dir.z /= len;
+                *(Vec3 *)((char *)shootData + 0x54) = dir;
+                return dir;
+            }
+        }
+    }
+    if (O_computerFireDirection) {
+        return ((Vec3 (*)(void *, void *, void *))O_computerFireDirection)(self, shootData, method);
+    }
+    return shootData ? *(Vec3 *)((char *)shootData + 0x54) : (Vec3){0.0f, 0.0f, 1.0f};
+}
 
-static inline CGFloat ScreenW(void) { return [UIScreen mainScreen].bounds.size.width; }
-static inline CGFloat ScreenH(void) { return [UIScreen mainScreen].bounds.size.height; }
+#pragma mark - ESP Overlay View
 
 @interface MWMEspView : UIView
 @end
 
 @implementation MWMEspView
 - (BOOL)isUserInteractionEnabled { return NO; }
+
 - (void)drawRect:(CGRect)rect {
     if (!g_espOn || !g_targetCount) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
 
-    void *cam = nullptr;
-    if (MP(M_camMain)) cam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
-    if (!alive(cam) || !MP(M_w2s)) return;
+    void *cam = MP(M_camMain) ? ((void *(*)(void *))MP(M_camMain))(M_camMain) : nullptr;
+    if (!alive(cam)) cam = g_lcam;
+    if (!alive(cam)) return;
 
-    CGContextSetLineWidth(ctx, 1.2);
-    CGContextSetRGBStrokeColor(ctx, 0.0, 0.9, 1.0, 0.95);
-    CGContextSetRGBFillColor(ctx, 0.0, 0.9, 1.0, 1.0);
+    CGFloat sw = ScreenW();
+    CGFloat sh = ScreenH();
+    CGPoint snapOrigin = CGPointMake(sw * 0.5f, sh);
+
+    CGContextSetLineWidth(ctx, 1.2f);
 
     for (int i = 0; i < g_targetCount; i++) {
         EspTarget *t = &g_targets[i];
-        Vec3 feet = ((Vec3 (*)(void *, Vec3, void *))MP(M_w2s))(cam, Vec3{t->head.x, t->head.y - 1.65f, t->head.z}, M_w2s);
-        Vec3 head = ((Vec3 (*)(void *, Vec3, void *))MP(M_w2s))(cam, t->head, M_w2s);
-        if (feet.z <= 0.f || head.z <= 0.f) continue;
+        Vec3 headWorld = t->head;
+        Vec3 feetWorld = { headWorld.x, headWorld.y - 1.70f, headWorld.z };
 
-        CGFloat sx = head.x, sy = head.y;
-        CGFloat h = feet.y - head.y;
-        if (h <= 2) continue;
-        CGFloat w = h * 0.48;
-        CGRect box = CGRectMake(sx - w / 2, sy, w, h);
+        CGPoint headPt, feetPt;
+        if (!worldToScreen(cam, headWorld, &headPt)) continue;
+        if (!worldToScreen(cam, feetWorld, &feetPt)) continue;
+
+        CGFloat h = feetPt.y - headPt.y;
+        if (h < 4.0f) continue;
+        CGFloat w = h * 0.48f;
+        CGRect box = CGRectMake(headPt.x - w * 0.5f, headPt.y, w, h);
+
+        UIColor *color = t->isAi ? [UIColor colorWithRed:1.0f green:0.85f blue:0.0f alpha:0.95f]
+                                 : [UIColor colorWithRed:0.2f green:1.0f blue:0.3f alpha:0.95f];
+
+        [color setStroke];
+        [color setFill];
+
+        // 1. Box
         CGContextStrokeRect(ctx, box);
 
-        // distance text
-        char label[64];
-        snprintf(label, sizeof label, "%s %d", t->name[0] ? t->name : (t->isAi ? "BOT" : "NPC"), (int)t->dist);
-        CGContextFillRect(ctx, CGRectMake(sx - w / 2 + 1, sy - 6, 3, 3));
-        (void)label;
-
-        // line from screen centre
-        CGContextMoveToPoint(ctx, ScreenW() * 0.5f, ScreenH());
-        CGContextAddLineToPoint(ctx, sx, sy + h);
-        CGContextSetRGBStrokeColor(ctx, 1.0, 0.25, 0.25, 0.35);
+        // 2. Snapline
+        CGContextMoveToPoint(ctx, snapOrigin.x, snapOrigin.y);
+        CGContextAddLineToPoint(ctx, feetPt.x, feetPt.y);
         CGContextStrokePath(ctx);
-        CGContextSetRGBStrokeColor(ctx, 0.0, 0.9, 1.0, 0.95);
+
+        // 3. Name & Distance tag
+        NSString *nameStr = (t->name[0] != '\0') ? [NSString stringWithUTF8String:t->name] : @"Player";
+        if (!nameStr) nameStr = @"Player";
+        NSString *tag = [NSString stringWithFormat:@"%@ [%dm]%s",
+                         nameStr, (int)t->dist, t->isAi ? " [BOT]" : ""];
+
+        UIFont *font = [UIFont boldSystemFontOfSize:10.0f];
+        NSDictionary *attrs = @{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: color
+        };
+        CGSize sz = [tag sizeWithAttributes:attrs];
+        CGPoint textPos = CGPointMake(headPt.x - sz.width * 0.5f, headPt.y - sz.height - 2.0f);
+        [tag drawAtPoint:textPos withAttributes:attrs];
     }
 }
 @end
 
-#pragma mark - Menus
-
-@interface MWMFloatingButton : UIButton
-@property (nonatomic, assign) CGPoint lastPoint;
-@property (nonatomic, copy) void (^tapHandler)(void);
-@end
-
-@implementation MWMFloatingButton
-+ (instancetype)floatingButton {
-    MWMFloatingButton *btn = [MWMFloatingButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = CGRectMake(20, 100, 50, 50);
-    btn.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.12 alpha:0.85];
-    btn.layer.cornerRadius = 25;
-    btn.layer.borderWidth = 2.0;
-    btn.layer.borderColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:0.9].CGColor;
-    btn.layer.shadowColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:0.6].CGColor;
-    btn.layer.shadowOffset = CGSizeMake(0, 3);
-    btn.layer.shadowOpacity = 0.8;
-    btn.layer.shadowRadius = 8;
-    [btn setTitle:@"M" forState:UIControlStateNormal];
-    [btn setTitleColor:[UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0] forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:22];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:btn action:@selector(handlePan:)];
-    [btn addGestureRecognizer:pan];
-    [btn addTarget:btn action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
-    return btn;
-}
-- (void)handlePan:(UIPanGestureRecognizer *)pan {
-    UIView *parent = self.superview;
-    if (!parent) return;
-    if (pan.state == UIGestureRecognizerStateBegan) self.lastPoint = [pan translationInView:parent];
-    else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint d = [pan translationInView:parent];
-        CGPoint c = CGPointMake(self.center.x + (d.x - self.lastPoint.x),
-                                self.center.y + (d.y - self.lastPoint.y));
-        CGFloat hw = self.bounds.size.width / 2.0, hh = self.bounds.size.height / 2.0;
-        c.x = fmax(hw + 5, fmin(parent.bounds.size.width - hw - 5, c.x));
-        c.y = fmax(hh + 20, fmin(parent.bounds.size.height - hh - 20, c.y));
-        self.center = c;
-        self.lastPoint = d;
-    }
-}
-- (void)tapped { if (self.tapHandler) self.tapHandler(); }
-@end
+#pragma mark - UI Menu & Floating Button
 
 @interface MWMMenuView : UIView
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UILabel *fovLabel;
-@property (nonatomic, strong) UILabel *aimLabel;
-@property (nonatomic, strong) UISlider *fovSlider;
-@property (nonatomic, strong) UISlider *aimSlider;
-@property (nonatomic, strong) UISwitch *recoilSwitch;
-@property (nonatomic, strong) UISwitch *espSwitch;
-@property (nonatomic, strong) UISwitch *aimSwitch;
-@property (nonatomic, strong) UISwitch *tutSwitch;
-@property (nonatomic, strong) UISwitch *rankSwitch;
+@property (retain) UILabel *statusLabel;
+@property (retain) UISwitch *recoilSwitch;
+@property (retain) UISwitch *espSwitch;
+@property (retain) UISwitch *aimSwitch;
+@property (retain) UISlider *aimFovSlider;
+@property (retain) UILabel *aimFovLabel;
+@property (retain) UISlider *fovSlider;
+@property (retain) UILabel *fovLabel;
 @end
 
 @implementation MWMMenuView
-+ (instancetype)menuViewWithFrame:(CGRect)frame {
-    MWMMenuView *m = [[MWMMenuView alloc] initWithFrame:frame];
-    [m setupUI];
-    return m;
-}
 
-- (UIView *)blurContent {
-    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
-    UIVisualEffectView *bv = [[UIVisualEffectView alloc] initWithEffect:blur];
-    bv.frame = self.bounds;
-    bv.layer.cornerRadius = 16;
-    bv.layer.masksToBounds = YES;
-    bv.layer.borderWidth = 1.2;
-    bv.layer.borderColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:0.4].CGColor;
-    [self addSubview:bv];
-    return bv.contentView;
-}
+- (id)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
 
-- (void)setupUI {
-    self.backgroundColor = [UIColor clearColor];
-    self.layer.cornerRadius = 16;
+    self.backgroundColor = [UIColor colorWithRed:0.08 green:0.09 blue:0.12 alpha:0.96];
+    self.layer.cornerRadius = 14.0;
+    self.layer.borderWidth = 1.0;
+    self.layer.borderColor = [UIColor colorWithRed:0.25 green:0.45 blue:0.85 alpha:0.7].CGColor;
     self.layer.masksToBounds = YES;
-    UIView *c = [self blurContent];
-    CGFloat w = self.bounds.size.width;
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, w - 60, 22)];
-    title.text = @"MINI WORLD ROYALE";
+    CGFloat y = 14;
+    CGFloat w = frame.size.width;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 22)];
+    title.text = @"Mini World Menu (VIP)";
     title.font = [UIFont boldSystemFontOfSize:16];
-    title.textColor = [UIColor colorWithRed:0.0 green:0.85 blue:0.95 alpha:1.0];
-    [c addSubview:title];
+    title.textColor = [UIColor colorWithRed:0.35 green:0.75 blue:1.0 alpha:1.0];
+    title.textAlignment = NSTextAlignmentCenter;
+    [self addSubview:title];
+    y += 26;
 
-    UIButton *x = [UIButton buttonWithType:UIButtonTypeCustom];
-    x.frame = CGRectMake(w - 42, 6, 34, 28);
-    [x setTitle:@"✕" forState:UIControlStateNormal];
-    [x setTitleColor:[UIColor colorWithWhite:0.7 alpha:1.0] forState:UIControlStateNormal];
-    x.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    [x addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
-    [c addSubview:x];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 16)];
+    self.statusLabel.text = @"Status: Initializing...";
+    self.statusLabel.font = [UIFont systemFontOfSize:11];
+    self.statusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
+    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    [self addSubview:self.statusLabel];
+    y += 24;
 
-    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(16, 36, w - 32, 1)];
-    sep.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-    [c addSubview:sep];
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(16, y, w - 32, 1)];
+    div.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    [self addSubview:div];
+    y += 12;
 
-    CGFloat y = 44;
-    self.recoilSwitch = [self toggle:c y:y t:@"No Recoil" on:g_norecoil a:@selector(recoilChanged:)];
-    y += 36;
-    self.espSwitch    = [self toggle:c y:y t:@"ESP Box / Name / Dist" on:g_espOn a:@selector(espChanged:)];
-    y += 36;
-    self.aimSwitch    = [self toggle:c y:y t:@"Silent Aim (head)" on:g_silentAim a:@selector(aimChanged:)];
-    y += 36;
+    self.recoilSwitch = [self toggleAt:&y title:@"No Recoil" sel:@selector(recoilToggled:)];
+    self.espSwitch = [self toggleAt:&y title:@"ESP (Box + Line + Dist)" sel:@selector(espToggled:)];
+    self.aimSwitch = [self toggleAt:&y title:@"Silent Aim (Auto Head)" sel:@selector(aimToggled:)];
 
-    // FOV
-    self.fovLabel = [self label:c y:y text:g_fov > 0 ? [NSString stringWithFormat:@"FOV (FP+TP): %d°", (int)g_fov] : @"FOV (FP+TP): Default"];
-    y += 20;
-    self.fovSlider = [self slider:c y:y min:60 max:120 v:g_fov > 0 ? g_fov : 90 a:@selector(fovChanged:)];
-    y += 32;
+    self.aimFovLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov]];
+    self.aimFovSlider = [self sliderAt:&y min:10 max:90 val:g_aimFov sel:@selector(aimFovChanged:)];
 
-    // Aim cone
-    self.aimLabel = [self label:c y:y text:[NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov]];
-    y += 20;
-    self.aimSlider = [self slider:c y:y min:5 max:90 v:g_aimFov a:@selector(aimFovChanged:)];
-    y += 34;
+    self.fovLabel = [self labelAt:&y text:g_fov > 0 ? [NSString stringWithFormat:@"Camera FOV: %d°", (int)g_fov] : @"Camera FOV: Default"];
+    self.fovSlider = [self sliderAt:&y min:60 max:120 val:g_fov > 0 ? g_fov : 90 sel:@selector(fovChanged:)];
 
-    self.tutSwitch  = [self toggle:c y:y t:@"Skip Tutorial" on:g_bypassTutorial a:@selector(tutChanged:)];
-    y += 34;
-    self.rankSwitch = [self toggle:c y:y t:@"Bypass Rank Lock" on:g_bypassRankLock a:@selector(rankChanged:)];
-    y += 34;
-
-    UIButton *fps = [UIButton buttonWithType:UIButtonTypeCustom];
-    fps.frame = CGRectMake(16, y, (w - 40) / 2, 30);
-    fps.backgroundColor = [UIColor colorWithRed:0.12 green:0.22 blue:0.32 alpha:0.8];
-    fps.layer.cornerRadius = 8;
-    [fps setTitle:@"120 FPS" forState:UIControlStateNormal];
-    [fps setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    fps.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    [fps addTarget:self action:@selector(fpsTapped) forControlEvents:UIControlEventTouchUpInside];
-    [c addSubview:fps];
-
+    y += 8;
     UIButton *rst = [UIButton buttonWithType:UIButtonTypeCustom];
-    rst.frame = CGRectMake(16 + (w - 40) / 2 + 8, y, (w - 40) / 2, 30);
-    rst.backgroundColor = [UIColor colorWithRed:0.25 green:0.10 blue:0.10 alpha:0.8];
+    rst.frame = CGRectMake(16, y, (w - 40) / 2, 32);
+    rst.backgroundColor = [UIColor colorWithRed:0.25 green:0.25 blue:0.3 alpha:0.8];
     rst.layer.cornerRadius = 8;
     [rst setTitle:@"Reset" forState:UIControlStateNormal];
     [rst setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    rst.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    rst.titleLabel.font = [UIFont systemFontOfSize:13];
     [rst addTarget:self action:@selector(resetTapped) forControlEvents:UIControlEventTouchUpInside];
-    [c addSubview:rst];
-    y += 38;
+    [self addSubview:rst];
 
-    self.statusLabel = [self label:c y:y text:@"Status: Waiting..."];
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
+    UIButton *cls = [UIButton buttonWithType:UIButtonTypeCustom];
+    cls.frame = CGRectMake(24 + (w - 40) / 2, y, (w - 40) / 2, 32);
+    cls.backgroundColor = [UIColor colorWithRed:0.8 green:0.25 blue:0.25 alpha:0.8];
+    cls.layer.cornerRadius = 8;
+    [cls setTitle:@"Close" forState:UIControlStateNormal];
+    [cls setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    cls.titleLabel.font = [UIFont systemFontOfSize:13];
+    [cls addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:cls];
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuPan:)];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [self addGestureRecognizer:pan];
+
+    return self;
 }
 
-- (UILabel *)label:(UIView *)c y:(CGFloat)y text:(NSString *)t {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y, self.bounds.size.width - 32, 18)];
-    l.font = [UIFont boldSystemFontOfSize:12];
-    l.textColor = [UIColor whiteColor];
-    l.text = t;
-    [c addSubview:l];
-    return l;
-}
-- (UISlider *)slider:(UIView *)c y:(CGFloat)y min:(float)mn max:(float)mx v:(float)v a:(SEL)a {
-    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(16, y, self.bounds.size.width - 32, 26)];
-    s.minimumValue = mn; s.maximumValue = mx; s.value = v;
-    [s addTarget:self action:a forControlEvents:UIControlEventValueChanged];
-    [c addSubview:s];
-    return s;
-}
-- (UISwitch *)toggle:(UIView *)c y:(CGFloat)y t:(NSString *)t on:(BOOL)on a:(SEL)a {
-    CGFloat w = self.bounds.size.width;
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 3, w - 76, 22)];
-    l.font = [UIFont boldSystemFontOfSize:13];
-    l.textColor = [UIColor whiteColor];
-    l.text = t;
-    [c addSubview:l];
-    UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(w - 64, y, 51, 31)];
-    s.on = on;
-    [s addTarget:self action:a forControlEvents:UIControlEventValueChanged];
-    [c addSubview:s];
-    return s;
+- (UISwitch *)toggleAt:(CGFloat *)yp title:(NSString *)t sel:(SEL)action {
+    CGFloat y = *yp;
+    CGFloat w = self.frame.size.width;
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, w - 80, 24)];
+    lbl.text = t;
+    lbl.font = [UIFont systemFontOfSize:13];
+    lbl.textColor = [UIColor whiteColor];
+    [self addSubview:lbl];
+
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, y, 51, 31)];
+    [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+    [self addSubview:sw];
+
+    *yp += 38;
+    return sw;
 }
 
-- (void)recoilChanged:(UISwitch *)s { g_norecoil = s.isOn; }
-- (void)espChanged:(UISwitch *)s    { g_espOn = s.isOn; }
-- (void)aimChanged:(UISwitch *)s    { g_silentAim = s.isOn; }
-- (void)tutChanged:(UISwitch *)s    { g_bypassTutorial = s.isOn; }
-- (void)rankChanged:(UISwitch *)s   { g_bypassRankLock = s.isOn; }
-
-- (void)fovChanged:(UISlider *)s {
-    g_fov = s.value;
-    self.fovLabel.text = [NSString stringWithFormat:@"FOV (FP+TP): %d°", (int)g_fov];
+- (UILabel *)labelAt:(CGFloat *)yp text:(NSString *)t {
+    CGFloat y = *yp;
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, self.frame.size.width - 32, 18)];
+    lbl.text = t;
+    lbl.font = [UIFont systemFontOfSize:12];
+    lbl.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
+    [self addSubview:lbl];
+    *yp += 20;
+    return lbl;
 }
+
+- (UISlider *)sliderAt:(CGFloat *)yp min:(float)mn max:(float)mx val:(float)v sel:(SEL)action {
+    CGFloat y = *yp;
+    UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(16, y, self.frame.size.width - 32, 28)];
+    sl.minimumValue = mn;
+    sl.maximumValue = mx;
+    sl.value = v;
+    [sl addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+    [self addSubview:sl];
+    *yp += 32;
+    return sl;
+}
+
+- (void)recoilToggled:(UISwitch *)s { g_norecoil = s.isOn; }
+- (void)espToggled:(UISwitch *)s { g_espOn = s.isOn; }
+- (void)aimToggled:(UISwitch *)s { g_silentAim = s.isOn; }
 - (void)aimFovChanged:(UISlider *)s {
     g_aimFov = s.value;
-    self.aimLabel.text = [NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov];
+    self.aimFovLabel.text = [NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov];
 }
-- (void)fpsTapped {
-    if (MP(M_fps)) ((void (*)(int, void *))MP(M_fps))(120, M_fps);
-    self.statusLabel.text = @"FPS = 120";
+- (void)fovChanged:(UISlider *)s {
+    g_fov = s.value;
+    self.fovLabel.text = [NSString stringWithFormat:@"Camera FOV: %d°", (int)g_fov];
 }
+
 - (void)resetTapped {
-    g_norecoil = NO; g_espOn = NO; g_silentAim = NO; g_fov = 0.f;
-    self.recoilSwitch.on = NO; self.espSwitch.on = NO; self.aimSwitch.on = NO;
-    self.fovSlider.value = 90.f; self.fovLabel.text = @"FOV (FP+TP): Default";
+    g_norecoil = NO;
+    g_espOn = NO;
+    g_silentAim = NO;
+    g_fov = 0.0f;
+    self.recoilSwitch.on = NO;
+    self.espSwitch.on = NO;
+    self.aimSwitch.on = NO;
+    self.fovSlider.value = 90.0f;
+    self.fovLabel.text = @"Camera FOV: Default";
+    self.aimFovSlider.value = 35.0f;
+    self.aimFovLabel.text = @"Aim FOV: 35°";
 }
+
 - (void)closeTapped { self.hidden = YES; }
-- (void)handleMenuPan:(UIPanGestureRecognizer *)pan {
-    UIView *p = self.superview;
-    if (!p) return;
-    static CGPoint start;
-    if (pan.state == UIGestureRecognizerStateBegan) start = self.center;
-    else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint d = [pan translationInView:p];
-        self.center = CGPointMake(start.x + d.x, start.y + d.y);
-    }
+
+- (void)handlePan:(UIPanGestureRecognizer *)p {
+    CGPoint t = [p translationInView:self.superview];
+    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
+    [p setTranslation:CGPointZero inView:self.superview];
 }
+
 @end
 
-#pragma mark - UI manager
+#pragma mark - UI Manager
 
 @interface MWMUIManager : NSObject
-@property (nonatomic, strong) MWMFloatingButton *floatingButton;
-@property (nonatomic, strong) MWMMenuView *menuView;
-@property (nonatomic, strong) MWMEspView *espView;
-@property (nonatomic, strong) CADisplayLink *displayLink;
 + (instancetype)shared;
+@property (retain) UIButton *floatingBtn;
+@property (retain) MWMMenuView *menuView;
+@property (retain) MWMEspView *espView;
+@property (retain) CADisplayLink *displayLink;
 - (void)setupUI;
 @end
 
 @implementation MWMUIManager
+
 + (instancetype)shared {
-    static MWMUIManager *i = nil;
+    static MWMUIManager *inst;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ i = [[MWMUIManager alloc] init]; });
-    return i;
+    dispatch_once(&once, ^{ inst = [MWMUIManager new]; });
+    return inst;
 }
 
 - (void)setupUI {
     UIWindow *w = [UIApplication sharedApplication].keyWindow;
-    if (!w) for (UIWindow *x in [UIApplication sharedApplication].windows) if (x.isKeyWindow) { w = x; break; }
+    if (!w) {
+        id wins = [UIApplication sharedApplication].windows;
+        if ([wins isKindOfClass:[NSObject class]]) w = (UIWindow *)wins;
+    }
     if (!w) return;
 
     if (!self.espView) {
@@ -532,26 +514,48 @@ static inline CGFloat ScreenH(void) { return [UIScreen mainScreen].bounds.size.h
         self.espView.opaque = NO;
         [w addSubview:self.espView];
     }
-    if (!self.floatingButton) {
-        self.floatingButton = [MWMFloatingButton floatingButton];
-        __weak MWMUIManager *ws = self;
-        self.floatingButton.tapHandler = ^{
-            ws.menuView.hidden = !ws.menuView.hidden;
-            if (!ws.menuView.hidden) [ws.menuView.superview bringSubviewToFront:ws.menuView];
-        };
-        [w addSubview:self.floatingButton];
+
+    if (!self.floatingBtn) {
+        CGFloat size = 46.0;
+        self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        self.floatingBtn.frame = CGRectMake(20, 100, size, size);
+        self.floatingBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.4 blue:0.9 alpha:0.85];
+        self.floatingBtn.layer.cornerRadius = size / 2;
+        self.floatingBtn.layer.borderWidth = 1.5;
+        self.floatingBtn.layer.borderColor = [UIColor whiteColor].CGColor;
+        [self.floatingBtn setTitle:@"M" forState:UIControlStateNormal];
+        [self.floatingBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        self.floatingBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        [self.floatingBtn addTarget:self action:@selector(btnTapped) forControlEvents:UIControlEventTouchUpInside];
+
+        UIPanGestureRecognizer *p = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(btnPanned:)];
+        [self.floatingBtn addGestureRecognizer:p];
+        [w addSubview:self.floatingBtn];
     }
+
     if (!self.menuView) {
-        CGFloat mw = 320, mh = 470;
-        self.menuView = [MWMMenuView menuViewWithFrame:CGRectMake((w.bounds.size.width - mw) / 2,
-                                                                 40, mw, mh)];
+        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 120, 260, 360)];
         self.menuView.hidden = YES;
         [w addSubview:self.menuView];
     }
+
     if (!self.displayLink) {
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onFrame)];
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
+}
+
+- (void)btnTapped {
+    self.menuView.hidden = !self.menuView.hidden;
+    if (!self.menuView.hidden) {
+        [self.menuView.superview bringSubviewToFront:self.menuView];
+    }
+}
+
+- (void)btnPanned:(UIPanGestureRecognizer *)p {
+    CGPoint t = [p translationInView:self.floatingBtn.superview];
+    self.floatingBtn.center = CGPointMake(self.floatingBtn.center.x + t.x, self.floatingBtn.center.y + t.y);
+    [p setTranslation:CGPointZero inView:self.floatingBtn.superview];
 }
 
 - (void)setStatus:(NSString *)t color:(UIColor *)col {
@@ -591,17 +595,32 @@ static inline CGFloat ScreenH(void) { return [UIScreen mainScreen].bounds.size.h
 
     [self setStatus:@"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
 
-    if (g_norecoil && off_recoilAngles)
-        *(Vec2 *)((char *)g_lcam + off_recoilAngles) = Vec2{0.f, 0.f};
+    // 1. No recoil
+    if (g_norecoil && off_recoilAngles) {
+        *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){0.0f, 0.0f};
+    }
 
-    if (g_espOn || g_silentAim) scanPlayers();
+    // 2. Camera FOV: applies to both FPP and TPP
+    if (g_fov > 0.0f) {
+        // FP: update PlayerCamera
+        if (alive(g_lcam) && MP(M_setFpCameraFov)) {
+            ((void (*)(void *, float, float, void *))MP(M_setFpCameraFov))(g_lcam, g_fov, 0.0f, M_setFpCameraFov);
+        }
+        // TP & Main Camera: update Camera.main directly
+        void *mainCam = MP(M_camMain) ? ((void *(*)(void *))MP(M_camMain))(M_camMain) : nullptr;
+        if (alive(mainCam) && MP(M_fov)) {
+            ((void (*)(void *, float, void *))MP(M_fov))(mainCam, g_fov, M_fov);
+        }
+    }
 
-    // FOV is applied by hk_camTypeLateUpdate; nothing to do here. The hook also
-    // covers third-person because CameraTypeFPS is the base of the TP types.
+    // 3. Scan targets for ESP and Silent Aim
+    if (g_espOn || g_silentAim) {
+        scanPlayers();
+    }
 }
 @end
 
-#pragma mark - Resolution
+#pragma mark - Resolution & Hooking
 
 static void *findImage(const char *n) {
     size_t c = 0;
@@ -627,7 +646,6 @@ static BOOL resolveApi(void) {
     i_method_from_name = (void *(*)(void *, const char *, int))dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
     i_field_from_name  = (void *(*)(void *, const char *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
     i_field_offset     = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
-    i_object_unbox     = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
 
     g_apiResolved = (i_domain_get && i_thread_attach && i_get_assemblies &&
                      i_assembly_image && i_image_name && i_class_from_name &&
@@ -636,82 +654,107 @@ static BOOL resolveApi(void) {
     return g_apiResolved;
 }
 
+// Bypasses dummy implementations
+static void dummy_ret(void *self, void *mi) { (void)self; (void)mi; }
+static bool dummy_false(void *mi) { (void)mi; return false; }
+static bool dummy_true(int32_t id, void *mi) { (void)id; (void)mi; return true; }
+static bool dummy_true_2(int32_t id, void *cb, void *mi) { (void)id; (void)cb; (void)mi; return true; }
+
+static void (*pMSHookFunction)(void *, void *, void **) = nullptr;
+
 static BOOL resolveIl2Cpp(void) {
     void *game = findImage("Assembly-CSharp.dll");
     void *core = findImage("UnityEngine.CoreModule.dll");
     if (!game || !core) return NO;
 
-    void *K_obj = i_class_from_name(core, "UnityEngine", "Object");
-    void *K_camType = i_class_from_name(game, "", "CameraTypeFPS");
+    void *K_obj       = i_class_from_name(core, "UnityEngine", "Object");
     void *K_netPlayer = i_class_from_name(game, "WildWest.NetControllers", "NetPlayer");
-    void *K_netMgr = i_class_from_name(game, "WildWest.NetControllers", "NetManager");
+    void *K_netMgr    = i_class_from_name(game, "WildWest.NetControllers", "NetManager");
+    K_weaponProc      = i_class_from_name(game, "", "WeaponProcessBase");
 
     K_player    = i_class_from_name(game, "HQFPSTemplate", "Player");
     K_playerCam = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
     K_lpm       = i_class_from_name(game, "", "LocalPlayerManager");
     K_camera    = i_class_from_name(core, "UnityEngine", "Camera");
-    K_app       = i_class_from_name(core, "UnityEngine", "Application");
+
+    off_cachedPtr = fieldOff(K_obj, "m_CachedPtr");
+    off_lpmPlayer = fieldOff(K_lpm, "<LocalPlayer>k__BackingField");
+    off_playerType = fieldOff(K_lpm, "<LocalPlayerType>k__BackingField");
+    off_playerCam = fieldOff(K_player, "m_PlayerCamera");
+    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles");
 
     M_lpmInstance = methodOf(K_lpm, "get_Instance", 0);
     M_fov         = methodOf(K_camera, "set_fieldOfView", 1);
-    M_fovGet      = methodOf(K_camera, "get_fieldOfView", 0);
     M_w2s         = methodOf(K_camera, "WorldToScreenPoint", 1);
     M_camMain     = methodOf(K_camera, "get_main", 0);
-    M_fps         = methodOf(K_app, "set_targetFrameRate", 1);
-
-    M_camTypeLateUpdate = methodOf(K_camType, "onLaterUpdate", 0);
+    M_setFpCameraFov = methodOf(K_playerCam, "SetFPCameraFieldOfView", 2);
 
     M_netInstance = methodOf(K_netMgr, "get_Instance", 0);
     M_playerName  = methodOf(K_netPlayer, "GetPlayerName", 0);
     M_playerIsAi  = methodOf(K_netPlayer, "IsAiPlayer", 0);
     M_playerPos   = methodOf(K_netPlayer, "GetPosition", 0);
-    M_netId       = methodOf(K_netPlayer, "GetNetPlayerId", 0);
+    off_netPlayerMap = fieldOff(K_netMgr, "NetPlayerMap");
 
-    off_cachedPtr = fieldOff(K_obj, "m_CachedPtr");
-    off_lpmPlayer = fieldOff(K_lpm, "mLocalPlayer");
-    off_playerType = fieldOff(K_player, "LocalPlayerType");
-    off_playerCam = fieldOff(K_player, "_PlayerCamera");
-    off_camFp     = fieldOff(K_playerCam, "m_FpCamera");
-    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles");
-    off_netPlayerMap = fieldOff(i_class_from_name(game, "WildWest.NetControllers", "NetManagerBase"), "NetPlayerMap");
+    M_fireDir = methodOf(K_weaponProc, "computerFireDirection", 1);
 
-    // tutorial / rank
     void *K_sceneHelper = i_class_from_name(game, "", "LogicSceneHelper");
-    void *K_guideMgr = i_class_from_name(game, "", "BattleGuideManager");
-    void *K_lua = i_class_from_name(game, "", "LuaHelper");
-    void *K_promo = i_class_from_name(game, "Configs", "PromotionItem");
+    void *K_guideMgr    = i_class_from_name(game, "", "BattleGuideManager");
+    void *K_lua         = i_class_from_name(game, "", "LuaHelper");
+
     M_checkGuideScene = methodOf(K_sceneHelper, "CheckIsGuideScene", 0);
-    M_guideInit = methodOf(K_guideMgr, "Init", 0);
-    M_checkFuncOpen = methodOf(K_lua, "CheckFunctionIsOpen", 1);
-    M_rankLockGet = methodOf(K_promo, "get_RankLock", 0);
+    M_isNewbieGame    = methodOf(K_sceneHelper, "IsNewbieGame", 0);
+    M_guideInit       = methodOf(K_guideMgr, "Init", 0);
+    M_checkFuncOpen   = methodOf(K_lua, "CheckFunctionIsOpen", 1);
+    M_checkFuncUnlock = methodOf(K_lua, "CheckFuncUnlock", 2);
 
     if (!off_cachedPtr || !off_lpmPlayer || !off_playerType || !off_playerCam ||
         !off_recoilAngles || !MP(M_lpmInstance)) return NO;
 
+    pMSHookFunction = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
+
+    // Install Silent Aim
+    if (MP(M_fireDir)) {
+        if (pMSHookFunction) {
+            pMSHookFunction(MP(M_fireDir), (void *)&hk_computerFireDirection, (void **)&O_computerFireDirection);
+        }
+        *(void **)M_fireDir = (void *)&hk_computerFireDirection;
+    }
+
+    // Install Tutorial Bypass
+    if (g_bypassTutorial) {
+        if (MP(M_guideInit)) {
+            if (pMSHookFunction) pMSHookFunction(MP(M_guideInit), (void *)&dummy_ret, nullptr);
+            *(void **)M_guideInit = (void *)&dummy_ret;
+        }
+        if (MP(M_checkGuideScene)) {
+            if (pMSHookFunction) pMSHookFunction(MP(M_checkGuideScene), (void *)&dummy_false, nullptr);
+            *(void **)M_checkGuideScene = (void *)&dummy_false;
+        }
+        if (MP(M_isNewbieGame)) {
+            if (pMSHookFunction) pMSHookFunction(MP(M_isNewbieGame), (void *)&dummy_false, nullptr);
+            *(void **)M_isNewbieGame = (void *)&dummy_false;
+        }
+    }
+
+    // Install Rank / Level Lock Bypass
+    if (g_bypassRankLock) {
+        if (MP(M_checkFuncOpen)) {
+            if (pMSHookFunction) pMSHookFunction(MP(M_checkFuncOpen), (void *)&dummy_true, nullptr);
+            *(void **)M_checkFuncOpen = (void *)&dummy_true;
+        }
+        if (MP(M_checkFuncUnlock)) {
+            if (pMSHookFunction) pMSHookFunction(MP(M_checkFuncUnlock), (void *)&dummy_true_2, nullptr);
+            *(void **)M_checkFuncUnlock = (void *)&dummy_true_2;
+        }
+    }
+
     g_il2cppReady = YES;
-    NSLog(@"[MWM] armed | camType=%p netMgr=%p esp=%p fov=%p",
-          MP(M_camTypeLateUpdate), MP(M_netInstance), off_netPlayerMap, MP(M_fov));
+    NSLog(@"[MWM] armed | netMgr=%p espOff=%zu fov=%p fireDir=%p",
+          MP(M_netInstance), off_netPlayerMap, MP(M_fov), MP(M_fireDir));
     return YES;
 }
 
-#pragma mark - Bypasses
-
-// Keep the tutorial manager from running its step machine.
-static void antiTutorial(void) {
-    if (!g_bypassTutorial || !MP(M_guideInit)) return;
-    static BOOL once = NO;
-    if (once) return;
-    once = YES;
-    // NOP-ing out Init() leaves _stepList empty, so no step is ever invoked.
-    void *mp = MP(M_guideInit);
-    uint32_t *p = (uint32_t *)mp;
-    p[0] = 0xD65F03C0u;   // RET
-}
-
-// Rank/level gate: CheckFunctionIsOpen is a Lua bridge; return true unconditionally.
-static BOOL hk_checkFuncOpen(int funcID, void *mi) { (void)funcID; (void)mi; return YES; }
-
-#pragma mark - Launch
+#pragma mark - Lifecycle
 
 static void tick(void) {
     [[MWMUIManager shared] setupUI];
@@ -721,7 +764,6 @@ static void tick(void) {
     if (!d) return;
     i_thread_attach(d);
     if (resolveIl2Cpp()) {
-        antiTutorial();
         NSLog(@"[MWM] ready");
     }
 }
@@ -735,7 +777,10 @@ static void pollUntilArmed(int attempt) {
 }
 
 static void onAppLaunched(CFNotificationCenterRef c, void *o, CFStringRef n,
-                          const void *obj, CFDictionaryRef info) { pollUntilArmed(0); }
+                          const void *obj, CFDictionaryRef info) {
+    (void)c; (void)o; (void)n; (void)obj; (void)info;
+    pollUntilArmed(0);
+}
 
 __attribute__((constructor)) static void mwm_entry(void) {
     CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL, &onAppLaunched,
