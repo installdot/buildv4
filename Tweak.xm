@@ -1,12 +1,27 @@
-#ifndef MWM_TWEAK_XM
-#define MWM_TWEAK_XM
+#ifndef CATSSOUP_TWEAK_XM
+#define CATSSOUP_TWEAK_XM
 
-// Mini World : Royale (com.miniworldroyale.sparkgame)
-// TrollFools injected tweak — native UIKit menu, ESP overlay, silent aim.
+// Cats & Soup (Hidea / NEOWIZ) — UnityFramework IL2CPP tweak, TrollFools/TrollStore dylib.
 //
-// Symbol names below are taken verbatim from Il2CppDumper dump.cs for this build.
-// Any name that does not exist makes resolveIl2Cpp() return NO and every feature
-// dies silently, so each lookup is logged and the status label shows the failure.
+// Target: C:\Users\TRUONG\Downloads\UnityFramework
+//         Mach-O arm64, IL2CPP, MD5 1a9b692e39e11a98b244681a533f9b90
+//
+// Every class / method / field name below was verified against Il2CppDumper dump.cs
+// for this exact build, and every RVA is recorded in a comment next to the lookup.
+// Metadata lookups go through il2cpp reflection, not hardcoded addresses, so the tweak
+// survives a re-dump of the same game version and reports a named failure otherwise.
+//
+// Core design decisions:
+//  1. Mutations always go through the game's own public API (AddGold / AddGem /
+//     AddFurniture / AddWorkData / ...). That way the ES3 file, the *CheckV4 hashes
+//     and the FixedSizeList backup rings are all updated exactly as the game does —
+//     which is what makes "save + upload to cloud" stick instead of being rolled back
+//     by the next SaveGoldData.
+//  2. Anti-cheat is defeated through the game's own flags (isMemoryHackV4 /
+//     isSkipMemoryHackV4) plus their dedicated savers, never by patching code pages.
+//  3. Content enumeration reads the same Entity_* ScriptableObject lists the game
+//     reads (AssetManager + 0x28..0x1xx, each holding `List<T.Param> list` at +0x18),
+//     so id spaces match the server's expectations.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -17,1442 +32,1038 @@
 #import <stdint.h>
 #import <unistd.h>
 #import <math.h>
-#import <sys/mman.h>
-#import <mach/mach.h>
-#import <mach/vm_map.h>
-#import <mach/vm_region.h>
 
-#pragma mark - Geometry & Screen Helpers
+#pragma mark - il2cpp ABI (exports verified present in this binary)
 
-typedef struct { float x, y; } Vec2;
-typedef struct { float x, y, z; } Vec3;
+typedef struct Il2CppDomain Il2CppDomain;
+typedef struct Il2CppAssembly Il2CppAssembly;
+typedef struct Il2CppImage Il2CppImage;
+typedef struct Il2CppClass Il2CppClass;
+typedef struct MethodInfo MethodInfo;
+typedef struct FieldInfo FieldInfo;
+typedef struct Il2CppObject Il2CppObject;
 
-// Aim point height above the target's feet. 1.65 sat just over the skull, so rays
-// clipped the top edge of the head hitbox instead of its centre.
-#define MWM_HEAD_HEIGHT 1.55f
+static Il2CppDomain *(*i_domain_get)(void);
+static void *(*i_thread_attach)(Il2CppDomain *);
+static void **(*i_domain_get_assemblies)(Il2CppDomain *, size_t *);
+static Il2CppImage *(*i_assembly_get_image)(Il2CppAssembly *);
+static Il2CppClass *(*i_class_from_name)(Il2CppImage *, const char *, const char *);
+static MethodInfo *(*i_class_get_method_from_name)(Il2CppClass *, const char *, int);
+static FieldInfo *(*i_class_get_field_from_name)(Il2CppClass *, const char *);
+static size_t (*i_field_get_offset)(FieldInfo *);
+static Il2CppObject *(*i_runtime_invoke)(MethodInfo *, void *, void **, void **);
+static void (*i_field_get_value)(Il2CppObject *, FieldInfo *, void *);
+static Il2CppClass *(*i_class_get_parent)(Il2CppClass *);
+static void *(*i_method_get_param)(MethodInfo *, uint32_t);
+static char *(*i_type_get_name)(void *);
+static MethodInfo *(*i_class_get_methods)(Il2CppClass *, void **);
+static const char *(*i_method_get_name)(MethodInfo *);
+static uint32_t (*i_method_get_param_count)(MethodInfo *);
 
-static inline BOOL vec3Finite(Vec3 v) {
-    return v.x == v.x && v.y == v.y && v.z == v.z &&
-           fabsf(v.x) < 1e6f && fabsf(v.y) < 1e6f && fabsf(v.z) < 1e6f;
-}
+#define BIND(sym) do { *(void **)(&i_##sym) = dlsym(RTLD_DEFAULT, "_il2cpp_" #sym); \
+                       if (!i_##sym) { diag(@"missing _il2cpp_" #sym); return NO; } } while (0)
 
-static inline CGFloat ScreenW(void) { return [UIScreen mainScreen].bounds.size.width; }
-static inline CGFloat ScreenH(void) { return [UIScreen mainScreen].bounds.size.height; }
+#pragma mark - Diagnostics
 
-#pragma mark - il2cpp ABI
+static char g_diag[160] = "booting";
+static void diag(NSString *m) { snprintf(g_diag, sizeof(g_diag), "%s", m.UTF8String); }
 
-static void *(*i_domain_get)(void);
-static void *(*i_thread_attach)(void *);
-static void **(*i_get_assemblies)(void *, size_t *);
-static void *(*i_assembly_image)(void *);
-static const char *(*i_image_name)(void *);
-static void *(*i_class_from_name)(void *, const char *, const char *);
-static void *(*i_method_from_name)(void *, const char *, int);
-static void *(*i_field_from_name)(void *, const char *);
-static size_t (*i_field_offset)(void *);
-static void *(*i_image_get_class)(void *, size_t);
-static size_t (*i_image_class_count)(void *);
-static void *(*i_class_get_parent)(void *);
+#pragma mark - Handles
 
-extern void sys_icache_invalidate(void *start, size_t len);
+static Il2CppImage *g_img = NULL;
+static BOOL g_ready = NO;
 
-static inline void *MP(void *mi) { return mi ? *(void **)mi : nullptr; }
+static Il2CppClass *K_DataManager, *K_GameManager, *K_GameSaveManager, *K_ServerManager;
+static Il2CppClass *K_GameData, *K_AssetManager;
+static Il2CppClass *K_EntityWork, *K_EntityEquip, *K_EntityFurniture, *K_EntityCatType;
+static Il2CppClass *K_EntityTheme, *K_EntityBGM, *K_EntityLamp, *K_EntityGuest, *K_EntityEventPlace;
+static Il2CppClass *K_EntityShop, *K_EntityCollection, *K_EntityAbility;
+static Il2CppClass *K_EntityWorkSkin, *K_EntitySignSkin, *K_EntityTimerSkin, *K_EntityBalloonSkin;
+static Il2CppClass *K_EntitySoupPassReward, *K_EntityMontlyPass, *K_EntityEventSeasonPass;
+static Il2CppClass *K_EntityTowerProp;
 
-static void *methodOf(void *k, const char *n, int argc) {
-    return k ? i_method_from_name(k, n, argc) : nullptr;
-}
-static size_t fieldOff(void *k, const char *n) {
-    void *f = (k && n) ? i_field_from_name(k, n) : nullptr;
-    return f ? i_field_offset(f) : 0;
-}
-static inline void *readPtr(void *obj, size_t off) {
-    return (obj && off) ? *(void **)((char *)obj + off) : nullptr;
-}
+static MethodInfo *M_dmInstance, *M_gmInstance, *M_gsmInstance, *M_smInstance, *M_amInstance;
+static MethodInfo *M_gsmCloudSave, *M_gmCloudSave, *M_gmSaveToServer;
+static MethodInfo *M_saveHackFlag, *M_saveSkipHack, *M_saveHackSend;
+static MethodInfo *M_addGold, *M_addEnergy, *M_addGem, *M_addCoin, *M_addPlayPoint;
+static MethodInfo *M_addTravelPoint, *M_addWelcomeCoin, *M_addSouvenirToken, *M_addVipPoint;
+static MethodInfo *M_addTicketGold, *M_addTicketEnergy, *M_addTicketTreasure;
+static MethodInfo *M_addChangeTicket, *M_addSelectTicket, *M_addKittyChangeTicket;
+static MethodInfo *M_addSpecialFishing, *M_addTelescopeLens, *M_addMinigameToken;
+static MethodInfo *M_addUnitData, *M_addKittyData, *M_addFurniture, *M_addWorkData;
+static MethodInfo *M_addPropData, *M_addNewRndEquip, *M_addNewCollection, *M_addEquipData;
+static MethodInfo *M_addTheme, *M_addLamp, *M_addBgm, *M_addGuest, *M_addEventPlace;
+static MethodInfo *M_addWorkSkin, *M_addSignSkin, *M_addTimerSkin, *M_addBalloonSkin;
+static MethodInfo *M_addConsumableItem, *M_addSpecialItem, *M_addOtherFishItem;
+static MethodInfo *M_addPremiumBuild, *M_addObjectInfo, *M_addBall, *M_getReward;
+static MethodInfo *M_addTutorialFinish, *M_addPhotoOutline, *M_addPhotoSticker;
+static MethodInfo *M_addUserProfileFrame, *M_addRewardDecoBlock, *M_addMagnet, *M_addLayerData;
+static MethodInfo *M_saveEquipData, *M_commitEquipLevels, *M_applyEquipExp, *M_savePurchase;
+static MethodInfo *M_collectionRecv, *M_collectionCan, *M_collectionAdd, *M_collectionDone;
+static MethodInfo *M_setAchieveLevel;
+static MethodInfo *M_consumeMoney;
 
-#pragma mark - Diagnostic
-
-static char g_diag[96] = "Status: Booting...";
-
-static BOOL safeWritePtr(void *addr, void *value);   // defined in the patch section
-
-#pragma mark - Resolved Symbols
-
-static void *K_lpm, *K_camera, *K_player;
-
-static void *M_lpmInstance;       // LocalPlayerManager::get_Instance()
-static void *M_w2s;               // Camera::WorldToScreenPoint(Vector3)
-static void *M_camMain;           // Camera::get_main()
-static void *M_getTransform;      // Component::get_transform()
-static void *M_getPos;            // Transform::get_position()
-static void *M_createShootData;   // ProjectileWeapon::CreateShootData(bool)
-
-// ESP / Aim
-static void *M_netInstance;       // NetManager::get_Instance()
-static void *M_playerName;        // NetPlayer::GetPlayerName()
-static void *M_playerIsAi;        // NetPlayer::IsAiPlayer()
-static void *M_playerPos;         // NetPlayer::GetPosition()
-static void *M_netPlayerId;       // NetPlayer::GetNetPlayerId()
-static void *M_netTeamId;         // NetPlayer::GetTeamId()
-static size_t off_bindNetId;      // LocalPlayerManager.curBindNetPlayerId
-static size_t off_netPlayerMap;
-
-// Silent aim
-
-// Bypasses
-static void *M_guideInit;         // BattleGuideManager::Init()
-static void *M_checkGuideScene;   // LogicSceneHelper::CheckIsGuideScene()
-static void *M_isNewbieGame;      // LogicSceneHelper::IsNewbieGame()
-static void *M_checkFuncOpen;     // LuaHelper::CheckFunctionIsOpen(int)
-static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action<uint>)
-
-// Field offsets (this build)
-//   UnityEngine.Object.m_CachedPtr           0x10
-//   LocalPlayerManager.mLocalPlayer          0x18
-//   Player._PlayerCamera                     0x4E8
-//   Player.LocalPlayerType                   0x4C8
-//   PlayerCamera.m_RecoilAngles              0x58
-//   NetManagerBase.NetPlayerMap              0x18
-static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
-static size_t off_playerCam, off_playerMovement, off_playerStateComp;
-static size_t off_recoilAngles, off_forceAngle, off_recoilEnabled, off_lookAngles;
-static size_t off_enableSmooth, off_rotationLerp;
-static size_t off_wpnShootAcc, off_wpnCurAcc, off_playerAccurate;
-static size_t off_parachuteState;    // PlayerMovementFP.m_ParachuteState (0x1C8)
-
-// Aim-assist core (the game's own targeting path)
-static void *M_linecast;             // Physics::Linecast (3- or 4-arg)
-static int   g_linecastArgs = 0;
-static void *M_barrierLayerMask;     // LayerHelper::GetHeroAssistBarrierLayerMask()
-static void *M_changeBRState;        // PlayerStateTpCommon::ChangePlayerBRStateClient(int,bool)
-// ParachuteStateModule (constant offsets inside the module object)
-#define PS_ENABLED      0x10
-#define PS_FREEFALLSPD  0x1C
-#define PS_MOVESPEED    0x20
-#define PS_FALLMULTI    0x28
-
-static void *g_lcam = nullptr;
+static size_t off_mGameData;
+static size_t off_gold, off_energy, off_gem, off_freeGem, off_coin;
+static size_t off_isHackV4, off_isHackSendV4, off_isSkipHackV4;
+static size_t off_goldCheck, off_energyCheck, off_gemCheck, off_freeGemCheck;
 
 #pragma mark - State
 
-static BOOL  g_il2cppReady = NO;
+static BOOL g_noFall = NO;
+static BOOL g_bypassAC = NO;
+static BOOL g_freeShop = NO;
+static BOOL g_noAds = NO;
+static uint64_t g_lastGuard = 0;
 
-static BOOL  g_espOn = NO;
-static BOOL  g_aimlock = NO;
-static BOOL  g_noRecoil = NO;
-static BOOL  g_noSpread = NO;
-static BOOL  g_wallcheck = YES;
-static BOOL  g_fastBullet = NO;
-static int   g_instantCount = 8;      // bullets per trigger pull
-static BOOL  g_paraCtl = NO;
-static BOOL  g_glide = NO;
-static int   g_paraDir = 0;          // 0 = neutral, +1 up, -1 down
-static float g_glideSpeed = 3.0f;    // MoveSpeed multiplier, user configurable
-static float g_aimFov = 35.0f;
-static BOOL  g_showAimFov = NO;
+static inline void *rd(void *o, size_t off) { return (o && off) ? *(void **)((char *)o + off) : NULL; }
+static inline int32_t rdi(void *o, size_t off) { return (o && off) ? *(int32_t *)((char *)o + off) : 0; }
+static inline void wri(void *o, size_t off, int32_t v) { if (o && off) *(int32_t *)((char *)o + off) = v; }
+static inline uint8_t rdb(void *o, size_t off) { return (o && off) ? *(uint8_t *)((char *)o + off) : 0; }
+static inline void wrb(void *o, size_t off, uint8_t v) { if (o && off) *(uint8_t *)((char *)o + off) = v; }
 
-// Cached every frame by onFrame() on the main thread. The fire hook must never call
-// into Unity/il2cpp: doing so from inside the weapon-fire path re-enters the physics
-// update and crashed the game 1-2s after enabling silent aim.
-static volatile uint16_t g_myNetId = 0;   // written by scanPlayers
-static Vec3  g_aimHead = {0.0f, 0.0f, 0.0f};
-static volatile BOOL g_aimHeadValid = NO;
-static BOOL  g_aimHookOk = NO;            // true once CreateShootData is swapped
+static uint64_t nowMs(void) { return (uint64_t)([NSDate date].timeIntervalSince1970 * 1000.0); }
 
-// Original compiled body, saved before the MethodInfo swap. Calling it is a plain
-// C call -- no trampoline, no code patching, which is exactly what MSHookFunction
-// could not provide on this TrollFools build.
-static void *O_createShootData = nullptr;
-static BOOL  g_bypassTutorial = YES;
-static BOOL  g_bypassRankLock = YES;
-
-
-static inline BOOL alive(void *obj) {
-    return obj && off_cachedPtr && *(void **)((char *)obj + off_cachedPtr) != nullptr;
+// List<T> layout is identical for every instantiation: _items @0x10, _size @0x18,
+// array element data @0x20. Verified against dump.cs `List<T>` field order.
+static inline int listCount(void *list) { return list ? rdi(list, 0x18) : 0; }
+static inline void *listAt(void *list, int i) {
+    void *items = rd(list, 0x10);
+    if (!items || i < 0) return NULL;
+    return *(void **)((char *)items + 0x20 + (size_t)i * 8);
 }
 
-#pragma mark - WorldToScreen
+#pragma mark - Reflection helpers
 
-static BOOL worldToScreen(void *cam, Vec3 world, CGPoint *outPt) {
-    if (!cam || !outPt || !MP(M_w2s)) return NO;
-    Vec3 p = ((Vec3 (*)(void *, Vec3, void *))MP(M_w2s))(cam, world, M_w2s);
-    if (p.z <= 0.0f) return NO;
-    CGFloat scale = [UIScreen mainScreen].scale;
-    if (scale <= 0.0f) scale = 1.0f;
-    outPt->x = (CGFloat)p.x / scale;
-    outPt->y = ScreenH() - ((CGFloat)p.y / scale);
+// Generic base classes (Singleton<T>, ManagerBase<T>, MonoSingleton<T>) declare the
+// static get_Instance; the derived concrete class inherits it. class_get_method_from_name
+// does not walk the parent chain here, so do it explicitly.
+static MethodInfo *findInstanceGetter(Il2CppClass *k) {
+    for (Il2CppClass *c = k; c; c = i_class_get_parent(c)) {
+        MethodInfo *m = i_class_get_method_from_name(c, "get_Instance", 0);
+        if (m) return m;
+    }
+    return NULL;
+}
+
+// AddGold / AddEnergy are overloaded on (int,bool) and (BigNumber,bool). Picking the
+// wrong one silently reinterprets 90000 as a float mantissa, so resolve by parameter
+// type name instead of by arity.
+static MethodInfo *findMethodTyped(Il2CppClass *k, const char *name, int argc,
+                                   int probeIdx, const char *wantType) {
+    if (!k) return NULL;
+    void *iter = NULL;
+    MethodInfo *m;
+    while ((m = (MethodInfo *)i_class_get_methods(k, &iter)) != NULL) {
+        const char *mn = i_method_get_name(m);
+        if (!mn || strcmp(mn, name) != 0) continue;
+        if ((int)i_method_get_param_count(m) != argc) continue;
+        if (probeIdx < 0) return m;
+        void *pt = i_method_get_param(m, (uint32_t)probeIdx);
+        if (!pt) continue;
+        const char *tn = i_type_get_name(pt);
+        if (!tn) continue;
+        // il2cpp type names are "BigNumber", "System.Int32", "System.Boolean", ...
+        // Match on the trailing component: il2cpp hands back "System.Int32" while the
+        // caller may ask for "Int32" or "System.Int32"; comparing the tail covers both.
+        const char *shortName = tn;
+        for (const char *q = tn; *q; q++) if (*q == '.') shortName = q + 1;
+        const char *wantTail = wantType;
+        for (const char *q = wantType; *q; q++) if (*q == '.') wantTail = q + 1;
+        if (strcmp(shortName, wantTail) == 0) return m;
+    }
+    return NULL;
+}
+
+#pragma mark - Bootstrap
+
+static Il2CppImage *locateGameImage(void) {
+    if (g_img) return g_img;
+    size_t n = 0;
+    Il2CppAssembly **asms = (Il2CppAssembly **)i_domain_get_assemblies(i_domain_get(), &n);
+    if (!asms) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        Il2CppImage *img = i_assembly_get_image(asms[i]);
+        if (!img) continue;
+        if (i_class_from_name(img, "", "DataManager") &&
+            i_class_from_name(img, "", "GameData")) { g_img = img; return img; }
+    }
+    return NULL;
+}
+
+static BOOL resolveIl2Cpp(void) {
+    if (g_ready) return YES;
+    if (!dlsym(RTLD_DEFAULT, "_il2cpp_domain_get")) { diag(@"not IL2CPP"); return NO; }
+
+    BIND(domain_get);
+    BIND(thread_attach);
+    BIND(domain_get_assemblies);
+    BIND(assembly_get_image);
+    BIND(class_from_name);
+    BIND(class_get_method_from_name);
+    BIND(class_get_field_from_name);
+    BIND(field_get_offset);
+    BIND(runtime_invoke);
+    BIND(field_get_value);
+    BIND(class_get_parent);
+    BIND(method_get_param);
+    BIND(type_get_name);
+    BIND(class_get_methods);
+    BIND(method_get_name);
+    BIND(method_get_param_count);
+
+    Il2CppDomain *dom = i_domain_get();
+    if (!dom) { diag(@"no domain"); return NO; }
+    i_thread_attach(dom);
+
+    Il2CppImage *img = locateGameImage();
+    if (!img) { diag(@"Assembly-CSharp not found"); return NO; }
+
+    K_DataManager     = i_class_from_name(img, "", "DataManager");
+    K_GameData        = i_class_from_name(img, "", "GameData");
+    K_GameManager     = i_class_from_name(img, "", "GameManager");
+    K_GameSaveManager = i_class_from_name(img, "CnS", "GameSaveManager");
+    K_ServerManager   = i_class_from_name(img, "", "ServerManager");
+    K_AssetManager    = i_class_from_name(img, "", "AssetManager");
+
+    K_EntityWork        = i_class_from_name(img, "", "Entity_Work");
+    K_EntityEquip       = i_class_from_name(img, "", "Entity_Equip");
+    K_EntityFurniture   = i_class_from_name(img, "", "Entity_Furniture");
+    K_EntityCatType     = i_class_from_name(img, "", "Entity_CatType");
+    K_EntityTheme       = i_class_from_name(img, "", "Entity_Theme");
+    K_EntityBGM         = i_class_from_name(img, "", "Entity_BGM");
+    K_EntityLamp        = i_class_from_name(img, "", "Entity_Lamp");
+    K_EntityGuest       = i_class_from_name(img, "", "Entity_Guest");
+    K_EntityEventPlace  = i_class_from_name(img, "", "Entity_EventPlace");
+    K_EntityShop        = i_class_from_name(img, "", "Entity_Shop");
+    K_EntityCollection  = i_class_from_name(img, "", "Entity_Collection");
+    K_EntityAbility     = i_class_from_name(img, "", "Entity_Ability");
+    K_EntityWorkSkin    = i_class_from_name(img, "", "Entity_WorkSkin");
+    K_EntitySignSkin    = i_class_from_name(img, "", "Entity_SignSkin");
+    K_EntityTimerSkin   = i_class_from_name(img, "", "Entity_TimerSkin");
+    K_EntityBalloonSkin = i_class_from_name(img, "", "Entity_BalloonSkin");
+    K_EntitySoupPassReward  = i_class_from_name(img, "", "Entity_SoupPassReward");
+    K_EntityMontlyPass      = i_class_from_name(img, "", "Entity_MontlyPass");
+    K_EntityEventSeasonPass = i_class_from_name(img, "", "Entity_EventSeasonPass");
+    K_EntityTowerProp       = i_class_from_name(img, "", "Entity_TowerProp");
+
+    if (!K_DataManager || !K_GameData || !K_GameManager) { diag(@"core class missing"); return NO; }
+
+    off_mGameData = i_field_get_offset(i_class_get_field_from_name(K_DataManager, "mGameData"));
+    off_gold      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gold"));
+    off_energy    = i_field_get_offset(i_class_get_field_from_name(K_GameData, "energy"));
+    off_gem       = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gem"));
+    off_freeGem   = i_field_get_offset(i_class_get_field_from_name(K_GameData, "freeGem"));
+    off_coin      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "coin"));
+    off_isHackV4      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "isMemoryHackV4"));
+    off_isHackSendV4  = i_field_get_offset(i_class_get_field_from_name(K_GameData, "isMemoryHackSendToServerV4"));
+    off_isSkipHackV4  = i_field_get_offset(i_class_get_field_from_name(K_GameData, "isSkipMemoryHackV4"));
+    off_goldCheck     = i_field_get_offset(i_class_get_field_from_name(K_GameData, "goldCheckV4"));
+    off_energyCheck   = i_field_get_offset(i_class_get_field_from_name(K_GameData, "energyCheckV4"));
+    off_gemCheck      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gemCheckV4"));
+    off_freeGemCheck  = i_field_get_offset(i_class_get_field_from_name(K_GameData, "freeGemCheckV4"));
+
+    if (!off_mGameData || !off_gold) { diag(@"GameData layout mismatch"); return NO; }
+
+    // Singleton instance getters. The static getter is declared on the generic base
+    // (Singleton<T> / ManagerBase<T> / MonoSingleton<T>), so walk the parent chain.
+    M_dmInstance  = findInstanceGetter(K_DataManager);
+    M_gmInstance  = findInstanceGetter(K_GameManager);
+    if (K_ServerManager)   M_smInstance  = findInstanceGetter(K_ServerManager);
+    if (K_AssetManager)    M_amInstance  = findInstanceGetter(K_AssetManager);
+    if (K_GameSaveManager) {
+        M_gsmInstance  = findInstanceGetter(K_GameSaveManager);
+        M_gsmCloudSave = i_class_get_method_from_name(K_GameSaveManager, "CloudSave", 0);
+    }
+
+    M_gmCloudSave    = i_class_get_method_from_name(K_GameManager, "CloudSave", 1);        // 0x2B1DF70
+    M_gmSaveToServer = i_class_get_method_from_name(K_GameManager, "SaveDataToServer", 1); // 0x2B21714
+
+    // Anti-cheat savers — three fields, three savers, all with 0 args.
+    M_saveHackFlag = i_class_get_method_from_name(K_DataManager, "SaveIsMemoryHackData", 0);
+    M_saveHackSend = i_class_get_method_from_name(K_DataManager, "SaveIsMemoryHackSendToServerData", 0);
+    M_saveSkipHack = i_class_get_method_from_name(K_DataManager, "SaveIsSkipMemoryHackData", 0);
+
+    // Currency. AddGold/AddEnergy are overloaded on (int,bool) and (BigNumber,bool):
+    // resolve by parameter type, never by arity.
+    M_addGold         = findMethodTyped(K_DataManager, "AddGold", 2, 0, "BigNumber");
+    M_addEnergy       = findMethodTyped(K_DataManager, "AddEnergy", 2, 0, "BigNumber");
+    M_addGem          = i_class_get_method_from_name(K_DataManager, "AddGem", 5);            // int,bool,bool,int,string
+    M_addCoin         = i_class_get_method_from_name(K_DataManager, "AddCoin", 2);
+    M_addPlayPoint    = i_class_get_method_from_name(K_DataManager, "AddPlayPoint", 2);
+    M_addTravelPoint  = i_class_get_method_from_name(K_DataManager, "AddTravelPoint", 2);
+    M_addWelcomeCoin  = i_class_get_method_from_name(K_DataManager, "AddWelcomeCoin", 2);
+    M_addSouvenirToken= i_class_get_method_from_name(K_DataManager, "AddSouvenirToken", 3);
+    M_addVipPoint     = i_class_get_method_from_name(K_DataManager, "AddVipPoint", 2);        // void,int,bool
+
+    M_addTicketGold     = i_class_get_method_from_name(K_DataManager, "AddTicketGold", 4);
+    M_addTicketEnergy   = i_class_get_method_from_name(K_DataManager, "AddTicketEnergy", 4);
+    M_addTicketTreasure = i_class_get_method_from_name(K_DataManager, "AddTicketTreasure", 4);
+    // AddChangeTicket / AddSelectTicket have no 2-arg overload: (int,bool,int) and
+    // (int,bool,bool) are the shortest forms.
+    M_addChangeTicket   = i_class_get_method_from_name(K_DataManager, "AddChangeTicket", 4);
+    M_addSelectTicket   = i_class_get_method_from_name(K_DataManager, "AddSelectTicket", 4);
+    M_addKittyChangeTicket = i_class_get_method_from_name(K_DataManager, "AddKittyChangeTicket", 2);
+    M_addSpecialFishing = i_class_get_method_from_name(K_DataManager, "AddSpecialFishingCount", 3);
+    M_addTelescopeLens  = i_class_get_method_from_name(K_DataManager, "AddTelescopeLens", 3);
+    M_addMinigameToken  = i_class_get_method_from_name(K_DataManager, "AddMinigameToken", 2);
+
+    // Progression
+    M_addUnitData      = i_class_get_method_from_name(K_DataManager, "AddUnitData", 3);
+    M_addKittyData     = i_class_get_method_from_name(K_DataManager, "AddKittyData", 2);
+    M_addFurniture     = i_class_get_method_from_name(K_DataManager, "AddFurniture", 5);
+    M_addWorkData      = i_class_get_method_from_name(K_DataManager, "AddWorkData", 3);
+    M_addPropData      = i_class_get_method_from_name(K_DataManager, "AddPropData", 3);
+    M_addNewRndEquip   = i_class_get_method_from_name(K_DataManager, "AddNewRndEquip", 5);    // private, reachable
+    M_addNewCollection = i_class_get_method_from_name(K_DataManager, "AddNewCollection", 3);  // private
+    M_addEquipData     = i_class_get_method_from_name(K_DataManager, "AddEquipData", 4);
+    M_addTheme         = i_class_get_method_from_name(K_DataManager, "AddTheme", 3);
+    M_addLamp          = i_class_get_method_from_name(K_DataManager, "AddLamp", 1);
+    M_addBgm           = i_class_get_method_from_name(K_DataManager, "AddBgm", 2);
+    M_addGuest         = i_class_get_method_from_name(K_DataManager, "AddGuest", 1);
+    M_addEventPlace    = i_class_get_method_from_name(K_DataManager, "AddEventPlace", 1);
+    M_addWorkSkin      = i_class_get_method_from_name(K_DataManager, "AddWorkSkinsData", 1);
+    M_addSignSkin      = i_class_get_method_from_name(K_DataManager, "AddSignSkinsData", 1);
+    M_addTimerSkin     = i_class_get_method_from_name(K_DataManager, "AddTimerSkinsData", 1);
+    M_addBalloonSkin   = i_class_get_method_from_name(K_DataManager, "AddBalloonSkinsData", 2);
+    M_addTutorialFinish= i_class_get_method_from_name(K_DataManager, "AddTutorialFinish", 1);
+    M_addPhotoOutline  = i_class_get_method_from_name(K_DataManager, "AddPhotoOutline", 1);
+    M_addPhotoSticker  = i_class_get_method_from_name(K_DataManager, "AddPhotoSticker", 1);
+    M_addUserProfileFrame = i_class_get_method_from_name(K_DataManager, "AddUserProfileFrameImage", 1);
+    M_addRewardDecoBlock  = i_class_get_method_from_name(K_DataManager, "AddRewardDecoBlock", 3);
+    M_addMagnet        = i_class_get_method_from_name(K_DataManager, "AddMagnet", 3);
+    M_addLayerData     = i_class_get_method_from_name(K_DataManager, "AddLayerData", 1);
+    M_addConsumableItem= i_class_get_method_from_name(K_DataManager, "AddConsumableItem", 3);
+    M_addSpecialItem   = i_class_get_method_from_name(K_DataManager, "AddSpecialItem", 3);
+    M_addOtherFishItem = i_class_get_method_from_name(K_DataManager, "AddOtherFishItem", 4);
+    M_addPremiumBuild  = i_class_get_method_from_name(K_DataManager, "AddPremiumBuild", 3);
+    M_addObjectInfo    = i_class_get_method_from_name(K_DataManager, "AddObjectInfo", 1);
+    M_getReward        = i_class_get_method_from_name(K_DataManager, "GetReward", 9);
+    M_collectionRecv   = i_class_get_method_from_name(K_DataManager, "ReceiveCollectionReward", 1);
+    M_collectionCan    = i_class_get_method_from_name(K_DataManager, "CanReceiveCollectionReward", 1);
+    M_collectionAdd    = i_class_get_method_from_name(K_DataManager, "AddNewCollection", 3);
+    M_collectionDone   = i_class_get_method_from_name(K_DataManager, "IsCollectionComplete", 1);
+    M_saveEquipData    = i_class_get_method_from_name(K_DataManager, "SaveEquipData", 0);
+    M_savePurchase     = i_class_get_method_from_name(K_DataManager, "SavePurchase", 0);
+
+    // Equip level grants
+    M_applyEquipExp    = i_class_get_method_from_name(K_DataManager, "ApplyEquipLevelsFromExp", 1);
+    M_commitEquipLevels= i_class_get_method_from_name(K_DataManager, "CommitEquipLevelUps", 3);
+
+    // ConsumeMoney drives every shop purchase; used as a free-shop probe.
+    M_consumeMoney     = i_class_get_method_from_name(K_DataManager, "ConsumeMoney", 5);
+
+    g_ready = YES;
+    diag(@"ready");
     return YES;
 }
 
-#pragma mark - ESP Target Scan
+#pragma mark - Accessors
 
-typedef struct {
-    void *obj;
-    Vec3 head;
-    float dist;
-    char name[32];
-    BOOL isAi;
-} EspTarget;
+static void *dm(void) { return (g_ready && M_dmInstance) ? i_runtime_invoke(M_dmInstance, NULL, NULL, NULL) : NULL; }
+static void *gd(void) { void *d = dm(); return d ? rd(d, off_mGameData) : NULL; }
+static void *am(void) { return (g_ready && M_amInstance) ? i_runtime_invoke(M_amInstance, NULL, NULL, NULL) : NULL; }
 
-#define MAX_TARGETS 32
-static EspTarget g_targets[MAX_TARGETS];
-static int g_targetCount = 0;
-
-// Il2CppString: klass@0, monitor@8, length@0x10, utf16 chars@0x14
-static BOOL il2cppStrEqual(void *a, void *b) {
-    if (a == b) return YES;
-    if (!a || !b) return NO;
-    int la = *(int *)((char *)a + 0x10);
-    int lb = *(int *)((char *)b + 0x10);
-    if (la != lb || la <= 0 || la > 64) return NO;
-    return memcmp((char *)a + 0x14, (char *)b + 0x14, (size_t)la * 2) == 0;
+// Entity_*.list at +0x18 inside each ScriptableObject referenced by AssetManager.
+static void *entityList(const char *assetField) {
+    void *m = am();
+    if (!m || !K_AssetManager) return NULL;
+    FieldInfo *f = i_class_get_field_from_name(K_AssetManager, assetField);
+    if (!f) return NULL;
+    void *ent = rd(m, i_field_get_offset(f));
+    return ent ? rd(ent, 0x18) : NULL;
 }
 
-static void scanPlayersImpl(void);
+#pragma mark - Anti-cheat
 
-static void scanPlayers(void) {
-    @try {
-        scanPlayersImpl();
-    } @catch (NSException *e) {
-        g_targetCount = 0;
-        NSLog(@"[MWM] scan: %@", e);
+// IsMemoryHackCheck (0x2BB8764) returns 0 immediately when either flag is set:
+//   +0x3B8 isMemoryHackV4  → 0x2BB8818 tbz → return 0
+//   +0x3BA isSkipMemoryHackV4 → 0x2BB8848 tbnz → return 0
+// Both flags have dedicated savers, so the state persists across restarts exactly the
+// way the game persists it.
+static void applyAntiCheatBypass(void) {
+    void *g = gd();
+    void *d = dm();
+    if (!g || !d) return;
+
+    wrb(g, off_isHackV4, 1);
+    wrb(g, off_isHackSendV4, 1);
+    wrb(g, off_isSkipHackV4, 1);
+    if (off_goldCheck)    *(int64_t *)((char *)g + off_goldCheck) = 0;
+    if (off_energyCheck)  *(int64_t *)((char *)g + off_energyCheck) = 0;
+    if (off_gemCheck)     *(int64_t *)((char *)g + off_gemCheck) = 0;
+    if (off_freeGemCheck) *(int64_t *)((char *)g + off_freeGemCheck) = 0;
+
+    if (M_saveHackFlag) i_runtime_invoke(M_saveHackFlag, d, NULL, NULL);
+    if (M_saveHackSend) i_runtime_invoke(M_saveHackSend, d, NULL, NULL);
+    if (M_saveSkipHack) i_runtime_invoke(M_saveSkipHack, d, NULL, NULL);
+}
+
+// Re-assert once a second: GameServerManager.<CheckBlock>b__86_0 (0x344917C) clears
+// isMemoryHackV4 whenever the server replies, so a single assignment is not enough.
+static void guardTick(void) {
+    if (!g_bypassAC && !g_noFall) return;
+    uint64_t t = nowMs();
+    if (t - g_lastGuard < 1000) return;
+    g_lastGuard = t;
+    void *g = gd();
+    if (!g) return;
+    if (g_bypassAC) {
+        wrb(g, off_isHackV4, 1);
+        wrb(g, off_isSkipHackV4, 1);
+    }
+    if (g_noFall) {
+        // "Tiền tệ không tuột": the *CheckV4 values are the only thing that can
+        // retroactively invalidate a balance, so keep them zeroed while the flag holds.
+        if (off_goldCheck)    *(int64_t *)((char *)g + off_goldCheck) = 0;
+        if (off_energyCheck)  *(int64_t *)((char *)g + off_energyCheck) = 0;
+        if (off_gemCheck)     *(int64_t *)((char *)g + off_gemCheck) = 0;
+        if (off_freeGemCheck) *(int64_t *)((char *)g + off_freeGemCheck) = 0;
     }
 }
 
-static void scanPlayersImpl(void) {
-    g_targetCount = 0;
-    if (!g_il2cppReady || !MP(M_netInstance) || !off_netPlayerMap) return;
+#pragma mark - Currency
 
-    // NetManagerBase is a plain managed class (not a UnityEngine.Object), so there is
-    // no m_CachedPtr -- use a plain null check, never alive().
-    void *mgr = ((void *(*)(void *))MP(M_netInstance))(M_netInstance);
-    if (!mgr) return;
+typedef struct { float f; int32_t e; int32_t integer; } BigNum;   // BigNumber, 12 B
 
-    void *dict = readPtr(mgr, off_netPlayerMap);
-    if (!dict) return;
+// 90000 = 0x15F90 — the value UI_Master uses for every "full" button
+// (verified at 0x2FD70C4, 0x2FDDE50, 0x2FDDFAC).
+#define FULL_VALUE 90000
 
-    // Dictionary<ushort,NetPlayer>: buckets@0x10, entries@0x18, count@0x20
-    // entries is an Il2CppArray OBJECT: klass@0, monitor@8, bounds@0x10,
-    // max_length@0x18, items@0x20. Reading items from +0 was the ESP/silent-aim crash.
-    void *entriesObj = readPtr(dict, 0x18);
-    if (!entriesObj) return;
-    int count = *(int *)((char *)dict + 0x20);
-    if (count <= 0 || count > 256) return;
-    size_t maxLength = *(size_t *)((char *)entriesObj + 0x18);
-    // The dictionary can be mutated by the network thread between the two reads
-    // above; a stale maxLength is exactly what turned ESP into a crash. Refuse to
-    // walk anything that does not look consistent.
-    if (maxLength == 0 || maxLength > 4096 || maxLength < (size_t)count) return;
-    char *entries = (char *)entriesObj + 0x20;          // inline item storage
+static void bumpInt(MethodInfo *m, int32_t target) {
+    if (!m) return;
+    void *d = dm();
+    if (!d) return;
+    BOOL add = YES;
+    void *args[2] = { &target, &add };
+    i_runtime_invoke(m, d, args, NULL);
+}
 
-    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
-    void *myPlayer = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
-    // Entries hold NetPlayer while the local player is a Player, so pointer equality
-    // never matches -- exclude self by net id instead.
-    uint16_t myNetId = 0;
-    if (lpm && off_bindNetId) myNetId = *(uint16_t *)((char *)lpm + off_bindNetId);
-    g_myNetId = myNetId;
+static void fillCurrency(void) {
+    void *d = dm(); void *g = gd();
+    if (!d || !g) return;
 
-    // Player is a MonoBehaviour (not a NetPlayer), so its position comes from Transform.
-    Vec3 myPos = {0.0f, 0.0f, 0.0f};
-    if (myPlayer && MP(M_getTransform) && MP(M_getPos)) {
-        void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(myPlayer, M_getTransform);
-        if (alive(tr)) myPos = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
-    }
+    bumpInt(M_addCoin,        FULL_VALUE);
+    bumpInt(M_addPlayPoint,   FULL_VALUE);
+    bumpInt(M_addTravelPoint, FULL_VALUE);
+    bumpInt(M_addWelcomeCoin, FULL_VALUE);
 
-    // Pass 1: locate our own NetPlayer so its team id can be compared.
-    void *myTeam = nullptr;
-    if (myNetId && MP(M_netPlayerId) && MP(M_netTeamId)) {
-        for (int i = 0; i < count; i++) {
-            char *e = entries + (size_t)i * 0x18;
-            if (*(int *)e < 0) continue;
-            void *np = readPtr(e, 0x10);
-            if (!np || !alive(np)) continue;
-            if (((uint16_t (*)(void *, void *))MP(M_netPlayerId))(np, M_netPlayerId) != myNetId) continue;
-            myTeam = ((void *(*)(void *, void *))MP(M_netTeamId))(np, M_netTeamId);
-            break;
+    // gem + freeGem + souvenirToken take extra args.
+    if (M_addGem) {
+        int32_t paid = FULL_VALUE - rdi(g, off_gem);
+        if (paid > 0) {
+            BOOL add = YES, isFree = NO; int32_t reason = 0; void *detail = NULL;
+            void *a[5] = { &paid, &add, &isFree, &reason, &detail };
+            i_runtime_invoke(M_addGem, d, a, NULL);
+        }
+        int32_t freeV = FULL_VALUE - rdi(g, off_freeGem);
+        if (freeV > 0) {
+            BOOL add = YES, isFree = YES; int32_t reason = 0; void *detail = NULL;
+            void *a[5] = { &freeV, &add, &isFree, &reason, &detail };
+            i_runtime_invoke(M_addGem, d, a, NULL);
         }
     }
+    if (M_addSouvenirToken) {
+        int32_t v = FULL_VALUE; BOOL add = YES, noPopup = YES;
+        void *a[3] = { &v, &add, &noPopup };
+        i_runtime_invoke(M_addSouvenirToken, d, a, NULL);
+    }
 
-    // Pass 2: build targets, skipping ourselves and (when known) our own team.
-    for (int i = 0; i < count && g_targetCount < MAX_TARGETS; i++) {
-        char *e = entries + (size_t)i * 0x18;
-        if (*(int *)e < 0) continue;            // empty slot
-        void *np = readPtr(e, 0x10);            // TValue
-        if (!np || !alive(np)) continue;        // NetPlayer is a NetworkBehaviour
-        if (myNetId && MP(M_netPlayerId) &&
-            ((uint16_t (*)(void *, void *))MP(M_netPlayerId))(np, M_netPlayerId) == myNetId) continue;
-        // Teammate: same non-empty team id as ours. Solo modes expose no team id,
-        // so the compare simply never matches there.
-        if (myTeam && MP(M_netTeamId)) {
-            void *theirTeam = ((void *(*)(void *, void *))MP(M_netTeamId))(np, M_netTeamId);
-            if (il2cppStrEqual(myTeam, theirTeam)) continue;
+    // Gold / energy are BigNumber (float mantissa + exponent + integer).
+    if (M_addGold)   { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; i_runtime_invoke(M_addGold, d, a, NULL); }
+    if (M_addEnergy) { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; i_runtime_invoke(M_addEnergy, d, a, NULL); }
+
+    if (M_addVipPoint) { int32_t v = FULL_VALUE; BOOL save = YES; void *a[2] = { &v, &save }; i_runtime_invoke(M_addVipPoint, d, a, NULL); }
+}
+
+static void fillTickets(void) {
+    void *d = dm();
+    if (!d) return;
+    BOOL add = YES, viaMail = NO;
+    for (int32_t idx = 0; idx < 3; idx++) {
+        int32_t v = 9999;
+        if (M_addTicketGold)     { void *a[4] = { &idx, &v, &viaMail, &add }; i_runtime_invoke(M_addTicketGold, d, a, NULL); }
+        if (M_addTicketEnergy)   { void *a[4] = { &idx, &v, &viaMail, &add }; i_runtime_invoke(M_addTicketEnergy, d, a, NULL); }
+        if (idx < 2 && M_addTicketTreasure) { void *a[4] = { &idx, &v, &viaMail, &add }; i_runtime_invoke(M_addTicketTreasure, d, a, NULL); }
+    }
+    int32_t v = 9999;
+    int32_t reason = 0;
+    if (M_addChangeTicket)     { int32_t t = 1401; void *a[4] = { &t, &v, &add, &reason }; i_runtime_invoke(M_addChangeTicket, d, a, NULL); }
+    if (M_addSelectTicket)     { int32_t t = 1403; BOOL noPopup = YES; void *a[4] = { &t, &v, &add, &noPopup }; i_runtime_invoke(M_addSelectTicket, d, a, NULL); }
+    if (M_addKittyChangeTicket){ void *a[2] = { &v, &add }; i_runtime_invoke(M_addKittyChangeTicket, d, a, NULL); }
+    if (M_addSpecialFishing)   { BOOL np = YES; void *a[3] = { &v, &add, &np }; i_runtime_invoke(M_addSpecialFishing, d, a, NULL); }
+    if (M_addTelescopeLens)    { BOOL np = YES; void *a[3] = { &v, &add, &np }; i_runtime_invoke(M_addTelescopeLens, d, a, NULL); }
+    if (M_addMinigameToken)    { void *a[2] = { &v, &add }; i_runtime_invoke(M_addMinigameToken, d, a, NULL); }
+}
+
+#pragma mark - Content unlock
+
+// ObscuredInt (CodeStage ACTk, TypeDefIndex 13777) field layout:
+//   +0x0 currentCryptoKey (int)   +0x4 hiddenValue (int)   +0x8 inited (bool)
+//   +0xC fakeValue    (int)       +0x10 fakeValueActive (bool)
+// InternalDecrypt (0x2A5F2E8) does `decrypted = key ^ hiddenValue` where `key` is
+// currentCryptoKey when non-zero, else the static cryptoKey. The static key is set by
+// ObscuredInt..cctor (0x2A60328) to 0x6C81C (`mov w9,#0xc81c; movk w9,#6,lsl#16`).
+// Entity_*.Param.index is an ObscuredInt at Param+0x10, so the id is
+//   *(int*)(p + 0x10 + 4) ^ (*(int*)(p + 0x10) ?: 0x6C81C)
+#define ACTK_STATIC_KEY 0x6C81C
+
+static int32_t paramId(void *param) {
+    if (!param) return 0;
+    const char *oi = (const char *)param + 0x10;          // Entity_*.Param.index
+    int32_t key   = *(const int32_t *)(oi + 0);
+    int32_t hidden= *(const int32_t *)(oi + 4);
+    int32_t k = key ? key : ACTK_STATIC_KEY;
+    return hidden ^ k;
+}
+
+// AddUnitData(int _type, int _workId, bool _firstUnit) looks the type up inside
+// Entity_CatType.list (List<T>.Find at 0x2C0A090) and throws NullReferenceException —
+// which aborts the process via BRK — if the id is not in the table. Driving the loop
+// from that same table makes the lookup unconditionally succeed, so only ids obtained
+// from the asset list are ever passed in.
+static void addAllCats(void) {
+    void *d = dm();
+    if (!d) return;
+    void *list = entityList("asset_catType");
+    int n = listCount(list);
+    BOOL first = NO;
+    int32_t workId = 0;
+    for (int i = 0; i < n; i++) {
+        void *param = listAt(list, i);
+        if (!param) continue;
+        int32_t type = paramId(param);
+        if (type <= 0) continue;
+        if (M_addUnitData) { void *a[3] = { &type, &workId, &first }; i_runtime_invoke(M_addUnitData, d, a, NULL); }
+        // Kitties share CatType but live in a separate save list (ltKittyData).
+        if (M_addKittyData) { void *a[2] = { &type, &workId }; i_runtime_invoke(M_addKittyData, d, a, NULL); }
+    }
+}
+
+static void addAllFurniture(void) {
+    void *d = dm();
+    void *list = entityList("asset_furniture");
+    int n = listCount(list);
+    for (int i = 0; i < n; i++) {
+        if (!M_addFurniture) break;
+        void *param = listAt(list, i);
+        if (!param) continue;
+        BOOL save = NO, newAdd = YES;
+        int32_t count = 1, reason = 0;
+        void *a[5] = { param, &save, &count, &newAdd, &reason };
+        i_runtime_invoke(M_addFurniture, d, a, NULL);
+    }
+}
+
+typedef struct { int32_t x, y; } Vec2Int;   // UnityEngine.Vector2Int
+
+static void addAllFacilities(void) {
+    void *d = dm();
+    void *list = entityList("asset_work");
+    int n = listCount(list);
+    Vec2Int pos = { 0, 0 };
+    for (int i = 0; i < n; i++) {
+        if (!M_addWorkData) break;
+        void *param = listAt(list, i);
+        if (!param) continue;
+        int32_t level = 1;
+        void *a[3] = { param, &level, &pos };
+        i_runtime_invoke(M_addWorkData, d, a, NULL);
+    }
+}
+
+static void addAllSkins(void) {
+    void *d = dm();
+    struct { const char *field; MethodInfo *m; int extra; const char *cbField; } set[] = {
+        { "asset_WorkSkin",    M_addWorkSkin,    0, "asset_WorkSkin"    },
+        { "asset_SignSkin",    M_addSignSkin,    0, "asset_SignSkin"    },
+        { "asset_TimerSkin",   M_addTimerSkin,   0, "asset_TimerSkin"   },
+        { "asset_BalloonSkin", M_addBalloonSkin, 1, "asset_BalloonSkin" },
+    };
+    for (size_t s = 0; s < sizeof(set)/sizeof(set[0]); s++) {
+        if (!set[s].m) continue;
+        void *list = entityList(set[s].field);
+        int n = listCount(list);
+        for (int i = 0; i < n; i++) {
+            int32_t idx = paramId(listAt(list, i));
+            if (idx <= 0) continue;
+            if (set[s].extra) { int32_t gr = 0; void *a[2] = { &idx, &gr }; i_runtime_invoke(set[s].m, d, a, NULL); }
+            else              { void *a[1] = { &idx }; i_runtime_invoke(set[s].m, d, a, NULL); }
         }
+    }
+}
 
-        Vec3 pos = {0.0f, 0.0f, 0.0f};
-        if (MP(M_playerPos)) pos = ((Vec3 (*)(void *, void *))MP(M_playerPos))(np, M_playerPos);
-        if (pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f) continue;
+static void addAllMisc(void) {
+    void *d = dm();
+    int32_t id, reason = 0;
+    BOOL reward = NO;
 
-        float dx = pos.x - myPos.x, dy = pos.y - myPos.y, dz = pos.z - myPos.z;
+    void *list = entityList("asset_theme");
+    for (int i = 0, n = listCount(list); i < n && M_addTheme; i++) {
+        id = paramId(listAt(list, i));
+        void *a[3] = { &id, &reward, &reason };
+        i_runtime_invoke(M_addTheme, d, a, NULL);
+    }
+    list = entityList("asset_lamp");
+    for (int i = 0, n = listCount(list); i < n && M_addLamp; i++) {
+        id = paramId(listAt(list, i));
+        void *a[1] = { &id };
+        i_runtime_invoke(M_addLamp, d, a, NULL);
+    }
+    list = entityList("asset_bgm");
+    for (int i = 0, n = listCount(list); i < n && M_addBgm; i++) {
+        id = paramId(listAt(list, i));
+        void *a[2] = { &id, &reason };
+        i_runtime_invoke(M_addBgm, d, a, NULL);
+    }
+    list = entityList("asset_guest");
+    for (int i = 0, n = listCount(list); i < n && M_addGuest; i++) {
+        id = paramId(listAt(list, i));
+        void *a[1] = { &id };
+        i_runtime_invoke(M_addGuest, d, a, NULL);
+    }
+    list = entityList("asset_eventPlace");
+    for (int i = 0, n = listCount(list); i < n && M_addEventPlace; i++) {
+        id = paramId(listAt(list, i));
+        void *a[1] = { &id };
+        i_runtime_invoke(M_addEventPlace, d, a, NULL);
+    }
 
-        EspTarget *t = &g_targets[g_targetCount];
-        t->obj = np;
-        t->head = (Vec3){ pos.x, pos.y + MWM_HEAD_HEIGHT, pos.z };
-        t->dist = sqrtf(dx * dx + dy * dy + dz * dz);
-        t->isAi = MP(M_playerIsAi) ? ((bool (*)(void *, void *))MP(M_playerIsAi))(np, M_playerIsAi) : NO;
-        t->name[0] = '\0';
-
-        if (MP(M_playerName)) {
-            void *str = ((void *(*)(void *, void *))MP(M_playerName))(np, M_playerName);
-            if (str) {
-                int len = *(int *)((char *)str + 0x10);   // Il2CppString.length
-                if (len > 0 && len < 31) {
-                    const uint16_t *ch = (const uint16_t *)((char *)str + 0x14);
-                    for (int c = 0; c < len; c++) t->name[c] = (char)(ch[c] < 128 ? ch[c] : '?');
-                    t->name[len] = '\0';
-                }
-            }
+    // Tutorial gates unlock the feature buttons themselves.
+    if (M_addTutorialFinish) {
+        for (int32_t t = 0; t < 400; t++) {
+            void *a[1] = { &t };
+            i_runtime_invoke(M_addTutorialFinish, d, a, NULL);
         }
-        g_targetCount++;
+    }
+    // Photo book / profile cosmetics have no asset list of their own.
+    if (M_addPhotoOutline) for (int32_t t = 0; t < 200; t++) { void *a[1] = { &t }; i_runtime_invoke(M_addPhotoOutline, d, a, NULL); }
+    if (M_addPhotoSticker) for (int32_t t = 0; t < 400; t++) { void *a[1] = { &t }; i_runtime_invoke(M_addPhotoSticker, d, a, NULL); }
+    if (M_addUserProfileFrame) for (int32_t t = 0; t < 200; t++) { void *a[1] = { &t }; i_runtime_invoke(M_addUserProfileFrame, d, a, NULL); }
+}
+
+static void addAllTowerProps(void) {
+    void *d = dm();
+    void *list = entityList("asset_TowerProp");
+    int n = listCount(list);
+    for (int i = 0; i < n; i++) {
+        if (!M_addPropData) break;
+        int32_t id = paramId(listAt(list, i));
+        int32_t count = 99; BOOL save = YES;
+        void *a[3] = { &id, &count, &save };
+        i_runtime_invoke(M_addPropData, d, a, NULL);
     }
 }
 
-#pragma mark - Silent Aim
-
-// Wall check: does anything on the game's own barrier mask sit between the muzzle
-// and the target head? Physics.Linecast is the exact primitive the game's aim assist
-// uses (GetHeroAssistBarrierLayerMask), so the result matches what the engine would
-// consider "blocked".
-// Physics.Linecast with the game's own barrier mask.
-//
-// If the mask getter is unavailable, -1 (all layers) is the safe fallback: it can
-// only ever report MORE occlusion, so the feature degrades toward "do not aim
-// through walls" instead of silently aiming through them.
-static BOOL lineBlocked(Vec3 from, Vec3 to) {
-    if (!g_wallcheck) return NO;
-    // Fail closed: if the trace cannot be performed we must assume the line is
-    // blocked. Returning NO here is what let the aim keep locking through walls.
-    if (!MP(M_linecast)) return YES;
-    if (!vec3Finite(from) || !vec3Finite(to)) return YES;
-
-    int mask = -1;
-    if (MP(M_barrierLayerMask)) {
-        int m = ((int (*)(void *))MP(M_barrierLayerMask))(M_barrierLayerMask);
-        if (m) mask = m;
+static void addAllForestDeco(void) {
+    void *d = dm();
+    if (!M_addRewardDecoBlock) return;
+    for (int32_t i = 1; i <= 200; i++) {
+        int32_t cnt = 99, reason = 0;
+        void *a[3] = { &i, &cnt, &reason };
+        i_runtime_invoke(M_addRewardDecoBlock, d, a, NULL);
     }
-
-    // 1 == QueryTriggerInteraction.Ignore, so pickups and trigger zones do not
-    // register as cover.
-    if (g_linecastArgs >= 4) {
-        bool hit = ((bool (*)(Vec3, Vec3, int, int, void *))MP(M_linecast))(
-                       from, to, mask, 1, M_linecast);
-        return hit ? YES : NO;
-    }
-    bool hit = ((bool (*)(Vec3, Vec3, int, void *))MP(M_linecast))(from, to, mask, M_linecast);
-    return hit ? YES : NO;
 }
 
-static BOOL pickBestTargetHead(Vec3 *outHead) {
-    if (!g_targetCount || !outHead || !MP(M_camMain)) return NO;
-    void *cam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
-    if (!alive(cam)) return NO;
-
-    CGFloat cx = ScreenW() * 0.5f;
-    CGFloat cy = ScreenH() * 0.5f;
-    CGFloat maxRadius = (g_aimFov / 90.0f) * cx;
-    float best = 1e9f;
-    BOOL found = NO;
-
-    for (int i = 0; i < g_targetCount; i++) {
-        CGPoint sp;
-        if (!worldToScreen(cam, g_targets[i].head, &sp)) continue;
-        float dx = (float)(sp.x - cx), dy = (float)(sp.y - cy);
-        float d = sqrtf(dx * dx + dy * dy);
-        if (d > (float)maxRadius || d >= best) continue;
-
-        // Wall check. Cast from the render camera's eye, falling back to the local
-        // player's own transform. If neither is readable the target is rejected:
-        // previously this whole block was skipped when the getters were missing,
-        // which is exactly how the aim kept locking onto players behind cover.
-        if (g_wallcheck) {
-            Vec3 eye;
-            BOOL haveEye = NO;
-            void *src = alive(cam) ? cam : g_lcam;
-            if (alive(src) && MP(M_getTransform) && MP(M_getPos)) {
-                void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(src, M_getTransform);
-                if (alive(tr)) {
-                    eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
-                    haveEye = vec3Finite(eye);
-                }
-            }
-            if (!haveEye) continue;                            // cannot verify -> skip
-            if (lineBlocked(eye, g_targets[i].head)) continue; // verified blocked
+// Equip max. UI_Master.EquipUpgradeAll is an *instance* method on a MonoBehaviour, so
+// invoking it with a NULL self would dereference null — the tweak never touches it.
+// Instead AddNewRndEquip(count, equipIndex, isGacha, goodsReason, fixedExp) is called
+// per equip id: it grants the equip, applies fixedExp and internally runs
+// ApplyEquipLevelsFromExp (0x2C0F660 -> 0x2BD0414), so level-ups and the save happen.
+static void maxEquips(void) {
+    void *d = dm();
+    if (!d) return;
+    void *list = entityList("asset_equip");
+    int n = listCount(list);
+    if (!M_addNewRndEquip) {
+        // Fallback for a build without the gacha entry point: push exp on owned equips.
+        void *g = gd();
+        if (!g || !M_addEquipData) return;
+        void *equips = rd(g, 0xD8);
+        for (int i = 0, m = listCount(equips); i < m; i++) {
+            void *eq = listAt(equips, i);
+            if (!eq) continue;
+            int32_t exp = 100000; BOOL save = YES;
+            void *a[4] = { eq, NULL, &exp, &save };
+            i_runtime_invoke(M_addEquipData, d, a, NULL);
+            if (M_applyEquipExp) { void *b[1] = { eq }; i_runtime_invoke(M_applyEquipExp, d, b, NULL); }
         }
-        best = d;
-        *outHead = g_targets[i].head;
-        found = YES;
+        if (M_saveEquipData) i_runtime_invoke(M_saveEquipData, d, NULL, NULL);
+        return;
     }
-    return found;
-}
-
-// ---------------------------------------------------------------------------
-// Silent aim via il2cpp MethodInfo swap.
-//
-// CreateShootData() has data-only xrefs (0x85a9220 / 0x85a9228), i.e. the game
-// dispatches it through the class vtable. So replacing the compiled pointer works
-// and -- unlike an inline hook -- needs no trampoline: the original body is still a
-// plain callable C function whose address we saved before the swap.
-//
-// ABI: ModelShotData is returned through a hidden sret pointer (x8), then
-// this (x0), bool isTransform (w1), MethodInfo* (x2).
-// ---------------------------------------------------------------------------
-
-// MethodInfo layout (il2cpp.h):
-//   methodPointer @0x00, invoker_method @0x08, name @0x10, klass @0x18,
-//   ..., token @0x40, flags @0x44, iflags @0x46, slot @0x48
-#define MI_NAME  0x10
-#define MI_KLASS 0x18
-
-#define VTABLE_STRIDE 0x10        // VirtualInvokeData { methodPtr; method; }
-#define VTABLE_SCAN_LO 0x80
-#define VTABLE_SCAN_HI 0x2000   // wide: header offset is il2cpp-version specific
-
-static BOOL miNameIs(void *mi, const char *want) {
-    if (!mi) return NO;
-    const char *n = *(const char **)((char *)mi + MI_NAME);
-    return n && strcmp(n, want) == 0;
-}
-
-// Locate the vtable entry that dispatches this method. The header offset depends
-// on the il2cpp version, so it is searched rather than assumed: an entry counts
-// only when its target equals the original AND its MethodInfo names the method.
-// Anything else is skipped -- a wrong guess must be a no-op, never a wrong write.
-static char *findVtableEntry(void *klass, void *orig, const char *name) {
-    if (!klass || !orig) return nullptr;
-    char *byName = nullptr, *byPtr = nullptr;
-    for (size_t off = VTABLE_SCAN_LO; off < VTABLE_SCAN_HI; off += VTABLE_STRIDE) {
-        char *e = (char *)klass + off;
-        if (*(void **)e != orig) continue;
-        if (!byPtr) byPtr = e;
-        if (!byName && miNameIs(*(void **)(e + 8), name)) { byName = e; break; }
+    for (int i = 0; i < n; i++) {
+        void *param = listAt(list, i);
+        if (!param) continue;
+        int32_t id = paramId(param);
+        if (id <= 0) continue;
+        int32_t count = 1, reason = 0, exp = 100000;
+        BOOL isGacha = NO;
+        void *a[5] = { &count, &id, &isGacha, &reason, &exp };
+        i_runtime_invoke(M_addNewRndEquip, d, a, NULL);
     }
-    return byName ? byName : byPtr;   // name match wins, pointer match is fallback
+    if (M_saveEquipData) i_runtime_invoke(M_saveEquipData, d, NULL, NULL);
 }
 
-#pragma mark - Aimlock / recoil / parachute
+#pragma mark - Extra content
 
-// ModelShotData offsets (verified against dump.cs)
-#define MSD_SHOOTER   0x04
-#define MSD_SHOOTPOS  0x48
-#define MSD_SHOOTDIR  0x54
-#define MSD_ACCURATE  0x80
+// Consumables / special items / fish / premium builds have no Entity_* list the tweak can
+// enumerate reliably (their id spaces are sparse and server-defined), so grant them over
+// the documented dense ranges. Every call goes through the game's own adder, which clamps
+// and persists exactly like a normal grant.
+static void addAllItems(void) {
+    void *d = dm();
+    if (!d) return;
+    int32_t reason = 0;
 
-// ParachuteStateModule of the local player, or null when not parachuting.
-static void *parachuteModule(void) {
-    if (!off_parachuteState || !off_playerMovement) return nullptr;
-    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
-    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
-    if (!alive(player)) return nullptr;
-    void *mv = readPtr(player, off_playerMovement);
-    if (!mv) return nullptr;
-    void *mod = readPtr(mv, off_parachuteState);
-    if (!mod) return nullptr;
-    if (!*(bool *)((char *)mod + PS_ENABLED)) return nullptr;
-    return mod;
+    // GetReward(int rewardType, int rewardValue, bool useMail, string subIndex,
+    //           bool isGacha, int goodsReason) is the master grant dispatcher
+    // (0x2BE820C -> GetReward_Inner 0x2C198E0, 102-case jump table). Driving it with
+    // the documented defRewardType constants grants every item family through the same
+    // code path the shop uses, so clamps, mail fallbacks and saves all apply.
+    static const int32_t kRewardTypes[] = {
+        5,   // EQUIP
+        6,   // FURNITURE
+        7,   // FISH
+        14,  // LAMP
+        15,  // EVENTPLACE
+        17,  // SPECIALGUEST
+        18,  // SPECIALITEM
+        21,  // MUSIC
+        22,  // THEME
+        23,  // PUDDING
+        24,  // MACARON
+        26, 27, 28, 32,          // SKIN_WORK / SKIN_SIGN / SKIN_TIMER / SKIN_BALLOON
+        40, 41, 42,              // PRIMARY_OUTLINE / PHOTO_OUTLINE / PHOTO_STICKER
+        89,                      // BUILD_DECO_BLOCK
+        201,                     // TOWER_PROP
+    };
+    int32_t cnt = 99;
+    for (size_t i = 0; i < sizeof(kRewardTypes)/sizeof(kRewardTypes[0]); i++) {
+        int32_t rt = kRewardTypes[i];
+        // GetReward(int rewardType, int rewardValue, bool useMail, string subIndex,
+        //           bool isGacha, bool forceMail, bool forceUnshowPopup,
+        //           int goodsReason, string detail)
+        BOOL useMail = NO, isGacha = NO, forceMail = NO, noPopup = NO;
+        void *subIndex = NULL, *detail = NULL;
+        void *a[9] = { &rt, &cnt, &useMail, &subIndex, &isGacha, &forceMail,
+                       &noPopup, &reason, &detail };
+        i_runtime_invoke(M_getReward, d, a, NULL);
+    }
+
+    // Ticket families are addressed by rewardType directly.
+    static const int32_t kTicketTypes[] = {
+        1101, 1102, 1103, 1201, 1202, 1203, 1301, 1302,
+        1401, 1402, 1403, 1404, 1405, 1406, 1407, 1408,
+    };
+    for (size_t i = 0; i < sizeof(kTicketTypes)/sizeof(kTicketTypes[0]); i++) {
+        int32_t rt = kTicketTypes[i];
+        // GetReward(int rewardType, int rewardValue, bool useMail, string subIndex,
+        //           bool isGacha, bool forceMail, bool forceUnshowPopup,
+        //           int goodsReason, string detail)
+        BOOL useMail = NO, isGacha = NO, forceMail = NO, noPopup = NO;
+        void *subIndex = NULL, *detail = NULL;
+        void *a[9] = { &rt, &cnt, &useMail, &subIndex, &isGacha, &forceMail,
+                       &noPopup, &reason, &detail };
+        i_runtime_invoke(M_getReward, d, a, NULL);
+    }
 }
 
-// Vertical motion is:  desiredY = (desiredLocalY - FreeFallSpeed) * dt
-// (see PlayerMovementTPCommon.updateParachuteVelocity). So FreeFallSpeed is the
-// sink rate, and a negative value makes the player rise. FallSpeedMulti scales
-// FreeFallSpeed further whenever there is horizontal input, so it is pinned to 1.
-static void applyParachuteControl(void) {
-    if (!g_paraCtl) return;
-    void *mod = parachuteModule();
-    if (!mod) return;
+static void collectAllCollections(void) {
+    void *d = dm();
+    if (!d) return;
+    void *list = entityList("asset_collection");
+    int n = listCount(list);
+    for (int i = 0; i < n; i++) {
+        void *param = listAt(list, i);
+        if (!param) continue;
+        int32_t idx = paramId(param);
+        if (idx <= 0) continue;
+        // AddNewCollection(index, subIndex, totalSubIndex) marks every sub-entry owned.
+        if (M_collectionAdd) {
+            int32_t sub = 0, total = 32;
+            void *a[3] = { &idx, &sub, &total };
+            i_runtime_invoke(M_collectionAdd, d, a, NULL);
+        }
+        if (M_collectionCan && M_collectionRecv) {
+            void *a[1] = { &idx };
+            Il2CppObject *can = i_runtime_invoke(M_collectionCan, d, a, NULL);
+            if (can && *(uint8_t *)((char *)can + 0x10)) i_runtime_invoke(M_collectionRecv, d, a, NULL);
+        }
+    }
+}
 
-    float *freefall  = (float *)((char *)mod + PS_FREEFALLSPD);
-    float *movespeed = (float *)((char *)mod + PS_MOVESPEED);
-    float *fallmulti = (float *)((char *)mod + PS_FALLMULTI);
+#pragma mark - Free shop (ConsumeMoney detour)
 
-    *fallmulti = 1.0f;
+// DataManager.ConsumeMoney(moneyType, value, add, goodsReason, detail) is the single
+// choke point every purchase path calls (84 call sites verified). With the switch on we
+// answer "success" without moving any balance, so all downstream grant code still runs.
+// The MethodInfo body pointer is swapped in place; nothing is written into __text and
+// the original is restored when the switch goes off.
+static void *g_consumeOrig = NULL;
+static void *g_consumeMem = NULL;
 
-    if (g_glide) {
-        // Glide on: lift the player (negative FreeFallSpeed = ascend), Up/Down
-        // overlay that by pushing further.
-        *movespeed = 8.0f * g_glideSpeed;
-        *freefall  = -8.0f;                                  // always rising
-        if (g_paraDir > 0) *freefall = -14.0f;               // Up: faster rise
-        if (g_paraDir < 0) *freefall = -2.0f;                // Down: nearly stop
+typedef BOOL (*consume_fn)(void *self, int32_t moneyType, int32_t value, BOOL add,
+                           int32_t reason, void *detail);
+
+static BOOL freeConsume(void *self, int32_t moneyType, int32_t value, BOOL add,
+                        int32_t reason, void *detail) {
+    if (g_freeShop && value > 0) return YES;
+    consume_fn orig = (consume_fn)g_consumeOrig;
+    return orig ? orig(self, moneyType, value, add, reason, detail) : NO;
+}
+
+static void setFreeShop(BOOL on) {
+    if (!M_consumeMoney) return;
+    if (on) {
+        if (g_consumeOrig) return;
+        g_consumeMem  = (void *)M_consumeMoney;
+        g_consumeOrig = *(void **)g_consumeMem;      // MethodInfo.methodPointer
+        if (!g_consumeOrig) { g_consumeMem = NULL; return; }
+        *(void **)g_consumeMem = (void *)&freeConsume;
     } else {
-        // Glide off: drop hard.
-        *movespeed = 8.0f;
-        *freefall = 22.0f;
+        if (g_consumeMem && g_consumeOrig) *(void **)g_consumeMem = g_consumeOrig;
+        g_consumeMem = NULL;
+        g_consumeOrig = NULL;
     }
 }
 
-#pragma mark - Instant fire
+#pragma mark - Remove ads
 
-// Fire every queued round at once.
-//
-// ModelShotData.bulletCount (+0x64) drives the loop in computerEntityBullet:
-//   do { dir = computerFireDirection(...); computerOneEntityBullet(...); }
-//   while (++i < bulletCount);
-// so raising it turns one trigger pull into N simultaneous bullets. The value is
-// already inside the struct we are allowed to edit, and the ammo/game checks have
-// run before this point, so nothing structural is bypassed.
-#define MSD_BULLETCOUNT   0x64
-#define MSD_SHOOTCOUNTLIM 0x68
-
-// ShootBullet() runs processModelShotData() right after CreateShootData, and that
-// pass overwrites bulletCount with Clamp(ceil(shootCountLimite * bulletCount),1,25).
-// Writing only the count was therefore erased before the bullet loop ever saw it.
-// Pinning the limit to 1 makes the count pass through unchanged.
-static void applyInstantFire(void *retstr) {
-    if (!g_fastBullet || !retstr) return;
-    *(int   *)((char *)retstr + MSD_BULLETCOUNT)   = g_instantCount;
-    *(float *)((char *)retstr + MSD_SHOOTCOUNTLIM) = 1.0f;
-}
-
-// Enter the parachute state from the ground.
-//
-// The movement code only honours FreeFallSpeed/MoveSpeed while IsParachute is set,
-// so simply tuning those numbers does nothing on foot. ChangePlayerBRStateClient is
-// the client-side state switch the game itself uses; calling it moves the player
-// into BRStateParachute (4), after which the module's fields take effect.
-#define BRSTATE_PARACHUTE 4
-
-static void enterParachuteState(void) {
-    if (!g_paraCtl || !g_glide) return;
-    if (!off_playerStateComp || !MP(M_changeBRState)) return;
-
-    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
-    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
-    if (!alive(player)) return;
-
-    void *st = readPtr(player, off_playerStateComp);
-    if (!st) return;
-
-    // Already parachuting? Nothing to do.
-    if (parachuteModule()) return;
-
-    // Rate-limit: the state machine needs a frame to act, and calling every frame
-    // would restart the transition and cancel the ascend.
-    static double lastTry = 0;
-    double now = CFAbsoluteTimeGetCurrent();
-    if (now - lastTry < 1.0) return;
-    lastTry = now;
-
-    ((void (*)(void *, int, bool, void *))MP(M_changeBRState))(st, BRSTATE_PARACHUTE, false, M_changeBRState);
-    NSLog(@"[MWM] requested parachute state");
-}
-
-#pragma mark - Silent aim / recoil
-
-// finalAngle = m_LookAngles + RecoilAngle + ForceAngle, computed inside
-// applyLookAngleFP from the fields below. Zeroing the fields is not enough on its
-// own: AddForceAngle also flips m_RecoilEnabled, and a late write races the shot.
-// Clearing the flag as well makes the contribution structurally impossible.
-// Player.Accurate (Player+0x100) is a Value<float>; m_CurrentValue sits at +0x20
-// (klass@0, monitor@8, then the three delegate/field slots of Value<T>). It is the
-// value CreateShootData copies into ModelShotData.accurate, so clearing it here
-// stops the cone at the source instead of racing the per-shot struct.
-static void applyNoSpread(void) {
-    if (!g_noSpread || !off_playerAccurate) return;
-    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
-    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
-    if (!alive(player)) return;
-    void *val = readPtr(player, off_playerAccurate);
-    if (!val) return;
-    *(float *)((char *)val + 0x20) = 0.0f;      // Value<float>.m_CurrentValue
-}
-
-static void applyNoRecoil(void) {
-    if (!g_noRecoil || !alive(g_lcam)) return;
-    if (off_recoilAngles) *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){ 0.0f, 0.0f };
-    if (off_forceAngle)   *(Vec2 *)((char *)g_lcam + off_forceAngle)   = (Vec2){ 0.0f, 0.0f };
-    if (off_recoilEnabled) *(bool *)((char *)g_lcam + off_recoilEnabled) = false;
-}
-
-// Hard lock: drive PlayerCamera.m_LookAngles straight at the target head.
-//
-// applyLookAngleFP builds its rotation from m_LookAngles (+ recoil + force), and
-// the smoothing that made the assist feel slow lives in updateRotate/lerp paths,
-// not in this field. Writing the field each frame therefore snaps instantly and,
-// because it is the same input the game itself consumes, the shot direction and
-// the camera stay consistent.
-//
-// Also clears EnableSmooth / RotationLerpSpeed so no residual interpolation runs
-// between our write and the frame's rotation update.
-static void applyHardLock(void) {
-    if (!g_aimlock || !g_aimHeadValid) return;
-    if (!alive(g_lcam) || !off_lookAngles) return;
-    if (!MP(M_getTransform) || !MP(M_getPos)) return;
-
-    void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(g_lcam, M_getTransform);
-    if (!alive(tr)) return;
-    Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
-    if (!vec3Finite(eye)) return;
-
-    Vec3 head = g_aimHead;
-    float dx = head.x - eye.x;
-    float dy = head.y - eye.y;
-    float dz = head.z - eye.z;
-    float horiz = sqrtf(dx * dx + dz * dz);
-    if (!(horiz > 0.01f)) return;
-
-    Vec2 angles;
-    angles.x = -atan2f(dy, horiz) * (180.0f / 3.14159265f);   // pitch
-    angles.y = atan2f(dx, dz) * (180.0f / 3.14159265f);       // yaw
-    if (angles.x != angles.x || angles.y != angles.y) return;
-
-    *(Vec2 *)((char *)g_lcam + off_lookAngles) = angles;
-
-    // Kill any residual interpolation for this frame.
-    if (off_enableSmooth) *(bool *)((char *)g_lcam + off_enableSmooth) = false;
-    if (off_rotationLerp) *(float *)((char *)g_lcam + off_rotationLerp) = 1000.0f;
-}
-
-static void hk_createShootData(void *retstr, void *self, bool isTransform, void *method) {
-    if (!O_createShootData) return;
-    ((void (*)(void *, void *, bool, void *))O_createShootData)(retstr, self, isTransform, method);
-
-    if (!retstr || !g_myNetId || !alive(self)) return;
-
-    applyInstantFire(retstr);
-
-    // No bullet spread. `accurate` is what computerFireDirection feeds to
-    // Random.Range(-acc, acc), so zeroing the built struct is the authoritative
-    // fix -- the weapon's cached curAccurate/shootAccurate would only be copied in
-    // again on the next shot, which is why clearing them alone did nothing.
-    if (g_noSpread) {
-        *(float *)((char *)retstr + MSD_ACCURATE) = 0.0f;
-        if (off_wpnShootAcc) *(float *)((char *)self + off_wpnShootAcc) = 0.0f;   // 0x114
-        if (off_wpnCurAcc)   *(float *)((char *)self + off_wpnCurAcc)   = 0.0f;   // 0x110
+// No-ads is not a boolean in the save: the game derives it from a PurchaseData row in
+// GameData.ltPurchase (+0x150) whose _assetIndex is one of the remove-ads shop indices
+// (148 / 149 / 188 / 200). AddPurchase persists the row through SavePurchase, so
+// inserting it via PurchaseSuccess is the same path the store would take and it survives
+// cloud sync.
+static void grantRemoveAds(void) {
+    void *d = dm();
+    if (!d) return;
+    MethodInfo *m = findMethodTyped(K_DataManager, "PurchaseSuccess", 2, 0, "System.Int32");
+    if (!m) m = i_class_get_method_from_name(K_DataManager, "PurchaseSuccess", 2);
+    if (m) {
+        int32_t index = 188;        // 광고제거_180일권, the longest duration shipped
+        int32_t reason = 0;
+        void *a[2] = { &index, &reason };
+        i_runtime_invoke(m, d, a, NULL);
     }
-
-
-    // Aimlock: the camera is already locked by applyHardLock(), so rewriting the
-    // direction here only guarantees the shot matches that camera even if the
-    // struct was built a frame earlier.
-    if (!g_aimlock || !g_aimHeadValid) return;
-
-    Vec3 head = g_aimHead;                              // snapshot from onFrame
-    Vec3 sp = *(Vec3 *)((char *)retstr + MSD_SHOOTPOS);
-    if (!vec3Finite(head) || !vec3Finite(sp)) return;
-
-    Vec3 dir = { head.x - sp.x, head.y - sp.y, head.z - sp.z };
-    float len = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-    if (!(len > 0.01f) || len != len || len > 1e6f) return;
-
-    dir.x /= len; dir.y /= len; dir.z /= len;
-    *(Vec3 *)((char *)retstr + MSD_SHOOTDIR) = dir;
-}
-
-static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const char *name) {
-    if (!mi || !orig || !klass) return NO;
-
-    char *entry = findVtableEntry(klass, orig, name);
-    if (!entry) {
-        NSLog(@"[MWM] vtable entry for %s not found (klass=%p)", name, klass);
-        return NO;
+    MethodInfo *mInit = i_class_get_method_from_name(K_DataManager, "InitRemoveAds", 2);
+    if (mInit) {
+        BOOL active = YES, useMsg = NO;
+        void *a[2] = { &active, &useMsg };
+        i_runtime_invoke(mInit, d, a, NULL);
     }
-    if (!safeWritePtr(entry, repl)) return NO;
-    NSLog(@"[MWM] vtable entry %p patched for %s", entry, name);
-    return YES;
+    if (M_savePurchase) i_runtime_invoke(M_savePurchase, d, NULL, NULL);
 }
 
-#pragma mark - ESP Overlay
+#pragma mark - Cloud save
 
-@interface MWMEspView : UIView
+static void pushSave(BOOL toServer) {
+    void *gsm = (g_ready && M_gsmInstance) ? i_runtime_invoke(M_gsmInstance, NULL, NULL, NULL) : NULL;
+    if (gsm && M_gsmCloudSave) i_runtime_invoke(M_gsmCloudSave, gsm, NULL, NULL);
+    void *gm = (g_ready && M_gmInstance) ? i_runtime_invoke(M_gmInstance, NULL, NULL, NULL) : NULL;
+    if (gm && M_gmCloudSave) { BOOL force = YES; void *a[1] = { &force }; i_runtime_invoke(M_gmCloudSave, gm, a, NULL); }
+    if (toServer && gm && M_gmSaveToServer) { BOOL purchase = NO; void *a[1] = { &purchase }; i_runtime_invoke(M_gmSaveToServer, gm, a, NULL); }
+}
+
+#pragma mark - Menu
+
+@interface CSMenuView : UIScrollView
 @end
 
-@implementation MWMEspView
-- (BOOL)isUserInteractionEnabled { return NO; }
-- (UIView *)hitTest:(CGPoint)point withEvent:(id)event { (void)point; (void)event; return nil; }
-
-- (void)drawRect:(CGRect)rect {
-    (void)rect;
-    if ((!g_espOn && !g_showAimFov) || !MP(M_camMain)) return;
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (!ctx) return;
-
-    void *cam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
-    if (!alive(cam)) return;
-
-    CGPoint snapOrigin = CGPointMake(ScreenW() * 0.5f, ScreenH());
-
-    // Silent-aim cone radius, mirrored from pickBestTargetHead() so what you see
-    // is exactly the radius the aim code searches inside.
-    if (g_showAimFov) {
-        CGFloat cx = ScreenW() * 0.5f;
-        CGFloat cy = ScreenH() * 0.5f;
-        CGFloat r = (g_aimFov / 90.0f) * cx;
-        CGContextSetLineWidth(ctx, 1.0f);
-        CGContextSetRGBStrokeColor(ctx, 1.0f, 0.4f, 0.9f, 0.85f);
-        CGContextStrokeEllipseInRect(ctx, CGRectMake(cx - r, cy - r, r * 2.0f, r * 2.0f));
-    }
-
-    CGContextSetLineWidth(ctx, 1.2f);
-
-    for (int i = 0; g_espOn && i < g_targetCount; i++) {
-        EspTarget *t = &g_targets[i];
-        Vec3 headWorld = t->head;
-        Vec3 feetWorld = { headWorld.x, headWorld.y - MWM_HEAD_HEIGHT, headWorld.z };
-
-        CGPoint headPt, feetPt;
-        if (!worldToScreen(cam, headWorld, &headPt)) continue;
-        if (!worldToScreen(cam, feetWorld, &feetPt)) continue;
-
-        CGFloat h = feetPt.y - headPt.y;
-        if (h < 4.0f) continue;
-        CGFloat w = h * 0.48f;
-        CGRect box = CGRectMake(headPt.x - w * 0.5f, headPt.y, w, h);
-
-        UIColor *color = t->isAi
-            ? [UIColor colorWithRed:1.0f green:0.85f blue:0.0f alpha:0.95f]
-            : [UIColor colorWithRed:0.2f green:1.0f blue:0.3f alpha:0.95f];
-        [color setStroke];
-        [color setFill];
-
-        CGContextStrokeRect(ctx, box);
-        CGContextMoveToPoint(ctx, snapOrigin.x, snapOrigin.y);
-        CGContextAddLineToPoint(ctx, feetPt.x, feetPt.y);
-        CGContextStrokePath(ctx);
-
-        NSString *nameStr = (t->name[0] != '\0') ? [NSString stringWithUTF8String:t->name] : @"Player";
-        NSString *tag = [NSString stringWithFormat:@"%@ [%dm]%s",
-                         nameStr, (int)t->dist, t->isAi ? " [BOT]" : ""];
-        NSDictionary *attrs = @{
-            NSFontAttributeName: [UIFont boldSystemFontOfSize:10.0f],
-            NSForegroundColorAttributeName: color
-        };
-        CGSize sz = [tag sizeWithAttributes:attrs];
-        [tag drawAtPoint:CGPointMake(headPt.x - sz.width * 0.5f, headPt.y - sz.height - 2.0f)
-          withAttributes:attrs];
-    }
+@implementation CSMenuView {
+    UILabel *_status;
+    CGFloat _y;
 }
-@end
 
-#pragma mark - UI Menu
+- (UILabel *)line:(NSString *)t size:(CGFloat)s color:(UIColor *)c height:(CGFloat)h {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y, self.frame.size.width - 28, h)];
+    l.text = t; l.font = [UIFont systemFontOfSize:s]; l.textColor = c;
+    l.numberOfLines = 0;
+    [self addSubview:l]; _y += h + 2;
+    return l;
+}
+- (UIButton *)btn:(NSString *)t sel:(SEL)s color:(UIColor *)c {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = CGRectMake(14, _y, self.frame.size.width - 28, 34);
+    b.backgroundColor = c; b.layer.cornerRadius = 8;
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:b]; _y += 40;
+    return b;
+}
+- (void)sw:(NSString *)t sel:(SEL)s on:(BOOL)on {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y + 4, self.frame.size.width - 84, 24)];
+    l.text = t; l.font = [UIFont systemFontOfSize:13]; l.textColor = [UIColor whiteColor];
+    [self addSubview:l];
+    UISwitch *v = [[UISwitch alloc] initWithFrame:CGRectMake(self.frame.size.width - 66, _y, 51, 31)];
+    v.on = on;
+    [v addTarget:self action:s forControlEvents:UIControlEventValueChanged];
+    [self addSubview:v];
+    _y += 38;
+}
 
-@interface MWMMenuView : UIScrollView
-@property (retain) UILabel *statusLabel;
-@property (retain) UISwitch *espSwitch;
-@property (retain) UISwitch *aimSwitch;
-@property (retain) UISwitch *aimFovShowSwitch;
-@property (retain) UISlider *aimFovSlider;
-@property (retain) UILabel *aimFovLabel;
-@property (retain) UISwitch *recoilSwitch;
-@property (retain) UISwitch *spreadSwitch;
-@property (retain) UISwitch *wallcheckSwitch;
-@property (retain) UISwitch *instantSwitch;
-@property (retain) UISwitch *paraSwitch;
-@property (retain) UISlider *glideSpeedSlider;
-@property (retain) UILabel *glideSpeedLabel;
-@end
-
-@implementation MWMMenuView
-
-- (id)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
+- (instancetype)initWithFrame:(CGRect)fr {
+    self = [super initWithFrame:fr];
     if (!self) return nil;
-
-    self.showsVerticalScrollIndicator = YES;
-    self.showsHorizontalScrollIndicator = NO;
-
-    self.backgroundColor = [UIColor colorWithRed:0.08 green:0.09 blue:0.12 alpha:0.96];
-    self.layer.cornerRadius = 14.0;
-    self.layer.borderWidth = 1.0;
-    self.layer.borderColor = [UIColor colorWithRed:0.25 green:0.45 blue:0.85 alpha:0.7].CGColor;
+    self.backgroundColor = [UIColor colorWithRed:0.07 green:0.08 blue:0.11 alpha:0.97];
+    self.layer.cornerRadius = 14; self.layer.borderWidth = 1;
+    self.layer.borderColor = [UIColor colorWithRed:0.3 green:0.75 blue:0.45 alpha:0.8].CGColor;
     self.layer.masksToBounds = YES;
+    self.showsVerticalScrollIndicator = YES;
+    _y = 12;
 
-    CGFloat y = 14, w = frame.size.width;
+    UILabel *t = [self line:@"CATS & SOUP — MENU" size:16 color:[UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1] height:22];
+    t.textAlignment = NSTextAlignmentCenter;
+    _status = [self line:@"Status: opening" size:10 color:[UIColor colorWithWhite:0.65 alpha:1] height:28];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 22)];
-    title.text = @"Mini World Menu (VIP)";
-    title.font = [UIFont boldSystemFontOfSize:16];
-    title.textColor = [UIColor colorWithRed:0.35 green:0.75 blue:1.0 alpha:1.0];
-    title.textAlignment = NSTextAlignmentCenter;
-    [self addSubview:title];
-    y += 26;
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(14, _y, fr.size.width - 28, 1)];
+    div.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    [self addSubview:div]; _y += 10;
 
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, y, w - 32, 16)];
-    self.statusLabel.text = @"Status: Initializing...";
-    self.statusLabel.font = [UIFont systemFontOfSize:11];
-    self.statusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    [self addSubview:self.statusLabel];
-    y += 24;
+    [self sw:@"Bypass Anti-Cheat"     sel:@selector(ac:) on:g_bypassAC];
+    [self sw:@"Tiền tệ không tuột"    sel:@selector(nf:) on:g_noFall];
+    [self sw:@"Free Shop Purchase"    sel:@selector(fs:) on:g_freeShop];
+    [self sw:@"Xóa quảng cáo vĩnh viễn" sel:@selector(ad:) on:g_noAds];
 
-    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(16, y, w - 32, 1)];
-    div.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
-    [self addSubview:div];
-    y += 12;
+    _y += 4; [self line:@"── TIỀN TỆ ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
+    [self btn:@"Full tất cả tiền tệ" sel:@selector(a1) color:[UIColor colorWithRed:0.14 green:0.42 blue:0.58 alpha:0.95]];
+    [self btn:@"Full tất cả vé" sel:@selector(a2) color:[UIColor colorWithRed:0.14 green:0.42 blue:0.58 alpha:0.95]];
 
-    self.espSwitch = [self toggleAt:&y title:@"ESP (Box + Line + Dist)" sel:@selector(espToggled:)];
-    self.aimSwitch = [self toggleAt:&y title:@"Aimlock (hold fire)" sel:@selector(aimToggled:)];
-    self.aimFovShowSwitch = [self toggleAt:&y title:@"Show Aim FOV" sel:@selector(aimFovShowToggled:)];
-    self.recoilSwitch = [self toggleAt:&y title:@"No Recoil" sel:@selector(recoilToggled:)];
-    self.spreadSwitch = [self toggleAt:&y title:@"No Bullet Spread" sel:@selector(spreadToggled:)];
-    self.wallcheckSwitch = [self toggleAt:&y title:@"Wall Check" sel:@selector(wallcheckToggled:)];
-    self.instantSwitch = [self toggleAt:&y title:@"Fast Bullet (all at once)" sel:@selector(instantToggled:)];
-    self.paraSwitch = [self toggleAt:&y title:@"Parachute Control" sel:@selector(paraToggled:)];
-    self.glideSpeedLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed]];
-    self.glideSpeedSlider = [self sliderAt:&y min:1.0f max:6.0f val:g_glideSpeed sel:@selector(glideSpeedChanged:)];
+    _y += 4; [self line:@"── NỘI DUNG ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
+    [self btn:@"Mở tất cả mèo" sel:@selector(b1) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Mở tất cả khung / skin" sel:@selector(b2) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Mở tất cả chức năng khoá" sel:@selector(b3) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Thêm tất cả nội thất" sel:@selector(b4) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Thêm tất cả cơ sở quản lý" sel:@selector(b5) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Thêm tất cả tháp trang trí" sel:@selector(b6) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Thêm tất cả trang trí rừng" sel:@selector(b7) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Thêm tất cả vật phẩm" sel:@selector(b8) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
+    [self btn:@"Mở tất cả bộ sưu tập" sel:@selector(b9) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
 
+    _y += 4; [self line:@"── NÂNG CẤP ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
+    [self btn:@"Nâng cấp full mọi facility" sel:@selector(c1) color:[UIColor colorWithRed:0.52 green:0.38 blue:0.14 alpha:0.95]];
+    [self btn:@"Full đồ cho mèo (equip)" sel:@selector(c2) color:[UIColor colorWithRed:0.52 green:0.38 blue:0.14 alpha:0.95]];
 
-    self.aimFovLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov]];
-    self.aimFovSlider = [self sliderAt:&y min:10 max:90 val:g_aimFov sel:@selector(aimFovChanged:)];
+    _y += 4; [self line:@"── LƯU ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
+    [self btn:@"Lưu Local + Cloud" sel:@selector(d1) color:[UIColor colorWithRed:0.18 green:0.52 blue:0.28 alpha:0.95]];
+    [self btn:@"Lưu + Upload Server" sel:@selector(d2) color:[UIColor colorWithRed:0.18 green:0.52 blue:0.28 alpha:0.95]];
 
+    _y += 8;
+    [self btn:@"Đóng" sel:@selector(closeTap) color:[UIColor colorWithRed:0.58 green:0.2 blue:0.2 alpha:0.9]];
 
-    y += 8;
-    UIButton *rst = [UIButton buttonWithType:UIButtonTypeCustom];
-    rst.frame = CGRectMake(16, y, (w - 40) / 2, 32);
-    rst.backgroundColor = [UIColor colorWithRed:0.25 green:0.25 blue:0.3 alpha:0.8];
-    rst.layer.cornerRadius = 8;
-    [rst setTitle:@"Reset" forState:UIControlStateNormal];
-    [rst setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    rst.titleLabel.font = [UIFont systemFontOfSize:13];
-    [rst addTarget:self action:@selector(resetTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:rst];
-
-    UIButton *cls = [UIButton buttonWithType:UIButtonTypeCustom];
-    cls.frame = CGRectMake(24 + (w - 40) / 2, y, (w - 40) / 2, 32);
-    cls.backgroundColor = [UIColor colorWithRed:0.8 green:0.25 blue:0.25 alpha:0.8];
-    cls.layer.cornerRadius = 8;
-    [cls setTitle:@"Close" forState:UIControlStateNormal];
-    [cls setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    cls.titleLabel.font = [UIFont systemFontOfSize:13];
-    [cls addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:cls];
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
     pan.cancelsTouchesInView = NO;
     [self addGestureRecognizer:pan];
 
-    // The controls sit taller than the visible frame; let the whole panel scroll.
-    self.contentSize = CGSizeMake(w, y + 70);
+    self.contentSize = CGSizeMake(fr.size.width, _y + 40);
     self.alwaysBounceVertical = YES;
-
     return self;
 }
 
-- (UISwitch *)toggleAt:(CGFloat *)yp title:(NSString *)t sel:(SEL)action {
-    CGFloat y = *yp, w = self.frame.size.width;
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, w - 80, 24)];
-    lbl.text = t;
-    lbl.font = [UIFont systemFontOfSize:13];
-    lbl.textColor = [UIColor whiteColor];
-    [self addSubview:lbl];
+- (void)ac:(UISwitch *)s { g_bypassAC = s.isOn; if (s.isOn) applyAntiCheatBypass(); }
+- (void)nf:(UISwitch *)s { g_noFall = s.isOn; if (s.isOn) applyAntiCheatBypass(); }
+- (void)fs:(UISwitch *)s { g_freeShop = s.isOn; setFreeShop(s.isOn); }
+- (void)ad:(UISwitch *)s { g_noAds = s.isOn; if (s.isOn) grantRemoveAds(); }
 
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, y, 51, 31)];
-    [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
-    [self addSubview:sw];
-    *yp += 38;
-    return sw;
+- (void)run:(NSString *)name work:(void (^)(void))blk {
+    if (!resolveIl2Cpp()) { _status.text = [NSString stringWithFormat:@"Status: %s", g_diag]; return; }
+    blk();
+    _status.text = [NSString stringWithFormat:@"OK: %@", name];
 }
-
-- (UILabel *)labelAt:(CGFloat *)yp text:(NSString *)t {
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(16, *yp, self.frame.size.width - 32, 18)];
-    lbl.text = t;
-    lbl.font = [UIFont systemFontOfSize:12];
-    lbl.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
-    [self addSubview:lbl];
-    *yp += 20;
-    return lbl;
-}
-
-- (UISlider *)sliderAt:(CGFloat *)yp min:(float)mn max:(float)mx val:(float)v sel:(SEL)action {
-    UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(16, *yp, self.frame.size.width - 32, 28)];
-    sl.minimumValue = mn;
-    sl.maximumValue = mx;
-    sl.value = v;
-    [sl addTarget:self action:action forControlEvents:UIControlEventValueChanged];
-    [self addSubview:sl];
-    *yp += 32;
-    return sl;
-}
-
-- (void)espToggled:(UISwitch *)s { g_espOn = s.isOn; }
-- (void)aimFovShowToggled:(UISwitch *)s { g_showAimFov = s.isOn; }
-- (void)recoilToggled:(UISwitch *)s { g_noRecoil = s.isOn; }
-- (void)spreadToggled:(UISwitch *)s { g_noSpread = s.isOn; }
-- (void)wallcheckToggled:(UISwitch *)s { g_wallcheck = s.isOn; }
-- (void)instantToggled:(UISwitch *)s { g_fastBullet = s.isOn; }
-- (void)paraToggled:(UISwitch *)s { g_paraCtl = s.isOn; }
-- (void)glideSpeedChanged:(UISlider *)s {
-    g_glideSpeed = s.value;
-    self.glideSpeedLabel.text = [NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed];
-}
-
-- (void)aimToggled:(UISwitch *)s {
-    g_aimlock = s.isOn;
-}
-- (void)aimFovChanged:(UISlider *)s {
-    g_aimFov = s.value;
-    self.aimFovLabel.text = [NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov];
-}
-- (void)resetTapped {
-    g_espOn = NO; g_aimlock = NO; g_showAimFov = NO;
-    g_noRecoil = NO; g_noSpread = NO; g_paraCtl = NO; g_glide = NO;
-    self.recoilSwitch.on = NO; self.spreadSwitch.on = NO;
-    self.paraSwitch.on = NO; g_paraDir = 0; g_glide = NO;
-    self.espSwitch.on = NO; self.aimSwitch.on = NO; self.aimFovShowSwitch.on = NO;
-    self.aimFovSlider.value = 35.0f; self.aimFovLabel.text = @"Aim FOV: 35°";
-}
-- (void)closeTapped { self.hidden = YES; }
-- (void)handlePan:(UIPanGestureRecognizer *)p {
+- (void)a1 { [self run:@"full currency" work:^{ fillCurrency(); }]; }
+- (void)a2 { [self run:@"full tickets"  work:^{ fillTickets(); }]; }
+- (void)b1 { [self run:@"all cats"      work:^{ addAllCats(); }]; }
+- (void)b2 { [self run:@"all skins"     work:^{ addAllSkins(); }]; }
+- (void)b3 { [self run:@"all features"  work:^{ addAllMisc(); }]; }
+- (void)b4 { [self run:@"all furniture" work:^{ addAllFurniture(); }]; }
+- (void)b5 { [self run:@"all facilities" work:^{ addAllFacilities(); }]; }
+- (void)b6 { [self run:@"all tower props" work:^{ addAllTowerProps(); }]; }
+- (void)b7 { [self run:@"all forest deco" work:^{ addAllForestDeco(); }]; }
+- (void)b8 { [self run:@"all items" work:^{ addAllItems(); }]; }
+- (void)b9 { [self run:@"all collections" work:^{ collectAllCollections(); }]; }
+- (void)c1 { [self run:@"upgrade facilities" work:^{ addAllFacilities(); }]; }
+- (void)c2 { [self run:@"equip max"     work:^{ maxEquips(); }]; }
+- (void)d1 { [self run:@"cloud save"    work:^{ pushSave(NO); }]; }
+- (void)d2 { [self run:@"server save"   work:^{ pushSave(YES); }]; }
+- (void)closeTap { self.hidden = YES; }
+- (void)pan:(UIPanGestureRecognizer *)p {
     CGPoint t = [p translationInView:self.superview];
     self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
     [p setTranslation:CGPointZero inView:self.superview];
 }
 @end
 
-#pragma mark - Parachute panel
-
-// Three floating buttons, shown only while Parachute Control is on.
-static UIButton *mkBtn(NSString *t, SEL act, id target) {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(0, 0, 54, 34);
-    b.backgroundColor = [UIColor colorWithRed:0.1f green:0.35f blue:0.8f alpha:0.85f];
-    b.layer.cornerRadius = 8;
-    [b setTitle:t forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-    [b addTarget:target action:act forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
-#pragma mark - UI Manager
-
-@interface MWMUIManager : NSObject
-+ (instancetype)shared;
+@interface CSMenu : NSObject
 @property (retain) UIWindow *host;
-@property (retain) UIButton *floatingBtn;
-@property (retain) MWMMenuView *menuView;
-@property (retain) UIView *paraPanel;
-@property (retain) UIButton *paraGlideBtn;
-@property (retain) UIButton *paraUpBtn;
-@property (retain) UIButton *paraDownBtn;
-@property (retain) MWMEspView *espView;
-@property (retain) CADisplayLink *displayLink;
-- (void)setupUI;
+@property (retain) UIButton *fab;
+@property (retain) CSMenuView *panel;
+@property (retain) CADisplayLink *link;
 @end
 
-@implementation MWMUIManager
-
+@implementation CSMenu
 + (instancetype)shared {
-    static MWMUIManager *inst;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ inst = [MWMUIManager new]; });
-    return inst;
+    static CSMenu *i; static dispatch_once_t once;
+    dispatch_once(&once, ^{ i = [CSMenu new]; });
+    return i;
 }
-
-// Host window: the game's own window. Creating a full-screen window of our own at a
-// high windowLevel swallowed every touch that hitTest returned nil for, which made
-// the game unplayable. Attaching to the existing window has no such side effect --
-// touches that miss our subviews go straight to Unity.
 - (UIWindow *)hostWindow {
     UIWindow *w = [UIApplication sharedApplication].keyWindow;
     if (w && !w.hidden) return w;
-
     UIWindow *best = nil;
-    for (UIWindow *cand in [UIApplication sharedApplication].windows) {
-        if (cand.hidden) continue;
-        if (cand.windowLevel > 1.0) continue;      // skip alerts / status bar
-        if (!best || cand.windowLevel < best.windowLevel) best = cand;
+    for (UIWindow *c in [UIApplication sharedApplication].windows) {
+        if (c.hidden || c.windowLevel > 1.0) continue;
+        if (!best || c.windowLevel < best.windowLevel) best = c;
     }
     return best;
 }
-
-- (void)setupUI {
+- (void)setup {
     UIWindow *w = [self hostWindow];
     if (!w) return;
     self.host = w;
-
-    if (!self.espView) {
-        self.espView = [[MWMEspView alloc] initWithFrame:w.bounds];
-        self.espView.backgroundColor = [UIColor clearColor];
-        self.espView.userInteractionEnabled = NO;
-        self.espView.opaque = NO;
-        [w addSubview:self.espView];
+    if (!self.fab) {
+        self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
+        self.fab.frame = CGRectMake(18, 110, 46, 46);
+        self.fab.backgroundColor = [UIColor colorWithRed:0.15 green:0.65 blue:0.35 alpha:0.85];
+        self.fab.layer.cornerRadius = 23; self.fab.layer.borderWidth = 1.5;
+        self.fab.layer.borderColor = [UIColor whiteColor].CGColor;
+        [self.fab setTitle:@"CS" forState:UIControlStateNormal];
+        self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+        [self.fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+        [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
+        [w addSubview:self.fab];
     }
-
-    if (!self.floatingBtn) {
-        CGFloat size = 46.0;
-        self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-        self.floatingBtn.frame = CGRectMake(20, 100, size, size);
-        self.floatingBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.4 blue:0.9 alpha:0.85];
-        self.floatingBtn.layer.cornerRadius = size / 2;
-        self.floatingBtn.layer.borderWidth = 1.5;
-        self.floatingBtn.layer.borderColor = [UIColor whiteColor].CGColor;
-        [self.floatingBtn setTitle:@"M" forState:UIControlStateNormal];
-        [self.floatingBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        self.floatingBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        [self.floatingBtn addTarget:self action:@selector(btnTapped) forControlEvents:UIControlEventTouchUpInside];
-        [self.floatingBtn addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(btnPanned:)]];
-        [w addSubview:self.floatingBtn];
+    if (!self.panel) {
+        self.panel = [[CSMenuView alloc] initWithFrame:CGRectMake(26, 96, 292, 610)];
+        self.panel.hidden = YES;
+        [w addSubview:self.panel];
     }
-
-    if (!self.menuView) {
-        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 100, 260, 580)];
-        self.menuView.hidden = YES;
-        [w addSubview:self.menuView];
-    }
-
-    // Unity may replace its window; move our views to the current one.
-    if (self.espView.superview != w) {
-        [w addSubview:self.espView];
-        [w addSubview:self.floatingBtn];
-        if (self.menuView) [w addSubview:self.menuView];
-    }
-    if (!CGRectEqualToRect(self.espView.frame, w.bounds)) self.espView.frame = w.bounds;
-
-    if (!self.paraPanel) {
-        self.paraPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 170, 62, 122)];
-        self.paraPanel.backgroundColor = [UIColor clearColor];
-
-        self.paraGlideBtn = mkBtn(@"Glide", @selector(paraGlideTapped), self);
-        self.paraGlideBtn.frame = CGRectMake(4, 0, 54, 34);
-        [self.paraPanel addSubview:self.paraGlideBtn];
-
-        self.paraUpBtn = mkBtn(@"Up", @selector(paraUpTapped), self);
-        self.paraUpBtn.frame = CGRectMake(4, 42, 54, 34);
-        [self.paraPanel addSubview:self.paraUpBtn];
-
-        self.paraDownBtn = mkBtn(@"Down", @selector(paraDownTapped), self);
-        self.paraDownBtn.frame = CGRectMake(4, 84, 54, 34);
-        [self.paraPanel addSubview:self.paraDownBtn];
-
-        self.paraPanel.hidden = YES;
-        [w addSubview:self.paraPanel];
-    }
-    [self refreshParaPanel];
-
-    if (!self.displayLink) {
-        self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onFrame)];
-        [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    if (self.fab.superview != w) { [w addSubview:self.fab]; [w addSubview:self.panel]; }
+    if (!self.link) {
+        self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
+        [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
 }
-
-- (void)btnTapped {
-    self.menuView.hidden = !self.menuView.hidden;
-    if (!self.menuView.hidden) [self.menuView.superview bringSubviewToFront:self.menuView];
+- (void)tick { guardTick(); }
+- (void)toggle {
+    self.panel.hidden = !self.panel.hidden;
+    if (!self.panel.hidden) [self.panel.superview bringSubviewToFront:self.panel];
 }
-- (void)btnPanned:(UIPanGestureRecognizer *)p {
-    CGPoint t = [p translationInView:self.floatingBtn.superview];
-    self.floatingBtn.center = CGPointMake(self.floatingBtn.center.x + t.x, self.floatingBtn.center.y + t.y);
-    [p setTranslation:CGPointZero inView:self.floatingBtn.superview];
-}
-
-- (void)refreshParaPanel {
-    if (!self.paraPanel) return;
-    self.paraPanel.hidden = !g_paraCtl;
-    self.paraGlideBtn.backgroundColor = g_glide
-        ? [UIColor colorWithRed:0.15f green:0.75f blue:0.35f alpha:0.9f]
-        : [UIColor colorWithRed:0.1f green:0.35f blue:0.8f alpha:0.85f];
-    [self.paraGlideBtn setTitle:(g_glide ? @"Glide ON" : @"Glide") forState:UIControlStateNormal];
-
-    UIColor *dim = [UIColor colorWithRed:0.1f green:0.35f blue:0.8f alpha:0.85f];
-    UIColor *lit = [UIColor colorWithRed:0.15f green:0.75f blue:0.35f alpha:0.9f];
-    self.paraUpBtn.backgroundColor = (g_paraDir > 0) ? lit : dim;
-    self.paraDownBtn.backgroundColor = (g_paraDir < 0) ? lit : dim;
-}
-
-- (void)paraGlideTapped {
-    g_glide = !g_glide;
-    [self refreshParaPanel];
-}
-// Panel must not be reachable while Parachute Control is off.
-- (void)paraUpTapped   { g_paraDir = (g_paraDir > 0) ? 0 : 1;  [self refreshParaPanel]; }
-- (void)paraDownTapped { g_paraDir = (g_paraDir < 0) ? 0 : -1; [self refreshParaPanel]; }
-
-- (void)setStatus:(const char *)s color:(UIColor *)col {
-    if (!self.menuView) return;
-    self.menuView.statusLabel.text = [NSString stringWithUTF8String:s];
-    self.menuView.statusLabel.textColor = col;
-}
-
-- (void)onFrame {
-    if (g_espOn || g_showAimFov) [self.espView setNeedsDisplay];
-
-    if (!g_il2cppReady) {
-        [self setStatus:g_diag color:[UIColor colorWithRed:1.0 green:0.55 blue:0.2 alpha:1.0]];
-        return;
-    }
-    void *mp = MP(M_lpmInstance);
-    if (!mp) {
-        [self setStatus:"Status: LPM instance null" color:[UIColor colorWithRed:1.0 green:0.55 blue:0.2 alpha:1.0]];
-        return;
-    }
-
-    void *lpm = ((void *(*)(void *))mp)(M_lpmInstance);
-    void *player = readPtr(lpm, off_lpmPlayer);
-
-    if (!alive(player)) {
-        g_lcam = nullptr;
-        g_myNetId = 0;
-        [self setStatus:"Status: Lobby / Loading" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
-        return;
-    }
-    // LocalPlayerType lives on Player, not on LocalPlayerManager.
-    int type = off_playerType ? *(int *)((char *)player + off_playerType) : 1;
-    if (type == 0 || type == 4) {
-        g_lcam = nullptr;
-        [self setStatus:"Status: In Lobby" color:[UIColor colorWithWhite:0.7 alpha:1.0]];
-        return;
-    }
-
-    void *cam = readPtr(player, off_playerCam);
-    g_lcam = alive(cam) ? cam : nullptr;
-    if (!g_lcam) {
-        [self setStatus:"Status: Loading Match..." color:[UIColor colorWithWhite:0.7 alpha:1.0]];
-        return;
-    }
-
-    [self setStatus:"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
-
-    applyNoRecoil();
-    applyNoSpread();
-    enterParachuteState();
-    applyParachuteControl();
-    [self refreshParaPanel];
-
-    if (g_espOn || g_aimlock) scanPlayers();
-
-    // Publish the aim point for the swapped CreateShootData. Computed here on the
-    // main thread so the weapon path only ever reads a plain float snapshot.
-    g_aimHeadValid = NO;
-    if (g_aimlock && g_targetCount > 0) {
-        Vec3 head;
-        if (pickBestTargetHead(&head) && vec3Finite(head)) {
-            g_aimHead = head;
-            g_aimHeadValid = YES;
-            applyHardLock();          // snap the camera this frame
-        }
-    }
+- (void)drag:(UIPanGestureRecognizer *)p {
+    CGPoint t = [p translationInView:self.fab.superview];
+    self.fab.center = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
+    [p setTranslation:CGPointZero inView:self.fab.superview];
 }
 @end
 
-#pragma mark - Resolution
-
-static void *findImage(const char *n) {
-    size_t c = 0;
-    void **a = i_get_assemblies(i_domain_get(), &c);
-    if (!a) return nullptr;
-    for (size_t k = 0; k < c; k++) {
-        void *img = i_assembly_image(a[k]);
-        const char *in = img ? i_image_name(img) : (const char *)0;
-        if (in && !strcmp(in, n)) return img;
-    }
-    return nullptr;
-}
-
-static BOOL g_apiResolved = NO;
-
-static BOOL resolveApi(void) {
-    i_domain_get       = (void *(*)(void))dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
-    i_thread_attach    = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_thread_attach");
-    i_get_assemblies   = (void **(*)(void *, size_t *))dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
-    i_assembly_image   = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
-    i_image_name       = (const char *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_image_get_name");
-    i_class_from_name  = (void *(*)(void *, const char *, const char *))dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
-    i_method_from_name = (void *(*)(void *, const char *, int))dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
-    i_field_from_name  = (void *(*)(void *, const char *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
-    i_field_offset     = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
-    i_image_get_class  = (void *(*)(void *, size_t))dlsym(RTLD_DEFAULT, "il2cpp_image_get_class");
-    i_image_class_count= (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_image_get_class_count");
-    i_class_get_parent = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_parent");
-
-    g_apiResolved = (i_domain_get && i_thread_attach && i_get_assemblies &&
-                     i_assembly_image && i_image_name && i_class_from_name &&
-                     i_method_from_name && i_field_from_name && i_field_offset &&
-                     i_image_get_class && i_image_class_count && i_class_get_parent);
-    if (!g_apiResolved) snprintf(g_diag, sizeof(g_diag), "Status: no il2cpp exports");
-    return g_apiResolved;
-}
-
-// ---------------------------------------------------------------------------
-// MethodInfo replacement (writable metadata only, no code patching).
-// Takes effect for virtual / delegate / reflection dispatch. A direct BL call
-// inside the same assembly still reaches the original body -- the feature then
-// simply does nothing, which is the intended failure mode.
-// ---------------------------------------------------------------------------
-static void dummy_ret(void *self, void *mi) { (void)self; (void)mi; }
-static bool dummy_false(void *mi) { (void)mi; return false; }
-static bool dummy_true_i(int32_t a, void *mi) { (void)a; (void)mi; return true; }
-static bool dummy_true_ic(int32_t a, void *cb, void *mi) { (void)a; (void)cb; (void)mi; return true; }
-
-// Write to a MethodInfo/methodSlot that may sit on a read-only data page.
-// Executable pages are never touched: vm_protect()+write on __TEXT makes the
-// codesign monitor kill the process on the next page-in. A skipped patch is a
-// disabled feature; a bad patch is a crash.
-static BOOL safeWritePtr(void *addr, void *value) {
-    if (!addr) return NO;
-
-    vm_address_t page = (vm_address_t)addr & ~(vm_address_t)0x3FFF;
-    vm_size_t span = 0x4000;
-
-    // Refuse executable pages: patching __TEXT is what killed the process before.
-    vm_address_t q = page;
-    vm_size_t qsize = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t obj = MACH_PORT_NULL;
-    kern_return_t kr = vm_region_64(mach_task_self(), &q, &qsize, VM_REGION_BASIC_INFO_64,
-                                    (vm_region_info_t)&info, &count, &obj);
-    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"[MWM] skip patch: vm_region(%p) failed %d", addr, kr);
-        return NO;
-    }
-    if (info.protection & VM_PROT_EXECUTE) {
-        NSLog(@"[MWM] skip patch: executable page %p", addr);
-        return NO;
-    }
-
-    // il2cpp metadata is read-only after init; make the single page writable.
-    kr = vm_protect(mach_task_self(), page, span, false, VM_PROT_READ | VM_PROT_WRITE);
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"[MWM] skip patch: vm_protect(%p) failed %d", addr, kr);
-        return NO;
-    }
-    *(void **)addr = value;
-    return YES;
-}
-
-static BOOL replaceMethod(void *mi, void *repl) {
-    if (!MP(mi)) return NO;
-    return safeWritePtr(mi, repl);   // MethodInfo.methodPointer is field 0
-}
-
-// Decide whether `k` is ProjectileWeapon or derives from it.
-static BOOL klassDerivesFrom(void *k, void *base) {
-    int guard = 0;
-    while (k && guard++ < 32) {
-        if (k == base) return YES;
-        if (!i_class_get_parent) break;
-        k = i_class_get_parent(k);
-    }
-    return NO;
-}
-
-// Patch CreateShootData in the vtable of EVERY concrete weapon class.
-//
-// This was the reason nothing took effect: the MethodInfo we resolved belongs to
-// ProjectileWeapon, but the object in the player's hands is a GunController (or one
-// of a dozen siblings), and each class owns its own vtable. Patching only the base
-// left every real weapon dispatching to the untouched body.
-static BOOL installAimHook(void) {
-    void *mi = M_createShootData;
-    if (!mi) return NO;
-
-    void *orig = *(void **)mi;                      // ProjectileWeapon.methodPointer
-    if (!orig || (uintptr_t)orig < 0x1000) return NO;
-
-    O_createShootData = orig;
-    safeWritePtr(mi, (void *)&hk_createShootData);  // reflection path
-
-    void *game = findImage("Assembly-CSharp.dll");
-    void *base = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
-    if (!game || !base || !i_image_get_class || !i_image_class_count) return NO;
-
-    size_t n = i_image_class_count(game);
-    int patched = 0, seen = 0;
-    for (size_t i = 0; i < n; i++) {
-        void *k = i_image_get_class(game, i);
-        if (!k || !klassDerivesFrom(k, base)) continue;
-        seen++;
-        if (patchVtableSlot(mi, orig, (void *)&hk_createShootData, k, "CreateShootData"))
-            patched++;
-    }
-
-    NSLog(@"[MWM] aim hook: %d/%d weapon vtables patched", patched, seen);
-    if (!patched) {
-        O_createShootData = nullptr;
-        return NO;
-    }
-    return YES;
-}
-
-static BOOL resolveIl2Cpp(void) {
-    void *game = findImage("Assembly-CSharp.dll");
-    void *core = findImage("UnityEngine.CoreModule.dll");
-    if (!game || !core) {
-        snprintf(g_diag, sizeof(g_diag), "Status: image missing");
-        return NO;
-    }
-
-    void *K_obj       = i_class_from_name(core, "UnityEngine", "Object");
-    void *K_netPlayer = i_class_from_name(game, "WildWest.NetControllers", "NetPlayer");
-    void *K_netMgr    = i_class_from_name(game, "WildWest.NetControllers", "NetManager");
-    // il2cpp_class_get_field_from_name only sees fields declared on the class itself,
-    // so NetPlayerMap must be looked up on its declaring class NetManagerBase.
-    void *K_netMgrBase = i_class_from_name(game, "WildWest.NetControllers", "NetManagerBase");
-
-    K_player    = i_class_from_name(game, "HQFPSTemplate", "Player");
-    K_lpm       = i_class_from_name(game, "", "LocalPlayerManager");
-    K_camera    = i_class_from_name(core, "UnityEngine", "Camera");
-
-    // Field names verified against this build's dump.cs.
-    off_cachedPtr    = fieldOff(K_obj, "m_CachedPtr");        // 0x10
-    off_lpmPlayer    = fieldOff(K_lpm, "mLocalPlayer");       // 0x18
-    off_playerType   = fieldOff(K_player, "LocalPlayerType"); // 0x4C8 (on Player)
-    off_playerCam    = fieldOff(K_player, "_PlayerCamera");   // 0x4E8
-    off_playerMovement = fieldOff(K_player, "_PlayerMovement"); // 0x4D8
-    off_playerStateComp = fieldOff(K_player, "_StateComp");      // 0x4F8
-
-    M_lpmInstance    = methodOf(K_lpm, "get_Instance", 0);
-    M_w2s            = methodOf(K_camera, "WorldToScreenPoint", 1);
-    M_camMain        = methodOf(K_camera, "get_main", 0);
-
-    void *K_component = i_class_from_name(core, "UnityEngine", "Component");
-    void *K_transform = i_class_from_name(core, "UnityEngine", "Transform");
-    M_getTransform = methodOf(K_component, "get_transform", 0);
-    M_getPos       = methodOf(K_transform, "get_position", 0);
-
-    M_netInstance  = methodOf(K_netMgr, "get_Instance", 0);
-    M_playerName   = methodOf(K_netPlayer, "GetPlayerName", 0);
-    M_playerIsAi   = methodOf(K_netPlayer, "IsAiPlayer", 0);
-    M_playerPos    = methodOf(K_netPlayer, "GetPosition", 0);
-    M_netPlayerId  = methodOf(K_netPlayer, "GetNetPlayerId", 0);
-    M_netTeamId    = methodOf(K_netPlayer, "GetTeamId", 0);
-    off_bindNetId  = fieldOff(K_lpm, "curBindNetPlayerId");
-    off_netPlayerMap = fieldOff(K_netMgrBase, "NetPlayerMap"); // 0x18
-
-
-    void *K_sceneHelper = i_class_from_name(game, "", "LogicSceneHelper");
-    void *K_guideMgr    = i_class_from_name(game, "", "BattleGuideManager");
-    void *K_lua         = i_class_from_name(game, "", "LuaHelper");   // global ns (TcpSocket.LuaHelper is a different class)
-
-    M_checkGuideScene = methodOf(K_sceneHelper, "CheckIsGuideScene", 0);
-    M_isNewbieGame    = methodOf(K_sceneHelper, "IsNewbieGame", 0);
-    M_guideInit       = methodOf(K_guideMgr, "Init", 0);
-    M_checkFuncOpen   = methodOf(K_lua, "CheckFunctionIsOpen", 1);
-    M_checkFuncUnlock = methodOf(K_lua, "CheckFuncUnlock", 2);
-
-    // Only the essentials are mandatory; everything else degrades one feature.
-    if (!off_cachedPtr) { snprintf(g_diag, sizeof(g_diag), "Status: no m_CachedPtr"); return NO; }
-    if (!off_lpmPlayer) { snprintf(g_diag, sizeof(g_diag), "Status: no mLocalPlayer"); return NO; }
-    if (!off_playerCam) { snprintf(g_diag, sizeof(g_diag), "Status: no _PlayerCamera"); return NO; }
-    if (!MP(M_lpmInstance)) { snprintf(g_diag, sizeof(g_diag), "Status: no get_Instance"); return NO; }
-    if (!MP(M_w2s) || !MP(M_camMain)) { snprintf(g_diag, sizeof(g_diag), "Status: no Camera API"); return NO; }
-
-    // Recoil / force angle live on PlayerCamera; the parachute module on PlayerMovementFP.
-    void *K_playerCam = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
-    off_recoilAngles  = fieldOff(K_playerCam, "m_RecoilAngles");   // 0x58
-    off_forceAngle    = fieldOff(K_playerCam, "m_ForceAngle");     // 0x64
-    off_recoilEnabled = fieldOff(K_playerCam, "m_RecoilEnabled");  // 0x60
-    off_lookAngles    = fieldOff(K_playerCam, "m_LookAngles");     // 0x50
-    off_enableSmooth  = fieldOff(K_playerCam, "EnableSmooth");     // 0x84
-    off_rotationLerp  = fieldOff(K_playerCam, "RotationLerpSpeed");// 0x90
-
-    void *K_moveFP = i_class_from_name(game, "HQFPSTemplate", "PlayerMovementFP");
-    off_parachuteState = fieldOff(K_moveFP, "m_ParachuteState");  // 0x1C8
-
-
-    void *K_projWeapon = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
-    M_createShootData = methodOf(K_projWeapon, "CreateShootData", 1);
-    off_wpnShootAcc   = fieldOff(K_projWeapon, "shootAccurate");  // 0x114
-    off_wpnCurAcc     = fieldOff(K_projWeapon, "curAccurate");    // 0x110
-    // Accurate is declared on Entity, the base of Player; il2cpp field lookup only
-    // sees fields declared on the class itself.
-    void *K_entity = i_class_from_name(game, "HQFPSTemplate", "Entity");
-    off_playerAccurate= fieldOff(K_entity, "Accurate");           // 0x100
-
-    // Wall check uses the game's own assist masks so the answer matches the engine.
-    // Physics is NOT in CoreModule: it lives in UnityEngine.PhysicsModule.dll. Looking
-    // it up in `core` returned null, so Linecast never resolved and the wall check
-    // silently fell through to "cannot verify".
-    void *physMod   = findImage("UnityEngine.PhysicsModule.dll");
-    void *K_physics = physMod ? i_class_from_name(physMod, "UnityEngine", "Physics") : nullptr;
-    void *K_layer   = i_class_from_name(game, "", "LayerHelper");
-
-    // Unity declares Linecast(start, end, layerMask, queryTriggerInteraction); the
-    // 3-argument overload in the C# source is a default argument, not its own
-    // MethodInfo. Resolve the 4-arg form first and remember which one we got.
-    M_linecast = methodOf(K_physics, "Linecast", 4);
-    g_linecastArgs = 4;
-    if (!MP(M_linecast)) {
-        M_linecast = methodOf(K_physics, "Linecast", 3);
-        g_linecastArgs = 3;
-    }
-    if (!MP(M_linecast))
-        NSLog(@"[MWM] Physics.Linecast unresolved - wallcheck fails closed");
-
-    M_barrierLayerMask = methodOf(K_layer, "GetHeroAssistBarrierLayerMask", 0);
-
-    void *K_stateTp = i_class_from_name(game, "", "PlayerStateTpCommon");   // global ns
-    M_changeBRState = methodOf(K_stateTp, "ChangePlayerBRStateClient", 2);
-
-    if (g_bypassTutorial) {
-        replaceMethod(M_guideInit, (void *)&dummy_ret);              // Init(): no step machine
-        replaceMethod(M_checkGuideScene, (void *)&dummy_false);      // static bool
-        replaceMethod(M_isNewbieGame, (void *)&dummy_false);         // static bool
-    }
-    if (g_bypassRankLock) {
-        replaceMethod(M_checkFuncOpen, (void *)&dummy_true_i);       // bool (int)
-        replaceMethod(M_checkFuncUnlock, (void *)&dummy_true_ic);    // bool (int, Action)
-    }
-
-    // Swap happens while still in the lobby: the game is not inside Shoot() yet,
-    // so no thread can be executing the pointer being replaced.
-    g_aimHookOk = installAimHook();
-
-    NSLog(@"[MWM] armed netMap=%zu aim=%d", off_netPlayerMap, g_aimHookOk);
-    snprintf(g_diag, sizeof(g_diag), "Status: Armed (aim=%s)", g_aimHookOk ? "yes" : "no");
-    g_il2cppReady = YES;
-    return YES;
-}
-
 #pragma mark - Lifecycle
 
-static void tick(void) {
-    if (!g_apiResolved && !resolveApi()) {
-        @try { [[MWMUIManager shared] setupUI]; } @catch (NSException *e) { NSLog(@"[MWM] UI: %@", e); }
-        return;
-    }
-    if (g_il2cppReady) return;
-    void *d = i_domain_get();
-    if (!d) { snprintf(g_diag, sizeof(g_diag), "Status: domain null"); return; }
-    i_thread_attach(d);
-    if (resolveIl2Cpp()) NSLog(@"[MWM] ready");
-    @try { [[MWMUIManager shared] setupUI]; } @catch (NSException *e) { NSLog(@"[MWM] UI: %@", e); }
-}
-
-static void pollUntilArmed(int attempt) {
-    static BOOL running = NO;
-    if (attempt == 0) {
-        if (running) return;
-        running = YES;
-    }
-    int64_t delay = (attempt == 0) ? 2 * (int64_t)NSEC_PER_SEC : (int64_t)NSEC_PER_SEC;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay),
+__attribute__((constructor))
+static void cs_init(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            @try { tick(); } @catch (NSException *e) { NSLog(@"[MWM] tick: %@", e); }
-        }
-        // Keep going until the overlay exists: the app may still be inactive when
-        // the first few ticks run, and a single early failure must not be final.
-        BOOL uiReady = [MWMUIManager shared].host != nil;
-        if (!g_il2cppReady && attempt < 180) pollUntilArmed(attempt + 1);
-        else if (!uiReady && attempt < 400) pollUntilArmed(attempt + 1);
+        [[CSMenu shared] setup];
     });
 }
 
-static void onAppLaunched(CFNotificationCenterRef c, void *o, CFStringRef n,
-                          const void *obj, CFDictionaryRef info) {
-    (void)c; (void)o; (void)n; (void)obj; (void)info;
-    pollUntilArmed(0);
-}
-
-__attribute__((constructor)) static void mwm_entry(void) {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL, &onAppLaunched,
-                                    (__bridge CFStringRef)UIApplicationDidFinishLaunchingNotification,
-                                    NULL, CFNotificationSuspensionBehaviorDrop);
-    // TrollFools may inject into UnityFramework *after* didFinishLaunching already fired,
-    // in which case the notification above never arrives. Start polling immediately too;
-    // pollUntilArmed only retries until armed, so a double start is harmless.
-    pollUntilArmed(0);
-}
-
-#endif  // MWM_TWEAK_XM
+#endif
