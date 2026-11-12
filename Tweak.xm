@@ -107,7 +107,9 @@ static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action<uint
 //   NetManagerBase.NetPlayerMap              0x18
 static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
 static size_t off_playerCam, off_playerMovement, off_playerEquip;
-static size_t off_recoilAngles, off_forceAngle, off_downFire;
+static size_t off_recoilAngles, off_forceAngle, off_recoilEnabled, off_downFire, off_lookAngles;
+static size_t off_enableSmooth, off_rotationLerp;
+static size_t off_wpnShootAcc, off_wpnCurAcc;
 static size_t off_parachuteState;    // PlayerMovementFP.m_ParachuteState (0x1C8)
 
 // Aim-assist core (the game's own targeting path)
@@ -372,7 +374,7 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
 
 #define VTABLE_STRIDE 0x10        // VirtualInvokeData { methodPtr; method; }
 #define VTABLE_SCAN_LO 0x80
-#define VTABLE_SCAN_HI 0x400
+#define VTABLE_SCAN_HI 0x2000   // wide: header offset is il2cpp-version specific
 
 static BOOL miNameIs(void *mi, const char *want) {
     if (!mi) return NO;
@@ -386,13 +388,14 @@ static BOOL miNameIs(void *mi, const char *want) {
 // Anything else is skipped -- a wrong guess must be a no-op, never a wrong write.
 static char *findVtableEntry(void *klass, void *orig, const char *name) {
     if (!klass || !orig) return nullptr;
+    char *byName = nullptr, *byPtr = nullptr;
     for (size_t off = VTABLE_SCAN_LO; off < VTABLE_SCAN_HI; off += VTABLE_STRIDE) {
         char *e = (char *)klass + off;
         if (*(void **)e != orig) continue;
-        if (!miNameIs(*(void **)(e + 8), name)) continue;
-        return e;
+        if (!byPtr) byPtr = e;
+        if (!byName && miNameIs(*(void **)(e + 8), name)) { byName = e; break; }
     }
-    return nullptr;
+    return byName ? byName : byPtr;   // name match wins, pointer match is fallback
 }
 
 #pragma mark - Aimlock / recoil / parachute
@@ -465,6 +468,17 @@ static void applyParachuteControl(void) {
 static void tryAutoFire(void) {
     if (!g_autoFire || !g_aimlock || !g_aimHeadValid) return;
     if (fireButtonDown()) return;                       // user already firing
+
+    // Wall check on the *live* line of fire, not just the picker's camera ray.
+    // The picker can pass and the muzzle line still be blocked by cover the camera
+    // sees past, which is exactly the "auto shoot ignores walls" report.
+    if (g_wallcheck && MP(M_getPos) && MP(M_getTransform) && alive(g_lcam)) {
+        void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(g_lcam, M_getTransform);
+        if (alive(tr)) {
+            Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
+            if (vec3Finite(eye) && lineBlocked(eye, g_aimHead)) return;
+        }
+    }
     if (!alive(g_lcam)) return;
     void *player = nullptr;
     if (MP(M_lpmInstance)) {
@@ -485,13 +499,54 @@ static void tryAutoFire(void) {
 
 #pragma mark - Silent aim / recoil
 
-// Recoil angles sit on PlayerCamera and feed the camera every frame; zeroing them
-// from the display link is enough -- no hook, no code patching.
+// finalAngle = m_LookAngles + RecoilAngle + ForceAngle, computed inside
+// applyLookAngleFP from the fields below. Zeroing the fields is not enough on its
+// own: AddForceAngle also flips m_RecoilEnabled, and a late write races the shot.
+// Clearing the flag as well makes the contribution structurally impossible.
 static void applyNoRecoil(void) {
-    if (!g_noRecoil || !off_recoilAngles || !alive(g_lcam)) return;
-    *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){ 0.0f, 0.0f };
-    if (off_forceAngle)
-        *(Vec2 *)((char *)g_lcam + off_forceAngle) = (Vec2){ 0.0f, 0.0f };
+    if (!g_noRecoil || !alive(g_lcam)) return;
+    if (off_recoilAngles) *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){ 0.0f, 0.0f };
+    if (off_forceAngle)   *(Vec2 *)((char *)g_lcam + off_forceAngle)   = (Vec2){ 0.0f, 0.0f };
+    if (off_recoilEnabled) *(bool *)((char *)g_lcam + off_recoilEnabled) = false;
+}
+
+// Hard lock: drive PlayerCamera.m_LookAngles straight at the target head.
+//
+// applyLookAngleFP builds its rotation from m_LookAngles (+ recoil + force), and
+// the smoothing that made the assist feel slow lives in updateRotate/lerp paths,
+// not in this field. Writing the field each frame therefore snaps instantly and,
+// because it is the same input the game itself consumes, the shot direction and
+// the camera stay consistent.
+//
+// Also clears EnableSmooth / RotationLerpSpeed so no residual interpolation runs
+// between our write and the frame's rotation update.
+static void applyHardLock(void) {
+    if (!g_aimlock || !g_aimHeadValid) return;
+    if (!alive(g_lcam) || !off_lookAngles) return;
+    if (!MP(M_getTransform) || !MP(M_getPos)) return;
+
+    void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(g_lcam, M_getTransform);
+    if (!alive(tr)) return;
+    Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
+    if (!vec3Finite(eye)) return;
+
+    Vec3 head = g_aimHead;
+    float dx = head.x - eye.x;
+    float dy = head.y - eye.y;
+    float dz = head.z - eye.z;
+    float horiz = sqrtf(dx * dx + dz * dz);
+    if (!(horiz > 0.01f)) return;
+
+    Vec2 angles;
+    angles.x = -atan2f(dy, horiz) * (180.0f / 3.14159265f);   // pitch
+    angles.y = atan2f(dx, dz) * (180.0f / 3.14159265f);       // yaw
+    if (angles.x != angles.x || angles.y != angles.y) return;
+
+    *(Vec2 *)((char *)g_lcam + off_lookAngles) = angles;
+
+    // Kill any residual interpolation for this frame.
+    if (off_enableSmooth) *(bool *)((char *)g_lcam + off_enableSmooth) = false;
+    if (off_rotationLerp) *(float *)((char *)g_lcam + off_rotationLerp) = 1000.0f;
 }
 
 static void hk_createShootData(void *retstr, void *self, bool isTransform, void *method) {
@@ -500,9 +555,15 @@ static void hk_createShootData(void *retstr, void *self, bool isTransform, void 
 
     if (!retstr || !g_myNetId || !alive(self)) return;
 
-    // No bullet spread: `accurate` feeds Random.Range(-acc, acc) around shootDir.
-    // Zeroing it here removes the cone for every shot.
-    if (g_noSpread) *(float *)((char *)retstr + MSD_ACCURATE) = 0.0f;
+    // No bullet spread. `accurate` is what computerFireDirection feeds to
+    // Random.Range(-acc, acc), so zeroing the built struct is the authoritative
+    // fix -- the weapon's cached curAccurate/shootAccurate would only be copied in
+    // again on the next shot, which is why clearing them alone did nothing.
+    if (g_noSpread) {
+        *(float *)((char *)retstr + MSD_ACCURATE) = 0.0f;
+        if (off_wpnShootAcc) *(float *)((char *)self + off_wpnShootAcc) = 0.0f;   // 0x114
+        if (off_wpnCurAcc)   *(float *)((char *)self + off_wpnCurAcc)   = 0.0f;   // 0x110
+    }
 
     // Aimlock only while the fire button is actually held down.
     if (!g_aimlock || !g_aimHeadValid) return;
@@ -546,11 +607,15 @@ static BOOL installAimHook(void) {
     BOOL miOk = safeWritePtr(mi, (void *)&hk_createShootData);
     BOOL vtOk = patchVtableSlot(mi, orig, (void *)&hk_createShootData, "CreateShootData");
 
-    if (!miOk && !vtOk) {
+    // Verify by reading the slot back: a failed write must not report success,
+    // otherwise every feature silently degrades while claiming to be armed.
+    BOOL live = vtOk && MP(M_createShootData) == (void *)&hk_createShootData;
+    if (!live) {
         O_createShootData = nullptr;
+        NSLog(@"[MWM] aim hook NOT armed (mi=%d vtable=%d)", miOk, vtOk);
         return NO;
     }
-    NSLog(@"[MWM] aim hook mi=%d vtable=%d", miOk, vtOk);
+    NSLog(@"[MWM] aim hook armed (mi=%d vtable=%d)", miOk, vtOk);
     return YES;
 }
 
@@ -1008,6 +1073,7 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
         if (pickBestTargetHead(&head) && vec3Finite(head)) {
             g_aimHead = head;
             g_aimHeadValid = YES;
+            applyHardLock();          // snap the camera this frame
         }
     }
     tryAutoFire();
@@ -1167,8 +1233,12 @@ static BOOL resolveIl2Cpp(void) {
 
     // Recoil / force angle live on PlayerCamera; the parachute module on PlayerMovementFP.
     void *K_playerCam = i_class_from_name(game, "HQFPSTemplate", "PlayerCamera");
-    off_recoilAngles = fieldOff(K_playerCam, "m_RecoilAngles");   // 0x58
-    off_forceAngle   = fieldOff(K_playerCam, "m_ForceAngle");     // 0x64
+    off_recoilAngles  = fieldOff(K_playerCam, "m_RecoilAngles");   // 0x58
+    off_forceAngle    = fieldOff(K_playerCam, "m_ForceAngle");     // 0x64
+    off_recoilEnabled = fieldOff(K_playerCam, "m_RecoilEnabled");  // 0x60
+    off_lookAngles    = fieldOff(K_playerCam, "m_LookAngles");     // 0x50
+    off_enableSmooth  = fieldOff(K_playerCam, "EnableSmooth");     // 0x84
+    off_rotationLerp  = fieldOff(K_playerCam, "RotationLerpSpeed");// 0x90
 
     void *K_moveFP = i_class_from_name(game, "HQFPSTemplate", "PlayerMovementFP");
     off_parachuteState = fieldOff(K_moveFP, "m_ParachuteState");  // 0x1C8
@@ -1179,6 +1249,8 @@ static BOOL resolveIl2Cpp(void) {
     void *K_projWeapon = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
     M_createShootData = methodOf(K_projWeapon, "CreateShootData", 1);
     M_shoot           = methodOf(K_projWeapon, "Shoot", 0);
+    off_wpnShootAcc   = fieldOff(K_projWeapon, "shootAccurate");  // 0x114
+    off_wpnCurAcc     = fieldOff(K_projWeapon, "curAccurate");    // 0x110
 
     // Wall check uses the game's own assist masks so the answer matches the engine.
     void *K_physics = i_class_from_name(core, "UnityEngine", "Physics");
