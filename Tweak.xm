@@ -53,6 +53,7 @@ static FieldInfo *(*i_class_get_field_from_name)(Il2CppClass *, const char *);
 static size_t (*i_field_get_offset)(FieldInfo *);
 static Il2CppObject *(*i_runtime_invoke)(MethodInfo *, void *, void **, void **);
 static void (*i_field_get_value)(Il2CppObject *, FieldInfo *, void *);
+static void (*i_field_static_get_value)(FieldInfo *, void *);
 static Il2CppClass *(*i_class_get_parent)(Il2CppClass *);
 static void *(*i_method_get_param)(MethodInfo *, uint32_t);
 static char *(*i_type_get_name)(void *);
@@ -60,7 +61,119 @@ static MethodInfo *(*i_class_get_methods)(Il2CppClass *, void **);
 static const char *(*i_method_get_name)(MethodInfo *);
 static uint32_t (*i_method_get_param_count)(MethodInfo *);
 
-#define BIND(sym) do { *(void **)(&i_##sym) = dlsym(RTLD_DEFAULT, "_il2cpp_" #sym); \
+// UnityFramework is loaded by the app with RTLD_LOCAL, so its exported il2cpp_* symbols
+// are not visible to dlsym(RTLD_DEFAULT) from an injected dylib — that is the "not IL2CPP"
+// status. Resolve in two stages:
+//   1. dlsym(RTLD_DEFAULT) for a jailbreak-style global load,
+//   2. else dlopen the already-loaded UnityFramework image by path, which returns the
+//      existing handle and makes its exports visible to dlsym.
+//   3. else scan loaded images with _dyld_get_image_header for the one whose __TEXT
+//      contains the IL2CPP marker and resolve by symbol-table lookup on that image.
+
+// This UnityFramework build declares 241 `_il2cpp_*` symbols in LC_SYMTAB but the
+// LC_DYLD_EXPORTS_TRIE contains a single empty entry, so the symbols are NOT exported:
+// dlsym() can never find them, on any handle, global or not. That is the real cause of
+// "Status: not IL2CPP". Resolve by walking the in-memory Mach-O of the loaded image:
+//   __mh_execute_header + slide -> LC_SEGMENT_64 (find __TEXT vmaddr/slide)
+//   -> LC_SYMTAB -> nlist_64[] (string table indices) -> value + slide.
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach-o/dyld.h>
+
+static const struct mach_header_64 *g_ufHeader = NULL;
+static char g_ufPath[1024] = {0};
+static uint64_t g_ufTextVMAddr = 0;
+static const char *g_ufStrTab = NULL;
+static const struct nlist_64 *g_ufSymTab = NULL;
+static uint32_t g_ufNSyms = 0;
+
+// LC_SYMTAB stores *file* offsets. In this image __LINKEDIT has fileoff 0x9024000 but
+// vmaddr 0x943C000, so `header + symoff` lands in the wrong, already-mapped region and
+// every lookup silently misses. Convert file offset -> vm address through the segment
+// table before dereferencing.
+static const char *uf_ptr_for_fileoff(const struct mach_header_64 *h, uint32_t fileoff) {
+    const char *cmdPtr = (const char *)(h + 1);
+    for (uint32_t c = 0; c < h->ncmds; c++) {
+        const struct load_command *lc = (const struct load_command *)cmdPtr;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (fileoff >= seg->fileoff && fileoff < seg->fileoff + seg->filesize) {
+                uint64_t vm = seg->vmaddr + (fileoff - seg->fileoff);
+                return (const char *)((uintptr_t)h - (uintptr_t)g_ufTextVMAddr + (uintptr_t)vm);
+            }
+        }
+        cmdPtr += lc->cmdsize;
+    }
+    return NULL;
+}
+
+static BOOL locateUnityFramework(void) {
+    if (g_ufHeader) return YES;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "UnityFramework")) continue;
+
+        const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+        const struct symtab_command *symcmd = NULL;
+        uint64_t textVM = 0;
+        const char *cmdPtr = (const char *)(h + 1);
+        for (uint32_t c = 0; c < h->ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)cmdPtr;
+            if (lc->cmd == LC_SYMTAB) symcmd = (const struct symtab_command *)lc;
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if (seg->fileoff == 0) textVM = seg->vmaddr;      // __TEXT
+            }
+            cmdPtr += lc->cmdsize;
+        }
+        if (!symcmd) continue;
+
+        g_ufHeader = h;
+        strncpy(g_ufPath, name, sizeof(g_ufPath) - 1);
+        g_ufTextVMAddr = textVM;
+        g_ufSymTab = (const struct nlist_64 *)uf_ptr_for_fileoff(h, symcmd->symoff);
+        g_ufStrTab = uf_ptr_for_fileoff(h, symcmd->stroff);
+        g_ufNSyms  = symcmd->nsyms;
+        if (!g_ufSymTab || !g_ufStrTab) { g_ufHeader = NULL; continue; }
+        return YES;
+    }
+    return NO;
+}
+
+static void *resolveIl2cppSym(const char *name) {
+    // Symbols ARE exported (35,358 entries in LC_DYLD_EXPORTS_TRIE, 241 of them
+    // _il2cpp_*). The only trap: dlsym() takes the C name *without* the Mach-O
+    // leading underscore, i.e. dlsym("il2cpp_domain_get") finds "_il2cpp_domain_get".
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+
+    // RTLD_DEFAULT only covers the global scope; if UnityFramework was loaded with
+    // RTLD_LOCAL, dlopen its real path from the dyld image list and resolve there.
+    if (!locateUnityFramework()) return NULL;
+    void *h = dlopen(g_ufPath, RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen(g_ufPath, RTLD_NOW);
+    if (h) { p = dlsym(h, name); if (p) return p; }
+
+    // Last resort: the in-memory LC_SYMTAB. n_value is a link-time VM address; textBase
+    // already carries the dyld slide, so adding slide again would double it.
+    const uintptr_t textBase = (uintptr_t)g_ufHeader - (uintptr_t)g_ufTextVMAddr;
+    for (uint32_t i = 0; i < g_ufNSyms; i++) {
+        const struct nlist_64 *nl = &g_ufSymTab[i];
+        uint32_t strx = nl->n_un.n_strx;
+        if (!strx || strx >= 0x7FFFFFFF) continue;
+        // Symtab entries keep the leading underscore.
+        const char *symName = g_ufStrTab + strx;
+        if (symName[0] != '_' || strcmp(symName + 1, name) != 0) continue;
+        if ((nl->n_type & N_TYPE) != N_SECT || !nl->n_value) continue;
+        return (void *)(textBase + (uintptr_t)nl->n_value);
+    }
+    return NULL;
+}
+
+#define BIND(sym) do { *(void **)(&i_##sym) = resolveIl2cppSym("il2cpp_" #sym); \
                        if (!i_##sym) { diag(@"missing _il2cpp_" #sym); return NO; } } while (0)
 
 #pragma mark - Diagnostics
@@ -76,7 +189,7 @@ static BOOL g_ready = NO;
 static Il2CppClass *K_DataManager, *K_GameManager, *K_GameSaveManager;
 static Il2CppClass *K_GameData, *K_AssetManager;
 
-static MethodInfo *M_dmInstance, *M_gmInstance, *M_gsmInstance, *M_amInstance;
+static MethodInfo *M_gmInstance;
 static MethodInfo *M_gsmCloudSave, *M_gmCloudSave, *M_gmSaveToServer;
 static MethodInfo *M_saveHackFlag, *M_saveSkipHack, *M_saveHackSend;
 static MethodInfo *M_addGold, *M_addEnergy, *M_addGem, *M_addCoin, *M_addPlayPoint;
@@ -90,7 +203,7 @@ static MethodInfo *M_addTheme, *M_addLamp, *M_addBgm, *M_addGuest, *M_addEventPl
 static MethodInfo *M_addWorkSkin, *M_addSignSkin, *M_addTimerSkin, *M_addBalloonSkin;
 static MethodInfo *M_getReward;
 static MethodInfo *M_addTutorialFinish, *M_addPhotoOutline, *M_addPhotoSticker;
-static MethodInfo *M_addUserProfileFrame, *M_addRewardDecoBlock;
+static MethodInfo *M_addRewardDecoBlock;
 static MethodInfo *M_saveEquipData, *M_applyEquipExp, *M_savePurchase;
 static MethodInfo *M_collectionRecv, *M_collectionCan, *M_collectionAdd;
 static MethodInfo *M_consumeMoney;
@@ -125,13 +238,21 @@ static inline void *listAt(void *list, int i) {
 
 #pragma mark - Reflection helpers
 
-// Generic base classes (Singleton<T>, ManagerBase<T>, MonoSingleton<T>) declare the
-// static get_Instance; the derived concrete class inherits it. class_get_method_from_name
-// does not walk the parent chain here, so do it explicitly.
-static MethodInfo *findInstanceGetter(Il2CppClass *k) {
+// get_Instance() lives on the *generic* base (Singleton<T> / ManagerBase<T> /
+// MonoSingleton<T>). The MethodInfo reachable from a concrete class belongs to the
+// generic definition, and runtime_invoke on it returns garbage — that is why no feature
+// ever did anything. Read the static backing field of the inflated base instead:
+//   Singleton<T>     -> private  static T instance
+//   MonoSingleton<T> -> protected static T _instance
+//   ManagerBase<T>   -> private  static T <Instance>k__BackingField
+static void *staticInstance(Il2CppClass *k, const char *fieldName) {
+    if (!k || !fieldName) return NULL;
     for (Il2CppClass *c = k; c; c = i_class_get_parent(c)) {
-        MethodInfo *m = i_class_get_method_from_name(c, "get_Instance", 0);
-        if (m) return m;
+        FieldInfo *f = i_class_get_field_from_name(c, fieldName);
+        if (!f) continue;
+        void *out = NULL;
+        i_field_static_get_value(f, &out);
+        if (out) return out;
     }
     return NULL;
 }
@@ -183,7 +304,16 @@ static Il2CppImage *locateGameImage(void) {
 
 static BOOL resolveIl2Cpp(void) {
     if (g_ready) return YES;
-    if (!dlsym(RTLD_DEFAULT, "_il2cpp_domain_get")) { diag(@"not IL2CPP"); return NO; }
+    // A failing resolve walks the whole LC_SYMTAB (24k entries); doing that on every tap
+    // blocks the main thread and makes the menu look dead. Retry at most every 3 s.
+    static uint64_t lastTry = 0;
+    uint64_t now = (uint64_t)([NSDate date].timeIntervalSince1970 * 1000.0);
+    if (lastTry && now - lastTry < 3000) return NO;
+    lastTry = now;
+    // Do NOT probe with dlsym here: this image exports nothing (its LC_DYLD_EXPORTS_TRIE
+    // holds one empty entry) while 241 _il2cpp_* symbols live in LC_SYMTAB, so only
+    // resolveIl2cppSym() can find them.
+    if (!resolveIl2cppSym("il2cpp_domain_get")) { diag(@"not IL2CPP"); return NO; }
 
     BIND(domain_get);
     BIND(thread_attach);
@@ -195,6 +325,7 @@ static BOOL resolveIl2Cpp(void) {
     BIND(field_get_offset);
     BIND(runtime_invoke);
     BIND(field_get_value);
+    BIND(field_static_get_value);
     BIND(class_get_parent);
     BIND(method_get_param);
     BIND(type_get_name);
@@ -235,13 +366,9 @@ static BOOL resolveIl2Cpp(void) {
 
     // Singleton instance getters. The static getter is declared on the generic base
     // (Singleton<T> / ManagerBase<T> / MonoSingleton<T>), so walk the parent chain.
-    M_dmInstance  = findInstanceGetter(K_DataManager);
-    M_gmInstance  = findInstanceGetter(K_GameManager);
-    if (K_AssetManager)    M_amInstance  = findInstanceGetter(K_AssetManager);
-    if (K_GameSaveManager) {
-        M_gsmInstance  = findInstanceGetter(K_GameSaveManager);
-        M_gsmCloudSave = i_class_get_method_from_name(K_GameSaveManager, "CloudSave", 0);
-    }
+    // GameManager declares a non-generic get_Instance (0x2B0D710) that is safe to
+    // invoke; the other managers only expose the generic-base getter, so their
+    // instances come from staticInstance().
 
     M_gmCloudSave    = i_class_get_method_from_name(K_GameManager, "CloudSave", 1);        // 0x2B1DF70
     M_gmSaveToServer = i_class_get_method_from_name(K_GameManager, "SaveDataToServer", 1); // 0x2B21714
@@ -295,7 +422,6 @@ static BOOL resolveIl2Cpp(void) {
     M_addTutorialFinish= i_class_get_method_from_name(K_DataManager, "AddTutorialFinish", 1);
     M_addPhotoOutline  = i_class_get_method_from_name(K_DataManager, "AddPhotoOutline", 1);
     M_addPhotoSticker  = i_class_get_method_from_name(K_DataManager, "AddPhotoSticker", 1);
-    M_addUserProfileFrame = i_class_get_method_from_name(K_DataManager, "AddUserProfileFrameImage", 1);
     M_addRewardDecoBlock  = i_class_get_method_from_name(K_DataManager, "AddRewardDecoBlock", 3);
     M_getReward        = i_class_get_method_from_name(K_DataManager, "GetReward", 9);
     M_collectionRecv   = i_class_get_method_from_name(K_DataManager, "ReceiveCollectionReward", 1);
@@ -317,9 +443,13 @@ static BOOL resolveIl2Cpp(void) {
 
 #pragma mark - Accessors
 
-static void *dm(void) { return (g_ready && M_dmInstance) ? i_runtime_invoke(M_dmInstance, NULL, NULL, NULL) : NULL; }
+static void *gmInstance(void) {
+    if (!g_ready || !M_gmInstance) return NULL;
+    return i_runtime_invoke(M_gmInstance, NULL, NULL, NULL);
+}
+static void *dm(void) { return staticInstance(K_DataManager, "instance"); }
 static void *gd(void) { void *d = dm(); return d ? rd(d, off_mGameData) : NULL; }
-static void *am(void) { return (g_ready && M_amInstance) ? i_runtime_invoke(M_amInstance, NULL, NULL, NULL) : NULL; }
+static void *am(void) { return staticInstance(K_AssetManager, "<Instance>k__BackingField"); }
 
 // Entity_*.list at +0x18 inside each ScriptableObject referenced by AssetManager.
 static void *entityList(const char *assetField) {
@@ -339,6 +469,9 @@ static void *entityList(const char *assetField) {
 // Both flags have dedicated savers, so the state persists across restarts exactly the
 // way the game persists it.
 static void applyAntiCheatBypass(void) {
+    // Called straight from a UISwitch action, i.e. on the main thread, which is not an
+    // il2cpp-attached thread until resolveIl2Cpp() has run. Ensure both.
+    if (!resolveIl2Cpp()) return;
     void *g = gd();
     void *d = dm();
     if (!g || !d) return;
@@ -363,6 +496,7 @@ static void guardTick(void) {
     uint64_t t = nowMs();
     if (t - g_lastGuard < 1000) return;
     g_lastGuard = t;
+    if (!g_ready) return;              // domain not attached yet
     void *g = gd();
     if (!g) return;
     if (g_bypassAC) {
@@ -590,17 +724,27 @@ static void addAllMisc(void) {
         i_runtime_invoke(M_addEventPlace, d, a, NULL);
     }
 
-    // Tutorial gates unlock the feature buttons themselves.
+    // Photo book / profile cosmetics have real Entity_* tables, so enumerate them
+    // instead of guessing id ranges (a blind 0..400 loop is both slow and mostly wrong).
+    list = entityList("asset_photoOutline");
+    for (int i = 0, n = listCount(list); i < n && M_addPhotoOutline; i++) {
+        id = paramId(listAt(list, i));
+        if (id > 0) { void *a[1] = { &id }; i_runtime_invoke(M_addPhotoOutline, d, a, NULL); }
+    }
+    list = entityList("asset_photoSticker");
+    for (int i = 0, n = listCount(list); i < n && M_addPhotoSticker; i++) {
+        id = paramId(listAt(list, i));
+        if (id > 0) { void *a[1] = { &id }; i_runtime_invoke(M_addPhotoSticker, d, a, NULL); }
+    }
+
+    // Tutorial flags are dense small ints; 64 covers every shipped step. This is the
+    // only remaining range loop and it is bounded and cheap.
     if (M_addTutorialFinish) {
-        for (int32_t t = 0; t < 400; t++) {
+        for (int32_t t = 0; t < 64; t++) {
             void *a[1] = { &t };
             i_runtime_invoke(M_addTutorialFinish, d, a, NULL);
         }
     }
-    // Photo book / profile cosmetics have no asset list of their own.
-    if (M_addPhotoOutline) for (int32_t t = 0; t < 200; t++) { void *a[1] = { &t }; i_runtime_invoke(M_addPhotoOutline, d, a, NULL); }
-    if (M_addPhotoSticker) for (int32_t t = 0; t < 400; t++) { void *a[1] = { &t }; i_runtime_invoke(M_addPhotoSticker, d, a, NULL); }
-    if (M_addUserProfileFrame) for (int32_t t = 0; t < 200; t++) { void *a[1] = { &t }; i_runtime_invoke(M_addUserProfileFrame, d, a, NULL); }
 }
 
 static void addAllTowerProps(void) {
@@ -618,10 +762,17 @@ static void addAllTowerProps(void) {
 
 static void addAllForestDeco(void) {
     void *d = dm();
-    if (!M_addRewardDecoBlock) return;
-    for (int32_t i = 1; i <= 200; i++) {
-        int32_t cnt = 99, reason = 0;
-        void *a[3] = { &i, &cnt, &reason };
+    if (!d || !M_addRewardDecoBlock) return;
+    // Enumerate Entity_BlockReward (AssetManager+0x2A8) instead of a blind 1..200 scan:
+    // unknown deco ids are rejected by the game anyway, so the scan only wasted cycles.
+    void *list = entityList("asset_BlockReward");
+    int n = listCount(list);
+    int32_t reason = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t id = paramId(listAt(list, i));
+        if (id <= 0) continue;
+        int32_t cnt = 99;
+        void *a[3] = { &id, &cnt, &reason };
         i_runtime_invoke(M_addRewardDecoBlock, d, a, NULL);
     }
 }
@@ -774,6 +925,7 @@ static BOOL freeConsume(void *self, int32_t moneyType, int32_t value, BOOL add,
 }
 
 static void setFreeShop(BOOL on) {
+    if (!resolveIl2Cpp()) return;
     if (!M_consumeMoney) return;
     if (on) {
         if (g_consumeOrig) return;
@@ -796,6 +948,7 @@ static void setFreeShop(BOOL on) {
 // inserting it via PurchaseSuccess is the same path the store would take and it survives
 // cloud sync.
 static void grantRemoveAds(void) {
+    if (!resolveIl2Cpp()) return;
     void *d = dm();
     if (!d) return;
     MethodInfo *m = findMethodTyped(K_DataManager, "PurchaseSuccess", 2, 0, "System.Int32");
@@ -818,49 +971,60 @@ static void grantRemoveAds(void) {
 #pragma mark - Cloud save
 
 static void pushSave(BOOL toServer) {
-    void *gsm = (g_ready && M_gsmInstance) ? i_runtime_invoke(M_gsmInstance, NULL, NULL, NULL) : NULL;
+    void *gsm = staticInstance(K_GameSaveManager, "<Instance>k__BackingField");
     if (gsm && M_gsmCloudSave) i_runtime_invoke(M_gsmCloudSave, gsm, NULL, NULL);
-    void *gm = (g_ready && M_gmInstance) ? i_runtime_invoke(M_gmInstance, NULL, NULL, NULL) : NULL;
+    void *gm = gmInstance();
     if (gm && M_gmCloudSave) { BOOL force = YES; void *a[1] = { &force }; i_runtime_invoke(M_gmCloudSave, gm, a, NULL); }
     if (toServer && gm && M_gmSaveToServer) { BOOL purchase = NO; void *a[1] = { &purchase }; i_runtime_invoke(M_gmSaveToServer, gm, a, NULL); }
 }
 
 #pragma mark - Menu
 
-@interface CSMenuView : UIScrollView
+// Container: a fixed header that is the drag grip, plus an inner UIScrollView that owns
+// the controls. The grip must NOT live inside the scroll view — a pan gesture attached to
+// a subview of a UIScrollView still competes with the scroll view's own pan recognizer,
+// which is why dragging anywhere near the top scrolled the panel instead of the list.
+@interface CSMenuView : UIView
+@property (readonly) UIView *grip;
+@property (readonly) UIScrollView *scroller;
 @end
 
 @implementation CSMenuView {
     UILabel *_status;
     CGFloat _y;
+    UIScrollView *_scroller;
 }
+@synthesize grip = _grip;
+@synthesize scroller = _scroller;
+
+- (CGFloat)innerWidth { return self.frame.size.width - 28; }
 
 - (UILabel *)line:(NSString *)t size:(CGFloat)s color:(UIColor *)c height:(CGFloat)h {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y, self.frame.size.width - 28, h)];
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y, [self innerWidth], h)];
     l.text = t; l.font = [UIFont systemFontOfSize:s]; l.textColor = c;
     l.numberOfLines = 0;
-    [self addSubview:l]; _y += h + 2;
+    [_scroller addSubview:l]; _y += h + 2;
     return l;
 }
 - (UIButton *)btn:(NSString *)t sel:(SEL)s color:(UIColor *)c {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(14, _y, self.frame.size.width - 28, 34);
+    b.frame = CGRectMake(14, _y, [self innerWidth], 34);
     b.backgroundColor = c; b.layer.cornerRadius = 8;
     [b setTitle:t forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:b]; _y += 40;
+    [_scroller addSubview:b]; _y += 40;
     return b;
 }
 - (void)sw:(NSString *)t sel:(SEL)s on:(BOOL)on {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y + 4, self.frame.size.width - 84, 24)];
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y + 4, [self innerWidth] - 56, 24)];
     l.text = t; l.font = [UIFont systemFontOfSize:13]; l.textColor = [UIColor whiteColor];
-    [self addSubview:l];
+    [_scroller addSubview:l];
     UISwitch *v = [[UISwitch alloc] initWithFrame:CGRectMake(self.frame.size.width - 66, _y, 51, 31)];
     v.on = on;
     [v addTarget:self action:s forControlEvents:UIControlEventValueChanged];
-    [self addSubview:v];
+    [_scroller addSubview:v];
     _y += 38;
 }
 
@@ -871,16 +1035,41 @@ static void pushSave(BOOL toServer) {
     self.layer.cornerRadius = 14; self.layer.borderWidth = 1;
     self.layer.borderColor = [UIColor colorWithRed:0.3 green:0.75 blue:0.45 alpha:0.8].CGColor;
     self.layer.masksToBounds = YES;
-    self.showsVerticalScrollIndicator = YES;
-    _y = 12;
 
-    UILabel *t = [self line:@"CATS & SOUP — MENU" size:16 color:[UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1] height:22];
+    // --- fixed header: the only drag surface ---
+    const CGFloat headerH = 40.0;
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, fr.size.width, headerH)];
+    header.backgroundColor = [UIColor colorWithRed:0.10 green:0.12 blue:0.16 alpha:1.0];
+    header.userInteractionEnabled = YES;
+    [self addSubview:header];
+    _grip = header;
+
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, fr.size.width - 16, headerH)];
+    t.text = @"CATS & SOUP — MENU";
+    t.font = [UIFont boldSystemFontOfSize:15];
+    t.textColor = [UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1];
     t.textAlignment = NSTextAlignmentCenter;
+    t.userInteractionEnabled = NO;
+    [header addSubview:t];
+
+    // --- scrollable body: owns every control and its own pan recognizer ---
+    _scroller = [[UIScrollView alloc] initWithFrame:CGRectMake(0, headerH, fr.size.width, fr.size.height - headerH)];
+    _scroller.showsVerticalScrollIndicator = YES;
+    _scroller.showsHorizontalScrollIndicator = NO;
+    _scroller.alwaysBounceVertical = YES;
+    // Default YES: a drag is claimed by the scroll view (so the list scrolls) while a
+    // quick tap still reaches the button. Setting this to NO is what made the panel
+    // impossible to scroll — every touch went straight to a control.
+    _scroller.delaysContentTouches = YES;
+    _scroller.canCancelContentTouches = YES;
+    [self addSubview:_scroller];
+
+    _y = 10;
     _status = [self line:@"Status: opening" size:10 color:[UIColor colorWithWhite:0.65 alpha:1] height:28];
 
-    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(14, _y, fr.size.width - 28, 1)];
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(14, _y, [self innerWidth], 1)];
     div.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
-    [self addSubview:div]; _y += 10;
+    [_scroller addSubview:div]; _y += 10;
 
     [self sw:@"Bypass Anti-Cheat"     sel:@selector(ac:) on:g_bypassAC];
     [self sw:@"Tiền tệ không tuột"    sel:@selector(nf:) on:g_noFall];
@@ -913,24 +1102,37 @@ static void pushSave(BOOL toServer) {
     _y += 8;
     [self btn:@"Đóng" sel:@selector(closeTap) color:[UIColor colorWithRed:0.58 green:0.2 blue:0.2 alpha:0.9]];
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
-    pan.cancelsTouchesInView = NO;
-    [self addGestureRecognizer:pan];
-
-    self.contentSize = CGSizeMake(fr.size.width, _y + 40);
-    self.alwaysBounceVertical = YES;
+    _scroller.contentSize = CGSizeMake(fr.size.width, _y + 30);
     return self;
 }
 
 - (void)ac:(UISwitch *)s { g_bypassAC = s.isOn; if (s.isOn) applyAntiCheatBypass(); }
-- (void)nf:(UISwitch *)s { g_noFall = s.isOn; if (s.isOn) applyAntiCheatBypass(); }
+- (void)nf:(UISwitch *)s { g_noFall = s.isOn; if (s.isOn) applyAntiCheatBypass(); guardTick(); }
 - (void)fs:(UISwitch *)s { g_freeShop = s.isOn; setFreeShop(s.isOn); }
 - (void)ad:(UISwitch *)s { g_noAds = s.isOn; if (s.isOn) grantRemoveAds(); }
 
+// Bulk operations touch hundreds of objects and each Add* performs an ES3 write plus a
+// V4 hash recompute. Running that synchronously inside a UI action freezes the main
+// thread for seconds (and the watchdog can kill the app), which is why the buttons
+// looked dead. Run the work on a background thread with the il2cpp thread attached and
+// marshal only the status text back.
 - (void)run:(NSString *)name work:(void (^)(void))blk {
-    if (!resolveIl2Cpp()) { _status.text = [NSString stringWithFormat:@"Status: %s", g_diag]; return; }
-    blk();
-    _status.text = [NSString stringWithFormat:@"OK: %@", name];
+    // Reflection lookups and the first il2cpp touch must stay on the main thread.
+    if (!resolveIl2Cpp()) {
+        _status.text = [NSString stringWithFormat:@"ERR %s", g_diag];
+        return;
+    }
+    // ES3 (_esFile) and the FixedSizeList rings are not thread-safe, so bulk work runs
+    // on one dedicated serial queue rather than the global pool: still off the main
+    // thread (the UI stays responsive), but never two bulk ops at once.
+    static dispatch_queue_t bulkQ; static dispatch_once_t onceQ;
+    dispatch_once(&onceQ, ^{ bulkQ = dispatch_queue_create("catsoup.bulk", 0); });
+    _status.text = [NSString stringWithFormat:@"... %@", name];
+    dispatch_async(bulkQ, ^{
+        @autoreleasepool { blk(); }
+        NSString *msg = [NSString stringWithFormat:@"OK: %@", name];
+        dispatch_async(dispatch_get_main_queue(), ^{ self->_status.text = msg; });
+    });
 }
 - (void)a1 { [self run:@"full currency" work:^{ fillCurrency(); }]; }
 - (void)a2 { [self run:@"full tickets"  work:^{ fillTickets(); }]; }
@@ -948,15 +1150,37 @@ static void pushSave(BOOL toServer) {
 - (void)d1 { [self run:@"cloud save"    work:^{ pushSave(NO); }]; }
 - (void)d2 { [self run:@"server save"   work:^{ pushSave(YES); }]; }
 - (void)closeTap { self.hidden = YES; }
-- (void)pan:(UIPanGestureRecognizer *)p {
-    CGPoint t = [p translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + t.x, self.center.y + t.y);
-    [p setTranslation:CGPointZero inView:self.superview];
+@end
+
+// Dedicated overlay window. Attaching our views to the game's own UIWindow is what made
+// the panel unresponsive: Unity's view sits above and claims the pan gestures, and a
+// re-parent on the game's window churn keeps cancelling in-flight scrolls. A window of
+// its own at a higher level, whose hitTest returns nil outside our two views, lets every
+// other touch fall straight through to the game.
+@interface CSOverlayWindow : UIWindow
+@property (retain) UIView *fab;
+@property (retain) UIView *panel;
+@end
+
+@implementation CSOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(id)event {
+    if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
+    UIView *cands[2] = { self.panel, self.fab };
+    for (int i = 0; i < 2; i++) {
+        UIView *v = cands[i];
+        if (!v || v.hidden || !v.userInteractionEnabled) continue;
+        CGPoint p = [self convertPoint:point toView:v];
+        if ([v pointInside:p withEvent:event]) {
+            UIView *hit = [v hitTest:p withEvent:event];
+            if (hit) return hit;
+        }
+    }
+    return nil;   // pass through to the game
 }
 @end
 
 @interface CSMenu : NSObject
-@property (retain) UIWindow *host;
+@property (retain) CSOverlayWindow *host;
 @property (retain) UIButton *fab;
 @property (retain) CSMenuView *panel;
 @property (retain) CADisplayLink *link;
@@ -968,47 +1192,78 @@ static void pushSave(BOOL toServer) {
     dispatch_once(&once, ^{ i = [CSMenu new]; });
     return i;
 }
-- (UIWindow *)hostWindow {
-    UIWindow *w = [UIApplication sharedApplication].keyWindow;
-    if (w && !w.hidden) return w;
-    UIWindow *best = nil;
-    for (UIWindow *c in [UIApplication sharedApplication].windows) {
-        if (c.hidden || c.windowLevel > 1.0) continue;
-        if (!best || c.windowLevel < best.windowLevel) best = c;
+- (void)attach {
+    if (!self.host) {
+        CGRect scr = [UIScreen mainScreen].bounds;
+        CSOverlayWindow *w = [[CSOverlayWindow alloc] initWithFrame:scr];
+        w.backgroundColor = [UIColor clearColor];
+        w.windowLevel = UIWindowLevelStatusBar + 100.0;
+        w.userInteractionEnabled = YES;
+        self.host = w;
+        [w makeKeyAndVisible];
+        if (self.fab)   { [w addSubview:self.fab];   w.fab = self.fab; }
+        if (self.panel) { [w addSubview:self.panel]; w.panel = self.panel; }
+        return;
     }
-    return best;
+    // Only re-seat if iOS actually tore the views down; never re-add on a timer.
+    if (self.fab && self.fab.superview != self.host) {
+        [self.host addSubview:self.fab];
+        self.host.fab = self.fab;
+    }
+    if (self.panel && self.panel.superview != self.host) {
+        CGPoint off = self.panel.scroller.contentOffset;
+        [self.host addSubview:self.panel];
+        self.host.panel = self.panel;
+        self.panel.scroller.contentOffset = off;
+    }
 }
+
 - (void)setup {
-    UIWindow *w = [self hostWindow];
-    if (!w) return;
-    self.host = w;
+
     if (!self.fab) {
         self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
         self.fab.frame = CGRectMake(18, 110, 46, 46);
         self.fab.backgroundColor = [UIColor colorWithRed:0.15 green:0.65 blue:0.35 alpha:0.85];
-        self.fab.layer.cornerRadius = 23; self.fab.layer.borderWidth = 1.5;
+        self.fab.layer.cornerRadius = 23;
+        self.fab.layer.borderWidth = 1.5;
         self.fab.layer.borderColor = [UIColor whiteColor].CGColor;
         [self.fab setTitle:@"CS" forState:UIControlStateNormal];
+        [self.fab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:15];
         [self.fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
-        [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
-        [w addSubview:self.fab];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
+        [self.fab addGestureRecognizer:pan];
     }
     if (!self.panel) {
         self.panel = [[CSMenuView alloc] initWithFrame:CGRectMake(26, 96, 292, 610)];
         self.panel.hidden = YES;
-        [w addSubview:self.panel];
+        // Drag handle: the title bar only, so the scroll view keeps its own pan.
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragPanel:)];
+        pan.cancelsTouchesInView = YES;
+        [self.panel.grip addGestureRecognizer:pan];
     }
-    if (self.fab.superview != w) { [w addSubview:self.fab]; [w addSubview:self.panel]; }
+    [self attach];
+    [self.host bringSubviewToFront:self.panel];
+    [self.host bringSubviewToFront:self.fab];
     if (!self.link) {
         self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
         [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
 }
-- (void)tick { guardTick(); }
+- (void)tick {
+    guardTick();
+    // Our window is independent of the game's, so nothing here can cancel a scroll mid-drag.
+    if (!self.panel.window || !self.fab.window) [self attach];
+    else if (self.host.hidden) self.host.hidden = NO;   // iOS un-hides stolen key windows
+}
+- (void)dragPanel:(UIPanGestureRecognizer *)p {
+    CGPoint t = [p translationInView:self.panel.superview];
+    self.panel.center = CGPointMake(self.panel.center.x + t.x, self.panel.center.y + t.y);
+    [p setTranslation:CGPointZero inView:self.panel.superview];
+}
 - (void)toggle {
     self.panel.hidden = !self.panel.hidden;
-    if (!self.panel.hidden) [self.panel.superview bringSubviewToFront:self.panel];
+    if (!self.panel.hidden) [self.host bringSubviewToFront:self.panel];
 }
 - (void)drag:(UIPanGestureRecognizer *)p {
     CGPoint t = [p translationInView:self.fab.superview];
