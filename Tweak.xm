@@ -73,16 +73,10 @@ static void diag(NSString *m) { snprintf(g_diag, sizeof(g_diag), "%s", m.UTF8Str
 static Il2CppImage *g_img = NULL;
 static BOOL g_ready = NO;
 
-static Il2CppClass *K_DataManager, *K_GameManager, *K_GameSaveManager, *K_ServerManager;
+static Il2CppClass *K_DataManager, *K_GameManager, *K_GameSaveManager;
 static Il2CppClass *K_GameData, *K_AssetManager;
-static Il2CppClass *K_EntityWork, *K_EntityEquip, *K_EntityFurniture, *K_EntityCatType;
-static Il2CppClass *K_EntityTheme, *K_EntityBGM, *K_EntityLamp, *K_EntityGuest, *K_EntityEventPlace;
-static Il2CppClass *K_EntityShop, *K_EntityCollection, *K_EntityAbility;
-static Il2CppClass *K_EntityWorkSkin, *K_EntitySignSkin, *K_EntityTimerSkin, *K_EntityBalloonSkin;
-static Il2CppClass *K_EntitySoupPassReward, *K_EntityMontlyPass, *K_EntityEventSeasonPass;
-static Il2CppClass *K_EntityTowerProp;
 
-static MethodInfo *M_dmInstance, *M_gmInstance, *M_gsmInstance, *M_smInstance, *M_amInstance;
+static MethodInfo *M_dmInstance, *M_gmInstance, *M_gsmInstance, *M_amInstance;
 static MethodInfo *M_gsmCloudSave, *M_gmCloudSave, *M_gmSaveToServer;
 static MethodInfo *M_saveHackFlag, *M_saveSkipHack, *M_saveHackSend;
 static MethodInfo *M_addGold, *M_addEnergy, *M_addGem, *M_addCoin, *M_addPlayPoint;
@@ -91,20 +85,18 @@ static MethodInfo *M_addTicketGold, *M_addTicketEnergy, *M_addTicketTreasure;
 static MethodInfo *M_addChangeTicket, *M_addSelectTicket, *M_addKittyChangeTicket;
 static MethodInfo *M_addSpecialFishing, *M_addTelescopeLens, *M_addMinigameToken;
 static MethodInfo *M_addUnitData, *M_addKittyData, *M_addFurniture, *M_addWorkData;
-static MethodInfo *M_addPropData, *M_addNewRndEquip, *M_addNewCollection, *M_addEquipData;
+static MethodInfo *M_addPropData, *M_addNewRndEquip, *M_addEquipData;
 static MethodInfo *M_addTheme, *M_addLamp, *M_addBgm, *M_addGuest, *M_addEventPlace;
 static MethodInfo *M_addWorkSkin, *M_addSignSkin, *M_addTimerSkin, *M_addBalloonSkin;
-static MethodInfo *M_addConsumableItem, *M_addSpecialItem, *M_addOtherFishItem;
-static MethodInfo *M_addPremiumBuild, *M_addObjectInfo, *M_addBall, *M_getReward;
+static MethodInfo *M_getReward;
 static MethodInfo *M_addTutorialFinish, *M_addPhotoOutline, *M_addPhotoSticker;
-static MethodInfo *M_addUserProfileFrame, *M_addRewardDecoBlock, *M_addMagnet, *M_addLayerData;
-static MethodInfo *M_saveEquipData, *M_commitEquipLevels, *M_applyEquipExp, *M_savePurchase;
-static MethodInfo *M_collectionRecv, *M_collectionCan, *M_collectionAdd, *M_collectionDone;
-static MethodInfo *M_setAchieveLevel;
+static MethodInfo *M_addUserProfileFrame, *M_addRewardDecoBlock;
+static MethodInfo *M_saveEquipData, *M_applyEquipExp, *M_savePurchase;
+static MethodInfo *M_collectionRecv, *M_collectionCan, *M_collectionAdd;
 static MethodInfo *M_consumeMoney;
 
 static size_t off_mGameData;
-static size_t off_gold, off_energy, off_gem, off_freeGem, off_coin;
+static size_t off_gold, off_gem, off_freeGem, off_coin;
 static size_t off_isHackV4, off_isHackSendV4, off_isSkipHackV4;
 static size_t off_goldCheck, off_energyCheck, off_gemCheck, off_freeGemCheck;
 
@@ -118,8 +110,6 @@ static uint64_t g_lastGuard = 0;
 
 static inline void *rd(void *o, size_t off) { return (o && off) ? *(void **)((char *)o + off) : NULL; }
 static inline int32_t rdi(void *o, size_t off) { return (o && off) ? *(int32_t *)((char *)o + off) : 0; }
-static inline void wri(void *o, size_t off, int32_t v) { if (o && off) *(int32_t *)((char *)o + off) = v; }
-static inline uint8_t rdb(void *o, size_t off) { return (o && off) ? *(uint8_t *)((char *)o + off) : 0; }
 static inline void wrb(void *o, size_t off, uint8_t v) { if (o && off) *(uint8_t *)((char *)o + off) = v; }
 
 static uint64_t nowMs(void) { return (uint64_t)([NSDate date].timeIntervalSince1970 * 1000.0); }
@@ -223,35 +213,13 @@ static BOOL resolveIl2Cpp(void) {
     K_GameData        = i_class_from_name(img, "", "GameData");
     K_GameManager     = i_class_from_name(img, "", "GameManager");
     K_GameSaveManager = i_class_from_name(img, "CnS", "GameSaveManager");
-    K_ServerManager   = i_class_from_name(img, "", "ServerManager");
     K_AssetManager    = i_class_from_name(img, "", "AssetManager");
 
-    K_EntityWork        = i_class_from_name(img, "", "Entity_Work");
-    K_EntityEquip       = i_class_from_name(img, "", "Entity_Equip");
-    K_EntityFurniture   = i_class_from_name(img, "", "Entity_Furniture");
-    K_EntityCatType     = i_class_from_name(img, "", "Entity_CatType");
-    K_EntityTheme       = i_class_from_name(img, "", "Entity_Theme");
-    K_EntityBGM         = i_class_from_name(img, "", "Entity_BGM");
-    K_EntityLamp        = i_class_from_name(img, "", "Entity_Lamp");
-    K_EntityGuest       = i_class_from_name(img, "", "Entity_Guest");
-    K_EntityEventPlace  = i_class_from_name(img, "", "Entity_EventPlace");
-    K_EntityShop        = i_class_from_name(img, "", "Entity_Shop");
-    K_EntityCollection  = i_class_from_name(img, "", "Entity_Collection");
-    K_EntityAbility     = i_class_from_name(img, "", "Entity_Ability");
-    K_EntityWorkSkin    = i_class_from_name(img, "", "Entity_WorkSkin");
-    K_EntitySignSkin    = i_class_from_name(img, "", "Entity_SignSkin");
-    K_EntityTimerSkin   = i_class_from_name(img, "", "Entity_TimerSkin");
-    K_EntityBalloonSkin = i_class_from_name(img, "", "Entity_BalloonSkin");
-    K_EntitySoupPassReward  = i_class_from_name(img, "", "Entity_SoupPassReward");
-    K_EntityMontlyPass      = i_class_from_name(img, "", "Entity_MontlyPass");
-    K_EntityEventSeasonPass = i_class_from_name(img, "", "Entity_EventSeasonPass");
-    K_EntityTowerProp       = i_class_from_name(img, "", "Entity_TowerProp");
 
     if (!K_DataManager || !K_GameData || !K_GameManager) { diag(@"core class missing"); return NO; }
 
     off_mGameData = i_field_get_offset(i_class_get_field_from_name(K_DataManager, "mGameData"));
     off_gold      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gold"));
-    off_energy    = i_field_get_offset(i_class_get_field_from_name(K_GameData, "energy"));
     off_gem       = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gem"));
     off_freeGem   = i_field_get_offset(i_class_get_field_from_name(K_GameData, "freeGem"));
     off_coin      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "coin"));
@@ -269,7 +237,6 @@ static BOOL resolveIl2Cpp(void) {
     // (Singleton<T> / ManagerBase<T> / MonoSingleton<T>), so walk the parent chain.
     M_dmInstance  = findInstanceGetter(K_DataManager);
     M_gmInstance  = findInstanceGetter(K_GameManager);
-    if (K_ServerManager)   M_smInstance  = findInstanceGetter(K_ServerManager);
     if (K_AssetManager)    M_amInstance  = findInstanceGetter(K_AssetManager);
     if (K_GameSaveManager) {
         M_gsmInstance  = findInstanceGetter(K_GameSaveManager);
@@ -315,7 +282,6 @@ static BOOL resolveIl2Cpp(void) {
     M_addWorkData      = i_class_get_method_from_name(K_DataManager, "AddWorkData", 3);
     M_addPropData      = i_class_get_method_from_name(K_DataManager, "AddPropData", 3);
     M_addNewRndEquip   = i_class_get_method_from_name(K_DataManager, "AddNewRndEquip", 5);    // private, reachable
-    M_addNewCollection = i_class_get_method_from_name(K_DataManager, "AddNewCollection", 3);  // private
     M_addEquipData     = i_class_get_method_from_name(K_DataManager, "AddEquipData", 4);
     M_addTheme         = i_class_get_method_from_name(K_DataManager, "AddTheme", 3);
     M_addLamp          = i_class_get_method_from_name(K_DataManager, "AddLamp", 1);
@@ -331,24 +297,15 @@ static BOOL resolveIl2Cpp(void) {
     M_addPhotoSticker  = i_class_get_method_from_name(K_DataManager, "AddPhotoSticker", 1);
     M_addUserProfileFrame = i_class_get_method_from_name(K_DataManager, "AddUserProfileFrameImage", 1);
     M_addRewardDecoBlock  = i_class_get_method_from_name(K_DataManager, "AddRewardDecoBlock", 3);
-    M_addMagnet        = i_class_get_method_from_name(K_DataManager, "AddMagnet", 3);
-    M_addLayerData     = i_class_get_method_from_name(K_DataManager, "AddLayerData", 1);
-    M_addConsumableItem= i_class_get_method_from_name(K_DataManager, "AddConsumableItem", 3);
-    M_addSpecialItem   = i_class_get_method_from_name(K_DataManager, "AddSpecialItem", 3);
-    M_addOtherFishItem = i_class_get_method_from_name(K_DataManager, "AddOtherFishItem", 4);
-    M_addPremiumBuild  = i_class_get_method_from_name(K_DataManager, "AddPremiumBuild", 3);
-    M_addObjectInfo    = i_class_get_method_from_name(K_DataManager, "AddObjectInfo", 1);
     M_getReward        = i_class_get_method_from_name(K_DataManager, "GetReward", 9);
     M_collectionRecv   = i_class_get_method_from_name(K_DataManager, "ReceiveCollectionReward", 1);
     M_collectionCan    = i_class_get_method_from_name(K_DataManager, "CanReceiveCollectionReward", 1);
     M_collectionAdd    = i_class_get_method_from_name(K_DataManager, "AddNewCollection", 3);
-    M_collectionDone   = i_class_get_method_from_name(K_DataManager, "IsCollectionComplete", 1);
     M_saveEquipData    = i_class_get_method_from_name(K_DataManager, "SaveEquipData", 0);
     M_savePurchase     = i_class_get_method_from_name(K_DataManager, "SavePurchase", 0);
 
     // Equip level grants
     M_applyEquipExp    = i_class_get_method_from_name(K_DataManager, "ApplyEquipLevelsFromExp", 1);
-    M_commitEquipLevels= i_class_get_method_from_name(K_DataManager, "CommitEquipLevelUps", 3);
 
     // ConsumeMoney drives every shop purchase; used as a free-shop probe.
     M_consumeMoney     = i_class_get_method_from_name(K_DataManager, "ConsumeMoney", 5);
@@ -443,10 +400,14 @@ static void fillCurrency(void) {
     void *d = dm(); void *g = gd();
     if (!d || !g) return;
 
-    bumpInt(M_addCoin,        FULL_VALUE);
-    bumpInt(M_addPlayPoint,   FULL_VALUE);
-    bumpInt(M_addTravelPoint, FULL_VALUE);
-    bumpInt(M_addWelcomeCoin, FULL_VALUE);
+    // Top up rather than add blindly: these Add* clamp at the game's own cap (coin /
+    // playPoint / travelPoint cap at 999999, gem at 999999), so adding FULL_VALUE to an
+    // already-high balance just wastes the call and, for gem, would overshoot the cap.
+    int32_t delta;
+    delta = FULL_VALUE - rdi(g, off_coin);        if (delta > 0) bumpInt(M_addCoin, delta);
+    delta = FULL_VALUE;                            bumpInt(M_addPlayPoint,   delta);
+    delta = FULL_VALUE;                            bumpInt(M_addTravelPoint, delta);
+    delta = FULL_VALUE;                            bumpInt(M_addWelcomeCoin, delta);
 
     // gem + freeGem + souvenirToken take extra args.
     if (M_addGem) {
