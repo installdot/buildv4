@@ -443,10 +443,41 @@ static BOOL resolveIl2Cpp(void) {
 
 #pragma mark - Accessors
 
+static int g_excCount = 0;   // managed exceptions swallowed by rcInvoke
+
+// runtime_invoke's 4th parameter receives the managed exception object. Passing NULL
+// there means a throw inside the invoked method (e.g. AddUnitData doing List.Find on an
+// unknown id and raising NullReferenceException) has nowhere to land, and the process
+// dies. Capture it into a local so a bad id skips instead of killing the game.
+static Il2CppObject *rcInvoke(MethodInfo *m, void *obj, void **args) {
+    if (!m) return NULL;
+    Il2CppObject *exc = NULL;
+    Il2CppObject *r = i_runtime_invoke(m, obj, args, (void **)&exc);
+    if (exc) {
+        // Do NOT touch g_diag here: it holds the resolve status shown in the panel, and
+        // this runs many times per bulk pass. Count instead and surface it once.
+        g_excCount++;
+        return NULL;
+    }
+    return r;
+}
+
+
 static void *gmInstance(void) {
     if (!g_ready || !M_gmInstance) return NULL;
-    return i_runtime_invoke(M_gmInstance, NULL, NULL, NULL);
+    return rcInvoke(M_gmInstance, NULL, NULL);
 }
+// Bulk grants call the game's adders hundreds of times, and each one does an ES3 write
+// plus a V4 hash recompute. All of it must stay on the main thread (Unity API), but a
+// single uninterrupted pass trips the 10 s watchdog. pump() yields to the run loop every
+// N calls so the app stays alive and the UI keeps repainting.
+static void pump(int i) {
+    if ((i & 7) != 7) return;
+    @autoreleasepool {
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0]];
+    }
+}
+
 static void *dm(void) { return staticInstance(K_DataManager, "instance"); }
 static void *gd(void) { void *d = dm(); return d ? rd(d, off_mGameData) : NULL; }
 static void *am(void) { return staticInstance(K_AssetManager, "<Instance>k__BackingField"); }
@@ -484,9 +515,9 @@ static void applyAntiCheatBypass(void) {
     if (off_gemCheck)     *(int64_t *)((char *)g + off_gemCheck) = 0;
     if (off_freeGemCheck) *(int64_t *)((char *)g + off_freeGemCheck) = 0;
 
-    if (M_saveHackFlag) i_runtime_invoke(M_saveHackFlag, d, NULL, NULL);
-    if (M_saveHackSend) i_runtime_invoke(M_saveHackSend, d, NULL, NULL);
-    if (M_saveSkipHack) i_runtime_invoke(M_saveSkipHack, d, NULL, NULL);
+    if (M_saveHackFlag) rcInvoke(M_saveHackFlag, d, NULL);
+    if (M_saveHackSend) rcInvoke(M_saveHackSend, d, NULL);
+    if (M_saveSkipHack) rcInvoke(M_saveSkipHack, d, NULL);
 }
 
 // Re-assert once a second: GameServerManager.<CheckBlock>b__86_0 (0x344917C) clears
@@ -527,7 +558,7 @@ static void bumpInt(MethodInfo *m, int32_t target) {
     if (!d) return;
     BOOL add = YES;
     void *args[2] = { &target, &add };
-    i_runtime_invoke(m, d, args, NULL);
+    rcInvoke(m, d, args);
 }
 
 static void fillCurrency(void) {
@@ -549,26 +580,26 @@ static void fillCurrency(void) {
         if (paid > 0) {
             BOOL add = YES, isFree = NO; int32_t reason = 0; void *detail = NULL;
             void *a[5] = { &paid, &add, &isFree, &reason, &detail };
-            i_runtime_invoke(M_addGem, d, a, NULL);
+            rcInvoke(M_addGem, d, a);
         }
         int32_t freeV = FULL_VALUE - rdi(g, off_freeGem);
         if (freeV > 0) {
             BOOL add = YES, isFree = YES; int32_t reason = 0; void *detail = NULL;
             void *a[5] = { &freeV, &add, &isFree, &reason, &detail };
-            i_runtime_invoke(M_addGem, d, a, NULL);
+            rcInvoke(M_addGem, d, a);
         }
     }
     if (M_addSouvenirToken) {
         int32_t v = FULL_VALUE; BOOL add = YES, noPopup = YES;
         void *a[3] = { &v, &add, &noPopup };
-        i_runtime_invoke(M_addSouvenirToken, d, a, NULL);
+        rcInvoke(M_addSouvenirToken, d, a);
     }
 
     // Gold / energy are BigNumber (float mantissa + exponent + integer).
-    if (M_addGold)   { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; i_runtime_invoke(M_addGold, d, a, NULL); }
-    if (M_addEnergy) { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; i_runtime_invoke(M_addEnergy, d, a, NULL); }
+    if (M_addGold)   { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; rcInvoke(M_addGold, d, a); }
+    if (M_addEnergy) { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; rcInvoke(M_addEnergy, d, a); }
 
-    if (M_addVipPoint) { int32_t v = FULL_VALUE; BOOL save = YES; void *a[2] = { &v, &save }; i_runtime_invoke(M_addVipPoint, d, a, NULL); }
+    if (M_addVipPoint) { int32_t v = FULL_VALUE; BOOL save = YES; void *a[2] = { &v, &save }; rcInvoke(M_addVipPoint, d, a); }
 }
 
 static void fillTickets(void) {
@@ -577,18 +608,18 @@ static void fillTickets(void) {
     BOOL add = YES, viaMail = NO;
     for (int32_t idx = 0; idx < 3; idx++) {
         int32_t v = 9999;
-        if (M_addTicketGold)     { void *a[4] = { &idx, &v, &viaMail, &add }; i_runtime_invoke(M_addTicketGold, d, a, NULL); }
-        if (M_addTicketEnergy)   { void *a[4] = { &idx, &v, &viaMail, &add }; i_runtime_invoke(M_addTicketEnergy, d, a, NULL); }
-        if (idx < 2 && M_addTicketTreasure) { void *a[4] = { &idx, &v, &viaMail, &add }; i_runtime_invoke(M_addTicketTreasure, d, a, NULL); }
+        if (M_addTicketGold)     { void *a[4] = { &idx, &v, &viaMail, &add }; rcInvoke(M_addTicketGold, d, a); }
+        if (M_addTicketEnergy)   { void *a[4] = { &idx, &v, &viaMail, &add }; rcInvoke(M_addTicketEnergy, d, a); }
+        if (idx < 2 && M_addTicketTreasure) { void *a[4] = { &idx, &v, &viaMail, &add }; rcInvoke(M_addTicketTreasure, d, a); }
     }
     int32_t v = 9999;
     int32_t reason = 0;
-    if (M_addChangeTicket)     { int32_t t = 1401; void *a[4] = { &t, &v, &add, &reason }; i_runtime_invoke(M_addChangeTicket, d, a, NULL); }
-    if (M_addSelectTicket)     { int32_t t = 1403; BOOL noPopup = YES; void *a[4] = { &t, &v, &add, &noPopup }; i_runtime_invoke(M_addSelectTicket, d, a, NULL); }
-    if (M_addKittyChangeTicket){ void *a[2] = { &v, &add }; i_runtime_invoke(M_addKittyChangeTicket, d, a, NULL); }
-    if (M_addSpecialFishing)   { BOOL np = YES; void *a[3] = { &v, &add, &np }; i_runtime_invoke(M_addSpecialFishing, d, a, NULL); }
-    if (M_addTelescopeLens)    { BOOL np = YES; void *a[3] = { &v, &add, &np }; i_runtime_invoke(M_addTelescopeLens, d, a, NULL); }
-    if (M_addMinigameToken)    { void *a[2] = { &v, &add }; i_runtime_invoke(M_addMinigameToken, d, a, NULL); }
+    if (M_addChangeTicket)     { int32_t t = 1401; void *a[4] = { &t, &v, &add, &reason }; rcInvoke(M_addChangeTicket, d, a); }
+    if (M_addSelectTicket)     { int32_t t = 1403; BOOL noPopup = YES; void *a[4] = { &t, &v, &add, &noPopup }; rcInvoke(M_addSelectTicket, d, a); }
+    if (M_addKittyChangeTicket){ void *a[2] = { &v, &add }; rcInvoke(M_addKittyChangeTicket, d, a); }
+    if (M_addSpecialFishing)   { BOOL np = YES; void *a[3] = { &v, &add, &np }; rcInvoke(M_addSpecialFishing, d, a); }
+    if (M_addTelescopeLens)    { BOOL np = YES; void *a[3] = { &v, &add, &np }; rcInvoke(M_addTelescopeLens, d, a); }
+    if (M_addMinigameToken)    { void *a[2] = { &v, &add }; rcInvoke(M_addMinigameToken, d, a); }
 }
 
 #pragma mark - Content unlock
@@ -629,9 +660,10 @@ static void addAllCats(void) {
         if (!param) continue;
         int32_t type = paramId(param);
         if (type <= 0) continue;
-        if (M_addUnitData) { void *a[3] = { &type, &workId, &first }; i_runtime_invoke(M_addUnitData, d, a, NULL); }
+        pump(i);
+        if (M_addUnitData) { void *a[3] = { &type, &workId, &first }; rcInvoke(M_addUnitData, d, a); }
         // Kitties share CatType but live in a separate save list (ltKittyData).
-        if (M_addKittyData) { void *a[2] = { &type, &workId }; i_runtime_invoke(M_addKittyData, d, a, NULL); }
+        if (M_addKittyData) { void *a[2] = { &type, &workId }; rcInvoke(M_addKittyData, d, a); }
     }
 }
 
@@ -645,8 +677,9 @@ static void addAllFurniture(void) {
         if (!param) continue;
         BOOL save = NO, newAdd = YES;
         int32_t count = 1, reason = 0;
+        pump(i);
         void *a[5] = { param, &save, &count, &newAdd, &reason };
-        i_runtime_invoke(M_addFurniture, d, a, NULL);
+        rcInvoke(M_addFurniture, d, a);
     }
 }
 
@@ -662,8 +695,9 @@ static void addAllFacilities(void) {
         void *param = listAt(list, i);
         if (!param) continue;
         int32_t level = 1;
+        pump(i);
         void *a[3] = { param, &level, &pos };
-        i_runtime_invoke(M_addWorkData, d, a, NULL);
+        rcInvoke(M_addWorkData, d, a);
     }
 }
 
@@ -682,8 +716,8 @@ static void addAllSkins(void) {
         for (int i = 0; i < n; i++) {
             int32_t idx = paramId(listAt(list, i));
             if (idx <= 0) continue;
-            if (set[s].extra) { int32_t gr = 0; void *a[2] = { &idx, &gr }; i_runtime_invoke(set[s].m, d, a, NULL); }
-            else              { void *a[1] = { &idx }; i_runtime_invoke(set[s].m, d, a, NULL); }
+            if (set[s].extra) { int32_t gr = 0; void *a[2] = { &idx, &gr }; rcInvoke(set[s].m, d, a); }
+            else              { void *a[1] = { &idx }; rcInvoke(set[s].m, d, a); }
         }
     }
 }
@@ -697,31 +731,31 @@ static void addAllMisc(void) {
     for (int i = 0, n = listCount(list); i < n && M_addTheme; i++) {
         id = paramId(listAt(list, i));
         void *a[3] = { &id, &reward, &reason };
-        i_runtime_invoke(M_addTheme, d, a, NULL);
+        rcInvoke(M_addTheme, d, a);
     }
     list = entityList("asset_lamp");
     for (int i = 0, n = listCount(list); i < n && M_addLamp; i++) {
         id = paramId(listAt(list, i));
         void *a[1] = { &id };
-        i_runtime_invoke(M_addLamp, d, a, NULL);
+        rcInvoke(M_addLamp, d, a);
     }
     list = entityList("asset_bgm");
     for (int i = 0, n = listCount(list); i < n && M_addBgm; i++) {
         id = paramId(listAt(list, i));
         void *a[2] = { &id, &reason };
-        i_runtime_invoke(M_addBgm, d, a, NULL);
+        rcInvoke(M_addBgm, d, a);
     }
     list = entityList("asset_guest");
     for (int i = 0, n = listCount(list); i < n && M_addGuest; i++) {
         id = paramId(listAt(list, i));
         void *a[1] = { &id };
-        i_runtime_invoke(M_addGuest, d, a, NULL);
+        rcInvoke(M_addGuest, d, a);
     }
     list = entityList("asset_eventPlace");
     for (int i = 0, n = listCount(list); i < n && M_addEventPlace; i++) {
         id = paramId(listAt(list, i));
         void *a[1] = { &id };
-        i_runtime_invoke(M_addEventPlace, d, a, NULL);
+        rcInvoke(M_addEventPlace, d, a);
     }
 
     // Photo book / profile cosmetics have real Entity_* tables, so enumerate them
@@ -729,12 +763,12 @@ static void addAllMisc(void) {
     list = entityList("asset_photoOutline");
     for (int i = 0, n = listCount(list); i < n && M_addPhotoOutline; i++) {
         id = paramId(listAt(list, i));
-        if (id > 0) { void *a[1] = { &id }; i_runtime_invoke(M_addPhotoOutline, d, a, NULL); }
+        if (id > 0) { void *a[1] = { &id }; rcInvoke(M_addPhotoOutline, d, a); }
     }
     list = entityList("asset_photoSticker");
     for (int i = 0, n = listCount(list); i < n && M_addPhotoSticker; i++) {
         id = paramId(listAt(list, i));
-        if (id > 0) { void *a[1] = { &id }; i_runtime_invoke(M_addPhotoSticker, d, a, NULL); }
+        if (id > 0) { void *a[1] = { &id }; rcInvoke(M_addPhotoSticker, d, a); }
     }
 
     // Tutorial flags are dense small ints; 64 covers every shipped step. This is the
@@ -742,7 +776,7 @@ static void addAllMisc(void) {
     if (M_addTutorialFinish) {
         for (int32_t t = 0; t < 64; t++) {
             void *a[1] = { &t };
-            i_runtime_invoke(M_addTutorialFinish, d, a, NULL);
+            rcInvoke(M_addTutorialFinish, d, a);
         }
     }
 }
@@ -754,9 +788,10 @@ static void addAllTowerProps(void) {
     for (int i = 0; i < n; i++) {
         if (!M_addPropData) break;
         int32_t id = paramId(listAt(list, i));
+        pump(i);
         int32_t count = 99; BOOL save = YES;
         void *a[3] = { &id, &count, &save };
-        i_runtime_invoke(M_addPropData, d, a, NULL);
+        rcInvoke(M_addPropData, d, a);
     }
 }
 
@@ -771,9 +806,10 @@ static void addAllForestDeco(void) {
     for (int i = 0; i < n; i++) {
         int32_t id = paramId(listAt(list, i));
         if (id <= 0) continue;
+        pump(i);
         int32_t cnt = 99;
         void *a[3] = { &id, &cnt, &reason };
-        i_runtime_invoke(M_addRewardDecoBlock, d, a, NULL);
+        rcInvoke(M_addRewardDecoBlock, d, a);
     }
 }
 
@@ -797,10 +833,10 @@ static void maxEquips(void) {
             if (!eq) continue;
             int32_t exp = 100000; BOOL save = YES;
             void *a[4] = { eq, NULL, &exp, &save };
-            i_runtime_invoke(M_addEquipData, d, a, NULL);
-            if (M_applyEquipExp) { void *b[1] = { eq }; i_runtime_invoke(M_applyEquipExp, d, b, NULL); }
+            rcInvoke(M_addEquipData, d, a);
+            if (M_applyEquipExp) { void *b[1] = { eq }; rcInvoke(M_applyEquipExp, d, b); }
         }
-        if (M_saveEquipData) i_runtime_invoke(M_saveEquipData, d, NULL, NULL);
+        if (M_saveEquipData) rcInvoke(M_saveEquipData, d, NULL);
         return;
     }
     for (int i = 0; i < n; i++) {
@@ -809,11 +845,12 @@ static void maxEquips(void) {
         int32_t id = paramId(param);
         if (id <= 0) continue;
         int32_t count = 1, reason = 0, exp = 100000;
+        pump(i);
         BOOL isGacha = NO;
         void *a[5] = { &count, &id, &isGacha, &reason, &exp };
-        i_runtime_invoke(M_addNewRndEquip, d, a, NULL);
+        rcInvoke(M_addNewRndEquip, d, a);
     }
-    if (M_saveEquipData) i_runtime_invoke(M_saveEquipData, d, NULL, NULL);
+    if (M_saveEquipData) rcInvoke(M_saveEquipData, d, NULL);
 }
 
 #pragma mark - Extra content
@@ -859,7 +896,7 @@ static void addAllItems(void) {
         void *subIndex = NULL, *detail = NULL;
         void *a[9] = { &rt, &cnt, &useMail, &subIndex, &isGacha, &forceMail,
                        &noPopup, &reason, &detail };
-        i_runtime_invoke(M_getReward, d, a, NULL);
+        rcInvoke(M_getReward, d, a);
     }
 
     // Ticket families are addressed by rewardType directly.
@@ -876,7 +913,7 @@ static void addAllItems(void) {
         void *subIndex = NULL, *detail = NULL;
         void *a[9] = { &rt, &cnt, &useMail, &subIndex, &isGacha, &forceMail,
                        &noPopup, &reason, &detail };
-        i_runtime_invoke(M_getReward, d, a, NULL);
+        rcInvoke(M_getReward, d, a);
     }
 }
 
@@ -894,12 +931,12 @@ static void collectAllCollections(void) {
         if (M_collectionAdd) {
             int32_t sub = 0, total = 32;
             void *a[3] = { &idx, &sub, &total };
-            i_runtime_invoke(M_collectionAdd, d, a, NULL);
+            rcInvoke(M_collectionAdd, d, a);
         }
         if (M_collectionCan && M_collectionRecv) {
             void *a[1] = { &idx };
-            Il2CppObject *can = i_runtime_invoke(M_collectionCan, d, a, NULL);
-            if (can && *(uint8_t *)((char *)can + 0x10)) i_runtime_invoke(M_collectionRecv, d, a, NULL);
+            Il2CppObject *can = rcInvoke(M_collectionCan, d, a);
+            if (can && *(uint8_t *)((char *)can + 0x10)) rcInvoke(M_collectionRecv, d, a);
         }
     }
 }
@@ -957,25 +994,25 @@ static void grantRemoveAds(void) {
         int32_t index = 188;        // 광고제거_180일권, the longest duration shipped
         int32_t reason = 0;
         void *a[2] = { &index, &reason };
-        i_runtime_invoke(m, d, a, NULL);
+        rcInvoke(m, d, a);
     }
     MethodInfo *mInit = i_class_get_method_from_name(K_DataManager, "InitRemoveAds", 2);
     if (mInit) {
         BOOL active = YES, useMsg = NO;
         void *a[2] = { &active, &useMsg };
-        i_runtime_invoke(mInit, d, a, NULL);
+        rcInvoke(mInit, d, a);
     }
-    if (M_savePurchase) i_runtime_invoke(M_savePurchase, d, NULL, NULL);
+    if (M_savePurchase) rcInvoke(M_savePurchase, d, NULL);
 }
 
 #pragma mark - Cloud save
 
 static void pushSave(BOOL toServer) {
     void *gsm = staticInstance(K_GameSaveManager, "<Instance>k__BackingField");
-    if (gsm && M_gsmCloudSave) i_runtime_invoke(M_gsmCloudSave, gsm, NULL, NULL);
+    if (gsm && M_gsmCloudSave) rcInvoke(M_gsmCloudSave, gsm, NULL);
     void *gm = gmInstance();
-    if (gm && M_gmCloudSave) { BOOL force = YES; void *a[1] = { &force }; i_runtime_invoke(M_gmCloudSave, gm, a, NULL); }
-    if (toServer && gm && M_gmSaveToServer) { BOOL purchase = NO; void *a[1] = { &purchase }; i_runtime_invoke(M_gmSaveToServer, gm, a, NULL); }
+    if (gm && M_gmCloudSave) { BOOL force = YES; void *a[1] = { &force }; rcInvoke(M_gmCloudSave, gm, a); }
+    if (toServer && gm && M_gmSaveToServer) { BOOL purchase = NO; void *a[1] = { &purchase }; rcInvoke(M_gmSaveToServer, gm, a); }
 }
 
 #pragma mark - Menu
@@ -1117,23 +1154,25 @@ static void pushSave(BOOL toServer) {
 // looked dead. Run the work on a background thread with the il2cpp thread attached and
 // marshal only the status text back.
 - (void)run:(NSString *)name work:(void (^)(void))blk {
-    // Reflection lookups and the first il2cpp touch must stay on the main thread.
     if (!resolveIl2Cpp()) {
         _status.text = [NSString stringWithFormat:@"ERR %s", g_diag];
         return;
     }
-    // ES3 (_esFile) and the FixedSizeList rings are not thread-safe, so bulk work runs
-    // on one dedicated serial queue rather than the global pool: still off the main
-    // thread (the UI stays responsive), but never two bulk ops at once.
-    static dispatch_queue_t bulkQ; static dispatch_once_t onceQ;
-    dispatch_once(&onceQ, ^{ bulkQ = dispatch_queue_create("catsoup.bulk", 0); });
+    // MUST run on the main thread. Every DataManager.Add* ultimately touches Unity
+    // objects (GameObject instantiation, UI popups, ES3 file IO) and Unity's API is
+    // main-thread-only; calling it from the bulk queue is what crashed the game on
+    // every action button. Toggles never crashed because they stayed on main.
     _status.text = [NSString stringWithFormat:@"... %@", name];
-    dispatch_async(bulkQ, ^{
+    g_excCount = 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool { blk(); }
-        NSString *msg = [NSString stringWithFormat:@"OK: %@", name];
-        dispatch_async(dispatch_get_main_queue(), ^{ self->_status.text = msg; });
+        // Surface skipped grants so a partial fill is visible instead of looking silent.
+        self->_status.text = g_excCount
+            ? [NSString stringWithFormat:@"OK: %@ (%d skipped)", name, g_excCount]
+            : [NSString stringWithFormat:@"OK: %@", name];
     });
 }
+
 - (void)a1 { [self run:@"full currency" work:^{ fillCurrency(); }]; }
 - (void)a2 { [self run:@"full tickets"  work:^{ fillTickets(); }]; }
 - (void)b1 { [self run:@"all cats"      work:^{ addAllCats(); }]; }
