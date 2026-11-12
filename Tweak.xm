@@ -109,6 +109,11 @@ static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
 static size_t off_playerCam, off_playerMovement, off_playerEquip;
 static size_t off_recoilAngles, off_forceAngle, off_downFire;
 static size_t off_parachuteState;    // PlayerMovementFP.m_ParachuteState (0x1C8)
+
+// Aim-assist core (the game's own targeting path)
+static void *M_linecast;             // Physics::Linecast(Vector3, Vector3, int)
+static void *M_shoot;                // ProjectileWeapon::Shoot()
+static void *M_barrierLayerMask;     // LayerHelper::GetHeroAssistBarrierLayerMask()
 // ParachuteStateModule (constant offsets inside the module object)
 #define PS_ENABLED      0x10
 #define PS_FREEFALLSPD  0x1C
@@ -125,6 +130,8 @@ static BOOL  g_espOn = NO;
 static BOOL  g_aimlock = NO;
 static BOOL  g_noRecoil = NO;
 static BOOL  g_noSpread = NO;
+static BOOL  g_wallcheck = YES;
+static BOOL  g_autoFire = NO;
 static BOOL  g_paraCtl = NO;
 static BOOL  g_glide = NO;
 static int   g_paraDir = 0;          // 0 = neutral, +1 up, -1 down
@@ -300,6 +307,19 @@ static void scanPlayersImpl(void) {
 
 #pragma mark - Silent Aim
 
+// Wall check: does anything on the game's own barrier mask sit between the muzzle
+// and the target head? Physics.Linecast is the exact primitive the game's aim assist
+// uses (GetHeroAssistBarrierLayerMask), so the result matches what the engine would
+// consider "blocked".
+static BOOL lineBlocked(Vec3 from, Vec3 to) {
+    if (!g_wallcheck) return NO;
+    if (!MP(M_linecast) || !MP(M_barrierLayerMask)) return NO;
+    int mask = ((int (*)(void *))MP(M_barrierLayerMask))(M_barrierLayerMask);
+    if (!mask) return NO;
+    bool hit = ((bool (*)(Vec3, Vec3, int, void *))MP(M_linecast))(from, to, mask, M_linecast);
+    return hit ? YES : NO;
+}
+
 static BOOL pickBestTargetHead(Vec3 *outHead) {
     if (!g_targetCount || !outHead || !MP(M_camMain)) return NO;
     void *cam = ((void *(*)(void *))MP(M_camMain))(M_camMain);
@@ -316,11 +336,18 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
         if (!worldToScreen(cam, g_targets[i].head, &sp)) continue;
         float dx = (float)(sp.x - cx), dy = (float)(sp.y - cy);
         float d = sqrtf(dx * dx + dy * dy);
-        if (d <= (float)maxRadius && d < best) {
-            best = d;
-            *outHead = g_targets[i].head;
-            found = YES;
+        if (d > (float)maxRadius || d >= best) continue;
+        // Wall check against the target's head, cast from the camera.
+        if (MP(M_getPos) && MP(M_getTransform)) {
+            void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(cam, M_getTransform);
+            if (alive(tr)) {
+                Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
+                if (vec3Finite(eye) && lineBlocked(eye, g_targets[i].head)) continue;
+            }
         }
+        best = d;
+        *outHead = g_targets[i].head;
+        found = YES;
     }
     return found;
 }
@@ -427,6 +454,33 @@ static void applyParachuteControl(void) {
         *movespeed = 8.0f;
         *freefall  = 22.0f;
     }
+}
+
+#pragma mark - Auto fire
+
+// Fires the instant a target passes the cone test: no need to press the button.
+// Shoot() has data-only xrefs (dispatched through the vtable), and it is the same
+// entry the touch handler uses, so rate of fire and ammo are still enforced by the
+// game itself.
+static void tryAutoFire(void) {
+    if (!g_autoFire || !g_aimlock || !g_aimHeadValid) return;
+    if (fireButtonDown()) return;                       // user already firing
+    if (!alive(g_lcam)) return;
+    void *player = nullptr;
+    if (MP(M_lpmInstance)) {
+        void *lpm = ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance);
+        if (lpm && off_lpmPlayer) player = readPtr(lpm, off_lpmPlayer);
+    }
+    if (!alive(player)) return;
+
+    void *eq = off_playerEquip ? readPtr(player, off_playerEquip) : nullptr;
+    if (!eq) return;
+    void *handler = readPtr(eq, 0x28);                  // mActiveEHandler
+    if (!handler) return;
+    void *item = readPtr(handler, 0x30);                // m_AttachedEquipmentItem
+    if (!alive(item) || !MP(M_shoot)) return;
+
+    ((void (*)(void *, void *))MP(M_shoot))(item, M_shoot);
 }
 
 #pragma mark - Silent aim / recoil
@@ -583,8 +637,9 @@ static BOOL installAimHook(void) {
 @property (retain) UILabel *aimFovLabel;
 @property (retain) UISwitch *recoilSwitch;
 @property (retain) UISwitch *spreadSwitch;
+@property (retain) UISwitch *wallcheckSwitch;
+@property (retain) UISwitch *autoFireSwitch;
 @property (retain) UISwitch *paraSwitch;
-@property (retain) UISwitch *glideSwitch;
 @property (retain) UISlider *glideSpeedSlider;
 @property (retain) UILabel *glideSpeedLabel;
 @end
@@ -629,8 +684,9 @@ static BOOL installAimHook(void) {
     self.aimFovShowSwitch = [self toggleAt:&y title:@"Show Aim FOV" sel:@selector(aimFovShowToggled:)];
     self.recoilSwitch = [self toggleAt:&y title:@"No Recoil" sel:@selector(recoilToggled:)];
     self.spreadSwitch = [self toggleAt:&y title:@"No Bullet Spread" sel:@selector(spreadToggled:)];
+    self.wallcheckSwitch = [self toggleAt:&y title:@"Wall Check" sel:@selector(wallcheckToggled:)];
+    self.autoFireSwitch = [self toggleAt:&y title:@"Auto Fire (no wait)" sel:@selector(autoFireToggled:)];
     self.paraSwitch = [self toggleAt:&y title:@"Parachute Control" sel:@selector(paraToggled:)];
-    self.glideSwitch = [self toggleAt:&y title:@"Glide" sel:@selector(glideToggled:)];
     self.glideSpeedLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed]];
     self.glideSpeedSlider = [self sliderAt:&y min:1.0f max:6.0f val:g_glideSpeed sel:@selector(glideSpeedChanged:)];
 
@@ -703,8 +759,9 @@ static BOOL installAimHook(void) {
 - (void)aimFovShowToggled:(UISwitch *)s { g_showAimFov = s.isOn; }
 - (void)recoilToggled:(UISwitch *)s { g_noRecoil = s.isOn; }
 - (void)spreadToggled:(UISwitch *)s { g_noSpread = s.isOn; }
+- (void)wallcheckToggled:(UISwitch *)s { g_wallcheck = s.isOn; }
+- (void)autoFireToggled:(UISwitch *)s { g_autoFire = s.isOn; }
 - (void)paraToggled:(UISwitch *)s { g_paraCtl = s.isOn; }
-- (void)glideToggled:(UISwitch *)s { g_glide = s.isOn; }
 - (void)glideSpeedChanged:(UISlider *)s {
     g_glideSpeed = s.value;
     self.glideSpeedLabel.text = [NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed];
@@ -721,7 +778,7 @@ static BOOL installAimHook(void) {
     g_espOn = NO; g_aimlock = NO; g_showAimFov = NO;
     g_noRecoil = NO; g_noSpread = NO; g_paraCtl = NO; g_glide = NO;
     self.recoilSwitch.on = NO; self.spreadSwitch.on = NO;
-    self.paraSwitch.on = NO; self.glideSwitch.on = NO; g_paraDir = 0;
+    self.paraSwitch.on = NO; g_paraDir = 0; g_glide = NO;
     self.espSwitch.on = NO; self.aimSwitch.on = NO; self.aimFovShowSwitch.on = NO;
     self.aimFovSlider.value = 35.0f; self.aimFovLabel.text = @"Aim FOV: 35°";
 }
@@ -886,7 +943,6 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
 
 - (void)paraGlideTapped {
     g_glide = !g_glide;
-    [self.menuView.glideSwitch setOn:g_glide animated:YES];
     [self refreshParaPanel];
 }
 // Panel must not be reachable while Parachute Control is off.
@@ -940,7 +996,6 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
 
     applyNoRecoil();
     applyParachuteControl();
-    if (self.menuView) [self.menuView.glideSwitch setOn:g_glide animated:NO];
     [self refreshParaPanel];
 
     if (g_espOn || g_aimlock) scanPlayers();
@@ -955,6 +1010,7 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
             g_aimHeadValid = YES;
         }
     }
+    tryAutoFire();
 }
 @end
 
@@ -1122,6 +1178,13 @@ static BOOL resolveIl2Cpp(void) {
 
     void *K_projWeapon = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
     M_createShootData = methodOf(K_projWeapon, "CreateShootData", 1);
+    M_shoot           = methodOf(K_projWeapon, "Shoot", 0);
+
+    // Wall check uses the game's own assist masks so the answer matches the engine.
+    void *K_physics = i_class_from_name(core, "UnityEngine", "Physics");
+    void *K_layer   = i_class_from_name(game, "", "LayerHelper");
+    M_linecast         = methodOf(K_physics, "Linecast", 3);
+    M_barrierLayerMask = methodOf(K_layer, "GetHeroAssistBarrierLayerMask", 0);
 
     if (g_bypassTutorial) {
         replaceMethod(M_guideInit, (void *)&dummy_ret);              // Init(): no step machine
