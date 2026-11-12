@@ -113,7 +113,7 @@ static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action<uint
 //   PlayerCamera.m_RecoilAngles              0x58
 //   NetManagerBase.NetPlayerMap              0x18
 static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
-static size_t off_playerCam, off_playerMovement;
+static size_t off_playerCam, off_playerMovement, off_playerStateComp;
 static size_t off_recoilAngles, off_forceAngle, off_recoilEnabled, off_lookAngles;
 static size_t off_enableSmooth, off_rotationLerp;
 static size_t off_wpnShootAcc, off_wpnCurAcc, off_playerAccurate;
@@ -123,6 +123,7 @@ static size_t off_parachuteState;    // PlayerMovementFP.m_ParachuteState (0x1C8
 static void *M_linecast;             // Physics::Linecast (3- or 4-arg)
 static int   g_linecastArgs = 0;
 static void *M_barrierLayerMask;     // LayerHelper::GetHeroAssistBarrierLayerMask()
+static void *M_changeBRState;        // PlayerStateTpCommon::ChangePlayerBRStateClient(int,bool)
 // ParachuteStateModule (constant offsets inside the module object)
 #define PS_ENABLED      0x10
 #define PS_FREEFALLSPD  0x1C
@@ -509,6 +510,39 @@ static void applyInstantFire(void *retstr) {
     if (!g_fastBullet || !retstr) return;
     *(int   *)((char *)retstr + MSD_BULLETCOUNT)   = g_instantCount;
     *(float *)((char *)retstr + MSD_SHOOTCOUNTLIM) = 1.0f;
+}
+
+// Enter the parachute state from the ground.
+//
+// The movement code only honours FreeFallSpeed/MoveSpeed while IsParachute is set,
+// so simply tuning those numbers does nothing on foot. ChangePlayerBRStateClient is
+// the client-side state switch the game itself uses; calling it moves the player
+// into BRStateParachute (4), after which the module's fields take effect.
+#define BRSTATE_PARACHUTE 4
+
+static void enterParachuteState(void) {
+    if (!g_paraCtl || !g_glide) return;
+    if (!off_playerStateComp || !MP(M_changeBRState)) return;
+
+    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
+    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
+    if (!alive(player)) return;
+
+    void *st = readPtr(player, off_playerStateComp);
+    if (!st) return;
+
+    // Already parachuting? Nothing to do.
+    if (parachuteModule()) return;
+
+    // Rate-limit: the state machine needs a frame to act, and calling every frame
+    // would restart the transition and cancel the ascend.
+    static double lastTry = 0;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - lastTry < 1.0) return;
+    lastTry = now;
+
+    ((void (*)(void *, int, bool, void *))MP(M_changeBRState))(st, BRSTATE_PARACHUTE, false, M_changeBRState);
+    NSLog(@"[MWM] requested parachute state");
 }
 
 #pragma mark - Silent aim / recoil
@@ -1079,6 +1113,7 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
 
     applyNoRecoil();
     applyNoSpread();
+    enterParachuteState();
     applyParachuteControl();
     [self refreshParaPanel];
 
@@ -1264,6 +1299,7 @@ static BOOL resolveIl2Cpp(void) {
     off_playerType   = fieldOff(K_player, "LocalPlayerType"); // 0x4C8 (on Player)
     off_playerCam    = fieldOff(K_player, "_PlayerCamera");   // 0x4E8
     off_playerMovement = fieldOff(K_player, "_PlayerMovement"); // 0x4D8
+    off_playerStateComp = fieldOff(K_player, "_StateComp");      // 0x4F8
 
     M_lpmInstance    = methodOf(K_lpm, "get_Instance", 0);
     M_w2s            = methodOf(K_camera, "WorldToScreenPoint", 1);
@@ -1344,6 +1380,9 @@ static BOOL resolveIl2Cpp(void) {
         NSLog(@"[MWM] Physics.Linecast unresolved - wallcheck fails closed");
 
     M_barrierLayerMask = methodOf(K_layer, "GetHeroAssistBarrierLayerMask", 0);
+
+    void *K_stateTp = i_class_from_name(game, "", "PlayerStateTpCommon");   // global ns
+    M_changeBRState = methodOf(K_stateTp, "ChangePlayerBRStateClient", 2);
 
     if (g_bypassTutorial) {
         replaceMethod(M_guideInit, (void *)&dummy_ret);              // Init(): no step machine
