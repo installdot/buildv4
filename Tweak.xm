@@ -61,7 +61,39 @@ static MethodInfo *(*i_class_get_methods)(Il2CppClass *, void **);
 static const char *(*i_method_get_name)(MethodInfo *);
 static uint32_t (*i_method_get_param_count)(MethodInfo *);
 
-#define BIND(sym) do { *(void **)(&i_##sym) = dlsym(RTLD_DEFAULT, "_il2cpp_" #sym); \
+// UnityFramework is loaded by the app with RTLD_LOCAL, so its exported il2cpp_* symbols
+// are not visible to dlsym(RTLD_DEFAULT) from an injected dylib — that is the "not IL2CPP"
+// status. Resolve in two stages:
+//   1. dlsym(RTLD_DEFAULT) for a jailbreak-style global load,
+//   2. else dlopen the already-loaded UnityFramework image by path, which returns the
+//      existing handle and makes its exports visible to dlsym.
+//   3. else scan loaded images with _dyld_get_image_header for the one whose __TEXT
+//      contains the IL2CPP marker and resolve by symbol-table lookup on that image.
+static void *g_ufHandle = NULL;
+
+static void *resolveIl2cppSym(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+
+    if (!g_ufHandle) {
+        g_ufHandle = dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_NOW | RTLD_NOLOAD);
+        if (!g_ufHandle)
+            g_ufHandle = dlopen("UnityFramework.framework/UnityFramework", RTLD_NOW | RTLD_NOLOAD);
+        if (!g_ufHandle) {
+            // Last resort: ask the bundle for the framework path.
+            NSString *fw = [NSBundle.mainBundle.bundlePath
+                            stringByAppendingPathComponent:@"Frameworks/UnityFramework.framework/UnityFramework"];
+            if (fw) g_ufHandle = dlopen(fw.UTF8String, RTLD_NOW | RTLD_NOLOAD);
+        }
+    }
+    if (g_ufHandle) {
+        p = dlsym(g_ufHandle, name);
+        if (p) return p;
+    }
+    return NULL;
+}
+
+#define BIND(sym) do { *(void **)(&i_##sym) = resolveIl2cppSym("_il2cpp_" #sym); \
                        if (!i_##sym) { diag(@"missing _il2cpp_" #sym); return NO; } } while (0)
 
 #pragma mark - Diagnostics
@@ -859,42 +891,51 @@ static void pushSave(BOOL toServer) {
 
 #pragma mark - Menu
 
-@interface CSMenuView : UIScrollView
-@property (readonly) UILabel *titleBar;
+// Container: a fixed header that is the drag grip, plus an inner UIScrollView that owns
+// the controls. The grip must NOT live inside the scroll view — a pan gesture attached to
+// a subview of a UIScrollView still competes with the scroll view's own pan recognizer,
+// which is why dragging anywhere near the top scrolled the panel instead of the list.
+@interface CSMenuView : UIView
+@property (readonly) UIView *grip;
+@property (readonly) UIScrollView *scroller;
 @end
 
 @implementation CSMenuView {
     UILabel *_status;
     CGFloat _y;
+    UIScrollView *_scroller;
 }
-@synthesize titleBar = _titleBar;
+@synthesize grip = _grip;
+@synthesize scroller = _scroller;
+
+- (CGFloat)innerWidth { return self.frame.size.width - 28; }
 
 - (UILabel *)line:(NSString *)t size:(CGFloat)s color:(UIColor *)c height:(CGFloat)h {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y, self.frame.size.width - 28, h)];
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y, [self innerWidth], h)];
     l.text = t; l.font = [UIFont systemFontOfSize:s]; l.textColor = c;
     l.numberOfLines = 0;
-    [self addSubview:l]; _y += h + 2;
+    [_scroller addSubview:l]; _y += h + 2;
     return l;
 }
 - (UIButton *)btn:(NSString *)t sel:(SEL)s color:(UIColor *)c {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(14, _y, self.frame.size.width - 28, 34);
+    b.frame = CGRectMake(14, _y, [self innerWidth], 34);
     b.backgroundColor = c; b.layer.cornerRadius = 8;
     [b setTitle:t forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
     [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:b]; _y += 40;
+    [_scroller addSubview:b]; _y += 40;
     return b;
 }
 - (void)sw:(NSString *)t sel:(SEL)s on:(BOOL)on {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y + 4, self.frame.size.width - 84, 24)];
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y + 4, [self innerWidth] - 56, 24)];
     l.text = t; l.font = [UIFont systemFontOfSize:13]; l.textColor = [UIColor whiteColor];
-    [self addSubview:l];
+    [_scroller addSubview:l];
     UISwitch *v = [[UISwitch alloc] initWithFrame:CGRectMake(self.frame.size.width - 66, _y, 51, 31)];
     v.on = on;
     [v addTarget:self action:s forControlEvents:UIControlEventValueChanged];
-    [self addSubview:v];
+    [_scroller addSubview:v];
     _y += 38;
 }
 
@@ -905,18 +946,38 @@ static void pushSave(BOOL toServer) {
     self.layer.cornerRadius = 14; self.layer.borderWidth = 1;
     self.layer.borderColor = [UIColor colorWithRed:0.3 green:0.75 blue:0.45 alpha:0.8].CGColor;
     self.layer.masksToBounds = YES;
-    self.showsVerticalScrollIndicator = YES;
-    _y = 12;
 
-    UILabel *t = [self line:@"CATS & SOUP — MENU" size:16 color:[UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1] height:22];
+    // --- fixed header: the only drag surface ---
+    const CGFloat headerH = 40.0;
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, fr.size.width, headerH)];
+    header.backgroundColor = [UIColor colorWithRed:0.10 green:0.12 blue:0.16 alpha:1.0];
+    header.userInteractionEnabled = YES;
+    [self addSubview:header];
+    _grip = header;
+
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, fr.size.width - 16, headerH)];
+    t.text = @"CATS & SOUP — MENU";
+    t.font = [UIFont boldSystemFontOfSize:15];
+    t.textColor = [UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1];
     t.textAlignment = NSTextAlignmentCenter;
-    t.userInteractionEnabled = YES;      // draggable handle
-    _titleBar = t;
+    t.userInteractionEnabled = NO;
+    [header addSubview:t];
+
+    // --- scrollable body: owns every control and its own pan recognizer ---
+    _scroller = [[UIScrollView alloc] initWithFrame:CGRectMake(0, headerH, fr.size.width, fr.size.height - headerH)];
+    _scroller.showsVerticalScrollIndicator = YES;
+    _scroller.showsHorizontalScrollIndicator = NO;
+    _scroller.alwaysBounceVertical = YES;
+    _scroller.delaysContentTouches = NO;
+    _scroller.canCancelContentTouches = YES;
+    [self addSubview:_scroller];
+
+    _y = 10;
     _status = [self line:@"Status: opening" size:10 color:[UIColor colorWithWhite:0.65 alpha:1] height:28];
 
-    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(14, _y, fr.size.width - 28, 1)];
+    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(14, _y, [self innerWidth], 1)];
     div.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
-    [self addSubview:div]; _y += 10;
+    [_scroller addSubview:div]; _y += 10;
 
     [self sw:@"Bypass Anti-Cheat"     sel:@selector(ac:) on:g_bypassAC];
     [self sw:@"Tiền tệ không tuột"    sel:@selector(nf:) on:g_noFall];
@@ -949,15 +1010,7 @@ static void pushSave(BOOL toServer) {
     _y += 8;
     [self btn:@"Đóng" sel:@selector(closeTap) color:[UIColor colorWithRed:0.58 green:0.2 blue:0.2 alpha:0.9]];
 
-    // Do NOT attach a pan recognizer to this UIScrollView. A second pan on the same
-    // view competes with UIScrollView.panGestureRecognizer, which is what killed both
-    // scrolling and the buttons' touch delivery. Dragging is handled by the title bar
-    // (added by CSMenu) through a separate handle view instead.
-    self.delaysContentTouches = NO;
-    self.canCancelContentTouches = YES;
-
-    self.contentSize = CGSizeMake(fr.size.width, _y + 40);
-    self.alwaysBounceVertical = YES;
+    _scroller.contentSize = CGSizeMake(fr.size.width, _y + 30);
     return self;
 }
 
@@ -1037,9 +1090,13 @@ static void pushSave(BOOL toServer) {
     if (!w) return;
     self.host = w;
     if (self.fab.superview != w) {
+        // Re-parenting resets a UIScrollView's pan state, so only do it when the view is
+        // genuinely detached — and preserve the scroll offset across the move.
+        CGPoint off = self.panel.scroller.contentOffset;
         [w addSubview:self.fab];
         [w addSubview:self.panel];
         [w bringSubviewToFront:self.fab];
+        self.panel.scroller.contentOffset = off;
     }
 }
 
@@ -1068,7 +1125,7 @@ static void pushSave(BOOL toServer) {
         // Drag handle: the title bar only, so the scroll view keeps its own pan.
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragPanel:)];
         pan.cancelsTouchesInView = YES;
-        [self.panel.titleBar addGestureRecognizer:pan];
+        [self.panel.grip addGestureRecognizer:pan];
     }
     [self attach];
     if (!self.link) {
@@ -1078,9 +1135,12 @@ static void pushSave(BOOL toServer) {
 }
 - (void)tick {
     guardTick();
-    // Cheap identity check: Unity swaps windows on scene change and our views would
-    // otherwise stay attached to a dead window and stop responding.
-    if (self.fab.superview != self.host || !self.fab.superview) [self attach];
+    // Only re-parent when the host actually changed (Unity swaps UIWindow on scene load).
+    // Comparing against the *live* key window every frame would re-add the panel on any
+    // transient window shuffle, which cancels an in-flight scroll gesture.
+    UIWindow *live = [self hostWindow];
+    if (!live) return;
+    if (live != self.host || self.panel.superview != live) [self attach];
 }
 - (void)dragPanel:(UIPanGestureRecognizer *)p {
     CGPoint t = [p translationInView:self.panel.superview];
