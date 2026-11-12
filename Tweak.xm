@@ -478,13 +478,16 @@ static void applyParachuteControl(void) {
     *fallmulti = 1.0f;
 
     if (g_glide) {
-        // Glide on: no sink by default, Up lifts, Down sinks gently.
+        // Glide on: lift the player (negative FreeFallSpeed = ascend), Up/Down
+        // overlay that by pushing further.
         *movespeed = 8.0f * g_glideSpeed;
-        *freefall  = -(float)g_paraDir * 6.0f;
+        *freefall  = -8.0f;                                  // always rising
+        if (g_paraDir > 0) *freefall = -14.0f;               // Up: faster rise
+        if (g_paraDir < 0) *freefall = -2.0f;                // Down: nearly stop
     } else {
-        // Glide off: drop hard (this is what the original module does on release).
+        // Glide off: drop hard.
         *movespeed = 8.0f;
-        *freefall  = 22.0f;
+        *freefall = 22.0f;
     }
 }
 
@@ -716,7 +719,7 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
 
 #pragma mark - UI Menu
 
-@interface MWMMenuView : UIView
+@interface MWMMenuView : UIScrollView
 @property (retain) UILabel *statusLabel;
 @property (retain) UISwitch *espSwitch;
 @property (retain) UISwitch *aimSwitch;
@@ -742,6 +745,9 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
 - (id)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
+
+    self.showsVerticalScrollIndicator = YES;
+    self.showsHorizontalScrollIndicator = NO;
 
     self.backgroundColor = [UIColor colorWithRed:0.08 green:0.09 blue:0.12 alpha:0.96];
     self.layer.cornerRadius = 14.0;
@@ -814,7 +820,14 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
     [cls addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
     [self addSubview:cls];
 
-    [self addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)]];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    pan.cancelsTouchesInView = NO;
+    [self addGestureRecognizer:pan];
+
+    // The controls sit taller than the visible frame; let the whole panel scroll.
+    self.contentSize = CGSizeMake(w, y + 70);
+    self.alwaysBounceVertical = YES;
+
     return self;
 }
 
