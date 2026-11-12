@@ -140,8 +140,11 @@ static BOOL  g_aimlock = NO;
 static BOOL  g_noRecoil = NO;
 static BOOL  g_noSpread = NO;
 static BOOL  g_wallcheck = YES;
-static BOOL  g_instantFire = NO;
-static int   g_instantCount = 8;
+static BOOL  g_fastBullet = NO;
+static float g_bulletSpeed = 0.0f;    // 0 = game default
+static float g_fireRate = 0.1f;       // seconds between shots (lower = faster)
+static BOOL  g_fastShoot = NO;
+static int   g_instantCount = 8;      // bullets per trigger pull
 static BOOL  g_paraCtl = NO;
 static BOOL  g_glide = NO;
 static int   g_paraDir = 0;          // 0 = neutral, +1 up, -1 down
@@ -497,15 +500,29 @@ static void applyParachuteControl(void) {
 // run before this point, so nothing structural is bypassed.
 #define MSD_BULLETCOUNT   0x64
 #define MSD_SHOOTCOUNTLIM 0x68
+#define MSD_BULLTSPEED    0xC4
 
 // ShootBullet() runs processModelShotData() right after CreateShootData, and that
 // pass overwrites bulletCount with Clamp(ceil(shootCountLimite * bulletCount),1,25).
 // Writing only the count was therefore erased before the bullet loop ever saw it.
 // Pinning the limit to 1 makes the count pass through unchanged.
 static void applyInstantFire(void *retstr) {
-    if (!g_instantFire || !retstr) return;
+    if (!g_fastBullet || !retstr) return;
     *(int   *)((char *)retstr + MSD_BULLETCOUNT)   = g_instantCount;
     *(float *)((char *)retstr + MSD_SHOOTCOUNTLIM) = 1.0f;
+    if (g_bulletSpeed > 0.0f) *(float *)((char *)retstr + MSD_BULLTSPEED) = g_bulletSpeed;
+}
+
+// Fast shoot: fire-rate gate. EquipmentItem.m_NextTimeCanUse @0xD4 is compared
+// against Time.time inside the game's own check, so lowering it makes the weapon
+// ready again immediately -- the fire-rate loop in updateUseTime reads it directly.
+static void applyFastShoot(void *item) {
+    if (!g_fastShoot || !item) return;
+    // m_NextTimeCanUse is compared against Time.time in the game's own check.
+    // Setting it to (now - rate) makes the weapon ready again after the configured
+    // cooldown instead of on the very next frame (0 = fires every single frame).
+    float now = CFAbsoluteTimeGetCurrent();
+    *(float *)((char *)item + 0xD4) = now - g_fireRate;
 }
 
 #pragma mark - Silent aim / recoil
@@ -591,6 +608,9 @@ static void hk_createShootData(void *retstr, void *self, bool isTransform, void 
         if (off_wpnShootAcc) *(float *)((char *)self + off_wpnShootAcc) = 0.0f;   // 0x114
         if (off_wpnCurAcc)   *(float *)((char *)self + off_wpnCurAcc)   = 0.0f;   // 0x110
     }
+
+    // Fast shoot: reset the fire-rate gate so the next shot can start immediately.
+    applyFastShoot(self);
 
     // Aimlock: the camera is already locked by applyHardLock(), so rewriting the
     // direction here only guarantees the shot matches that camera even if the
@@ -707,8 +727,13 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
 @property (retain) UISwitch *spreadSwitch;
 @property (retain) UISwitch *wallcheckSwitch;
 @property (retain) UISwitch *instantSwitch;
+@property (retain) UISwitch *fastShootSwitch;
+@property (retain) UISlider *fireRateSlider;
+@property (retain) UILabel *fireRateLabel;
 @property (retain) UISwitch *paraSwitch;
 @property (retain) UISlider *glideSpeedSlider;
+@property (retain) UISlider *bulletSpeedSlider;
+@property (retain) UILabel *bulletSpeedLabel;
 @property (retain) UILabel *glideSpeedLabel;
 @end
 
@@ -753,10 +778,16 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
     self.recoilSwitch = [self toggleAt:&y title:@"No Recoil" sel:@selector(recoilToggled:)];
     self.spreadSwitch = [self toggleAt:&y title:@"No Bullet Spread" sel:@selector(spreadToggled:)];
     self.wallcheckSwitch = [self toggleAt:&y title:@"Wall Check" sel:@selector(wallcheckToggled:)];
-    self.instantSwitch = [self toggleAt:&y title:@"Instant Fire (all at once)" sel:@selector(instantToggled:)];
+    self.instantSwitch = [self toggleAt:&y title:@"Fast Bullet (all at once)" sel:@selector(instantToggled:)];
+    self.fastShootSwitch = [self toggleAt:&y title:@"Fast Shoot" sel:@selector(fastShootToggled:)];
+    self.fireRateLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Fire Rate: %.1fs", g_fireRate]];
+    self.fireRateSlider = [self sliderAt:&y min:0.05f max:0.5f val:g_fireRate sel:@selector(fireRateChanged:)];
     self.paraSwitch = [self toggleAt:&y title:@"Parachute Control" sel:@selector(paraToggled:)];
     self.glideSpeedLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed]];
     self.glideSpeedSlider = [self sliderAt:&y min:1.0f max:6.0f val:g_glideSpeed sel:@selector(glideSpeedChanged:)];
+
+    self.bulletSpeedLabel = [self labelAt:&y text:g_bulletSpeed > 0 ? [NSString stringWithFormat:@"Bullet Speed: %.0f m/s", g_bulletSpeed] : @"Bullet Speed: Game Default"];
+    self.bulletSpeedSlider = [self sliderAt:&y min:100 max:600 val:g_bulletSpeed > 0 ? g_bulletSpeed : 300 sel:@selector(bulletSpeedChanged:)];
 
     self.aimFovLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Aim FOV: %d°", (int)g_aimFov]];
     self.aimFovSlider = [self sliderAt:&y min:10 max:90 val:g_aimFov sel:@selector(aimFovChanged:)];
@@ -828,7 +859,18 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
 - (void)recoilToggled:(UISwitch *)s { g_noRecoil = s.isOn; }
 - (void)spreadToggled:(UISwitch *)s { g_noSpread = s.isOn; }
 - (void)wallcheckToggled:(UISwitch *)s { g_wallcheck = s.isOn; }
-- (void)instantToggled:(UISwitch *)s { g_instantFire = s.isOn; }
+- (void)instantToggled:(UISwitch *)s { g_fastBullet = s.isOn; }
+- (void)fastShootToggled:(UISwitch *)s { g_fastShoot = s.isOn; }
+- (void)fireRateChanged:(UISlider *)s {
+    g_fireRate = s.value;
+    self.fireRateLabel.text = [NSString stringWithFormat:@"Fire Rate: %.2fs", g_fireRate];
+}
+- (void)bulletSpeedChanged:(UISlider *)s {
+    g_bulletSpeed = s.value;
+    self.bulletSpeedLabel.text = g_bulletSpeed > 0
+        ? [NSString stringWithFormat:@"Bullet Speed: %.0f m/s", g_bulletSpeed]
+        : @"Bullet Speed: Game Default";
+}
 - (void)paraToggled:(UISwitch *)s { g_paraCtl = s.isOn; }
 - (void)glideSpeedChanged:(UISlider *)s {
     g_glideSpeed = s.value;
@@ -844,6 +886,7 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
 }
 - (void)resetTapped {
     g_espOn = NO; g_aimlock = NO; g_showAimFov = NO;
+    g_bulletSpeed = 0.0f; self.bulletSpeedSlider.value = 300; self.bulletSpeedLabel.text = @"Bullet Speed: Game Default";
     g_noRecoil = NO; g_noSpread = NO; g_paraCtl = NO; g_glide = NO;
     self.recoilSwitch.on = NO; self.spreadSwitch.on = NO;
     self.paraSwitch.on = NO; g_paraDir = 0; g_glide = NO;
@@ -945,7 +988,7 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
     }
 
     if (!self.menuView) {
-        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 110, 260, 500)];
+        self.menuView = [[MWMMenuView alloc] initWithFrame:CGRectMake(40, 100, 260, 580)];
         self.menuView.hidden = YES;
         [w addSubview:self.menuView];
     }
