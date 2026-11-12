@@ -46,6 +46,9 @@ static void *(*i_class_from_name)(void *, const char *, const char *);
 static void *(*i_method_from_name)(void *, const char *, int);
 static void *(*i_field_from_name)(void *, const char *);
 static size_t (*i_field_offset)(void *);
+static void *(*i_image_get_class)(void *, size_t);
+static size_t (*i_image_class_count)(void *);
+static void *(*i_class_get_parent)(void *);
 
 extern void sys_icache_invalidate(void *start, size_t len);
 
@@ -106,15 +109,14 @@ static void *M_checkFuncUnlock;   // LuaHelper::CheckFuncUnlock(int, Action<uint
 //   PlayerCamera.m_RecoilAngles              0x58
 //   NetManagerBase.NetPlayerMap              0x18
 static size_t off_cachedPtr, off_lpmPlayer, off_playerType;
-static size_t off_playerCam, off_playerMovement, off_playerEquip;
-static size_t off_recoilAngles, off_forceAngle, off_recoilEnabled, off_downFire, off_lookAngles;
+static size_t off_playerCam, off_playerMovement;
+static size_t off_recoilAngles, off_forceAngle, off_recoilEnabled, off_lookAngles;
 static size_t off_enableSmooth, off_rotationLerp;
-static size_t off_wpnShootAcc, off_wpnCurAcc;
+static size_t off_wpnShootAcc, off_wpnCurAcc, off_playerAccurate;
 static size_t off_parachuteState;    // PlayerMovementFP.m_ParachuteState (0x1C8)
 
 // Aim-assist core (the game's own targeting path)
 static void *M_linecast;             // Physics::Linecast(Vector3, Vector3, int)
-static void *M_shoot;                // ProjectileWeapon::Shoot()
 static void *M_barrierLayerMask;     // LayerHelper::GetHeroAssistBarrierLayerMask()
 // ParachuteStateModule (constant offsets inside the module object)
 #define PS_ENABLED      0x10
@@ -133,7 +135,8 @@ static BOOL  g_aimlock = NO;
 static BOOL  g_noRecoil = NO;
 static BOOL  g_noSpread = NO;
 static BOOL  g_wallcheck = YES;
-static BOOL  g_autoFire = NO;
+static BOOL  g_instantFire = NO;
+static int   g_instantCount = 8;
 static BOOL  g_paraCtl = NO;
 static BOOL  g_glide = NO;
 static int   g_paraDir = 0;          // 0 = neutral, +1 up, -1 down
@@ -313,11 +316,20 @@ static void scanPlayersImpl(void) {
 // and the target head? Physics.Linecast is the exact primitive the game's aim assist
 // uses (GetHeroAssistBarrierLayerMask), so the result matches what the engine would
 // consider "blocked".
+// Physics.Linecast with the game's own barrier mask.
+//
+// If the mask getter is unavailable, -1 (all layers) is the safe fallback: it can
+// only ever report MORE occlusion, so the feature degrades toward "do not aim
+// through walls" instead of silently aiming through them.
 static BOOL lineBlocked(Vec3 from, Vec3 to) {
-    if (!g_wallcheck) return NO;
-    if (!MP(M_linecast) || !MP(M_barrierLayerMask)) return NO;
-    int mask = ((int (*)(void *))MP(M_barrierLayerMask))(M_barrierLayerMask);
-    if (!mask) return NO;
+    if (!g_wallcheck || !MP(M_linecast)) return NO;
+    if (!vec3Finite(from) || !vec3Finite(to)) return YES;     // refuse garbage
+
+    int mask = -1;
+    if (MP(M_barrierLayerMask)) {
+        int m = ((int (*)(void *))MP(M_barrierLayerMask))(M_barrierLayerMask);
+        if (m) mask = m;
+    }
     bool hit = ((bool (*)(Vec3, Vec3, int, void *))MP(M_linecast))(from, to, mask, M_linecast);
     return hit ? YES : NO;
 }
@@ -406,19 +418,6 @@ static char *findVtableEntry(void *klass, void *orig, const char *name) {
 #define MSD_SHOOTDIR  0x54
 #define MSD_ACCURATE  0x80
 
-// Fires only while the fire button is held: PlayerEquipmentController.downFireCache.
-// The flag lives on the local player's equipment controller, so a plain read from
-// the main thread is enough -- the weapon path never touches il2cpp itself.
-static BOOL fireButtonDown(void) {
-    if (!off_downFire || !off_playerEquip) return NO;
-    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
-    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
-    if (!alive(player)) return NO;
-    void *eq = readPtr(player, off_playerEquip);
-    if (!eq) return NO;
-    return *(bool *)((char *)eq + off_downFire);
-}
-
 // ParachuteStateModule of the local player, or null when not parachuting.
 static void *parachuteModule(void) {
     if (!off_parachuteState || !off_playerMovement) return nullptr;
@@ -459,42 +458,22 @@ static void applyParachuteControl(void) {
     }
 }
 
-#pragma mark - Auto fire
+#pragma mark - Instant fire
 
-// Fires the instant a target passes the cone test: no need to press the button.
-// Shoot() has data-only xrefs (dispatched through the vtable), and it is the same
-// entry the touch handler uses, so rate of fire and ammo are still enforced by the
-// game itself.
-static void tryAutoFire(void) {
-    if (!g_autoFire || !g_aimlock || !g_aimHeadValid) return;
-    if (fireButtonDown()) return;                       // user already firing
+// Fire every queued round at once.
+//
+// ModelShotData.bulletCount (+0x64) drives the loop in computerEntityBullet:
+//   do { dir = computerFireDirection(...); computerOneEntityBullet(...); }
+//   while (++i < bulletCount);
+// so raising it turns one trigger pull into N simultaneous bullets. The value is
+// already inside the struct we are allowed to edit, and the ammo/game checks have
+// run before this point, so nothing structural is bypassed.
+#define MSD_BULLETCOUNT 0x64
 
-    // Wall check on the *live* line of fire, not just the picker's camera ray.
-    // The picker can pass and the muzzle line still be blocked by cover the camera
-    // sees past, which is exactly the "auto shoot ignores walls" report.
-    if (g_wallcheck && MP(M_getPos) && MP(M_getTransform) && alive(g_lcam)) {
-        void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(g_lcam, M_getTransform);
-        if (alive(tr)) {
-            Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
-            if (vec3Finite(eye) && lineBlocked(eye, g_aimHead)) return;
-        }
-    }
-    if (!alive(g_lcam)) return;
-    void *player = nullptr;
-    if (MP(M_lpmInstance)) {
-        void *lpm = ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance);
-        if (lpm && off_lpmPlayer) player = readPtr(lpm, off_lpmPlayer);
-    }
-    if (!alive(player)) return;
-
-    void *eq = off_playerEquip ? readPtr(player, off_playerEquip) : nullptr;
-    if (!eq) return;
-    void *handler = readPtr(eq, 0x28);                  // mActiveEHandler
-    if (!handler) return;
-    void *item = readPtr(handler, 0x30);                // m_AttachedEquipmentItem
-    if (!alive(item) || !MP(M_shoot)) return;
-
-    ((void (*)(void *, void *))MP(M_shoot))(item, M_shoot);
+static void applyInstantFire(void *retstr) {
+    if (!g_instantFire || !retstr) return;
+    int *count = (int *)((char *)retstr + MSD_BULLETCOUNT);
+    if (*count > 0) *count = g_instantCount;
 }
 
 #pragma mark - Silent aim / recoil
@@ -503,6 +482,20 @@ static void tryAutoFire(void) {
 // applyLookAngleFP from the fields below. Zeroing the fields is not enough on its
 // own: AddForceAngle also flips m_RecoilEnabled, and a late write races the shot.
 // Clearing the flag as well makes the contribution structurally impossible.
+// Player.Accurate (Player+0x100) is a Value<float>; m_CurrentValue sits at +0x20
+// (klass@0, monitor@8, then the three delegate/field slots of Value<T>). It is the
+// value CreateShootData copies into ModelShotData.accurate, so clearing it here
+// stops the cone at the source instead of racing the per-shot struct.
+static void applyNoSpread(void) {
+    if (!g_noSpread || !off_playerAccurate) return;
+    void *lpm = MP(M_lpmInstance) ? ((void *(*)(void *))MP(M_lpmInstance))(M_lpmInstance) : nullptr;
+    void *player = (lpm && off_lpmPlayer) ? readPtr(lpm, off_lpmPlayer) : nullptr;
+    if (!alive(player)) return;
+    void *val = readPtr(player, off_playerAccurate);
+    if (!val) return;
+    *(float *)((char *)val + 0x20) = 0.0f;      // Value<float>.m_CurrentValue
+}
+
 static void applyNoRecoil(void) {
     if (!g_noRecoil || !alive(g_lcam)) return;
     if (off_recoilAngles) *(Vec2 *)((char *)g_lcam + off_recoilAngles) = (Vec2){ 0.0f, 0.0f };
@@ -555,6 +548,8 @@ static void hk_createShootData(void *retstr, void *self, bool isTransform, void 
 
     if (!retstr || !g_myNetId || !alive(self)) return;
 
+    applyInstantFire(retstr);
+
     // No bullet spread. `accurate` is what computerFireDirection feeds to
     // Random.Range(-acc, acc), so zeroing the built struct is the authoritative
     // fix -- the weapon's cached curAccurate/shootAccurate would only be copied in
@@ -565,9 +560,10 @@ static void hk_createShootData(void *retstr, void *self, bool isTransform, void 
         if (off_wpnCurAcc)   *(float *)((char *)self + off_wpnCurAcc)   = 0.0f;   // 0x110
     }
 
-    // Aimlock only while the fire button is actually held down.
+    // Aimlock: the camera is already locked by applyHardLock(), so rewriting the
+    // direction here only guarantees the shot matches that camera even if the
+    // struct was built a frame earlier.
     if (!g_aimlock || !g_aimHeadValid) return;
-    if (!fireButtonDown()) return;
 
     Vec3 head = g_aimHead;                              // snapshot from onFrame
     Vec3 sp = *(Vec3 *)((char *)retstr + MSD_SHOOTPOS);
@@ -581,10 +577,8 @@ static void hk_createShootData(void *retstr, void *self, bool isTransform, void 
     *(Vec3 *)((char *)retstr + MSD_SHOOTDIR) = dir;
 }
 
-static BOOL patchVtableSlot(void *mi, void *orig, void *repl, const char *name) {
-    if (!mi || !orig) return NO;
-    void *klass = *(void **)((char *)mi + MI_KLASS);
-    if (!klass) return NO;
+static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const char *name) {
+    if (!mi || !orig || !klass) return NO;
 
     char *entry = findVtableEntry(klass, orig, name);
     if (!entry) {
@@ -593,29 +587,6 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, const char *name) 
     }
     if (!safeWritePtr(entry, repl)) return NO;
     NSLog(@"[MWM] vtable entry %p patched for %s", entry, name);
-    return YES;
-}
-
-static BOOL installAimHook(void) {
-    void *mi = M_createShootData;
-    if (!mi) return NO;
-
-    void *orig = *(void **)mi;                      // MethodInfo.methodPointer
-    if (!orig || (uintptr_t)orig < 0x1000) return NO;
-
-    O_createShootData = orig;
-    BOOL miOk = safeWritePtr(mi, (void *)&hk_createShootData);
-    BOOL vtOk = patchVtableSlot(mi, orig, (void *)&hk_createShootData, "CreateShootData");
-
-    // Verify by reading the slot back: a failed write must not report success,
-    // otherwise every feature silently degrades while claiming to be armed.
-    BOOL live = vtOk && MP(M_createShootData) == (void *)&hk_createShootData;
-    if (!live) {
-        O_createShootData = nullptr;
-        NSLog(@"[MWM] aim hook NOT armed (mi=%d vtable=%d)", miOk, vtOk);
-        return NO;
-    }
-    NSLog(@"[MWM] aim hook armed (mi=%d vtable=%d)", miOk, vtOk);
     return YES;
 }
 
@@ -703,7 +674,7 @@ static BOOL installAimHook(void) {
 @property (retain) UISwitch *recoilSwitch;
 @property (retain) UISwitch *spreadSwitch;
 @property (retain) UISwitch *wallcheckSwitch;
-@property (retain) UISwitch *autoFireSwitch;
+@property (retain) UISwitch *instantSwitch;
 @property (retain) UISwitch *paraSwitch;
 @property (retain) UISlider *glideSpeedSlider;
 @property (retain) UILabel *glideSpeedLabel;
@@ -750,7 +721,7 @@ static BOOL installAimHook(void) {
     self.recoilSwitch = [self toggleAt:&y title:@"No Recoil" sel:@selector(recoilToggled:)];
     self.spreadSwitch = [self toggleAt:&y title:@"No Bullet Spread" sel:@selector(spreadToggled:)];
     self.wallcheckSwitch = [self toggleAt:&y title:@"Wall Check" sel:@selector(wallcheckToggled:)];
-    self.autoFireSwitch = [self toggleAt:&y title:@"Auto Fire (no wait)" sel:@selector(autoFireToggled:)];
+    self.instantSwitch = [self toggleAt:&y title:@"Instant Fire (all at once)" sel:@selector(instantToggled:)];
     self.paraSwitch = [self toggleAt:&y title:@"Parachute Control" sel:@selector(paraToggled:)];
     self.glideSpeedLabel = [self labelAt:&y text:[NSString stringWithFormat:@"Glide Speed: %.1fx", g_glideSpeed]];
     self.glideSpeedSlider = [self sliderAt:&y min:1.0f max:6.0f val:g_glideSpeed sel:@selector(glideSpeedChanged:)];
@@ -825,7 +796,7 @@ static BOOL installAimHook(void) {
 - (void)recoilToggled:(UISwitch *)s { g_noRecoil = s.isOn; }
 - (void)spreadToggled:(UISwitch *)s { g_noSpread = s.isOn; }
 - (void)wallcheckToggled:(UISwitch *)s { g_wallcheck = s.isOn; }
-- (void)autoFireToggled:(UISwitch *)s { g_autoFire = s.isOn; }
+- (void)instantToggled:(UISwitch *)s { g_instantFire = s.isOn; }
 - (void)paraToggled:(UISwitch *)s { g_paraCtl = s.isOn; }
 - (void)glideSpeedChanged:(UISlider *)s {
     g_glideSpeed = s.value;
@@ -1060,6 +1031,7 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
     [self setStatus:"Status: In-Game (Active)" color:[UIColor colorWithRed:0.2 green:0.9 blue:0.3 alpha:1.0]];
 
     applyNoRecoil();
+    applyNoSpread();
     applyParachuteControl();
     [self refreshParaPanel];
 
@@ -1076,7 +1048,6 @@ static UIButton *mkBtn(NSString *t, SEL act, id target) {
             applyHardLock();          // snap the camera this frame
         }
     }
-    tryAutoFire();
 }
 @end
 
@@ -1106,10 +1077,14 @@ static BOOL resolveApi(void) {
     i_method_from_name = (void *(*)(void *, const char *, int))dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
     i_field_from_name  = (void *(*)(void *, const char *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
     i_field_offset     = (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
+    i_image_get_class  = (void *(*)(void *, size_t))dlsym(RTLD_DEFAULT, "il2cpp_image_get_class");
+    i_image_class_count= (size_t (*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_image_get_class_count");
+    i_class_get_parent = (void *(*)(void *))dlsym(RTLD_DEFAULT, "il2cpp_class_get_parent");
 
     g_apiResolved = (i_domain_get && i_thread_attach && i_get_assemblies &&
                      i_assembly_image && i_image_name && i_class_from_name &&
-                     i_method_from_name && i_field_from_name && i_field_offset);
+                     i_method_from_name && i_field_from_name && i_field_offset &&
+                     i_image_get_class && i_image_class_count && i_class_get_parent);
     if (!g_apiResolved) snprintf(g_diag, sizeof(g_diag), "Status: no il2cpp exports");
     return g_apiResolved;
 }
@@ -1168,6 +1143,55 @@ static BOOL replaceMethod(void *mi, void *repl) {
     return safeWritePtr(mi, repl);   // MethodInfo.methodPointer is field 0
 }
 
+// Decide whether `k` is ProjectileWeapon or derives from it.
+static BOOL klassDerivesFrom(void *k, void *base) {
+    int guard = 0;
+    while (k && guard++ < 32) {
+        if (k == base) return YES;
+        if (!i_class_get_parent) break;
+        k = i_class_get_parent(k);
+    }
+    return NO;
+}
+
+// Patch CreateShootData in the vtable of EVERY concrete weapon class.
+//
+// This was the reason nothing took effect: the MethodInfo we resolved belongs to
+// ProjectileWeapon, but the object in the player's hands is a GunController (or one
+// of a dozen siblings), and each class owns its own vtable. Patching only the base
+// left every real weapon dispatching to the untouched body.
+static BOOL installAimHook(void) {
+    void *mi = M_createShootData;
+    if (!mi) return NO;
+
+    void *orig = *(void **)mi;                      // ProjectileWeapon.methodPointer
+    if (!orig || (uintptr_t)orig < 0x1000) return NO;
+
+    O_createShootData = orig;
+    safeWritePtr(mi, (void *)&hk_createShootData);  // reflection path
+
+    void *game = findImage("Assembly-CSharp.dll");
+    void *base = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
+    if (!game || !base || !i_image_get_class || !i_image_class_count) return NO;
+
+    size_t n = i_image_class_count(game);
+    int patched = 0, seen = 0;
+    for (size_t i = 0; i < n; i++) {
+        void *k = i_image_get_class(game, i);
+        if (!k || !klassDerivesFrom(k, base)) continue;
+        seen++;
+        if (patchVtableSlot(mi, orig, (void *)&hk_createShootData, k, "CreateShootData"))
+            patched++;
+    }
+
+    NSLog(@"[MWM] aim hook: %d/%d weapon vtables patched", patched, seen);
+    if (!patched) {
+        O_createShootData = nullptr;
+        return NO;
+    }
+    return YES;
+}
+
 static BOOL resolveIl2Cpp(void) {
     void *game = findImage("Assembly-CSharp.dll");
     void *core = findImage("UnityEngine.CoreModule.dll");
@@ -1193,7 +1217,6 @@ static BOOL resolveIl2Cpp(void) {
     off_playerType   = fieldOff(K_player, "LocalPlayerType"); // 0x4C8 (on Player)
     off_playerCam    = fieldOff(K_player, "_PlayerCamera");   // 0x4E8
     off_playerMovement = fieldOff(K_player, "_PlayerMovement"); // 0x4D8
-    off_playerEquip  = fieldOff(K_player, "_PlayerEquipmentControllerComp"); // 0x520
 
     M_lpmInstance    = methodOf(K_lpm, "get_Instance", 0);
     M_w2s            = methodOf(K_camera, "WorldToScreenPoint", 1);
@@ -1243,14 +1266,15 @@ static BOOL resolveIl2Cpp(void) {
     void *K_moveFP = i_class_from_name(game, "HQFPSTemplate", "PlayerMovementFP");
     off_parachuteState = fieldOff(K_moveFP, "m_ParachuteState");  // 0x1C8
 
-    void *K_equipCtl = i_class_from_name(game, "HQFPSTemplate.Equipment", "PlayerEquipmentController");
-    off_downFire = fieldOff(K_equipCtl, "downFireCache");         // 0x50
 
     void *K_projWeapon = i_class_from_name(game, "HQFPSTemplate.Equipment", "ProjectileWeapon");
     M_createShootData = methodOf(K_projWeapon, "CreateShootData", 1);
-    M_shoot           = methodOf(K_projWeapon, "Shoot", 0);
     off_wpnShootAcc   = fieldOff(K_projWeapon, "shootAccurate");  // 0x114
     off_wpnCurAcc     = fieldOff(K_projWeapon, "curAccurate");    // 0x110
+    // Accurate is declared on Entity, the base of Player; il2cpp field lookup only
+    // sees fields declared on the class itself.
+    void *K_entity = i_class_from_name(game, "HQFPSTemplate", "Entity");
+    off_playerAccurate= fieldOff(K_entity, "Accurate");           // 0x100
 
     // Wall check uses the game's own assist masks so the answer matches the engine.
     void *K_physics = i_class_from_name(core, "UnityEngine", "Physics");
