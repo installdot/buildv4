@@ -27,6 +27,10 @@
 typedef struct { float x, y; } Vec2;
 typedef struct { float x, y, z; } Vec3;
 
+// Aim point height above the target's feet. 1.65 sat just over the skull, so rays
+// clipped the top edge of the head hitbox instead of its centre.
+#define MWM_HEAD_HEIGHT 1.55f
+
 static inline BOOL vec3Finite(Vec3 v) {
     return v.x == v.x && v.y == v.y && v.z == v.z &&
            fabsf(v.x) < 1e6f && fabsf(v.y) < 1e6f && fabsf(v.z) < 1e6f;
@@ -116,7 +120,8 @@ static size_t off_wpnShootAcc, off_wpnCurAcc, off_playerAccurate;
 static size_t off_parachuteState;    // PlayerMovementFP.m_ParachuteState (0x1C8)
 
 // Aim-assist core (the game's own targeting path)
-static void *M_linecast;             // Physics::Linecast(Vector3, Vector3, int)
+static void *M_linecast;             // Physics::Linecast (3- or 4-arg)
+static int   g_linecastArgs = 0;
 static void *M_barrierLayerMask;     // LayerHelper::GetHeroAssistBarrierLayerMask()
 // ParachuteStateModule (constant offsets inside the module object)
 #define PS_ENABLED      0x10
@@ -290,7 +295,7 @@ static void scanPlayersImpl(void) {
 
         EspTarget *t = &g_targets[g_targetCount];
         t->obj = np;
-        t->head = (Vec3){ pos.x, pos.y + 1.65f, pos.z };
+        t->head = (Vec3){ pos.x, pos.y + MWM_HEAD_HEIGHT, pos.z };
         t->dist = sqrtf(dx * dx + dy * dy + dz * dz);
         t->isAi = MP(M_playerIsAi) ? ((bool (*)(void *, void *))MP(M_playerIsAi))(np, M_playerIsAi) : NO;
         t->name[0] = '\0';
@@ -322,13 +327,24 @@ static void scanPlayersImpl(void) {
 // only ever report MORE occlusion, so the feature degrades toward "do not aim
 // through walls" instead of silently aiming through them.
 static BOOL lineBlocked(Vec3 from, Vec3 to) {
-    if (!g_wallcheck || !MP(M_linecast)) return NO;
-    if (!vec3Finite(from) || !vec3Finite(to)) return YES;     // refuse garbage
+    if (!g_wallcheck) return NO;
+    // Fail closed: if the trace cannot be performed we must assume the line is
+    // blocked. Returning NO here is what let the aim keep locking through walls.
+    if (!MP(M_linecast)) return YES;
+    if (!vec3Finite(from) || !vec3Finite(to)) return YES;
 
     int mask = -1;
     if (MP(M_barrierLayerMask)) {
         int m = ((int (*)(void *))MP(M_barrierLayerMask))(M_barrierLayerMask);
         if (m) mask = m;
+    }
+
+    // 1 == QueryTriggerInteraction.Ignore, so pickups and trigger zones do not
+    // register as cover.
+    if (g_linecastArgs >= 4) {
+        bool hit = ((bool (*)(Vec3, Vec3, int, int, void *))MP(M_linecast))(
+                       from, to, mask, 1, M_linecast);
+        return hit ? YES : NO;
     }
     bool hit = ((bool (*)(Vec3, Vec3, int, void *))MP(M_linecast))(from, to, mask, M_linecast);
     return hit ? YES : NO;
@@ -351,13 +367,24 @@ static BOOL pickBestTargetHead(Vec3 *outHead) {
         float dx = (float)(sp.x - cx), dy = (float)(sp.y - cy);
         float d = sqrtf(dx * dx + dy * dy);
         if (d > (float)maxRadius || d >= best) continue;
-        // Wall check against the target's head, cast from the camera.
-        if (MP(M_getPos) && MP(M_getTransform)) {
-            void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(cam, M_getTransform);
-            if (alive(tr)) {
-                Vec3 eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
-                if (vec3Finite(eye) && lineBlocked(eye, g_targets[i].head)) continue;
+
+        // Wall check. Cast from the render camera's eye, falling back to the local
+        // player's own transform. If neither is readable the target is rejected:
+        // previously this whole block was skipped when the getters were missing,
+        // which is exactly how the aim kept locking onto players behind cover.
+        if (g_wallcheck) {
+            Vec3 eye;
+            BOOL haveEye = NO;
+            void *src = alive(cam) ? cam : g_lcam;
+            if (alive(src) && MP(M_getTransform) && MP(M_getPos)) {
+                void *tr = ((void *(*)(void *, void *))MP(M_getTransform))(src, M_getTransform);
+                if (alive(tr)) {
+                    eye = ((Vec3 (*)(void *, void *))MP(M_getPos))(tr, M_getPos);
+                    haveEye = vec3Finite(eye);
+                }
             }
+            if (!haveEye) continue;                            // cannot verify -> skip
+            if (lineBlocked(eye, g_targets[i].head)) continue; // verified blocked
         }
         best = d;
         *outHead = g_targets[i].head;
@@ -468,12 +495,17 @@ static void applyParachuteControl(void) {
 // so raising it turns one trigger pull into N simultaneous bullets. The value is
 // already inside the struct we are allowed to edit, and the ammo/game checks have
 // run before this point, so nothing structural is bypassed.
-#define MSD_BULLETCOUNT 0x64
+#define MSD_BULLETCOUNT   0x64
+#define MSD_SHOOTCOUNTLIM 0x68
 
+// ShootBullet() runs processModelShotData() right after CreateShootData, and that
+// pass overwrites bulletCount with Clamp(ceil(shootCountLimite * bulletCount),1,25).
+// Writing only the count was therefore erased before the bullet loop ever saw it.
+// Pinning the limit to 1 makes the count pass through unchanged.
 static void applyInstantFire(void *retstr) {
     if (!g_instantFire || !retstr) return;
-    int *count = (int *)((char *)retstr + MSD_BULLETCOUNT);
-    if (*count > 0) *count = g_instantCount;
+    *(int   *)((char *)retstr + MSD_BULLETCOUNT)   = g_instantCount;
+    *(float *)((char *)retstr + MSD_SHOOTCOUNTLIM) = 1.0f;
 }
 
 #pragma mark - Silent aim / recoil
@@ -626,7 +658,7 @@ static BOOL patchVtableSlot(void *mi, void *orig, void *repl, void *klass, const
     for (int i = 0; g_espOn && i < g_targetCount; i++) {
         EspTarget *t = &g_targets[i];
         Vec3 headWorld = t->head;
-        Vec3 feetWorld = { headWorld.x, headWorld.y - 1.70f, headWorld.z };
+        Vec3 feetWorld = { headWorld.x, headWorld.y - MWM_HEAD_HEIGHT, headWorld.z };
 
         CGPoint headPt, feetPt;
         if (!worldToScreen(cam, headWorld, &headPt)) continue;
@@ -1277,9 +1309,25 @@ static BOOL resolveIl2Cpp(void) {
     off_playerAccurate= fieldOff(K_entity, "Accurate");           // 0x100
 
     // Wall check uses the game's own assist masks so the answer matches the engine.
-    void *K_physics = i_class_from_name(core, "UnityEngine", "Physics");
+    // Physics is NOT in CoreModule: it lives in UnityEngine.PhysicsModule.dll. Looking
+    // it up in `core` returned null, so Linecast never resolved and the wall check
+    // silently fell through to "cannot verify".
+    void *physMod   = findImage("UnityEngine.PhysicsModule.dll");
+    void *K_physics = physMod ? i_class_from_name(physMod, "UnityEngine", "Physics") : nullptr;
     void *K_layer   = i_class_from_name(game, "", "LayerHelper");
-    M_linecast         = methodOf(K_physics, "Linecast", 3);
+
+    // Unity declares Linecast(start, end, layerMask, queryTriggerInteraction); the
+    // 3-argument overload in the C# source is a default argument, not its own
+    // MethodInfo. Resolve the 4-arg form first and remember which one we got.
+    M_linecast = methodOf(K_physics, "Linecast", 4);
+    g_linecastArgs = 4;
+    if (!MP(M_linecast)) {
+        M_linecast = methodOf(K_physics, "Linecast", 3);
+        g_linecastArgs = 3;
+    }
+    if (!MP(M_linecast))
+        NSLog(@"[MWM] Physics.Linecast unresolved - wallcheck fails closed");
+
     M_barrierLayerMask = methodOf(K_layer, "GetHeroAssistBarrierLayerMask", 0);
 
     if (g_bypassTutorial) {
