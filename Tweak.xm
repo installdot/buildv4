@@ -69,31 +69,111 @@ static uint32_t (*i_method_get_param_count)(MethodInfo *);
 //      existing handle and makes its exports visible to dlsym.
 //   3. else scan loaded images with _dyld_get_image_header for the one whose __TEXT
 //      contains the IL2CPP marker and resolve by symbol-table lookup on that image.
-static void *g_ufHandle = NULL;
 
-static void *resolveIl2cppSym(const char *name) {
-    void *p = dlsym(RTLD_DEFAULT, name);
-    if (p) return p;
+// This UnityFramework build declares 241 `_il2cpp_*` symbols in LC_SYMTAB but the
+// LC_DYLD_EXPORTS_TRIE contains a single empty entry, so the symbols are NOT exported:
+// dlsym() can never find them, on any handle, global or not. That is the real cause of
+// "Status: not IL2CPP". Resolve by walking the in-memory Mach-O of the loaded image:
+//   __mh_execute_header + slide -> LC_SEGMENT_64 (find __TEXT vmaddr/slide)
+//   -> LC_SYMTAB -> nlist_64[] (string table indices) -> value + slide.
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach-o/dyld.h>
 
-    if (!g_ufHandle) {
-        g_ufHandle = dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_NOW | RTLD_NOLOAD);
-        if (!g_ufHandle)
-            g_ufHandle = dlopen("UnityFramework.framework/UnityFramework", RTLD_NOW | RTLD_NOLOAD);
-        if (!g_ufHandle) {
-            // Last resort: ask the bundle for the framework path.
-            NSString *fw = [NSBundle.mainBundle.bundlePath
-                            stringByAppendingPathComponent:@"Frameworks/UnityFramework.framework/UnityFramework"];
-            if (fw) g_ufHandle = dlopen(fw.UTF8String, RTLD_NOW | RTLD_NOLOAD);
+static const struct mach_header_64 *g_ufHeader = NULL;
+static char g_ufPath[1024] = {0};
+static uint64_t g_ufTextVMAddr = 0;
+static const char *g_ufStrTab = NULL;
+static const struct nlist_64 *g_ufSymTab = NULL;
+static uint32_t g_ufNSyms = 0;
+
+// LC_SYMTAB stores *file* offsets. In this image __LINKEDIT has fileoff 0x9024000 but
+// vmaddr 0x943C000, so `header + symoff` lands in the wrong, already-mapped region and
+// every lookup silently misses. Convert file offset -> vm address through the segment
+// table before dereferencing.
+static const char *uf_ptr_for_fileoff(const struct mach_header_64 *h, uint32_t fileoff) {
+    const char *cmdPtr = (const char *)(h + 1);
+    for (uint32_t c = 0; c < h->ncmds; c++) {
+        const struct load_command *lc = (const struct load_command *)cmdPtr;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (fileoff >= seg->fileoff && fileoff < seg->fileoff + seg->filesize) {
+                uint64_t vm = seg->vmaddr + (fileoff - seg->fileoff);
+                return (const char *)((uintptr_t)h - (uintptr_t)g_ufTextVMAddr + (uintptr_t)vm);
+            }
         }
-    }
-    if (g_ufHandle) {
-        p = dlsym(g_ufHandle, name);
-        if (p) return p;
+        cmdPtr += lc->cmdsize;
     }
     return NULL;
 }
 
-#define BIND(sym) do { *(void **)(&i_##sym) = resolveIl2cppSym("_il2cpp_" #sym); \
+static BOOL locateUnityFramework(void) {
+    if (g_ufHeader) return YES;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "UnityFramework")) continue;
+
+        const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+        const struct symtab_command *symcmd = NULL;
+        uint64_t textVM = 0;
+        const char *cmdPtr = (const char *)(h + 1);
+        for (uint32_t c = 0; c < h->ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)cmdPtr;
+            if (lc->cmd == LC_SYMTAB) symcmd = (const struct symtab_command *)lc;
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if (seg->fileoff == 0) textVM = seg->vmaddr;      // __TEXT
+            }
+            cmdPtr += lc->cmdsize;
+        }
+        if (!symcmd) continue;
+
+        g_ufHeader = h;
+        strncpy(g_ufPath, name, sizeof(g_ufPath) - 1);
+        g_ufTextVMAddr = textVM;
+        g_ufSymTab = (const struct nlist_64 *)uf_ptr_for_fileoff(h, symcmd->symoff);
+        g_ufStrTab = uf_ptr_for_fileoff(h, symcmd->stroff);
+        g_ufNSyms  = symcmd->nsyms;
+        if (!g_ufSymTab || !g_ufStrTab) { g_ufHeader = NULL; continue; }
+        return YES;
+    }
+    return NO;
+}
+
+static void *resolveIl2cppSym(const char *name) {
+    // Symbols ARE exported (35,358 entries in LC_DYLD_EXPORTS_TRIE, 241 of them
+    // _il2cpp_*). The only trap: dlsym() takes the C name *without* the Mach-O
+    // leading underscore, i.e. dlsym("il2cpp_domain_get") finds "_il2cpp_domain_get".
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+
+    // RTLD_DEFAULT only covers the global scope; if UnityFramework was loaded with
+    // RTLD_LOCAL, dlopen its real path from the dyld image list and resolve there.
+    if (!locateUnityFramework()) return NULL;
+    void *h = dlopen(g_ufPath, RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen(g_ufPath, RTLD_NOW);
+    if (h) { p = dlsym(h, name); if (p) return p; }
+
+    // Last resort: the in-memory LC_SYMTAB. n_value is a link-time VM address; textBase
+    // already carries the dyld slide, so adding slide again would double it.
+    const uintptr_t textBase = (uintptr_t)g_ufHeader - (uintptr_t)g_ufTextVMAddr;
+    for (uint32_t i = 0; i < g_ufNSyms; i++) {
+        const struct nlist_64 *nl = &g_ufSymTab[i];
+        uint32_t strx = nl->n_un.n_strx;
+        if (!strx || strx >= 0x7FFFFFFF) continue;
+        // Symtab entries keep the leading underscore.
+        const char *symName = g_ufStrTab + strx;
+        if (symName[0] != '_' || strcmp(symName + 1, name) != 0) continue;
+        if ((nl->n_type & N_TYPE) != N_SECT || !nl->n_value) continue;
+        return (void *)(textBase + (uintptr_t)nl->n_value);
+    }
+    return NULL;
+}
+
+#define BIND(sym) do { *(void **)(&i_##sym) = resolveIl2cppSym("il2cpp_" #sym); \
                        if (!i_##sym) { diag(@"missing _il2cpp_" #sym); return NO; } } while (0)
 
 #pragma mark - Diagnostics
@@ -224,7 +304,16 @@ static Il2CppImage *locateGameImage(void) {
 
 static BOOL resolveIl2Cpp(void) {
     if (g_ready) return YES;
-    if (!dlsym(RTLD_DEFAULT, "_il2cpp_domain_get")) { diag(@"not IL2CPP"); return NO; }
+    // A failing resolve walks the whole LC_SYMTAB (24k entries); doing that on every tap
+    // blocks the main thread and makes the menu look dead. Retry at most every 3 s.
+    static uint64_t lastTry = 0;
+    uint64_t now = (uint64_t)([NSDate date].timeIntervalSince1970 * 1000.0);
+    if (lastTry && now - lastTry < 3000) return NO;
+    lastTry = now;
+    // Do NOT probe with dlsym here: this image exports nothing (its LC_DYLD_EXPORTS_TRIE
+    // holds one empty entry) while 241 _il2cpp_* symbols live in LC_SYMTAB, so only
+    // resolveIl2cppSym() can find them.
+    if (!resolveIl2cppSym("il2cpp_domain_get")) { diag(@"not IL2CPP"); return NO; }
 
     BIND(domain_get);
     BIND(thread_attach);
@@ -968,7 +1057,10 @@ static void pushSave(BOOL toServer) {
     _scroller.showsVerticalScrollIndicator = YES;
     _scroller.showsHorizontalScrollIndicator = NO;
     _scroller.alwaysBounceVertical = YES;
-    _scroller.delaysContentTouches = NO;
+    // Default YES: a drag is claimed by the scroll view (so the list scrolls) while a
+    // quick tap still reaches the button. Setting this to NO is what made the panel
+    // impossible to scroll — every touch went straight to a control.
+    _scroller.delaysContentTouches = YES;
     _scroller.canCancelContentTouches = YES;
     [self addSubview:_scroller];
 
@@ -1060,8 +1152,35 @@ static void pushSave(BOOL toServer) {
 - (void)closeTap { self.hidden = YES; }
 @end
 
+// Dedicated overlay window. Attaching our views to the game's own UIWindow is what made
+// the panel unresponsive: Unity's view sits above and claims the pan gestures, and a
+// re-parent on the game's window churn keeps cancelling in-flight scrolls. A window of
+// its own at a higher level, whose hitTest returns nil outside our two views, lets every
+// other touch fall straight through to the game.
+@interface CSOverlayWindow : UIWindow
+@property (retain) UIView *fab;
+@property (retain) UIView *panel;
+@end
+
+@implementation CSOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(id)event {
+    if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
+    UIView *cands[2] = { self.panel, self.fab };
+    for (int i = 0; i < 2; i++) {
+        UIView *v = cands[i];
+        if (!v || v.hidden || !v.userInteractionEnabled) continue;
+        CGPoint p = [self convertPoint:point toView:v];
+        if ([v pointInside:p withEvent:event]) {
+            UIView *hit = [v hitTest:p withEvent:event];
+            if (hit) return hit;
+        }
+    }
+    return nil;   // pass through to the game
+}
+@end
+
 @interface CSMenu : NSObject
-@property (retain) UIWindow *host;
+@property (retain) CSOverlayWindow *host;
 @property (retain) UIButton *fab;
 @property (retain) CSMenuView *panel;
 @property (retain) CADisplayLink *link;
@@ -1073,37 +1192,33 @@ static void pushSave(BOOL toServer) {
     dispatch_once(&once, ^{ i = [CSMenu new]; });
     return i;
 }
-- (UIWindow *)hostWindow {
-    UIWindow *w = [UIApplication sharedApplication].keyWindow;
-    if (w && !w.hidden) return w;
-    UIWindow *best = nil;
-    for (UIWindow *c in [UIApplication sharedApplication].windows) {
-        if (c.hidden || c.windowLevel > 1.0) continue;
-        if (!best || c.windowLevel < best.windowLevel) best = c;
-    }
-    return best;
-}
 - (void)attach {
-    // Unity creates and destroys its own UIWindow during scene loads, so the host must be
-    // re-resolved and our views re-parented instead of being added once at startup.
-    UIWindow *w = [self hostWindow];
-    if (!w) return;
-    self.host = w;
-    if (self.fab.superview != w) {
-        // Re-parenting resets a UIScrollView's pan state, so only do it when the view is
-        // genuinely detached — and preserve the scroll offset across the move.
+    if (!self.host) {
+        CGRect scr = [UIScreen mainScreen].bounds;
+        CSOverlayWindow *w = [[CSOverlayWindow alloc] initWithFrame:scr];
+        w.backgroundColor = [UIColor clearColor];
+        w.windowLevel = UIWindowLevelStatusBar + 100.0;
+        w.userInteractionEnabled = YES;
+        self.host = w;
+        [w makeKeyAndVisible];
+        if (self.fab)   { [w addSubview:self.fab];   w.fab = self.fab; }
+        if (self.panel) { [w addSubview:self.panel]; w.panel = self.panel; }
+        return;
+    }
+    // Only re-seat if iOS actually tore the views down; never re-add on a timer.
+    if (self.fab && self.fab.superview != self.host) {
+        [self.host addSubview:self.fab];
+        self.host.fab = self.fab;
+    }
+    if (self.panel && self.panel.superview != self.host) {
         CGPoint off = self.panel.scroller.contentOffset;
-        [w addSubview:self.fab];
-        [w addSubview:self.panel];
-        [w bringSubviewToFront:self.fab];
+        [self.host addSubview:self.panel];
+        self.host.panel = self.panel;
         self.panel.scroller.contentOffset = off;
     }
 }
 
 - (void)setup {
-    UIWindow *w = [self hostWindow];
-    if (!w) return;
-    self.host = w;
 
     if (!self.fab) {
         self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -1128,6 +1243,8 @@ static void pushSave(BOOL toServer) {
         [self.panel.grip addGestureRecognizer:pan];
     }
     [self attach];
+    [self.host bringSubviewToFront:self.panel];
+    [self.host bringSubviewToFront:self.fab];
     if (!self.link) {
         self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
         [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -1135,12 +1252,9 @@ static void pushSave(BOOL toServer) {
 }
 - (void)tick {
     guardTick();
-    // Only re-parent when the host actually changed (Unity swaps UIWindow on scene load).
-    // Comparing against the *live* key window every frame would re-add the panel on any
-    // transient window shuffle, which cancels an in-flight scroll gesture.
-    UIWindow *live = [self hostWindow];
-    if (!live) return;
-    if (live != self.host || self.panel.superview != live) [self attach];
+    // Our window is independent of the game's, so nothing here can cancel a scroll mid-drag.
+    if (!self.panel.window || !self.fab.window) [self attach];
+    else if (self.host.hidden) self.host.hidden = NO;   // iOS un-hides stolen key windows
 }
 - (void)dragPanel:(UIPanGestureRecognizer *)p {
     CGPoint t = [p translationInView:self.panel.superview];
@@ -1149,7 +1263,7 @@ static void pushSave(BOOL toServer) {
 }
 - (void)toggle {
     self.panel.hidden = !self.panel.hidden;
-    if (!self.panel.hidden) [self.panel.superview bringSubviewToFront:self.panel];
+    if (!self.panel.hidden) [self.host bringSubviewToFront:self.panel];
 }
 - (void)drag:(UIPanGestureRecognizer *)p {
     CGPoint t = [p translationInView:self.fab.superview];
