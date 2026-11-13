@@ -1,1324 +1,323 @@
-#ifndef CATSSOUP_TWEAK_XM
-#define CATSSOUP_TWEAK_XM
+// NetSpy — log (and optionally block) every network packet of haitacdaichien.
+// Target: Unity IL2CPP iOS arm64. Transport is UnityEngine.Networking -> libcurl,
+// so there is no NSURLSession to hook; everything goes through il2cpp.
+//
+// EVERY il2cpp method takes a trailing `const MethodInfo*`. Instance methods are
+// (this, ..., method); statics are (..., method). Hooks MUST forward that register
+// untouched or the callee reads garbage. Arities below match that exactly.
+//
+// Output in the app sandbox, Documents/:
+//   netspy.log     one line per event
+//   netspy.block   optional CSV of serviceIds to drop, e.g. 361,321
 
-// Cats & Soup (Hidea / NEOWIZ) — UnityFramework IL2CPP tweak, TrollFools/TrollStore dylib.
-//
-// Target: C:\Users\TRUONG\Downloads\UnityFramework
-//         Mach-O arm64, IL2CPP, MD5 1a9b692e39e11a98b244681a533f9b90
-//
-// Every class / method / field name below was verified against Il2CppDumper dump.cs
-// for this exact build, and every RVA is recorded in a comment next to the lookup.
-// Metadata lookups go through il2cpp reflection, not hardcoded addresses, so the tweak
-// survives a re-dump of the same game version and reports a named failure otherwise.
-//
-// Core design decisions:
-//  1. Mutations always go through the game's own public API (AddGold / AddGem /
-//     AddFurniture / AddWorkData / ...). That way the ES3 file, the *CheckV4 hashes
-//     and the FixedSizeList backup rings are all updated exactly as the game does —
-//     which is what makes "save + upload to cloud" stick instead of being rolled back
-//     by the next SaveGoldData.
-//  2. Anti-cheat is defeated through the game's own flags (isMemoryHackV4 /
-//     isSkipMemoryHackV4) plus their dedicated savers, never by patching code pages.
-//  3. Content enumeration reads the same Entity_* ScriptableObject lists the game
-//     reads (AssetManager + 0x28..0x1xx, each holding `List<T.Param> list` at +0x18),
-//     so id spaces match the server's expectations.
-
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
-#import <string.h>
-#import <stdio.h>
-#import <stdint.h>
-#import <unistd.h>
-#import <math.h>
+#import <mach-o/dyld.h>
+#import <substrate.h>
 
-#pragma mark - il2cpp ABI (exports verified present in this binary)
+// ---------------------------------------------------------------------------
+// il2cpp objects
+// ---------------------------------------------------------------------------
+typedef struct Il2CppString {
+    void *klass;
+    void *monitor;
+    int32_t length;
+    uint16_t chars[];
+} Il2CppString;
 
-typedef struct Il2CppDomain Il2CppDomain;
-typedef struct Il2CppAssembly Il2CppAssembly;
-typedef struct Il2CppImage Il2CppImage;
-typedef struct Il2CppClass Il2CppClass;
-typedef struct MethodInfo MethodInfo;
-typedef struct FieldInfo FieldInfo;
-typedef struct Il2CppObject Il2CppObject;
+typedef struct Il2CppArray {
+    void *klass;
+    void *monitor;
+    void *bounds;
+    uint64_t max_length;
+    uint8_t data[];
+} Il2CppArray;
 
-static Il2CppDomain *(*i_domain_get)(void);
-static void *(*i_thread_attach)(Il2CppDomain *);
-static void **(*i_domain_get_assemblies)(Il2CppDomain *, size_t *);
-static Il2CppImage *(*i_assembly_get_image)(Il2CppAssembly *);
-static Il2CppClass *(*i_class_from_name)(Il2CppImage *, const char *, const char *);
-static MethodInfo *(*i_class_get_method_from_name)(Il2CppClass *, const char *, int);
-static FieldInfo *(*i_class_get_field_from_name)(Il2CppClass *, const char *);
-static size_t (*i_field_get_offset)(FieldInfo *);
-static Il2CppObject *(*i_runtime_invoke)(MethodInfo *, void *, void **, void **);
-static void (*i_field_get_value)(Il2CppObject *, FieldInfo *, void *);
-static void (*i_field_static_get_value)(FieldInfo *, void *);
-static Il2CppClass *(*i_class_get_parent)(Il2CppClass *);
-static void *(*i_method_get_param)(MethodInfo *, uint32_t);
-static char *(*i_type_get_name)(void *);
-static MethodInfo *(*i_class_get_methods)(Il2CppClass *, void **);
-static const char *(*i_method_get_name)(MethodInfo *);
-static uint32_t (*i_method_get_param_count)(MethodInfo *);
+// ---------------------------------------------------------------------------
+// log
+// ---------------------------------------------------------------------------
+static NSString *gLogPath;
+static FILE *gFile;
+static NSLock *gLock;
 
-// UnityFramework is loaded by the app with RTLD_LOCAL, so its exported il2cpp_* symbols
-// are not visible to dlsym(RTLD_DEFAULT) from an injected dylib — that is the "not IL2CPP"
-// status. Resolve in two stages:
-//   1. dlsym(RTLD_DEFAULT) for a jailbreak-style global load,
-//   2. else dlopen the already-loaded UnityFramework image by path, which returns the
-//      existing handle and makes its exports visible to dlsym.
-//   3. else scan loaded images with _dyld_get_image_header for the one whose __TEXT
-//      contains the IL2CPP marker and resolve by symbol-table lookup on that image.
+static NSString *DocsPath(void) {
+    static NSString *d;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *a = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        d = a.count ? a[0] : @"/tmp";
+    });
+    return d;
+}
 
-// This UnityFramework build declares 241 `_il2cpp_*` symbols in LC_SYMTAB but the
-// LC_DYLD_EXPORTS_TRIE contains a single empty entry, so the symbols are NOT exported:
-// dlsym() can never find them, on any handle, global or not. That is the real cause of
-// "Status: not IL2CPP". Resolve by walking the in-memory Mach-O of the loaded image:
-//   __mh_execute_header + slide -> LC_SEGMENT_64 (find __TEXT vmaddr/slide)
-//   -> LC_SYMTAB -> nlist_64[] (string table indices) -> value + slide.
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach-o/dyld.h>
+static void LogLine(NSString *fmt, ...) {
+    if (!gLock) {
+        gLock = [NSLock new];
+        gLogPath = [DocsPath() stringByAppendingPathComponent:@"netspy.log"];
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
 
-static const struct mach_header_64 *g_ufHeader = NULL;
-static char g_ufPath[1024] = {0};
-static uint64_t g_ufTextVMAddr = 0;
-static const char *g_ufStrTab = NULL;
-static const struct nlist_64 *g_ufSymTab = NULL;
-static uint32_t g_ufNSyms = 0;
+    static NSDateFormatter *df;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        df = [NSDateFormatter new];
+        df.dateFormat = @"HH:mm:ss.SSS";
+    });
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                      [df stringFromDate:[NSDate date]], body];
 
-// LC_SYMTAB stores *file* offsets. In this image __LINKEDIT has fileoff 0x9024000 but
-// vmaddr 0x943C000, so `header + symoff` lands in the wrong, already-mapped region and
-// every lookup silently misses. Convert file offset -> vm address through the segment
-// table before dereferencing.
-static const char *uf_ptr_for_fileoff(const struct mach_header_64 *h, uint32_t fileoff) {
-    const char *cmdPtr = (const char *)(h + 1);
-    for (uint32_t c = 0; c < h->ncmds; c++) {
-        const struct load_command *lc = (const struct load_command *)cmdPtr;
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-            if (fileoff >= seg->fileoff && fileoff < seg->fileoff + seg->filesize) {
-                uint64_t vm = seg->vmaddr + (fileoff - seg->fileoff);
-                return (const char *)((uintptr_t)h - (uintptr_t)g_ufTextVMAddr + (uintptr_t)vm);
-            }
+    [gLock lock];
+    if (!gFile) gFile = fopen(gLogPath.UTF8String, "a");
+    if (gFile) { fputs(line.UTF8String, gFile); fflush(gFile); }
+    [gLock unlock];
+}
+
+static NSString *HexOf(const uint8_t *p, NSUInteger n) {
+    if (!p || !n) return @"";
+    NSMutableString *s = [NSMutableString stringWithCapacity:n * 2];
+    for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
+    return s;
+}
+
+static NSString *DumpArray(Il2CppArray *a, NSString *label) {
+    if (!a) return [NSString stringWithFormat:@"%@=(null)", label];
+    uint64_t n = a->max_length;
+    if (!n) return [NSString stringWithFormat:@"%@=(empty)", label];
+    if (n <= 4096) return [NSString stringWithFormat:@"%@[%llu]=%@", label, n, HexOf(a->data, (NSUInteger)n)];
+    return [NSString stringWithFormat:@"%@[%llu]=%@...", label, n, HexOf(a->data, 512)];
+}
+
+static NSString *DumpStr(Il2CppString *s) {
+    if (!s) return @"(null)";
+    int32_t n = s->length;
+    if (n < 0 || n > 4096) return @"(bad)";
+    return [[NSString alloc] initWithCharacters:(const unichar *)s->chars length:(NSUInteger)n];
+}
+
+static BOOL ServiceBlocked(int32_t svc) {
+    static NSMutableSet *cache;
+    static time_t at;
+    time_t now = time(NULL);
+    if (!cache || now - at > 2) {
+        cache = [NSMutableSet new];
+        at = now;
+        NSString *p = [DocsPath() stringByAppendingPathComponent:@"netspy.block"];
+        NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        for (NSString *t in [s componentsSeparatedByCharactersInSet:
+                 [NSCharacterSet characterSetWithCharactersInString:@", \n\r\t"]]) {
+            if (t.length) [cache addObject:@(t.integerValue)];
         }
-        cmdPtr += lc->cmdsize;
     }
-    return NULL;
+    return [cache containsObject:@(svc)];
 }
 
-static BOOL locateUnityFramework(void) {
-    if (g_ufHeader) return YES;
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        const struct mach_header *mh = _dyld_get_image_header(i);
-        if (!mh || mh->magic != MH_MAGIC_64) continue;
-        const char *name = _dyld_get_image_name(i);
-        if (!name || !strstr(name, "UnityFramework")) continue;
-
-        const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
-        const struct symtab_command *symcmd = NULL;
-        uint64_t textVM = 0;
-        const char *cmdPtr = (const char *)(h + 1);
-        for (uint32_t c = 0; c < h->ncmds; c++) {
-            const struct load_command *lc = (const struct load_command *)cmdPtr;
-            if (lc->cmd == LC_SYMTAB) symcmd = (const struct symtab_command *)lc;
-            if (lc->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                if (seg->fileoff == 0) textVM = seg->vmaddr;      // __TEXT
-            }
-            cmdPtr += lc->cmdsize;
+// ---------------------------------------------------------------------------
+// base address: mach_header + slide (__TEXT vmaddr == 0 in this build)
+// ---------------------------------------------------------------------------
+static uintptr_t UfBase(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "UnityFramework")) {
+            const struct mach_header *mh = _dyld_get_image_header(i);
+            return (uintptr_t)mh + (uintptr_t)_dyld_get_image_vmaddr_slide(i);
         }
-        if (!symcmd) continue;
-
-        g_ufHeader = h;
-        strncpy(g_ufPath, name, sizeof(g_ufPath) - 1);
-        g_ufTextVMAddr = textVM;
-        g_ufSymTab = (const struct nlist_64 *)uf_ptr_for_fileoff(h, symcmd->symoff);
-        g_ufStrTab = uf_ptr_for_fileoff(h, symcmd->stroff);
-        g_ufNSyms  = symcmd->nsyms;
-        if (!g_ufSymTab || !g_ufStrTab) { g_ufHeader = NULL; continue; }
-        return YES;
     }
-    return NO;
+    return 0;
 }
 
-static void *resolveIl2cppSym(const char *name) {
-    // Symbols ARE exported (35,358 entries in LC_DYLD_EXPORTS_TRIE, 241 of them
-    // _il2cpp_*). The only trap: dlsym() takes the C name *without* the Mach-O
-    // leading underscore, i.e. dlsym("il2cpp_domain_get") finds "_il2cpp_domain_get".
-    void *p = dlsym(RTLD_DEFAULT, name);
-    if (p) return p;
+// ---------------------------------------------------------------------------
+// RVAs
+// ---------------------------------------------------------------------------
+// layer A — UnityEngine.Networking
+#define RVA_UWR_SetUrl          0x379D770
+#define RVA_UWR_Get             0x379EE10
+#define RVA_UWR_Put             0x379EEF0
+#define RVA_UWR_SendWebRequest  0x379CAD4
+#define RVA_DH_get_data         0x379AEEC
+// layer B — transport
+#define RVA_SendProtoPackage    0x151C554
+#define RVA_Selialize           0x151C764
+#define RVA_SendPackage         0x151CE4C
+#define RVA_SendHttpRequest     0x151C0AC
+#define RVA_ParsePbObject       0x19B4BF8
+// layer C — semantics
+#define RVA_LoginByAccount      0x1505960
+#define RVA_LoginGame           0x1507980
+#define RVA_PetRequestList      0x14FD040
+#define RVA_PetActivate         0x14FC68C
+#define RVA_PetUpgradeLevel     0x1501A3C
+#define RVA_PetEvolve           0x1501B50
+#define RVA_PetUpgradeSkill     0x1500B18
+#define RVA_PetRebirth          0x1503A5C
+#define RVA_PetUpgradeRuin      0x1502AF4
+#define RVA_LuckyRotate         0x150FDBC
+#define RVA_LuckyBuyChip        0x150FCAC
+#define RVA_ItemShardSummon     0x150D4B4
 
-    // RTLD_DEFAULT only covers the global scope; if UnityFramework was loaded with
-    // RTLD_LOCAL, dlopen its real path from the dyld image list and resolve there.
-    if (!locateUnityFramework()) return NULL;
-    void *h = dlopen(g_ufPath, RTLD_NOW | RTLD_NOLOAD);
-    if (!h) h = dlopen(g_ufPath, RTLD_NOW);
-    if (h) { p = dlsym(h, name); if (p) return p; }
+// ===========================================================================
+// layer A
+// ===========================================================================
+static void  (*oSetUrl)(void *, void *, void *);
+static void *(*oGet)(void *, void *);
+static void *(*oPut)(void *, void *, void *);
+static void *(*oSend)(void *, void *);
+static void *(*oDHData)(void *, void *);
 
-    // Last resort: the in-memory LC_SYMTAB. n_value is a link-time VM address; textBase
-    // already carries the dyld slide, so adding slide again would double it.
-    const uintptr_t textBase = (uintptr_t)g_ufHeader - (uintptr_t)g_ufTextVMAddr;
-    for (uint32_t i = 0; i < g_ufNSyms; i++) {
-        const struct nlist_64 *nl = &g_ufSymTab[i];
-        uint32_t strx = nl->n_un.n_strx;
-        if (!strx || strx >= 0x7FFFFFFF) continue;
-        // Symtab entries keep the leading underscore.
-        const char *symName = g_ufStrTab + strx;
-        if (symName[0] != '_' || strcmp(symName + 1, name) != 0) continue;
-        if ((nl->n_type & N_TYPE) != N_SECT || !nl->n_value) continue;
-        return (void *)(textBase + (uintptr_t)nl->n_value);
-    }
-    return NULL;
+static void HkSetUrl(void *self, void *url, void *m) {
+    LogLine(@"    url -> %@", DumpStr((Il2CppString *)url));
+    if (oSetUrl) oSetUrl(self, url, m);
 }
 
-#define BIND(sym) do { *(void **)(&i_##sym) = resolveIl2cppSym("il2cpp_" #sym); \
-                       if (!i_##sym) { diag(@"missing _il2cpp_" #sym); return NO; } } while (0)
-
-#pragma mark - Diagnostics
-
-static char g_diag[160] = "booting";
-static void diag(NSString *m) { snprintf(g_diag, sizeof(g_diag), "%s", m.UTF8String); }
-
-#pragma mark - Handles
-
-static Il2CppImage *g_img = NULL;
-static BOOL g_ready = NO;
-
-static Il2CppClass *K_DataManager, *K_GameManager, *K_GameSaveManager;
-static Il2CppClass *K_GameData, *K_AssetManager;
-
-static MethodInfo *M_gmInstance;
-static MethodInfo *M_gsmCloudSave, *M_gmCloudSave, *M_gmSaveToServer;
-static MethodInfo *M_saveHackFlag, *M_saveSkipHack, *M_saveHackSend;
-static MethodInfo *M_addGold, *M_addEnergy, *M_addGem, *M_addCoin, *M_addPlayPoint;
-static MethodInfo *M_addTravelPoint, *M_addWelcomeCoin, *M_addSouvenirToken, *M_addVipPoint;
-static MethodInfo *M_addTicketGold, *M_addTicketEnergy, *M_addTicketTreasure;
-static MethodInfo *M_addChangeTicket, *M_addSelectTicket, *M_addKittyChangeTicket;
-static MethodInfo *M_addSpecialFishing, *M_addTelescopeLens, *M_addMinigameToken;
-static MethodInfo *M_addUnitData, *M_addKittyData, *M_addFurniture, *M_addWorkData;
-static MethodInfo *M_addPropData, *M_addNewRndEquip, *M_addEquipData;
-static MethodInfo *M_addTheme, *M_addLamp, *M_addBgm, *M_addGuest, *M_addEventPlace;
-static MethodInfo *M_addWorkSkin, *M_addSignSkin, *M_addTimerSkin, *M_addBalloonSkin;
-static MethodInfo *M_getReward;
-static MethodInfo *M_addTutorialFinish, *M_addPhotoOutline, *M_addPhotoSticker;
-static MethodInfo *M_addRewardDecoBlock;
-static MethodInfo *M_saveEquipData, *M_applyEquipExp, *M_savePurchase;
-static MethodInfo *M_collectionRecv, *M_collectionCan, *M_collectionAdd;
-static MethodInfo *M_consumeMoney;
-
-static size_t off_mGameData;
-static size_t off_gold, off_gem, off_freeGem, off_coin;
-static size_t off_isHackV4, off_isHackSendV4, off_isSkipHackV4;
-static size_t off_goldCheck, off_energyCheck, off_gemCheck, off_freeGemCheck;
-
-#pragma mark - State
-
-static BOOL g_noFall = NO;
-static BOOL g_bypassAC = NO;
-static BOOL g_freeShop = NO;
-static BOOL g_noAds = NO;
-static uint64_t g_lastGuard = 0;
-
-static inline void *rd(void *o, size_t off) { return (o && off) ? *(void **)((char *)o + off) : NULL; }
-static inline int32_t rdi(void *o, size_t off) { return (o && off) ? *(int32_t *)((char *)o + off) : 0; }
-static inline void wrb(void *o, size_t off, uint8_t v) { if (o && off) *(uint8_t *)((char *)o + off) = v; }
-
-static uint64_t nowMs(void) { return (uint64_t)([NSDate date].timeIntervalSince1970 * 1000.0); }
-
-// List<T> layout is identical for every instantiation: _items @0x10, _size @0x18,
-// array element data @0x20. Verified against dump.cs `List<T>` field order.
-static inline int listCount(void *list) { return list ? rdi(list, 0x18) : 0; }
-static inline void *listAt(void *list, int i) {
-    void *items = rd(list, 0x10);
-    if (!items || i < 0) return NULL;
-    return *(void **)((char *)items + 0x20 + (size_t)i * 8);
-}
-
-#pragma mark - Reflection helpers
-
-// get_Instance() lives on the *generic* base (Singleton<T> / ManagerBase<T> /
-// MonoSingleton<T>). The MethodInfo reachable from a concrete class belongs to the
-// generic definition, and runtime_invoke on it returns garbage — that is why no feature
-// ever did anything. Read the static backing field of the inflated base instead:
-//   Singleton<T>     -> private  static T instance
-//   MonoSingleton<T> -> protected static T _instance
-//   ManagerBase<T>   -> private  static T <Instance>k__BackingField
-static void *staticInstance(Il2CppClass *k, const char *fieldName) {
-    if (!k || !fieldName) return NULL;
-    for (Il2CppClass *c = k; c; c = i_class_get_parent(c)) {
-        FieldInfo *f = i_class_get_field_from_name(c, fieldName);
-        if (!f) continue;
-        void *out = NULL;
-        i_field_static_get_value(f, &out);
-        if (out) return out;
-    }
-    return NULL;
-}
-
-// AddGold / AddEnergy are overloaded on (int,bool) and (BigNumber,bool). Picking the
-// wrong one silently reinterprets 90000 as a float mantissa, so resolve by parameter
-// type name instead of by arity.
-static MethodInfo *findMethodTyped(Il2CppClass *k, const char *name, int argc,
-                                   int probeIdx, const char *wantType) {
-    if (!k) return NULL;
-    void *iter = NULL;
-    MethodInfo *m;
-    while ((m = (MethodInfo *)i_class_get_methods(k, &iter)) != NULL) {
-        const char *mn = i_method_get_name(m);
-        if (!mn || strcmp(mn, name) != 0) continue;
-        if ((int)i_method_get_param_count(m) != argc) continue;
-        if (probeIdx < 0) return m;
-        void *pt = i_method_get_param(m, (uint32_t)probeIdx);
-        if (!pt) continue;
-        const char *tn = i_type_get_name(pt);
-        if (!tn) continue;
-        // il2cpp type names are "BigNumber", "System.Int32", "System.Boolean", ...
-        // Match on the trailing component: il2cpp hands back "System.Int32" while the
-        // caller may ask for "Int32" or "System.Int32"; comparing the tail covers both.
-        const char *shortName = tn;
-        for (const char *q = tn; *q; q++) if (*q == '.') shortName = q + 1;
-        const char *wantTail = wantType;
-        for (const char *q = wantType; *q; q++) if (*q == '.') wantTail = q + 1;
-        if (strcmp(shortName, wantTail) == 0) return m;
-    }
-    return NULL;
-}
-
-#pragma mark - Bootstrap
-
-static Il2CppImage *locateGameImage(void) {
-    if (g_img) return g_img;
-    size_t n = 0;
-    Il2CppAssembly **asms = (Il2CppAssembly **)i_domain_get_assemblies(i_domain_get(), &n);
-    if (!asms) return NULL;
-    for (size_t i = 0; i < n; i++) {
-        Il2CppImage *img = i_assembly_get_image(asms[i]);
-        if (!img) continue;
-        if (i_class_from_name(img, "", "DataManager") &&
-            i_class_from_name(img, "", "GameData")) { g_img = img; return img; }
-    }
-    return NULL;
-}
-
-static BOOL resolveIl2Cpp(void) {
-    if (g_ready) return YES;
-    // A failing resolve walks the whole LC_SYMTAB (24k entries); doing that on every tap
-    // blocks the main thread and makes the menu look dead. Retry at most every 3 s.
-    static uint64_t lastTry = 0;
-    uint64_t now = (uint64_t)([NSDate date].timeIntervalSince1970 * 1000.0);
-    if (lastTry && now - lastTry < 3000) return NO;
-    lastTry = now;
-    // Do NOT probe with dlsym here: this image exports nothing (its LC_DYLD_EXPORTS_TRIE
-    // holds one empty entry) while 241 _il2cpp_* symbols live in LC_SYMTAB, so only
-    // resolveIl2cppSym() can find them.
-    if (!resolveIl2cppSym("il2cpp_domain_get")) { diag(@"not IL2CPP"); return NO; }
-
-    BIND(domain_get);
-    BIND(thread_attach);
-    BIND(domain_get_assemblies);
-    BIND(assembly_get_image);
-    BIND(class_from_name);
-    BIND(class_get_method_from_name);
-    BIND(class_get_field_from_name);
-    BIND(field_get_offset);
-    BIND(runtime_invoke);
-    BIND(field_get_value);
-    BIND(field_static_get_value);
-    BIND(class_get_parent);
-    BIND(method_get_param);
-    BIND(type_get_name);
-    BIND(class_get_methods);
-    BIND(method_get_name);
-    BIND(method_get_param_count);
-
-    Il2CppDomain *dom = i_domain_get();
-    if (!dom) { diag(@"no domain"); return NO; }
-    i_thread_attach(dom);
-
-    Il2CppImage *img = locateGameImage();
-    if (!img) { diag(@"Assembly-CSharp not found"); return NO; }
-
-    K_DataManager     = i_class_from_name(img, "", "DataManager");
-    K_GameData        = i_class_from_name(img, "", "GameData");
-    K_GameManager     = i_class_from_name(img, "", "GameManager");
-    K_GameSaveManager = i_class_from_name(img, "CnS", "GameSaveManager");
-    K_AssetManager    = i_class_from_name(img, "", "AssetManager");
-
-
-    if (!K_DataManager || !K_GameData || !K_GameManager) { diag(@"core class missing"); return NO; }
-
-    off_mGameData = i_field_get_offset(i_class_get_field_from_name(K_DataManager, "mGameData"));
-    off_gold      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gold"));
-    off_gem       = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gem"));
-    off_freeGem   = i_field_get_offset(i_class_get_field_from_name(K_GameData, "freeGem"));
-    off_coin      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "coin"));
-    off_isHackV4      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "isMemoryHackV4"));
-    off_isHackSendV4  = i_field_get_offset(i_class_get_field_from_name(K_GameData, "isMemoryHackSendToServerV4"));
-    off_isSkipHackV4  = i_field_get_offset(i_class_get_field_from_name(K_GameData, "isSkipMemoryHackV4"));
-    off_goldCheck     = i_field_get_offset(i_class_get_field_from_name(K_GameData, "goldCheckV4"));
-    off_energyCheck   = i_field_get_offset(i_class_get_field_from_name(K_GameData, "energyCheckV4"));
-    off_gemCheck      = i_field_get_offset(i_class_get_field_from_name(K_GameData, "gemCheckV4"));
-    off_freeGemCheck  = i_field_get_offset(i_class_get_field_from_name(K_GameData, "freeGemCheckV4"));
-
-    if (!off_mGameData || !off_gold) { diag(@"GameData layout mismatch"); return NO; }
-
-    // Singleton instance getters. The static getter is declared on the generic base
-    // (Singleton<T> / ManagerBase<T> / MonoSingleton<T>), so walk the parent chain.
-    // GameManager declares a non-generic get_Instance (0x2B0D710) that is safe to
-    // invoke; the other managers only expose the generic-base getter, so their
-    // instances come from staticInstance().
-
-    M_gmCloudSave    = i_class_get_method_from_name(K_GameManager, "CloudSave", 1);        // 0x2B1DF70
-    M_gmSaveToServer = i_class_get_method_from_name(K_GameManager, "SaveDataToServer", 1); // 0x2B21714
-
-    // Anti-cheat savers — three fields, three savers, all with 0 args.
-    M_saveHackFlag = i_class_get_method_from_name(K_DataManager, "SaveIsMemoryHackData", 0);
-    M_saveHackSend = i_class_get_method_from_name(K_DataManager, "SaveIsMemoryHackSendToServerData", 0);
-    M_saveSkipHack = i_class_get_method_from_name(K_DataManager, "SaveIsSkipMemoryHackData", 0);
-
-    // Currency. AddGold/AddEnergy are overloaded on (int,bool) and (BigNumber,bool):
-    // resolve by parameter type, never by arity.
-    M_addGold         = findMethodTyped(K_DataManager, "AddGold", 2, 0, "BigNumber");
-    M_addEnergy       = findMethodTyped(K_DataManager, "AddEnergy", 2, 0, "BigNumber");
-    M_addGem          = i_class_get_method_from_name(K_DataManager, "AddGem", 5);            // int,bool,bool,int,string
-    M_addCoin         = i_class_get_method_from_name(K_DataManager, "AddCoin", 2);
-    M_addPlayPoint    = i_class_get_method_from_name(K_DataManager, "AddPlayPoint", 2);
-    M_addTravelPoint  = i_class_get_method_from_name(K_DataManager, "AddTravelPoint", 2);
-    M_addWelcomeCoin  = i_class_get_method_from_name(K_DataManager, "AddWelcomeCoin", 2);
-    M_addSouvenirToken= i_class_get_method_from_name(K_DataManager, "AddSouvenirToken", 3);
-    M_addVipPoint     = i_class_get_method_from_name(K_DataManager, "AddVipPoint", 2);        // void,int,bool
-
-    M_addTicketGold     = i_class_get_method_from_name(K_DataManager, "AddTicketGold", 4);
-    M_addTicketEnergy   = i_class_get_method_from_name(K_DataManager, "AddTicketEnergy", 4);
-    M_addTicketTreasure = i_class_get_method_from_name(K_DataManager, "AddTicketTreasure", 4);
-    // AddChangeTicket / AddSelectTicket have no 2-arg overload: (int,bool,int) and
-    // (int,bool,bool) are the shortest forms.
-    M_addChangeTicket   = i_class_get_method_from_name(K_DataManager, "AddChangeTicket", 4);
-    M_addSelectTicket   = i_class_get_method_from_name(K_DataManager, "AddSelectTicket", 4);
-    M_addKittyChangeTicket = i_class_get_method_from_name(K_DataManager, "AddKittyChangeTicket", 2);
-    M_addSpecialFishing = i_class_get_method_from_name(K_DataManager, "AddSpecialFishingCount", 3);
-    M_addTelescopeLens  = i_class_get_method_from_name(K_DataManager, "AddTelescopeLens", 3);
-    M_addMinigameToken  = i_class_get_method_from_name(K_DataManager, "AddMinigameToken", 2);
-
-    // Progression
-    M_addUnitData      = i_class_get_method_from_name(K_DataManager, "AddUnitData", 3);
-    M_addKittyData     = i_class_get_method_from_name(K_DataManager, "AddKittyData", 2);
-    M_addFurniture     = i_class_get_method_from_name(K_DataManager, "AddFurniture", 5);
-    M_addWorkData      = i_class_get_method_from_name(K_DataManager, "AddWorkData", 3);
-    M_addPropData      = i_class_get_method_from_name(K_DataManager, "AddPropData", 3);
-    M_addNewRndEquip   = i_class_get_method_from_name(K_DataManager, "AddNewRndEquip", 5);    // private, reachable
-    M_addEquipData     = i_class_get_method_from_name(K_DataManager, "AddEquipData", 4);
-    M_addTheme         = i_class_get_method_from_name(K_DataManager, "AddTheme", 3);
-    M_addLamp          = i_class_get_method_from_name(K_DataManager, "AddLamp", 1);
-    M_addBgm           = i_class_get_method_from_name(K_DataManager, "AddBgm", 2);
-    M_addGuest         = i_class_get_method_from_name(K_DataManager, "AddGuest", 1);
-    M_addEventPlace    = i_class_get_method_from_name(K_DataManager, "AddEventPlace", 1);
-    M_addWorkSkin      = i_class_get_method_from_name(K_DataManager, "AddWorkSkinsData", 1);
-    M_addSignSkin      = i_class_get_method_from_name(K_DataManager, "AddSignSkinsData", 1);
-    M_addTimerSkin     = i_class_get_method_from_name(K_DataManager, "AddTimerSkinsData", 1);
-    M_addBalloonSkin   = i_class_get_method_from_name(K_DataManager, "AddBalloonSkinsData", 2);
-    M_addTutorialFinish= i_class_get_method_from_name(K_DataManager, "AddTutorialFinish", 1);
-    M_addPhotoOutline  = i_class_get_method_from_name(K_DataManager, "AddPhotoOutline", 1);
-    M_addPhotoSticker  = i_class_get_method_from_name(K_DataManager, "AddPhotoSticker", 1);
-    M_addRewardDecoBlock  = i_class_get_method_from_name(K_DataManager, "AddRewardDecoBlock", 3);
-    M_getReward        = i_class_get_method_from_name(K_DataManager, "GetReward", 9);
-    M_collectionRecv   = i_class_get_method_from_name(K_DataManager, "ReceiveCollectionReward", 1);
-    M_collectionCan    = i_class_get_method_from_name(K_DataManager, "CanReceiveCollectionReward", 1);
-    M_collectionAdd    = i_class_get_method_from_name(K_DataManager, "AddNewCollection", 3);
-    M_saveEquipData    = i_class_get_method_from_name(K_DataManager, "SaveEquipData", 0);
-    M_savePurchase     = i_class_get_method_from_name(K_DataManager, "SavePurchase", 0);
-
-    // Equip level grants
-    M_applyEquipExp    = i_class_get_method_from_name(K_DataManager, "ApplyEquipLevelsFromExp", 1);
-
-    // ConsumeMoney drives every shop purchase; used as a free-shop probe.
-    M_consumeMoney     = i_class_get_method_from_name(K_DataManager, "ConsumeMoney", 5);
-
-    g_ready = YES;
-    diag(@"ready");
-    return YES;
-}
-
-#pragma mark - Accessors
-
-static int g_excCount = 0;   // managed exceptions swallowed by rcInvoke
-
-// runtime_invoke's 4th parameter receives the managed exception object. Passing NULL
-// there means a throw inside the invoked method (e.g. AddUnitData doing List.Find on an
-// unknown id and raising NullReferenceException) has nowhere to land, and the process
-// dies. Capture it into a local so a bad id skips instead of killing the game.
-static Il2CppObject *rcInvoke(MethodInfo *m, void *obj, void **args) {
-    if (!m) return NULL;
-    Il2CppObject *exc = NULL;
-    Il2CppObject *r = i_runtime_invoke(m, obj, args, (void **)&exc);
-    if (exc) {
-        // Do NOT touch g_diag here: it holds the resolve status shown in the panel, and
-        // this runs many times per bulk pass. Count instead and surface it once.
-        g_excCount++;
-        return NULL;
-    }
+static void *HkGet(void *uri, void *m) {
+    void *r = oGet ? oGet(uri, m) : 0;
+    LogLine(@"REQ GET %@  req=%p", DumpStr((Il2CppString *)uri), r);
     return r;
 }
 
-
-static void *gmInstance(void) {
-    if (!g_ready || !M_gmInstance) return NULL;
-    return rcInvoke(M_gmInstance, NULL, NULL);
-}
-// Bulk grants call the game's adders hundreds of times, and each one does an ES3 write
-// plus a V4 hash recompute. All of it must stay on the main thread (Unity API), but a
-// single uninterrupted pass trips the 10 s watchdog. pump() yields to the run loop every
-// N calls so the app stays alive and the UI keeps repainting.
-static void pump(int i) {
-    if ((i & 7) != 7) return;
-    @autoreleasepool {
-        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0]];
-    }
+static void *HkPut(void *uri, void *body, void *m) {
+    void *r = oPut ? oPut(uri, body, m) : 0;
+    LogLine(@"REQ PUT %@  req=%p  %@", DumpStr((Il2CppString *)uri), r,
+            DumpArray((Il2CppArray *)body, @"upload"));
+    return r;
 }
 
-static void *dm(void) { return staticInstance(K_DataManager, "instance"); }
-static void *gd(void) { void *d = dm(); return d ? rd(d, off_mGameData) : NULL; }
-static void *am(void) { return staticInstance(K_AssetManager, "<Instance>k__BackingField"); }
-
-// Entity_*.list at +0x18 inside each ScriptableObject referenced by AssetManager.
-static void *entityList(const char *assetField) {
-    void *m = am();
-    if (!m || !K_AssetManager) return NULL;
-    FieldInfo *f = i_class_get_field_from_name(K_AssetManager, assetField);
-    if (!f) return NULL;
-    void *ent = rd(m, i_field_get_offset(f));
-    return ent ? rd(ent, 0x18) : NULL;
+static void *HkSend(void *self, void *m) {
+    LogLine(@"REQ send req=%p", self);
+    return oSend ? oSend(self, m) : 0;
 }
 
-#pragma mark - Anti-cheat
-
-// IsMemoryHackCheck (0x2BB8764) returns 0 immediately when either flag is set:
-//   +0x3B8 isMemoryHackV4  → 0x2BB8818 tbz → return 0
-//   +0x3BA isSkipMemoryHackV4 → 0x2BB8848 tbnz → return 0
-// Both flags have dedicated savers, so the state persists across restarts exactly the
-// way the game persists it.
-static void applyAntiCheatBypass(void) {
-    // Called straight from a UISwitch action, i.e. on the main thread, which is not an
-    // il2cpp-attached thread until resolveIl2Cpp() has run. Ensure both.
-    if (!resolveIl2Cpp()) return;
-    void *g = gd();
-    void *d = dm();
-    if (!g || !d) return;
-
-    wrb(g, off_isHackV4, 1);
-    wrb(g, off_isHackSendV4, 1);
-    wrb(g, off_isSkipHackV4, 1);
-    if (off_goldCheck)    *(int64_t *)((char *)g + off_goldCheck) = 0;
-    if (off_energyCheck)  *(int64_t *)((char *)g + off_energyCheck) = 0;
-    if (off_gemCheck)     *(int64_t *)((char *)g + off_gemCheck) = 0;
-    if (off_freeGemCheck) *(int64_t *)((char *)g + off_freeGemCheck) = 0;
-
-    if (M_saveHackFlag) rcInvoke(M_saveHackFlag, d, NULL);
-    if (M_saveHackSend) rcInvoke(M_saveHackSend, d, NULL);
-    if (M_saveSkipHack) rcInvoke(M_saveSkipHack, d, NULL);
+static void *HkDHData(void *self, void *m) {
+    void *d = oDHData ? oDHData(self, m) : 0;
+    LogLine(@"RESP %@", DumpArray((Il2CppArray *)d, @"body"));
+    return d;
 }
 
-// Re-assert once a second: GameServerManager.<CheckBlock>b__86_0 (0x344917C) clears
-// isMemoryHackV4 whenever the server replies, so a single assignment is not enough.
-static void guardTick(void) {
-    if (!g_bypassAC && !g_noFall) return;
-    uint64_t t = nowMs();
-    if (t - g_lastGuard < 1000) return;
-    g_lastGuard = t;
-    if (!g_ready) return;              // domain not attached yet
-    void *g = gd();
-    if (!g) return;
-    if (g_bypassAC) {
-        wrb(g, off_isHackV4, 1);
-        wrb(g, off_isSkipHackV4, 1);
-    }
-    if (g_noFall) {
-        // "Tiền tệ không tuột": the *CheckV4 values are the only thing that can
-        // retroactively invalidate a balance, so keep them zeroed while the flag holds.
-        if (off_goldCheck)    *(int64_t *)((char *)g + off_goldCheck) = 0;
-        if (off_energyCheck)  *(int64_t *)((char *)g + off_energyCheck) = 0;
-        if (off_gemCheck)     *(int64_t *)((char *)g + off_gemCheck) = 0;
-        if (off_freeGemCheck) *(int64_t *)((char *)g + off_freeGemCheck) = 0;
-    }
+// ===========================================================================
+// layer B
+// ===========================================================================
+static void  (*oProto)(void *, int32_t, void *, void *);
+static void *(*oSer)(void *, void *, void *);
+static void  (*oPkg)(void *, void *, void *);
+static void  (*oHttp)(void *, int32_t, void *, void *, void *);
+static void *(*oParse)(void *, void *);
+
+static void HkProto(void *self, int32_t svc, void *obj, void *m) {
+    if (ServiceBlocked(svc)) { LogLine(@"C2S svc=%d  *** BLOCKED ***", svc); return; }
+    LogLine(@"C2S svc=%d obj=%p", svc, obj);
+    if (oProto) oProto(self, svc, obj, m);
 }
 
-#pragma mark - Currency
-
-typedef struct { float f; int32_t e; int32_t integer; } BigNum;   // BigNumber, 12 B
-
-// 90000 = 0x15F90 — the value UI_Master uses for every "full" button
-// (verified at 0x2FD70C4, 0x2FDDE50, 0x2FDDFAC).
-#define FULL_VALUE 90000
-
-static void bumpInt(MethodInfo *m, int32_t target) {
-    if (!m) return;
-    void *d = dm();
-    if (!d) return;
-    BOOL add = YES;
-    void *args[2] = { &target, &add };
-    rcInvoke(m, d, args);
-}
-
-static void fillCurrency(void) {
-    void *d = dm(); void *g = gd();
-    if (!d || !g) return;
-
-    // Top up rather than add blindly: these Add* clamp at the game's own cap (coin /
-    // playPoint / travelPoint cap at 999999, gem at 999999), so adding FULL_VALUE to an
-    // already-high balance just wastes the call and, for gem, would overshoot the cap.
-    int32_t delta;
-    delta = FULL_VALUE - rdi(g, off_coin);        if (delta > 0) bumpInt(M_addCoin, delta);
-    delta = FULL_VALUE;                            bumpInt(M_addPlayPoint,   delta);
-    delta = FULL_VALUE;                            bumpInt(M_addTravelPoint, delta);
-    delta = FULL_VALUE;                            bumpInt(M_addWelcomeCoin, delta);
-
-    // gem + freeGem + souvenirToken take extra args.
-    if (M_addGem) {
-        int32_t paid = FULL_VALUE - rdi(g, off_gem);
-        if (paid > 0) {
-            BOOL add = YES, isFree = NO; int32_t reason = 0; void *detail = NULL;
-            void *a[5] = { &paid, &add, &isFree, &reason, &detail };
-            rcInvoke(M_addGem, d, a);
-        }
-        int32_t freeV = FULL_VALUE - rdi(g, off_freeGem);
-        if (freeV > 0) {
-            BOOL add = YES, isFree = YES; int32_t reason = 0; void *detail = NULL;
-            void *a[5] = { &freeV, &add, &isFree, &reason, &detail };
-            rcInvoke(M_addGem, d, a);
-        }
-    }
-    if (M_addSouvenirToken) {
-        int32_t v = FULL_VALUE; BOOL add = YES, noPopup = YES;
-        void *a[3] = { &v, &add, &noPopup };
-        rcInvoke(M_addSouvenirToken, d, a);
-    }
-
-    // Gold / energy are BigNumber (float mantissa + exponent + integer).
-    if (M_addGold)   { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; rcInvoke(M_addGold, d, a); }
-    if (M_addEnergy) { BigNum bn = { (float)FULL_VALUE, 0, 0 }; BOOL add = YES; void *a[2] = { &bn, &add }; rcInvoke(M_addEnergy, d, a); }
-
-    if (M_addVipPoint) { int32_t v = FULL_VALUE; BOOL save = YES; void *a[2] = { &v, &save }; rcInvoke(M_addVipPoint, d, a); }
-}
-
-static void fillTickets(void) {
-    void *d = dm();
-    if (!d) return;
-    BOOL add = YES, viaMail = NO;
-    for (int32_t idx = 0; idx < 3; idx++) {
-        int32_t v = 9999;
-        if (M_addTicketGold)     { void *a[4] = { &idx, &v, &viaMail, &add }; rcInvoke(M_addTicketGold, d, a); }
-        if (M_addTicketEnergy)   { void *a[4] = { &idx, &v, &viaMail, &add }; rcInvoke(M_addTicketEnergy, d, a); }
-        if (idx < 2 && M_addTicketTreasure) { void *a[4] = { &idx, &v, &viaMail, &add }; rcInvoke(M_addTicketTreasure, d, a); }
-    }
-    int32_t v = 9999;
-    int32_t reason = 0;
-    if (M_addChangeTicket)     { int32_t t = 1401; void *a[4] = { &t, &v, &add, &reason }; rcInvoke(M_addChangeTicket, d, a); }
-    if (M_addSelectTicket)     { int32_t t = 1403; BOOL noPopup = YES; void *a[4] = { &t, &v, &add, &noPopup }; rcInvoke(M_addSelectTicket, d, a); }
-    if (M_addKittyChangeTicket){ void *a[2] = { &v, &add }; rcInvoke(M_addKittyChangeTicket, d, a); }
-    if (M_addSpecialFishing)   { BOOL np = YES; void *a[3] = { &v, &add, &np }; rcInvoke(M_addSpecialFishing, d, a); }
-    if (M_addTelescopeLens)    { BOOL np = YES; void *a[3] = { &v, &add, &np }; rcInvoke(M_addTelescopeLens, d, a); }
-    if (M_addMinigameToken)    { void *a[2] = { &v, &add }; rcInvoke(M_addMinigameToken, d, a); }
-}
-
-#pragma mark - Content unlock
-
-// ObscuredInt (CodeStage ACTk, TypeDefIndex 13777) field layout:
-//   +0x0 currentCryptoKey (int)   +0x4 hiddenValue (int)   +0x8 inited (bool)
-//   +0xC fakeValue    (int)       +0x10 fakeValueActive (bool)
-// InternalDecrypt (0x2A5F2E8) does `decrypted = key ^ hiddenValue` where `key` is
-// currentCryptoKey when non-zero, else the static cryptoKey. The static key is set by
-// ObscuredInt..cctor (0x2A60328) to 0x6C81C (`mov w9,#0xc81c; movk w9,#6,lsl#16`).
-// Entity_*.Param.index is an ObscuredInt at Param+0x10, so the id is
-//   *(int*)(p + 0x10 + 4) ^ (*(int*)(p + 0x10) ?: 0x6C81C)
-#define ACTK_STATIC_KEY 0x6C81C
-
-static int32_t paramId(void *param) {
-    if (!param) return 0;
-    const char *oi = (const char *)param + 0x10;          // Entity_*.Param.index
-    int32_t key   = *(const int32_t *)(oi + 0);
-    int32_t hidden= *(const int32_t *)(oi + 4);
-    int32_t k = key ? key : ACTK_STATIC_KEY;
-    return hidden ^ k;
-}
-
-// AddUnitData(int _type, int _workId, bool _firstUnit) looks the type up inside
-// Entity_CatType.list (List<T>.Find at 0x2C0A090) and throws NullReferenceException —
-// which aborts the process via BRK — if the id is not in the table. Driving the loop
-// from that same table makes the lookup unconditionally succeed, so only ids obtained
-// from the asset list are ever passed in.
-static void addAllCats(void) {
-    void *d = dm();
-    if (!d) return;
-    void *list = entityList("asset_catType");
-    int n = listCount(list);
-    BOOL first = NO;
-    int32_t workId = 0;
-    for (int i = 0; i < n; i++) {
-        void *param = listAt(list, i);
-        if (!param) continue;
-        int32_t type = paramId(param);
-        if (type <= 0) continue;
-        pump(i);
-        if (M_addUnitData) { void *a[3] = { &type, &workId, &first }; rcInvoke(M_addUnitData, d, a); }
-        // Kitties share CatType but live in a separate save list (ltKittyData).
-        if (M_addKittyData) { void *a[2] = { &type, &workId }; rcInvoke(M_addKittyData, d, a); }
-    }
-}
-
-static void addAllFurniture(void) {
-    void *d = dm();
-    void *list = entityList("asset_furniture");
-    int n = listCount(list);
-    for (int i = 0; i < n; i++) {
-        if (!M_addFurniture) break;
-        void *param = listAt(list, i);
-        if (!param) continue;
-        BOOL save = NO, newAdd = YES;
-        int32_t count = 1, reason = 0;
-        pump(i);
-        void *a[5] = { param, &save, &count, &newAdd, &reason };
-        rcInvoke(M_addFurniture, d, a);
-    }
-}
-
-typedef struct { int32_t x, y; } Vec2Int;   // UnityEngine.Vector2Int
-
-static void addAllFacilities(void) {
-    void *d = dm();
-    void *list = entityList("asset_work");
-    int n = listCount(list);
-    Vec2Int pos = { 0, 0 };
-    for (int i = 0; i < n; i++) {
-        if (!M_addWorkData) break;
-        void *param = listAt(list, i);
-        if (!param) continue;
-        int32_t level = 1;
-        pump(i);
-        void *a[3] = { param, &level, &pos };
-        rcInvoke(M_addWorkData, d, a);
-    }
-}
-
-static void addAllSkins(void) {
-    void *d = dm();
-    struct { const char *field; MethodInfo *m; int extra; const char *cbField; } set[] = {
-        { "asset_WorkSkin",    M_addWorkSkin,    0, "asset_WorkSkin"    },
-        { "asset_SignSkin",    M_addSignSkin,    0, "asset_SignSkin"    },
-        { "asset_TimerSkin",   M_addTimerSkin,   0, "asset_TimerSkin"   },
-        { "asset_BalloonSkin", M_addBalloonSkin, 1, "asset_BalloonSkin" },
-    };
-    for (size_t s = 0; s < sizeof(set)/sizeof(set[0]); s++) {
-        if (!set[s].m) continue;
-        void *list = entityList(set[s].field);
-        int n = listCount(list);
-        for (int i = 0; i < n; i++) {
-            int32_t idx = paramId(listAt(list, i));
-            if (idx <= 0) continue;
-            if (set[s].extra) { int32_t gr = 0; void *a[2] = { &idx, &gr }; rcInvoke(set[s].m, d, a); }
-            else              { void *a[1] = { &idx }; rcInvoke(set[s].m, d, a); }
-        }
-    }
-}
-
-static void addAllMisc(void) {
-    void *d = dm();
-    int32_t id, reason = 0;
-    BOOL reward = NO;
-
-    void *list = entityList("asset_theme");
-    for (int i = 0, n = listCount(list); i < n && M_addTheme; i++) {
-        id = paramId(listAt(list, i));
-        void *a[3] = { &id, &reward, &reason };
-        rcInvoke(M_addTheme, d, a);
-    }
-    list = entityList("asset_lamp");
-    for (int i = 0, n = listCount(list); i < n && M_addLamp; i++) {
-        id = paramId(listAt(list, i));
-        void *a[1] = { &id };
-        rcInvoke(M_addLamp, d, a);
-    }
-    list = entityList("asset_bgm");
-    for (int i = 0, n = listCount(list); i < n && M_addBgm; i++) {
-        id = paramId(listAt(list, i));
-        void *a[2] = { &id, &reason };
-        rcInvoke(M_addBgm, d, a);
-    }
-    list = entityList("asset_guest");
-    for (int i = 0, n = listCount(list); i < n && M_addGuest; i++) {
-        id = paramId(listAt(list, i));
-        void *a[1] = { &id };
-        rcInvoke(M_addGuest, d, a);
-    }
-    list = entityList("asset_eventPlace");
-    for (int i = 0, n = listCount(list); i < n && M_addEventPlace; i++) {
-        id = paramId(listAt(list, i));
-        void *a[1] = { &id };
-        rcInvoke(M_addEventPlace, d, a);
-    }
-
-    // Photo book / profile cosmetics have real Entity_* tables, so enumerate them
-    // instead of guessing id ranges (a blind 0..400 loop is both slow and mostly wrong).
-    list = entityList("asset_photoOutline");
-    for (int i = 0, n = listCount(list); i < n && M_addPhotoOutline; i++) {
-        id = paramId(listAt(list, i));
-        if (id > 0) { void *a[1] = { &id }; rcInvoke(M_addPhotoOutline, d, a); }
-    }
-    list = entityList("asset_photoSticker");
-    for (int i = 0, n = listCount(list); i < n && M_addPhotoSticker; i++) {
-        id = paramId(listAt(list, i));
-        if (id > 0) { void *a[1] = { &id }; rcInvoke(M_addPhotoSticker, d, a); }
-    }
-
-    // Tutorial flags are dense small ints; 64 covers every shipped step. This is the
-    // only remaining range loop and it is bounded and cheap.
-    if (M_addTutorialFinish) {
-        for (int32_t t = 0; t < 64; t++) {
-            void *a[1] = { &t };
-            rcInvoke(M_addTutorialFinish, d, a);
-        }
-    }
-}
-
-static void addAllTowerProps(void) {
-    void *d = dm();
-    void *list = entityList("asset_TowerProp");
-    int n = listCount(list);
-    for (int i = 0; i < n; i++) {
-        if (!M_addPropData) break;
-        int32_t id = paramId(listAt(list, i));
-        pump(i);
-        int32_t count = 99; BOOL save = YES;
-        void *a[3] = { &id, &count, &save };
-        rcInvoke(M_addPropData, d, a);
-    }
-}
-
-static void addAllForestDeco(void) {
-    void *d = dm();
-    if (!d || !M_addRewardDecoBlock) return;
-    // Enumerate Entity_BlockReward (AssetManager+0x2A8) instead of a blind 1..200 scan:
-    // unknown deco ids are rejected by the game anyway, so the scan only wasted cycles.
-    void *list = entityList("asset_BlockReward");
-    int n = listCount(list);
-    int32_t reason = 0;
-    for (int i = 0; i < n; i++) {
-        int32_t id = paramId(listAt(list, i));
-        if (id <= 0) continue;
-        pump(i);
-        int32_t cnt = 99;
-        void *a[3] = { &id, &cnt, &reason };
-        rcInvoke(M_addRewardDecoBlock, d, a);
-    }
-}
-
-// Equip max. UI_Master.EquipUpgradeAll is an *instance* method on a MonoBehaviour, so
-// invoking it with a NULL self would dereference null — the tweak never touches it.
-// Instead AddNewRndEquip(count, equipIndex, isGacha, goodsReason, fixedExp) is called
-// per equip id: it grants the equip, applies fixedExp and internally runs
-// ApplyEquipLevelsFromExp (0x2C0F660 -> 0x2BD0414), so level-ups and the save happen.
-static void maxEquips(void) {
-    void *d = dm();
-    if (!d) return;
-    void *list = entityList("asset_equip");
-    int n = listCount(list);
-    if (!M_addNewRndEquip) {
-        // Fallback for a build without the gacha entry point: push exp on owned equips.
-        void *g = gd();
-        if (!g || !M_addEquipData) return;
-        void *equips = rd(g, 0xD8);
-        for (int i = 0, m = listCount(equips); i < m; i++) {
-            void *eq = listAt(equips, i);
-            if (!eq) continue;
-            int32_t exp = 100000; BOOL save = YES;
-            void *a[4] = { eq, NULL, &exp, &save };
-            rcInvoke(M_addEquipData, d, a);
-            if (M_applyEquipExp) { void *b[1] = { eq }; rcInvoke(M_applyEquipExp, d, b); }
-        }
-        if (M_saveEquipData) rcInvoke(M_saveEquipData, d, NULL);
-        return;
-    }
-    for (int i = 0; i < n; i++) {
-        void *param = listAt(list, i);
-        if (!param) continue;
-        int32_t id = paramId(param);
-        if (id <= 0) continue;
-        int32_t count = 1, reason = 0, exp = 100000;
-        pump(i);
-        BOOL isGacha = NO;
-        void *a[5] = { &count, &id, &isGacha, &reason, &exp };
-        rcInvoke(M_addNewRndEquip, d, a);
-    }
-    if (M_saveEquipData) rcInvoke(M_saveEquipData, d, NULL);
-}
-
-#pragma mark - Extra content
-
-// Consumables / special items / fish / premium builds have no Entity_* list the tweak can
-// enumerate reliably (their id spaces are sparse and server-defined), so grant them over
-// the documented dense ranges. Every call goes through the game's own adder, which clamps
-// and persists exactly like a normal grant.
-static void addAllItems(void) {
-    void *d = dm();
-    if (!d) return;
-    int32_t reason = 0;
-
-    // GetReward(int rewardType, int rewardValue, bool useMail, string subIndex,
-    //           bool isGacha, int goodsReason) is the master grant dispatcher
-    // (0x2BE820C -> GetReward_Inner 0x2C198E0, 102-case jump table). Driving it with
-    // the documented defRewardType constants grants every item family through the same
-    // code path the shop uses, so clamps, mail fallbacks and saves all apply.
-    static const int32_t kRewardTypes[] = {
-        5,   // EQUIP
-        6,   // FURNITURE
-        7,   // FISH
-        14,  // LAMP
-        15,  // EVENTPLACE
-        17,  // SPECIALGUEST
-        18,  // SPECIALITEM
-        21,  // MUSIC
-        22,  // THEME
-        23,  // PUDDING
-        24,  // MACARON
-        26, 27, 28, 32,          // SKIN_WORK / SKIN_SIGN / SKIN_TIMER / SKIN_BALLOON
-        40, 41, 42,              // PRIMARY_OUTLINE / PHOTO_OUTLINE / PHOTO_STICKER
-        89,                      // BUILD_DECO_BLOCK
-        201,                     // TOWER_PROP
-    };
-    int32_t cnt = 99;
-    for (size_t i = 0; i < sizeof(kRewardTypes)/sizeof(kRewardTypes[0]); i++) {
-        int32_t rt = kRewardTypes[i];
-        // GetReward(int rewardType, int rewardValue, bool useMail, string subIndex,
-        //           bool isGacha, bool forceMail, bool forceUnshowPopup,
-        //           int goodsReason, string detail)
-        BOOL useMail = NO, isGacha = NO, forceMail = NO, noPopup = NO;
-        void *subIndex = NULL, *detail = NULL;
-        void *a[9] = { &rt, &cnt, &useMail, &subIndex, &isGacha, &forceMail,
-                       &noPopup, &reason, &detail };
-        rcInvoke(M_getReward, d, a);
-    }
-
-    // Ticket families are addressed by rewardType directly.
-    static const int32_t kTicketTypes[] = {
-        1101, 1102, 1103, 1201, 1202, 1203, 1301, 1302,
-        1401, 1402, 1403, 1404, 1405, 1406, 1407, 1408,
-    };
-    for (size_t i = 0; i < sizeof(kTicketTypes)/sizeof(kTicketTypes[0]); i++) {
-        int32_t rt = kTicketTypes[i];
-        // GetReward(int rewardType, int rewardValue, bool useMail, string subIndex,
-        //           bool isGacha, bool forceMail, bool forceUnshowPopup,
-        //           int goodsReason, string detail)
-        BOOL useMail = NO, isGacha = NO, forceMail = NO, noPopup = NO;
-        void *subIndex = NULL, *detail = NULL;
-        void *a[9] = { &rt, &cnt, &useMail, &subIndex, &isGacha, &forceMail,
-                       &noPopup, &reason, &detail };
-        rcInvoke(M_getReward, d, a);
-    }
-}
-
-static void collectAllCollections(void) {
-    void *d = dm();
-    if (!d) return;
-    void *list = entityList("asset_collection");
-    int n = listCount(list);
-    for (int i = 0; i < n; i++) {
-        void *param = listAt(list, i);
-        if (!param) continue;
-        int32_t idx = paramId(param);
-        if (idx <= 0) continue;
-        // AddNewCollection(index, subIndex, totalSubIndex) marks every sub-entry owned.
-        if (M_collectionAdd) {
-            int32_t sub = 0, total = 32;
-            void *a[3] = { &idx, &sub, &total };
-            rcInvoke(M_collectionAdd, d, a);
-        }
-        if (M_collectionCan && M_collectionRecv) {
-            void *a[1] = { &idx };
-            Il2CppObject *can = rcInvoke(M_collectionCan, d, a);
-            if (can && *(uint8_t *)((char *)can + 0x10)) rcInvoke(M_collectionRecv, d, a);
-        }
-    }
-}
-
-#pragma mark - Free shop (ConsumeMoney detour)
-
-// DataManager.ConsumeMoney(moneyType, value, add, goodsReason, detail) is the single
-// choke point every purchase path calls (84 call sites verified). With the switch on we
-// answer "success" without moving any balance, so all downstream grant code still runs.
-// The MethodInfo body pointer is swapped in place; nothing is written into __text and
-// the original is restored when the switch goes off.
-static void *g_consumeOrig = NULL;
-static void *g_consumeMem = NULL;
-
-typedef BOOL (*consume_fn)(void *self, int32_t moneyType, int32_t value, BOOL add,
-                           int32_t reason, void *detail);
-
-static BOOL freeConsume(void *self, int32_t moneyType, int32_t value, BOOL add,
-                        int32_t reason, void *detail) {
-    if (g_freeShop && value > 0) return YES;
-    consume_fn orig = (consume_fn)g_consumeOrig;
-    return orig ? orig(self, moneyType, value, add, reason, detail) : NO;
-}
-
-static void setFreeShop(BOOL on) {
-    if (!resolveIl2Cpp()) return;
-    if (!M_consumeMoney) return;
-    if (on) {
-        if (g_consumeOrig) return;
-        g_consumeMem  = (void *)M_consumeMoney;
-        g_consumeOrig = *(void **)g_consumeMem;      // MethodInfo.methodPointer
-        if (!g_consumeOrig) { g_consumeMem = NULL; return; }
-        *(void **)g_consumeMem = (void *)&freeConsume;
-    } else {
-        if (g_consumeMem && g_consumeOrig) *(void **)g_consumeMem = g_consumeOrig;
-        g_consumeMem = NULL;
-        g_consumeOrig = NULL;
-    }
-}
-
-#pragma mark - Remove ads
-
-// No-ads is not a boolean in the save: the game derives it from a PurchaseData row in
-// GameData.ltPurchase (+0x150) whose _assetIndex is one of the remove-ads shop indices
-// (148 / 149 / 188 / 200). AddPurchase persists the row through SavePurchase, so
-// inserting it via PurchaseSuccess is the same path the store would take and it survives
-// cloud sync.
-static void grantRemoveAds(void) {
-    if (!resolveIl2Cpp()) return;
-    void *d = dm();
-    if (!d) return;
-    MethodInfo *m = findMethodTyped(K_DataManager, "PurchaseSuccess", 2, 0, "System.Int32");
-    if (!m) m = i_class_get_method_from_name(K_DataManager, "PurchaseSuccess", 2);
-    if (m) {
-        int32_t index = 188;        // 광고제거_180일권, the longest duration shipped
-        int32_t reason = 0;
-        void *a[2] = { &index, &reason };
-        rcInvoke(m, d, a);
-    }
-    MethodInfo *mInit = i_class_get_method_from_name(K_DataManager, "InitRemoveAds", 2);
-    if (mInit) {
-        BOOL active = YES, useMsg = NO;
-        void *a[2] = { &active, &useMsg };
-        rcInvoke(mInit, d, a);
-    }
-    if (M_savePurchase) rcInvoke(M_savePurchase, d, NULL);
-}
-
-#pragma mark - Cloud save
-
-static void pushSave(BOOL toServer) {
-    void *gsm = staticInstance(K_GameSaveManager, "<Instance>k__BackingField");
-    if (gsm && M_gsmCloudSave) rcInvoke(M_gsmCloudSave, gsm, NULL);
-    void *gm = gmInstance();
-    if (gm && M_gmCloudSave) { BOOL force = YES; void *a[1] = { &force }; rcInvoke(M_gmCloudSave, gm, a); }
-    if (toServer && gm && M_gmSaveToServer) { BOOL purchase = NO; void *a[1] = { &purchase }; rcInvoke(M_gmSaveToServer, gm, a); }
-}
-
-#pragma mark - Menu
-
-// Container: a fixed header that is the drag grip, plus an inner UIScrollView that owns
-// the controls. The grip must NOT live inside the scroll view — a pan gesture attached to
-// a subview of a UIScrollView still competes with the scroll view's own pan recognizer,
-// which is why dragging anywhere near the top scrolled the panel instead of the list.
-@interface CSMenuView : UIView
-@property (readonly) UIView *grip;
-@property (readonly) UIScrollView *scroller;
-@end
-
-@implementation CSMenuView {
-    UILabel *_status;
-    CGFloat _y;
-    UIScrollView *_scroller;
-}
-@synthesize grip = _grip;
-@synthesize scroller = _scroller;
-
-- (CGFloat)innerWidth { return self.frame.size.width - 28; }
-
-- (UILabel *)line:(NSString *)t size:(CGFloat)s color:(UIColor *)c height:(CGFloat)h {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y, [self innerWidth], h)];
-    l.text = t; l.font = [UIFont systemFontOfSize:s]; l.textColor = c;
-    l.numberOfLines = 0;
-    [_scroller addSubview:l]; _y += h + 2;
-    return l;
-}
-- (UIButton *)btn:(NSString *)t sel:(SEL)s color:(UIColor *)c {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(14, _y, [self innerWidth], 34);
-    b.backgroundColor = c; b.layer.cornerRadius = 8;
-    [b setTitle:t forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    [b addTarget:self action:s forControlEvents:UIControlEventTouchUpInside];
-    [_scroller addSubview:b]; _y += 40;
+static void *HkSer(void *self, void *obj, void *m) {
+    void *b = oSer ? oSer(self, obj, m) : 0;
+    LogLine(@"    %@", DumpArray((Il2CppArray *)b, @"payload"));
     return b;
 }
-- (void)sw:(NSString *)t sel:(SEL)s on:(BOOL)on {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, _y + 4, [self innerWidth] - 56, 24)];
-    l.text = t; l.font = [UIFont systemFontOfSize:13]; l.textColor = [UIColor whiteColor];
-    [_scroller addSubview:l];
-    UISwitch *v = [[UISwitch alloc] initWithFrame:CGRectMake(self.frame.size.width - 66, _y, 51, 31)];
-    v.on = on;
-    [v addTarget:self action:s forControlEvents:UIControlEventValueChanged];
-    [_scroller addSubview:v];
-    _y += 38;
+
+static void HkPkg(void *self, void *req, void *m) {
+    LogLine(@"SEND RequestData=%p", req);
+    if (oPkg) oPkg(self, req, m);
 }
 
-- (instancetype)initWithFrame:(CGRect)fr {
-    self = [super initWithFrame:fr];
-    if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithRed:0.07 green:0.08 blue:0.11 alpha:0.97];
-    self.layer.cornerRadius = 14; self.layer.borderWidth = 1;
-    self.layer.borderColor = [UIColor colorWithRed:0.3 green:0.75 blue:0.45 alpha:0.8].CGColor;
-    self.layer.masksToBounds = YES;
-
-    // --- fixed header: the only drag surface ---
-    const CGFloat headerH = 40.0;
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, fr.size.width, headerH)];
-    header.backgroundColor = [UIColor colorWithRed:0.10 green:0.12 blue:0.16 alpha:1.0];
-    header.userInteractionEnabled = YES;
-    [self addSubview:header];
-    _grip = header;
-
-    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, fr.size.width - 16, headerH)];
-    t.text = @"CATS & SOUP — MENU";
-    t.font = [UIFont boldSystemFontOfSize:15];
-    t.textColor = [UIColor colorWithRed:0.4 green:0.9 blue:0.6 alpha:1];
-    t.textAlignment = NSTextAlignmentCenter;
-    t.userInteractionEnabled = NO;
-    [header addSubview:t];
-
-    // --- scrollable body: owns every control and its own pan recognizer ---
-    _scroller = [[UIScrollView alloc] initWithFrame:CGRectMake(0, headerH, fr.size.width, fr.size.height - headerH)];
-    _scroller.showsVerticalScrollIndicator = YES;
-    _scroller.showsHorizontalScrollIndicator = NO;
-    _scroller.alwaysBounceVertical = YES;
-    // Default YES: a drag is claimed by the scroll view (so the list scrolls) while a
-    // quick tap still reaches the button. Setting this to NO is what made the panel
-    // impossible to scroll — every touch went straight to a control.
-    _scroller.delaysContentTouches = YES;
-    _scroller.canCancelContentTouches = YES;
-    [self addSubview:_scroller];
-
-    _y = 10;
-    _status = [self line:@"Status: opening" size:10 color:[UIColor colorWithWhite:0.65 alpha:1] height:28];
-
-    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(14, _y, [self innerWidth], 1)];
-    div.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
-    [_scroller addSubview:div]; _y += 10;
-
-    [self sw:@"Bypass Anti-Cheat"     sel:@selector(ac:) on:g_bypassAC];
-    [self sw:@"Tiền tệ không tuột"    sel:@selector(nf:) on:g_noFall];
-    [self sw:@"Free Shop Purchase"    sel:@selector(fs:) on:g_freeShop];
-    [self sw:@"Xóa quảng cáo vĩnh viễn" sel:@selector(ad:) on:g_noAds];
-
-    _y += 4; [self line:@"── TIỀN TỆ ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
-    [self btn:@"Full tất cả tiền tệ" sel:@selector(a1) color:[UIColor colorWithRed:0.14 green:0.42 blue:0.58 alpha:0.95]];
-    [self btn:@"Full tất cả vé" sel:@selector(a2) color:[UIColor colorWithRed:0.14 green:0.42 blue:0.58 alpha:0.95]];
-
-    _y += 4; [self line:@"── NỘI DUNG ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
-    [self btn:@"Mở tất cả mèo" sel:@selector(b1) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Mở tất cả khung / skin" sel:@selector(b2) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Mở tất cả chức năng khoá" sel:@selector(b3) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Thêm tất cả nội thất" sel:@selector(b4) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Thêm tất cả cơ sở quản lý" sel:@selector(b5) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Thêm tất cả tháp trang trí" sel:@selector(b6) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Thêm tất cả trang trí rừng" sel:@selector(b7) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Thêm tất cả vật phẩm" sel:@selector(b8) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-    [self btn:@"Mở tất cả bộ sưu tập" sel:@selector(b9) color:[UIColor colorWithRed:0.28 green:0.28 blue:0.52 alpha:0.95]];
-
-    _y += 4; [self line:@"── NÂNG CẤP ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
-    [self btn:@"Nâng cấp full mọi facility" sel:@selector(c1) color:[UIColor colorWithRed:0.52 green:0.38 blue:0.14 alpha:0.95]];
-    [self btn:@"Full đồ cho mèo (equip)" sel:@selector(c2) color:[UIColor colorWithRed:0.52 green:0.38 blue:0.14 alpha:0.95]];
-
-    _y += 4; [self line:@"── LƯU ──" size:12 color:[UIColor colorWithWhite:0.5 alpha:1] height:18];
-    [self btn:@"Lưu Local + Cloud" sel:@selector(d1) color:[UIColor colorWithRed:0.18 green:0.52 blue:0.28 alpha:0.95]];
-    [self btn:@"Lưu + Upload Server" sel:@selector(d2) color:[UIColor colorWithRed:0.18 green:0.52 blue:0.28 alpha:0.95]];
-
-    _y += 8;
-    [self btn:@"Đóng" sel:@selector(closeTap) color:[UIColor colorWithRed:0.58 green:0.2 blue:0.2 alpha:0.9]];
-
-    _scroller.contentSize = CGSizeMake(fr.size.width, _y + 30);
-    return self;
-}
-
-- (void)ac:(UISwitch *)s { g_bypassAC = s.isOn; if (s.isOn) applyAntiCheatBypass(); }
-- (void)nf:(UISwitch *)s { g_noFall = s.isOn; if (s.isOn) applyAntiCheatBypass(); guardTick(); }
-- (void)fs:(UISwitch *)s { g_freeShop = s.isOn; setFreeShop(s.isOn); }
-- (void)ad:(UISwitch *)s { g_noAds = s.isOn; if (s.isOn) grantRemoveAds(); }
-
-// Bulk operations touch hundreds of objects and each Add* performs an ES3 write plus a
-// V4 hash recompute. Running that synchronously inside a UI action freezes the main
-// thread for seconds (and the watchdog can kill the app), which is why the buttons
-// looked dead. Run the work on a background thread with the il2cpp thread attached and
-// marshal only the status text back.
-- (void)run:(NSString *)name work:(void (^)(void))blk {
-    if (!resolveIl2Cpp()) {
-        _status.text = [NSString stringWithFormat:@"ERR %s", g_diag];
+static void HkHttp(void *self, int32_t svc, void *url, void *params, void *m) {
+    if (ServiceBlocked(svc)) {
+        LogLine(@"C2S HTTP svc=%d *** BLOCKED *** url=%@", svc, DumpStr((Il2CppString *)url));
         return;
     }
-    // MUST run on the main thread. Every DataManager.Add* ultimately touches Unity
-    // objects (GameObject instantiation, UI popups, ES3 file IO) and Unity's API is
-    // main-thread-only; calling it from the bulk queue is what crashed the game on
-    // every action button. Toggles never crashed because they stayed on main.
-    _status.text = [NSString stringWithFormat:@"... %@", name];
-    g_excCount = 0;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool { blk(); }
-        // Surface skipped grants so a partial fill is visible instead of looking silent.
-        self->_status.text = g_excCount
-            ? [NSString stringWithFormat:@"OK: %@ (%d skipped)", name, g_excCount]
-            : [NSString stringWithFormat:@"OK: %@", name];
-    });
+    LogLine(@"C2S HTTP svc=%d url=%@", svc, DumpStr((Il2CppString *)url));
+    if (oHttp) oHttp(self, svc, url, params, m);
 }
 
-- (void)a1 { [self run:@"full currency" work:^{ fillCurrency(); }]; }
-- (void)a2 { [self run:@"full tickets"  work:^{ fillTickets(); }]; }
-- (void)b1 { [self run:@"all cats"      work:^{ addAllCats(); }]; }
-- (void)b2 { [self run:@"all skins"     work:^{ addAllSkins(); }]; }
-- (void)b3 { [self run:@"all features"  work:^{ addAllMisc(); }]; }
-- (void)b4 { [self run:@"all furniture" work:^{ addAllFurniture(); }]; }
-- (void)b5 { [self run:@"all facilities" work:^{ addAllFacilities(); }]; }
-- (void)b6 { [self run:@"all tower props" work:^{ addAllTowerProps(); }]; }
-- (void)b7 { [self run:@"all forest deco" work:^{ addAllForestDeco(); }]; }
-- (void)b8 { [self run:@"all items" work:^{ addAllItems(); }]; }
-- (void)b9 { [self run:@"all collections" work:^{ collectAllCollections(); }]; }
-- (void)c1 { [self run:@"upgrade facilities" work:^{ addAllFacilities(); }]; }
-- (void)c2 { [self run:@"equip max"     work:^{ maxEquips(); }]; }
-- (void)d1 { [self run:@"cloud save"    work:^{ pushSave(NO); }]; }
-- (void)d2 { [self run:@"server save"   work:^{ pushSave(YES); }]; }
-- (void)closeTap { self.hidden = YES; }
-@end
-
-// Dedicated overlay window. Attaching our views to the game's own UIWindow is what made
-// the panel unresponsive: Unity's view sits above and claims the pan gestures, and a
-// re-parent on the game's window churn keeps cancelling in-flight scrolls. A window of
-// its own at a higher level, whose hitTest returns nil outside our two views, lets every
-// other touch fall straight through to the game.
-@interface CSOverlayWindow : UIWindow
-@property (retain) UIView *fab;
-@property (retain) UIView *panel;
-@end
-
-@implementation CSOverlayWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(id)event {
-    if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
-    UIView *cands[2] = { self.panel, self.fab };
-    for (int i = 0; i < 2; i++) {
-        UIView *v = cands[i];
-        if (!v || v.hidden || !v.userInteractionEnabled) continue;
-        CGPoint p = [self convertPoint:point toView:v];
-        if ([v pointInside:p withEvent:event]) {
-            UIView *hit = [v hitTest:p withEvent:event];
-            if (hit) return hit;
-        }
-    }
-    return nil;   // pass through to the game
+static void *HkParse(void *data, void *m) {
+    void *out = oParse ? oParse(data, m) : 0;
+    LogLine(@"S2C %@", DumpArray((Il2CppArray *)data, @"in"));
+    return out;
 }
-@end
 
-@interface CSMenu : NSObject
-@property (retain) CSOverlayWindow *host;
-@property (retain) UIButton *fab;
-@property (retain) CSMenuView *panel;
-@property (retain) CADisplayLink *link;
-@end
+// ===========================================================================
+// layer C
+// ===========================================================================
+static void (*oLoginAcc)(void *, void *, void *, void *);
+static void (*oLoginGame)(void *, int32_t, void *, void *);
+static void (*oPetList)(void *, void *);
+static void (*oPetAct)(void *, int32_t, void *);
+static void (*oPetLvl)(void *, int32_t, void *);
+static void (*oPetEvo)(void *, int32_t, void *);
+static void (*oPetSkl)(void *, int32_t, int32_t, void *);
+static void (*oPetReb)(void *, int32_t, void *);
+static void (*oPetRuin)(void *, int32_t, int32_t, void *);
+static void (*oLuckyRot)(void *, int32_t, void *);
+static void (*oLuckyChip)(void *, int32_t, void *);
+static void (*oShard)(void *, int32_t, int32_t, int32_t, void *);
 
-@implementation CSMenu
-+ (instancetype)shared {
-    static CSMenu *i; static dispatch_once_t once;
-    dispatch_once(&once, ^{ i = [CSMenu new]; });
-    return i;
+static void HkLoginAcc(void *s, void *u, void *p, void *m) {
+    LogLine(@"LOGIN user=%@ pass=%@", DumpStr((Il2CppString *)u), DumpStr((Il2CppString *)p));
+    if (oLoginAcc) oLoginAcc(s, u, p, m);
 }
-- (void)attach {
-    if (!self.host) {
-        CGRect scr = [UIScreen mainScreen].bounds;
-        CSOverlayWindow *w = [[CSOverlayWindow alloc] initWithFrame:scr];
-        w.backgroundColor = [UIColor clearColor];
-        w.windowLevel = UIWindowLevelStatusBar + 100.0;
-        w.userInteractionEnabled = YES;
-        self.host = w;
-        [w makeKeyAndVisible];
-        if (self.fab)   { [w addSubview:self.fab];   w.fab = self.fab; }
-        if (self.panel) { [w addSubview:self.panel]; w.panel = self.panel; }
-        return;
-    }
-    // Only re-seat if iOS actually tore the views down; never re-add on a timer.
-    if (self.fab && self.fab.superview != self.host) {
-        [self.host addSubview:self.fab];
-        self.host.fab = self.fab;
-    }
-    if (self.panel && self.panel.superview != self.host) {
-        CGPoint off = self.panel.scroller.contentOffset;
-        [self.host addSubview:self.panel];
-        self.host.panel = self.panel;
-        self.panel.scroller.contentOffset = off;
+static void HkLoginGame(void *s, int32_t sid, void *u, void *m) {
+    LogLine(@"LOGIN_GAME serverId=%d user=%@", sid, DumpStr((Il2CppString *)u));
+    if (oLoginGame) oLoginGame(s, sid, u, m);
+}
+static void HkPetList(void *s, void *m) { LogLine(@"PET 360 list"); if (oPetList) oPetList(s, m); }
+static void HkPetAct(void *s, int32_t id, void *m) { LogLine(@"PET 361 activate id=%d", id); if (oPetAct) oPetAct(s, id, m); }
+static void HkPetLvl(void *s, int32_t id, void *m) { LogLine(@"PET 362 level id=%d", id); if (oPetLvl) oPetLvl(s, id, m); }
+static void HkPetEvo(void *s, int32_t id, void *m) { LogLine(@"PET 363 evolve id=%d", id); if (oPetEvo) oPetEvo(s, id, m); }
+static void HkPetSkl(void *s, int32_t id, int32_t i, void *m) { LogLine(@"PET 364 skill id=%d idx=%d", id, i); if (oPetSkl) oPetSkl(s, id, i, m); }
+static void HkPetReb(void *s, int32_t id, void *m) { LogLine(@"PET 365 rebirth id=%d", id); if (oPetReb) oPetReb(s, id, m); }
+static void HkPetRuin(void *s, int32_t id, int32_t i, void *m) { LogLine(@"PET 366 ruin id=%d idx=%d", id, i); if (oPetRuin) oPetRuin(s, id, i, m); }
+static void HkLuckyRot(void *s, int32_t t, void *m) { LogLine(@"LUCKY 321 spin type=%d", t); if (oLuckyRot) oLuckyRot(s, t, m); }
+static void HkLuckyChip(void *s, int32_t n, void *m) { LogLine(@"LUCKY 323 buychip n=%d", n); if (oLuckyChip) oLuckyChip(s, n, m); }
+static void HkShard(void *s, int32_t ty, int32_t ik, int32_t n, void *m) {
+    LogLine(@"ITEM 254 shard type=%d item=%d n=%d", ty, ik, n);
+    if (oShard) oShard(s, ty, ik, n, m);
+}
+
+// ===========================================================================
+// install
+// ===========================================================================
+static void Install(void) {
+    static BOOL done;
+    if (done) return;
+    uintptr_t b = UfBase();
+    if (!b) return;
+    done = YES;
+    LogLine(@"=== hooks @ base=0x%lx ===", (unsigned long)b);
+
+#define H(rva, fn, orig) MSHookFunction((void *)(b + (rva)), (void *)(fn), (void **)&(orig))
+    H(RVA_UWR_SetUrl,          HkSetUrl,     oSetUrl);
+    H(RVA_UWR_Get,             HkGet,        oGet);
+    H(RVA_UWR_Put,             HkPut,        oPut);
+    H(RVA_UWR_SendWebRequest,  HkSend,       oSend);
+    H(RVA_DH_get_data,         HkDHData,     oDHData);
+    H(RVA_SendProtoPackage,    HkProto,      oProto);
+    H(RVA_Selialize,           HkSer,        oSer);
+    H(RVA_SendPackage,         HkPkg,        oPkg);
+    H(RVA_SendHttpRequest,     HkHttp,       oHttp);
+    H(RVA_ParsePbObject,       HkParse,      oParse);
+    H(RVA_LoginByAccount,      HkLoginAcc,   oLoginAcc);
+    H(RVA_LoginGame,           HkLoginGame,  oLoginGame);
+    H(RVA_PetRequestList,      HkPetList,    oPetList);
+    H(RVA_PetActivate,         HkPetAct,     oPetAct);
+    H(RVA_PetUpgradeLevel,     HkPetLvl,     oPetLvl);
+    H(RVA_PetEvolve,           HkPetEvo,     oPetEvo);
+    H(RVA_PetUpgradeSkill,     HkPetSkl,     oPetSkl);
+    H(RVA_PetRebirth,          HkPetReb,     oPetReb);
+    H(RVA_PetUpgradeRuin,      HkPetRuin,    oPetRuin);
+    H(RVA_LuckyRotate,         HkLuckyRot,   oLuckyRot);
+    H(RVA_LuckyBuyChip,        HkLuckyChip,  oLuckyChip);
+    H(RVA_ItemShardSummon,     HkShard,      oShard);
+#undef H
+    LogLine(@"=== hooks installed ===");
+}
+
+static void OnImage(const struct mach_header *mh, intptr_t slide) { Install(); }
+
+%ctor {
+    @autoreleasepool {
+        LogLine(@"===== NetSpy start, docs=%@ =====", DocsPath());
+        Install();
+        _dyld_register_func_for_add_image(OnImage);
     }
 }
-
-- (void)setup {
-
-    if (!self.fab) {
-        self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
-        self.fab.frame = CGRectMake(18, 110, 46, 46);
-        self.fab.backgroundColor = [UIColor colorWithRed:0.15 green:0.65 blue:0.35 alpha:0.85];
-        self.fab.layer.cornerRadius = 23;
-        self.fab.layer.borderWidth = 1.5;
-        self.fab.layer.borderColor = [UIColor whiteColor].CGColor;
-        [self.fab setTitle:@"CS" forState:UIControlStateNormal];
-        [self.fab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-        [self.fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
-        [self.fab addGestureRecognizer:pan];
-    }
-    if (!self.panel) {
-        self.panel = [[CSMenuView alloc] initWithFrame:CGRectMake(26, 96, 292, 610)];
-        self.panel.hidden = YES;
-        // Drag handle: the title bar only, so the scroll view keeps its own pan.
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragPanel:)];
-        pan.cancelsTouchesInView = YES;
-        [self.panel.grip addGestureRecognizer:pan];
-    }
-    [self attach];
-    [self.host bringSubviewToFront:self.panel];
-    [self.host bringSubviewToFront:self.fab];
-    if (!self.link) {
-        self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
-        [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-    }
-}
-- (void)tick {
-    guardTick();
-    // Our window is independent of the game's, so nothing here can cancel a scroll mid-drag.
-    if (!self.panel.window || !self.fab.window) [self attach];
-    else if (self.host.hidden) self.host.hidden = NO;   // iOS un-hides stolen key windows
-}
-- (void)dragPanel:(UIPanGestureRecognizer *)p {
-    CGPoint t = [p translationInView:self.panel.superview];
-    self.panel.center = CGPointMake(self.panel.center.x + t.x, self.panel.center.y + t.y);
-    [p setTranslation:CGPointZero inView:self.panel.superview];
-}
-- (void)toggle {
-    self.panel.hidden = !self.panel.hidden;
-    if (!self.panel.hidden) [self.host bringSubviewToFront:self.panel];
-}
-- (void)drag:(UIPanGestureRecognizer *)p {
-    CGPoint t = [p translationInView:self.fab.superview];
-    self.fab.center = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
-    [p setTranslation:CGPointZero inView:self.fab.superview];
-}
-@end
-
-#pragma mark - Lifecycle
-
-__attribute__((constructor))
-static void cs_init(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [[CSMenu shared] setup];
-    });
-}
-
-#endif
