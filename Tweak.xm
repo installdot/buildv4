@@ -1,323 +1,404 @@
-// NetSpy — log (and optionally block) every network packet of haitacdaichien.
-// Target: Unity IL2CPP iOS arm64. Transport is UnityEngine.Networking -> libcurl,
-// so there is no NSURLSession to hook; everything goes through il2cpp.
-//
-// EVERY il2cpp method takes a trailing `const MethodInfo*`. Instance methods are
-// (this, ..., method); statics are (..., method). Hooks MUST forward that register
-// untouched or the callee reads garbage. Arities below match that exactly.
-//
-// Output in the app sandbox, Documents/:
-//   netspy.log     one line per event
-//   netspy.block   optional CSV of serviceIds to drop, e.g. 361,321
+/* SKPNetLog — Soul Knight Prequel (iOS) full TLS request/response logger
+ *
+ * Hook points (UnityFramework, imagebase 0x0, RVAs from IDA UnityFramework.i64):
+ *   0x68095A4  UnityTls read shim  : long (void* state, void* buf, int* len)      -> *len = bytes read
+ *   0x6809714  UnityTls write shim : long (void* state, const void* buf, int* len) -> *len in/out
+ *   → plaintext TLS I/O of ALL game REST traffic (il2cpp System.Net.Http / UnityTls / mono-btls).
+ * Plus Tquic.framework (Tencent TnetQuicRequest::AddHeaders / SendRequest) and NSURLSession.
+ * Output: <sandbox>/Documents/skpnet/skpnet_YYYYmmdd_HHMMSS.log
+ */
 
 #import <Foundation/Foundation.h>
-#import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <substrate.h>
+#import <dlfcn.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
+#import <stdarg.h>
+#import <time.h>
+#import <pthread.h>
+#import <zlib.h>
 
-// ---------------------------------------------------------------------------
-// il2cpp objects
-// ---------------------------------------------------------------------------
-typedef struct Il2CppString {
-    void *klass;
-    void *monitor;
-    int32_t length;
-    uint16_t chars[];
-} Il2CppString;
+void MSHookFunction(void *symbol, void *hook, void **result);
 
-typedef struct Il2CppArray {
-    void *klass;
-    void *monitor;
-    void *bounds;
-    uint64_t max_length;
-    uint8_t data[];
-} Il2CppArray;
+/* ---------------- config ---------------- */
+#define MAX_STREAM_BODY (4 * 1024 * 1024)  /* cap per accumulated body */
+#define MAX_CHUNK        (64 * 1024 * 1024)
+#define FILENAME_PREFIX  "skpnet_"
 
-// ---------------------------------------------------------------------------
-// log
-// ---------------------------------------------------------------------------
-static NSString *gLogPath;
-static FILE *gFile;
-static NSLock *gLock;
+/* ---------------- globals ---------------- */
+static FILE *g_log = NULL;
+static FILE *g_err = NULL;
+static char  g_dir[512];
+static volatile int g_inited = 0;
 
-static NSString *DocsPath(void) {
-    static NSString *d;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSArray *a = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        d = a.count ? a[0] : @"/tmp";
-    });
-    return d;
+/* ---------------- util: log file ---------------- */
+static FILE *open_log(void) {
+    @autoreleasepool {
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *dir = [docs stringByAppendingPathComponent:@"skpnet"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        [df setDateFormat:@"yyyyMMdd_HHmmss"];
+        NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@%@.log", @"skpnet_", [df stringFromDate:[NSDate date]]]];
+        strncpy(g_dir, dir.fileSystemRepresentation, sizeof(g_dir) - 1);
+        return fopen(path.fileSystemRepresentation, "ab");
+    }
 }
 
-static void LogLine(NSString *fmt, ...) {
-    if (!gLock) {
-        gLock = [NSLock new];
-        gLogPath = [DocsPath() stringByAppendingPathComponent:@"netspy.log"];
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
+static void lprintf(const char *fmt, ...) __attribute__((format(printf,1,2)));
+static void lprintf(const char *fmt, ...) {
+    if (!g_log) g_log = open_log();
+    if (!g_log) return;
+    va_list ap; va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
     va_end(ap);
-
-    static NSDateFormatter *df;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        df = [NSDateFormatter new];
-        df.dateFormat = @"HH:mm:ss.SSS";
-    });
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                      [df stringFromDate:[NSDate date]], body];
-
-    [gLock lock];
-    if (!gFile) gFile = fopen(gLogPath.UTF8String, "a");
-    if (gFile) { fputs(line.UTF8String, gFile); fflush(gFile); }
-    [gLock unlock];
+    fflush(g_log);
 }
 
-static NSString *HexOf(const uint8_t *p, NSUInteger n) {
-    if (!p || !n) return @"";
-    NSMutableString *s = [NSMutableString stringWithCapacity:n * 2];
-    for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", p[i]];
-    return s;
+static void now_stamp(char *out, size_t n) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm; localtime_r(&ts.tv_sec, &tm);
+    snprintf(out, n, "%04d-%02d-%02d %02d:%02d:%02d.%03ld",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
 }
 
-static NSString *DumpArray(Il2CppArray *a, NSString *label) {
-    if (!a) return [NSString stringWithFormat:@"%@=(null)", label];
-    uint64_t n = a->max_length;
-    if (!n) return [NSString stringWithFormat:@"%@=(empty)", label];
-    if (n <= 4096) return [NSString stringWithFormat:@"%@[%llu]=%@", label, n, HexOf(a->data, (NSUInteger)n)];
-    return [NSString stringWithFormat:@"%@[%llu]=%@...", label, n, HexOf(a->data, 512)];
+/* ---------------- util: buffers ---------------- */
+typedef struct {
+    unsigned char *data;
+    size_t len, cap;
+    int    got_head;      /* header block parsed */
+    size_t body_start;    /* offset of body in data */
+    long   body_expected; /* content-length, -1 = unknown/chunked */
+    int    chunked;
+    int    is_gzip;
+    int    done;          /* record complete */
+} acc_t;
+
+static void acc_reset(acc_t *a) {
+    a->len = 0; a->got_head = 0; a->body_start = 0;
+    a->body_expected = -1; a->chunked = 0; a->is_gzip = 0; a->done = 0;
 }
 
-static NSString *DumpStr(Il2CppString *s) {
-    if (!s) return @"(null)";
-    int32_t n = s->length;
-    if (n < 0 || n > 4096) return @"(bad)";
-    return [[NSString alloc] initWithCharacters:(const unichar *)s->chars length:(NSUInteger)n];
-}
-
-static BOOL ServiceBlocked(int32_t svc) {
-    static NSMutableSet *cache;
-    static time_t at;
-    time_t now = time(NULL);
-    if (!cache || now - at > 2) {
-        cache = [NSMutableSet new];
-        at = now;
-        NSString *p = [DocsPath() stringByAppendingPathComponent:@"netspy.block"];
-        NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
-        for (NSString *t in [s componentsSeparatedByCharactersInSet:
-                 [NSCharacterSet characterSetWithCharactersInString:@", \n\r\t"]]) {
-            if (t.length) [cache addObject:@(t.integerValue)];
-        }
+static int acc_append(acc_t *a, const void *src, size_t n) {
+    if (n > MAX_CHUNK) n = MAX_CHUNK;
+    if (a->len + n + 1 > a->cap) {
+        size_t ncap = a->cap ? a->cap * 2 : 8192;
+        while (ncap < a->len + n + 1) ncap *= 2;
+        if (ncap > MAX_STREAM_BODY * 2) ncap = MAX_STREAM_BODY * 2 + 4096;
+        unsigned char *nd = (unsigned char *)realloc(a->data, ncap);
+        if (!nd) return 0;
+        a->data = nd; a->cap = ncap;
     }
-    return [cache containsObject:@(svc)];
+    memcpy(a->data + a->len, src, n);
+    a->len += n;
+    a->data[a->len] = 0;
+    return 1;
 }
 
-// ---------------------------------------------------------------------------
-// base address: mach_header + slide (__TEXT vmaddr == 0 in this build)
-// ---------------------------------------------------------------------------
-static uintptr_t UfBase(void) {
-    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (nm && strstr(nm, "UnityFramework")) {
-            const struct mach_header *mh = _dyld_get_image_header(i);
-            return (uintptr_t)mh + (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+/* ---------------- util: gzip inflate ---------------- */
+static int gunzip(const unsigned char *in, size_t inlen, unsigned char **out, size_t *outlen) {
+    size_t cap = inlen * 6 + 256;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        unsigned char *buf = (unsigned char *)malloc(cap);
+        if (!buf) return 0;
+        z_stream zs; memset(&zs, 0, sizeof(zs));
+        if (inflateInit2(&zs, 15 + 32) != Z_OK) { free(buf); return 0; } /* 15+32: gzip or zlib */
+        zs.next_in = (Bytef *)in; zs.avail_in = (uInt)inlen;
+        zs.next_out = buf; zs.avail_out = (uInt)cap;
+        int rc = inflate(&zs, Z_FINISH);
+        size_t produced = cap - zs.avail_out;
+        inflateEnd(&zs);
+        if (rc == Z_STREAM_END || rc == Z_OK) {
+            *out = buf; *outlen = produced;
+            return 1;
         }
+        free(buf);
+        if (rc == Z_BUF_ERROR) { cap *= 4; continue; }
+        return 0;
     }
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// RVAs
-// ---------------------------------------------------------------------------
-// layer A — UnityEngine.Networking
-#define RVA_UWR_SetUrl          0x379D770
-#define RVA_UWR_Get             0x379EE10
-#define RVA_UWR_Put             0x379EEF0
-#define RVA_UWR_SendWebRequest  0x379CAD4
-#define RVA_DH_get_data         0x379AEEC
-// layer B — transport
-#define RVA_SendProtoPackage    0x151C554
-#define RVA_Selialize           0x151C764
-#define RVA_SendPackage         0x151CE4C
-#define RVA_SendHttpRequest     0x151C0AC
-#define RVA_ParsePbObject       0x19B4BF8
-// layer C — semantics
-#define RVA_LoginByAccount      0x1505960
-#define RVA_LoginGame           0x1507980
-#define RVA_PetRequestList      0x14FD040
-#define RVA_PetActivate         0x14FC68C
-#define RVA_PetUpgradeLevel     0x1501A3C
-#define RVA_PetEvolve           0x1501B50
-#define RVA_PetUpgradeSkill     0x1500B18
-#define RVA_PetRebirth          0x1503A5C
-#define RVA_PetUpgradeRuin      0x1502AF4
-#define RVA_LuckyRotate         0x150FDBC
-#define RVA_LuckyBuyChip        0x150FCAC
-#define RVA_ItemShardSummon     0x150D4B4
-
-// ===========================================================================
-// layer A
-// ===========================================================================
-static void  (*oSetUrl)(void *, void *, void *);
-static void *(*oGet)(void *, void *);
-static void *(*oPut)(void *, void *, void *);
-static void *(*oSend)(void *, void *);
-static void *(*oDHData)(void *, void *);
-
-static void HkSetUrl(void *self, void *url, void *m) {
-    LogLine(@"    url -> %@", DumpStr((Il2CppString *)url));
-    if (oSetUrl) oSetUrl(self, url, m);
-}
-
-static void *HkGet(void *uri, void *m) {
-    void *r = oGet ? oGet(uri, m) : 0;
-    LogLine(@"REQ GET %@  req=%p", DumpStr((Il2CppString *)uri), r);
-    return r;
-}
-
-static void *HkPut(void *uri, void *body, void *m) {
-    void *r = oPut ? oPut(uri, body, m) : 0;
-    LogLine(@"REQ PUT %@  req=%p  %@", DumpStr((Il2CppString *)uri), r,
-            DumpArray((Il2CppArray *)body, @"upload"));
-    return r;
-}
-
-static void *HkSend(void *self, void *m) {
-    LogLine(@"REQ send req=%p", self);
-    return oSend ? oSend(self, m) : 0;
-}
-
-static void *HkDHData(void *self, void *m) {
-    void *d = oDHData ? oDHData(self, m) : 0;
-    LogLine(@"RESP %@", DumpArray((Il2CppArray *)d, @"body"));
-    return d;
-}
-
-// ===========================================================================
-// layer B
-// ===========================================================================
-static void  (*oProto)(void *, int32_t, void *, void *);
-static void *(*oSer)(void *, void *, void *);
-static void  (*oPkg)(void *, void *, void *);
-static void  (*oHttp)(void *, int32_t, void *, void *, void *);
-static void *(*oParse)(void *, void *);
-
-static void HkProto(void *self, int32_t svc, void *obj, void *m) {
-    if (ServiceBlocked(svc)) { LogLine(@"C2S svc=%d  *** BLOCKED ***", svc); return; }
-    LogLine(@"C2S svc=%d obj=%p", svc, obj);
-    if (oProto) oProto(self, svc, obj, m);
-}
-
-static void *HkSer(void *self, void *obj, void *m) {
-    void *b = oSer ? oSer(self, obj, m) : 0;
-    LogLine(@"    %@", DumpArray((Il2CppArray *)b, @"payload"));
-    return b;
-}
-
-static void HkPkg(void *self, void *req, void *m) {
-    LogLine(@"SEND RequestData=%p", req);
-    if (oPkg) oPkg(self, req, m);
-}
-
-static void HkHttp(void *self, int32_t svc, void *url, void *params, void *m) {
-    if (ServiceBlocked(svc)) {
-        LogLine(@"C2S HTTP svc=%d *** BLOCKED *** url=%@", svc, DumpStr((Il2CppString *)url));
-        return;
+static void printable_dump(const unsigned char *p, size_t n, char *out, size_t outcap) {
+    size_t o = 0;
+    for (size_t i = 0; i < n && o < outcap - 8; i++) {
+        unsigned char c = p[i];
+        out[o++] = (c >= 0x20 && c < 0x7f) ? (char)c : (c == '\n' || c == '\r' || c == '\t') ? (char)c : '.';
     }
-    LogLine(@"C2S HTTP svc=%d url=%@", svc, DumpStr((Il2CppString *)url));
-    if (oHttp) oHttp(self, svc, url, params, m);
+    out[o] = 0;
 }
 
-static void *HkParse(void *data, void *m) {
-    void *out = oParse ? oParse(data, m) : 0;
-    LogLine(@"S2C %@", DumpArray((Il2CppArray *)data, @"in"));
-    return out;
+/* ---------------- HTTP parse ---------------- */
+/* find header value (case-insensitive) within header block */
+static int http_header_value(const char *head, size_t headlen, const char *name,
+                             char *val, size_t valcap) {
+    size_t nlen = strlen(name);
+    const char *p = head, *end = head + headlen;
+    while (p < end) {
+        const char *eol = (const char *)memchr(p, '\n', end - p);
+        if (!eol) break;
+        size_t linelen = eol - p;
+        if (linelen > nlen + 1 &&
+            strncasecmp(p, name, nlen) == 0 && p[nlen] == ':') {
+            const char *v = p + nlen + 1;
+            while (v < eol && *v == ' ') v++;
+            size_t vl = eol - v;
+            while (vl && (v[vl-1] == '\r' || v[vl-1] == ' ')) vl--;
+            if (vl >= valcap) vl = valcap - 1;
+            memcpy(val, v, vl); val[vl] = 0;
+            return 1;
+        }
+        p = eol + 1;
+    }
+    return 0;
 }
 
-// ===========================================================================
-// layer C
-// ===========================================================================
-static void (*oLoginAcc)(void *, void *, void *, void *);
-static void (*oLoginGame)(void *, int32_t, void *, void *);
-static void (*oPetList)(void *, void *);
-static void (*oPetAct)(void *, int32_t, void *);
-static void (*oPetLvl)(void *, int32_t, void *);
-static void (*oPetEvo)(void *, int32_t, void *);
-static void (*oPetSkl)(void *, int32_t, int32_t, void *);
-static void (*oPetReb)(void *, int32_t, void *);
-static void (*oPetRuin)(void *, int32_t, int32_t, void *);
-static void (*oLuckyRot)(void *, int32_t, void *);
-static void (*oLuckyChip)(void *, int32_t, void *);
-static void (*oShard)(void *, int32_t, int32_t, int32_t, void *);
+static void log_record(const char *dir, void *conn, const char *tag,
+                       const char *line1, size_t line1len,
+                       const char *head, size_t headlen,
+                       const unsigned char *body, size_t bodylen,
+                       int is_gzip) {
+    char stamp[64]; now_stamp(stamp, sizeof(stamp));
+    char *linebuf = (char *)malloc(line1len + headlen + 2);
+    if (!linebuf) return;
+    memcpy(linebuf, line1, line1len); memcpy(linebuf + line1len, head, headlen);
+    linebuf[line1len + headlen] = 0;
+    for (size_t i = 0; i < line1len + headlen; i++)
+        if ((unsigned char)linebuf[i] < 0x20 && linebuf[i] != '\n' && linebuf[i] != '\r') linebuf[i] = ' ';
 
-static void HkLoginAcc(void *s, void *u, void *p, void *m) {
-    LogLine(@"LOGIN user=%@ pass=%@", DumpStr((Il2CppString *)u), DumpStr((Il2CppString *)p));
-    if (oLoginAcc) oLoginAcc(s, u, p, m);
-}
-static void HkLoginGame(void *s, int32_t sid, void *u, void *m) {
-    LogLine(@"LOGIN_GAME serverId=%d user=%@", sid, DumpStr((Il2CppString *)u));
-    if (oLoginGame) oLoginGame(s, sid, u, m);
-}
-static void HkPetList(void *s, void *m) { LogLine(@"PET 360 list"); if (oPetList) oPetList(s, m); }
-static void HkPetAct(void *s, int32_t id, void *m) { LogLine(@"PET 361 activate id=%d", id); if (oPetAct) oPetAct(s, id, m); }
-static void HkPetLvl(void *s, int32_t id, void *m) { LogLine(@"PET 362 level id=%d", id); if (oPetLvl) oPetLvl(s, id, m); }
-static void HkPetEvo(void *s, int32_t id, void *m) { LogLine(@"PET 363 evolve id=%d", id); if (oPetEvo) oPetEvo(s, id, m); }
-static void HkPetSkl(void *s, int32_t id, int32_t i, void *m) { LogLine(@"PET 364 skill id=%d idx=%d", id, i); if (oPetSkl) oPetSkl(s, id, i, m); }
-static void HkPetReb(void *s, int32_t id, void *m) { LogLine(@"PET 365 rebirth id=%d", id); if (oPetReb) oPetReb(s, id, m); }
-static void HkPetRuin(void *s, int32_t id, int32_t i, void *m) { LogLine(@"PET 366 ruin id=%d idx=%d", id, i); if (oPetRuin) oPetRuin(s, id, i, m); }
-static void HkLuckyRot(void *s, int32_t t, void *m) { LogLine(@"LUCKY 321 spin type=%d", t); if (oLuckyRot) oLuckyRot(s, t, m); }
-static void HkLuckyChip(void *s, int32_t n, void *m) { LogLine(@"LUCKY 323 buychip n=%d", n); if (oLuckyChip) oLuckyChip(s, n, m); }
-static void HkShard(void *s, int32_t ty, int32_t ik, int32_t n, void *m) {
-    LogLine(@"ITEM 254 shard type=%d item=%d n=%d", ty, ik, n);
-    if (oShard) oShard(s, ty, ik, n, m);
+    lprintf("================================================================\n");
+    lprintf("[%s] %s conn=%p size=%zu%s\n", tag, stamp, conn,
+            bodylen + headlen + line1len, is_gzip ? " (body gzipped)" : "");
+    lprintf("%s\n", linebuf);
+
+    unsigned char *dec = NULL; size_t declen = 0;
+    const unsigned char *show = body; size_t shown = bodylen;
+    if (is_gzip && body && bodylen && gunzip(body, bodylen, &dec, &declen)) {
+        show = dec; shown = declen;
+        lprintf("--- gunzip: %zu -> %zu bytes\n", bodylen, declen);
+    }
+    char *pb = (char *)malloc(shown + 1);
+    if (pb) {
+        printable_dump(show, shown, pb, shown + 1);
+        lprintf("--- body (%zu bytes):\n%s\n", shown, pb);
+        free(pb);
+    }
+    if (dec) free(dec);
+    free(linebuf);
 }
 
-// ===========================================================================
-// install
-// ===========================================================================
-static void Install(void) {
-    static BOOL done;
-    if (done) return;
-    uintptr_t b = UfBase();
-    if (!b) return;
-    done = YES;
-    LogLine(@"=== hooks @ base=0x%lx ===", (unsigned long)b);
-
-#define H(rva, fn, orig) MSHookFunction((void *)(b + (rva)), (void *)(fn), (void **)&(orig))
-    H(RVA_UWR_SetUrl,          HkSetUrl,     oSetUrl);
-    H(RVA_UWR_Get,             HkGet,        oGet);
-    H(RVA_UWR_Put,             HkPut,        oPut);
-    H(RVA_UWR_SendWebRequest,  HkSend,       oSend);
-    H(RVA_DH_get_data,         HkDHData,     oDHData);
-    H(RVA_SendProtoPackage,    HkProto,      oProto);
-    H(RVA_Selialize,           HkSer,        oSer);
-    H(RVA_SendPackage,         HkPkg,        oPkg);
-    H(RVA_SendHttpRequest,     HkHttp,       oHttp);
-    H(RVA_ParsePbObject,       HkParse,      oParse);
-    H(RVA_LoginByAccount,      HkLoginAcc,   oLoginAcc);
-    H(RVA_LoginGame,           HkLoginGame,  oLoginGame);
-    H(RVA_PetRequestList,      HkPetList,    oPetList);
-    H(RVA_PetActivate,         HkPetAct,     oPetAct);
-    H(RVA_PetUpgradeLevel,     HkPetLvl,     oPetLvl);
-    H(RVA_PetEvolve,           HkPetEvo,     oPetEvo);
-    H(RVA_PetUpgradeSkill,     HkPetSkl,     oPetSkl);
-    H(RVA_PetRebirth,          HkPetReb,     oPetReb);
-    H(RVA_PetUpgradeRuin,      HkPetRuin,    oPetRuin);
-    H(RVA_LuckyRotate,         HkLuckyRot,   oLuckyRot);
-    H(RVA_LuckyBuyChip,        HkLuckyChip,  oLuckyChip);
-    H(RVA_ItemShardSummon,     HkShard,      oShard);
-#undef H
-    LogLine(@"=== hooks installed ===");
+/* try to parse & flush a complete record; returns 1 if complete record emitted */
+static int acc_try_complete(acc_t *a, void *conn, const char *tag, const char *dir) {
+    if (a->done || a->len < 8) return 0;
+    const char *head_end = NULL;
+    if (!a->got_head) {
+        head_end = (a->len >= 4) ? (const char *)memmem(a->data, a->len, "\r\n\r\n", 4) : NULL;
+        if (!head_end) {
+            /* head still incomplete — wait for more */
+            return 0;
+        }
+        a->got_head = 1;
+        a->body_start = (size_t)(head_end - (const char *)a->data) + 4;
+        char clen[32] = {0}, cenc[64] = {0}, cte[64] = {0};
+        http_header_value((const char *)a->data, a->body_start, "Content-Length", clen, sizeof(clen));
+        http_header_value((const char *)a->data, a->body_start, "Content-Encoding", cenc, sizeof(cenc));
+        http_header_value((const char *)a->data, a->body_start, "Transfer-Encoding", cte, sizeof(cte));
+        a->body_expected = clen[0] ? strtol(clen, NULL, 10) : -1;
+        if (strstr(cte, "chunked")) a->chunked = 1;
+        a->is_gzip = (strstr(cenc, "gzip") != NULL) ||
+                     (a->len > a->body_start + 1 && a->data[a->body_start] == 0x1f && a->data[a->body_start + 1] == 0x8b);
+    }
+    size_t bodylen = a->len - a->body_start;
+    if (!a->chunked && a->body_expected >= 0) {
+        if (bodylen < (size_t)a->body_expected) return 0;
+        bodylen = (size_t)a->body_expected;
+    } else if (a->chunked) {
+        /* complete when terminating "0\r\n\r\n" (or bare "0\r\n\r\n" body) appears in body */
+        size_t scan_from = a->body_start;
+        const char *term = NULL;
+        if (a->len > 5) term = (const char *)memmem(a->data + scan_from, a->len - scan_from, "0\r\n\r\n", 5);
+        if (!term) return 0;
+        /* NOTE: chunked body stays chunk-encoded in log; good enough for reading */
+        bodylen = a->len - a->body_start;
+    }
+    a->done = 1;
+    log_record(dir, conn, tag, (const char *)a->data, 0,
+               (const char *)a->data, a->body_start - 4,
+               a->data + a->body_start, bodylen, a->is_gzip);
+    return 1;
 }
 
-static void OnImage(const struct mach_header *mh, intptr_t slide) { Install(); }
+/* ---------------- connection table ---------------- */
+typedef struct { void *key; acc_t out; acc_t in; int used; } conn_t;
+#define MAX_CONNS 64
+static conn_t g_conns[MAX_CONNS];
+
+static conn_t *conn_get(void *key) {
+    conn_t *free_slot = NULL;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (g_conns[i].used && g_conns[i].key == key) return &g_conns[i];
+        if (!g_conns[i].used && !free_slot) free_slot = &g_conns[i];
+    }
+    if (!free_slot) {
+        /* evict slot 0 */
+        free_slot = &g_conns[0];
+        if (free_slot->out.data) { free(free_slot->out.data); free_slot->out.data = NULL; }
+        if (free_slot->in.data)  { free(free_slot->in.data);  free_slot->in.data = NULL; }
+        memset(free_slot, 0, sizeof(*free_slot));
+    }
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->used = 1; free_slot->key = key;
+    free_slot->out.body_expected = -1; free_slot->in.body_expected = -1;
+    return free_slot;
+}
+
+/* ---------------- UnityTls hooks ---------------- */
+typedef long (*unitytls_read_t) (void *state, void *buf, int *len);
+typedef long (*unitytls_write_t)(void *state, const void *buf, int *len);
+
+static unitytls_read_t  orig_tls_read  = NULL;
+static unitytls_write_t orig_tls_write = NULL;
+
+/* RVA in UnityFramework (imagebase 0x0) */
+#define RVA_TLS_READ_SHIM   0x68095A4UL   /* calls mono_btls_ssl_read  */
+#define RVA_TLS_WRITE_SHIM  0x6809714UL   /* calls mono_btls_ssl_write */
+
+static void *get_base_unityframework(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (strstr(name, "UnityFramework")) {
+            return (void *)(_dyld_get_image_header(i) + _dyld_get_image_vmaddr_slide(i));
+        }
+    }
+    return NULL;
+}
+
+static long my_tls_write(void *state, const void *buf, int *len) {
+    long rc = orig_tls_write(state, buf, len);
+    int written = (rc == 0 && len) ? *len : 0;
+    if (rc == 0 && buf && written > 0) {
+        conn_t *c = conn_get(state);
+        if (c && acc_append(&c->out, buf, (size_t)written)) {
+            if (acc_try_complete(&c->out, state, ">>> OUT", g_dir)) {
+                acc_reset(&c->out);   /* ready for next request on keep-alive */
+            }
+        }
+    }
+    return rc;
+}
+
+static long my_tls_read(void *state, void *buf, int *len) {
+    long rc = orig_tls_read(state, buf, len);
+    if (rc == 0 && buf && len && *len > 0) {
+        conn_t *c = conn_get(state);
+        if (c && acc_append(&c->in, buf, (size_t)*len)) {
+            if (acc_try_complete(&c->in, state, "<<< IN ", g_dir)) {
+                acc_reset(&c->in);
+            }
+        }
+    }
+    return rc;
+}
+
+/* ---------------- TQUIC hooks (Tencent QUIC transport) ---------------- */
+static void *h_quic = NULL;
+typedef void *(*addheaders_t)(void *self, const char *a, const char *b, char c);
+typedef void *(*sendrequest_t)(void *self, const char *a, int b, char c);
+static addheaders_t  orig_quic_addheaders  = NULL;
+static sendrequest_t orig_quic_sendrequest = NULL;
+
+static void *my_quic_addheaders(void *self, const char *a, const char *b, char c) {
+    char stamp[64]; now_stamp(stamp, sizeof(stamp));
+    lprintf("----------------------------------------------------------------\n");
+    lprintf("[QUIC-HDR] %s conn=%p a=%s b=%s c=%d\n", stamp, self,
+            a ? a : "(null)", b ? b : "(null)", (int)c);
+    return orig_quic_addheaders(self, a, b, c);
+}
+
+static void *my_quic_sendrequest(void *self, const char *a, int b, char c) {
+    char stamp[64]; now_stamp(stamp, sizeof(stamp));
+    lprintf("----------------------------------------------------------------\n");
+    lprintf("[QUIC-REQ] %s conn=%p len=%d flag=%d\n", stamp, self, b, (int)c);
+    if (a && b > 0) {
+        size_t n = (size_t)b;
+        char *pb = (char *)malloc(n + 1);
+        if (pb) { printable_dump((const unsigned char *)a, n, pb, n + 1); lprintf("--- body:\n%s\n", pb); free(pb); }
+    }
+    return orig_quic_sendrequest(self, a, b, c);
+}
+
+/* ---------------- NSURLSession logging (SDK traffic) ---------------- */
+%group NSURLSessionLog
+%hook NSURLSession
+- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
+                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
+    @try {
+        char stamp[64]; now_stamp(stamp, sizeof(stamp));
+        NSString *meth = request.HTTPMethod ?: @"GET";
+        lprintf("----------------------------------------------------------------\n");
+        lprintf("[NS-REQ] %s %s %s\n", stamp, meth.UTF8String, request.URL.absoluteString.UTF8String);
+        NSDictionary *hs = request.allHTTPHeaderFields;
+        for (NSString *k in hs) lprintf("    %s: %s\n", k.UTF8String, [[hs objectForKey:k] UTF8String]);
+        NSData *b = request.HTTPBody;
+        if (b.length) {
+            char *pb = (char *)malloc(b.length + 1);
+            if (pb) {
+                printable_dump(b.bytes, b.length > 16384 ? 16384 : b.length, pb, b.length + 1);
+                lprintf("--- body (%lu bytes):\n%s\n", (unsigned long)b.length, pb);
+                free(pb);
+            }
+        }
+    } @catch (id e) {}
+    return %orig;
+}
+%end
+%end /* group */
+
+/* ---------------- install ---------------- */
+static void install_hooks(void) {
+    void *base = get_base_unityframework();
+    if (!base) return;
+
+    /* UnityTls plaintext I/O */
+    void *p_read  = (void *)((uintptr_t)base + RVA_TLS_READ_SHIM);
+    void *p_write = (void *)((uintptr_t)base + RVA_TLS_WRITE_SHIM);
+    MSHookFunction(p_write, (void *)my_tls_write, (void **)&orig_tls_write);
+    MSHookFunction(p_read,  (void *)my_tls_read,  (void **)&orig_tls_read);
+
+    /* TQUIC */
+    void *h = dlopen("@rpath/Tquic.framework/Tquic", RTLD_LAZY);
+    if (!h) h = dlopen("Tquic", RTLD_LAZY);
+    if (h) {
+        void *p1 = dlsym(h, "__ZN15TnetQuicRequest10AddHeadersEPKcS1_b");
+        void *p2 = dlsym(h, "__ZN15TnetQuicRequest11SendRequestEPKcib");
+        if (p1) MSHookFunction(p1, (void *)my_quic_addheaders, (void **)&orig_quic_addheaders);
+        if (p2) MSHookFunction(p2, (void *)my_quic_sendrequest, (void **)&orig_quic_sendrequest);
+        h_quic = h;
+    }
+
+    char stamp[64]; now_stamp(stamp, sizeof(stamp));
+    lprintf("[SKPNetLog] installed %s base=%p read=%p write=%p quic=%p\n",
+            stamp, base, p_read, p_write, h_quic);
+    g_inited = 1;
+}
+
+static void *watchdog(void *arg) {
+    for (int i = 0; i < 1200 && !g_inited; i++) {      /* poll up to ~120s */
+        if (get_base_unityframework()) { install_hooks(); break; }
+        usleep(100000);
+    }
+    return NULL;
+}
 
 %ctor {
     @autoreleasepool {
-        LogLine(@"===== NetSpy start, docs=%@ =====", DocsPath());
-        Install();
-        _dyld_register_func_for_add_image(OnImage);
+        %init(NSURLSessionLog);          /* activate the NSURLSession %hook group */
+        g_log = open_log();
+        lprintf("[SKPNetLog] injected\n");
+        pthread_t t;
+        pthread_create(&t, NULL, watchdog, NULL);
+        pthread_detach(t);
     }
 }
