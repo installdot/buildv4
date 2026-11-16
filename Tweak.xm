@@ -1,30 +1,34 @@
-/* SKPNetLog v2 — Soul Knight Prequel (iOS) TLS plaintext logger
+/* SKPNetLog v3 — Soul Knight Prequel (iOS) TLS plaintext logger
  *
- * Hook points (UnityFramework, imagebase 0x0, verified in IDA):
- *   0x68095A4  il2cpp UnityTls read shim  (0x170 bytes): long f(void* state, void* buf, int* len)
- *   0x6809714  il2cpp UnityTls write shim (0x214 bytes): long f(void* state, const void* buf, int* len)
- *   0x6807A68  mono-btls read trampoline  (0x0B0 bytes): int  f(void* ssl, void* buf, size_t len)
- *   0x6807B18  mono-btls write trampoline (0x0AC bytes): int  f(void* ssl, void* buf, size_t len)
- *   (both pairs resolve "mono_btls_ssl_read"/"mono_btls_ssl_write" from libmono-btls-shared)
+ * TARGETS: TrollFools / TrollStore / sideload injection (NO Substrate, NO ElleKit,
+ *          NO libhooker). This build performs NO code patching at all — no
+ *          MSHookFunction, no logos, no inline hooks, no trampolines.
  *
- * Install strategy (crash-safe):
- *   Poll the global the engine installer writes (RVA 0x987D440) instead of
- *   hooking the installer itself — it is a 12-byte thunk, too small for a
- *   16-byte arm64 hook patch (hooking it corrupts the adjacent function and
- *   crashes at launch). When the global turns non-zero the TLS subsystem is
- *   up; install the 4 TLS I/O hooks + TQUIC hooks then.
- *   All logging is mutex-protected (game does concurrent TLS I/O on worker threads).
+ * HOW IT HOOKS (pure data-pointer swap, verified in IDA):
+ *   UnityFramework keeps two writable globals holding the resolved BoringSSL
+ *   I/O entry points (mono-btls = BoringSSL embedded in the engine):
+ *     RVA 0x9870000  -> pointer to mono_btls_ssl_read   (int f(void* ssl, void* buf, int len))
+ *     RVA 0x9870008  -> pointer to mono_btls_ssl_write  (int f(void* ssl, const void* buf, int len))
+ *   Both the il2cpp UnityTls shims (0x68095A4 read / 0x6809714 write) and the
+ *   mono-side trampolines (0x6807A68 / 0x6807B18) call through exactly these two
+ *   globals (6 data xrefs each — the only interception points in the image).
+ *   They live in writable __data (the engine itself writes them), so replacing
+ *   the pointers is safe, reversible, and needs no code-signing bypass.
  *
- * Kill switches (NSUserDefaults in the app's domain, standard defaults):
- *   SKPNetLog_Disable  = YES  -> do nothing
- *   SKPNetLog_HookNS   = YES  -> also log NSURLSession (default OFF)
+ * TIMING: wait until the engine has resolved them (non-NULL) => TLS subsystem is
+ *   live and every call will route through our wrappers. A re-arm thread keeps
+ *   the pointers swapped if the engine ever re-resolves them.
+ *
+ * Kill switch (NSUserDefaults of the app):
+ *   SKPNetLog_Disable = YES  -> tweak inert
+ *   SKPNetLog_HookNS  = YES  -> also log NSURLSession (objective-c runtime swizzle, default OFF)
  *
  * Output: <sandbox>/Documents/skpnet/skpnet_YYYYmmdd_HHMMSS.log
  */
 
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #import <mach-o/dyld.h>
-#import <dlfcn.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
@@ -34,43 +38,32 @@
 #import <unistd.h>
 #import <zlib.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-void MSHookFunction(void *symbol, void *hook, void **result);
-#ifdef __cplusplus
-}
-#endif
-
 /* ---------------- config ---------------- */
 #define ACC_MAX_BYTES   (8 * 1024 * 1024)
 #define ACC_MAX_CHUNK   (2 * 1024 * 1024)
 
-/* RVAs (imagebase 0) */
-#define RVA_IL2CPP_TLS_READ_SHIM    0x68095A4UL
-#define RVA_IL2CPP_TLS_WRITE_SHIM   0x6809714UL
-#define RVA_BTLS_READ_TRAMPOLINE    0x6807A68UL
-#define RVA_BTLS_WRITE_TRAMPOLINE   0x6807B18UL
+/* RVA of the two BoringSSL I/O pointers (imagebase 0) */
+#define RVA_PTR_SSL_READ   0x9870000UL
+#define RVA_PTR_SSL_WRITE  0x9870008UL
 
 /* ---------------- globals ---------------- */
 static FILE         *g_log = NULL;
 static char          g_dir[512];
-static volatile int  g_phase2 = 0;
-static pthread_mutex_t g_lock;         /* recursive */
-static volatile int  g_lock_init_once = 0;
+static volatile int  g_installed = 0;
+static volatile int  g_stop = 0;
+static pthread_mutex_t g_lock;
+static volatile int  g_lock_init = 0;
 
 static void lock_init(void) {
-    if (!g_lock_init_once) {
-        pthread_mutexattr_t a;
-        pthread_mutexattr_init(&a);
-        pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(&g_lock, &a);
-        pthread_mutexattr_destroy(&a);
-        g_lock_init_once = 1;
-    }
+    if (g_lock_init) return;
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_lock, &a);
+    pthread_mutexattr_destroy(&a);
+    g_lock_init = 1;
 }
 
-/* ---------------- kill switches ---------------- */
 static BOOL sw_disable(void) { return [[NSUserDefaults standardUserDefaults] boolForKey:@"SKPNetLog_Disable"]; }
 static BOOL sw_hook_ns(void) { return [[NSUserDefaults standardUserDefaults] boolForKey:@"SKPNetLog_HookNS"]; }
 
@@ -84,9 +77,10 @@ static FILE *open_log_locked(void) {
         [df setDateFormat:@"yyyyMMdd_HHmmss"];
         NSString *path = [dir stringByAppendingPathComponent:
                           [NSString stringWithFormat:@"skpnet_%@.log", [df stringFromDate:[NSDate date]]]];
-        strncpy(g_dir, dir.fileSystemRepresentation, sizeof(g_dir) - 1);
-        g_dir[sizeof(g_dir) - 1] = 0;
-        return fopen(path.fileSystemRepresentation, "ab");
+        const char *fp = path.fileSystemRepresentation;
+        const char *dp = dir.fileSystemRepresentation;
+        if (dp) { strncpy(g_dir, dp, sizeof(g_dir) - 1); g_dir[sizeof(g_dir) - 1] = 0; }
+        return fp ? fopen(fp, "ab") : NULL;
     }
 }
 
@@ -118,7 +112,7 @@ typedef struct {
     size_t len, cap;
     int    got_head;
     size_t body_start;
-    long   body_expected;   /* -1 = unknown/chunked */
+    long   body_expected;
     int    chunked;
     int    is_gzip;
     int    done;
@@ -129,29 +123,26 @@ static void acc_reset(acc_t *a) {
     a->body_expected = -1; a->chunked = 0; a->is_gzip = 0; a->done = 0;
 }
 
-static int acc_append(acc_t *a, const void *src, size_t n) {
-    if (!src || n == 0) return 1;
+static void acc_append(acc_t *a, const void *src, size_t n) {
+    if (!src || !n || a->done) return;
     if (n > ACC_MAX_CHUNK) n = ACC_MAX_CHUNK;
-    /* hard cap: never grow beyond what we are allowed to store */
-    if (a->len >= ACC_MAX_BYTES) { a->done = 1; return 1; }   /* overflow guard: mark to skip */
+    if (a->len >= ACC_MAX_BYTES) { a->done = 1; return; }
     size_t room = ACC_MAX_BYTES - a->len - 1;
     if (n > room) n = room;
-
     if (a->len + n + 1 > a->cap) {
         size_t ncap = a->cap ? a->cap : 16384;
         while (ncap < a->len + n + 1) ncap *= 2;
         unsigned char *nd = (unsigned char *)realloc(a->data, ncap);
-        if (!nd) { a->done = 1; return 1; }
+        if (!nd) { a->done = 1; return; }
         a->data = nd; a->cap = ncap;
     }
     memcpy(a->data + a->len, src, n);
     a->len += n;
     a->data[a->len] = 0;
-    return 1;
 }
 
 /* ---------------- gzip ---------------- */
-static int gunzip(const unsigned char *in, size_t inlen, unsigned char **out, size_t *outlen) {
+static int gunzip_buf(const unsigned char *in, size_t inlen, unsigned char **out, size_t *outlen) {
     size_t cap = inlen * 6 + 256;
     for (int attempt = 0; attempt < 8; attempt++) {
         unsigned char *buf = (unsigned char *)malloc(cap);
@@ -172,7 +163,7 @@ static int gunzip(const unsigned char *in, size_t inlen, unsigned char **out, si
 }
 
 static void printable_dump(const unsigned char *p, size_t n, char *out, size_t outcap) {
-    if (!out || outcap == 0) return;
+    if (!out || !outcap) return;
     size_t o = 0;
     for (size_t i = 0; i < n && o < outcap - 1; i++) {
         unsigned char c = p[i];
@@ -217,13 +208,13 @@ static void log_record(const char *tag, void *conn, const char *head, size_t hea
     lock_init();
     pthread_mutex_lock(&g_lock);
     lprintf("================================================================\n");
-    lprintf("[%s] %s conn=%p headlen=%zu bodylen=%zu%s\n", tag, stamp, conn,
-            headlen, bodylen, is_gzip ? " (body gzipped)" : "");
+    lprintf("[%s] %s conn=%p head=%zu body=%zu%s\n", tag, stamp, conn,
+            headlen, bodylen, is_gzip ? " (gzip)" : "");
     lprintf("%s\n", headbuf);
 
     unsigned char *dec = NULL; size_t declen = 0;
     const unsigned char *show = body; size_t shown = bodylen;
-    if (is_gzip && body && bodylen && gunzip(body, bodylen, &dec, &declen)) {
+    if (is_gzip && body && bodylen && gunzip_buf(body, bodylen, &dec, &declen)) {
         show = dec; shown = declen;
         lprintf("--- gunzip: %zu -> %zu bytes\n", bodylen, declen);
     }
@@ -243,10 +234,10 @@ static void log_record(const char *tag, void *conn, const char *head, size_t hea
 static int acc_try_complete(acc_t *a, void *conn, const char *tag) {
     if (a->done || a->len < 8 || !a->data) return 0;
     if (!a->got_head) {
-        const char *head_end = (a->len >= 4) ? (const char *)memmem(a->data, a->len, "\r\n\r\n", 4) : NULL;
-        if (!head_end) return 0;
+        const char *he = (const char *)memmem(a->data, a->len, "\r\n\r\n", 4);
+        if (!he) return 0;
         a->got_head = 1;
-        a->body_start = (size_t)(head_end - (const char *)a->data) + 4;
+        a->body_start = (size_t)(he - (const char *)a->data) + 4;
         char clen[32] = {0}, cenc[64] = {0}, cte[64] = {0};
         http_header_value((const char *)a->data, a->body_start, "Content-Length", clen, sizeof(clen));
         http_header_value((const char *)a->data, a->body_start, "Content-Encoding", cenc, sizeof(cenc));
@@ -264,11 +255,17 @@ static int acc_try_complete(acc_t *a, void *conn, const char *tag) {
     } else if (a->chunked) {
         if (a->len < a->body_start + 5) return 0;
         if (!memmem(a->data + a->body_start, a->len - a->body_start, "0\r\n\r\n", 5)) return 0;
-        bodylen = a->len - a->body_start;   /* stays chunk-encoded in log */
+        bodylen = a->len - a->body_start;
     } else {
-        /* no content-length and not chunked: treat as complete on next record gap —
-           fall back: if body looks like a new HTTP record started, cut here */
-        return 0;
+        /* no length info: only flush if a new record clearly started */
+        const char *nxt = (a->len > 8)
+            ? (const char *)memmem(a->data + 8, a->len - 8, "HTTP/1.", 7) : NULL;
+        if (!nxt) return 0;
+        bodylen = (size_t)(nxt - (const char *)a->data);
+        a->done = 1;
+        log_record(tag, conn, (const char *)a->data, a->body_start,
+                   a->data + a->body_start, bodylen > a->body_start ? bodylen - a->body_start : 0, a->is_gzip);
+        return 1;
     }
     a->done = 1;
     log_record(tag, conn, (const char *)a->data, a->body_start,
@@ -276,7 +273,7 @@ static int acc_try_complete(acc_t *a, void *conn, const char *tag) {
     return 1;
 }
 
-/* ---------------- connection table (mutex-protected) ---------------- */
+/* ---------------- connection table ---------------- */
 typedef struct { void *key; acc_t out; acc_t in; } conn_t;
 #define MAX_CONNS 128
 static conn_t g_conns[MAX_CONNS];
@@ -285,120 +282,76 @@ static conn_t *conn_get(void *key) {
     if (!key) return NULL;
     lock_init();
     pthread_mutex_lock(&g_lock);
-    conn_t *free_slot = NULL;
+    conn_t *slot = NULL;
     for (int i = 0; i < MAX_CONNS; i++) {
-        if (g_conns[i].key == key) {
-            pthread_mutex_unlock(&g_lock);
-            return &g_conns[i];
-        }
-        if (!g_conns[i].key && !free_slot) free_slot = &g_conns[i];
+        if (g_conns[i].key == key) { pthread_mutex_unlock(&g_lock); return &g_conns[i]; }
+        if (!g_conns[i].key && !slot) slot = &g_conns[i];
     }
-    if (!free_slot) {
-        free_slot = &g_conns[0];
-        if (free_slot->out.data) { free(free_slot->out.data); free_slot->out.data = NULL; }
-        if (free_slot->in.data)  { free(free_slot->in.data);  free_slot->in.data = NULL; }
-        memset(free_slot, 0, sizeof(*free_slot));
+    if (!slot) {
+        slot = &g_conns[0];
+        if (slot->out.data) { free(slot->out.data); slot->out.data = NULL; }
+        if (slot->in.data)  { free(slot->in.data);  slot->in.data = NULL; }
+        memset(slot, 0, sizeof(*slot));
     }
-    memset(free_slot, 0, sizeof(*free_slot));
-    free_slot->key = key;
-    free_slot->out.body_expected = -1;
-    free_slot->in.body_expected = -1;
+    memset(slot, 0, sizeof(*slot));
+    slot->key = key;
+    slot->out.body_expected = -1;
+    slot->in.body_expected = -1;
     pthread_mutex_unlock(&g_lock);
-    return free_slot;
+    return slot;
 }
 
 static void conn_feed(void *key, int is_out, const void *buf, size_t n) {
-    if (sw_disable() || !buf || n == 0) return;
+    if (sw_disable() || !buf || !n) return;
     conn_t *c = conn_get(key);
     if (!c) return;
     acc_t *a = is_out ? &c->out : &c->in;
     pthread_mutex_lock(&g_lock);
     if (!a->done) {
-        if (acc_append(a, buf, n) && acc_try_complete(a, key, is_out ? ">>> OUT" : "<<< IN ")) {
-            acc_reset(a);
-        }
+        acc_append(a, buf, n);
+        if (acc_try_complete(a, key, is_out ? ">>> OUT" : "<<< IN ")) acc_reset(a);
     }
     pthread_mutex_unlock(&g_lock);
 }
 
-/* ---------------- TLS hooks ---------------- */
-/* il2cpp UnityTls shims: long f(void* state, void* buf, int* len) */
-typedef long (*tls_shim_t)(void *state, void *buf, int *len);
-/* mono-btls trampolines: int f(void* ssl, void* buf, size_t len) */
-typedef int (*btls_io_t)(void *ssl, void *buf, size_t len);
+/* ---------------- BoringSSL wrappers (data-pointer swap) ---------------- */
+/* Real signatures: int mono_btls_ssl_read(void* ssl, void* buf, int len)
+ *                  int mono_btls_ssl_write(void* ssl, const void* buf, int len) */
+typedef int (*btls_read_t)(void *ssl, void *buf, int len);
+typedef int (*btls_write_t)(void *ssl, const void *buf, int len);
 
-static tls_shim_t orig_shim_read = NULL, orig_shim_write = NULL;
-static btls_io_t  orig_tramp_read = NULL, orig_tramp_write = NULL;
+static btls_read_t  g_orig_read  = NULL;
+static btls_write_t g_orig_write = NULL;
 
-static long my_shim_write(void *state, void *buf, int *len) {
-    long rc = orig_shim_write(state, buf, len);
-    int written = (rc == 0 && len) ? *len : 0;
-    if (written > 0 && buf) conn_feed(state, 1, buf, (size_t)written);
-    return rc;
+static int my_btls_write(void *ssl, const void *buf, int len) {
+    if (!g_orig_write) return -1;
+    int n = g_orig_write(ssl, buf, len);
+    if (n > 0 && buf) conn_feed(ssl, 1, buf, (size_t)n);
+    return n;
 }
 
-static long my_shim_read(void *state, void *buf, int *len) {
-    long rc = orig_shim_read(state, buf, len);
-    if (rc == 0 && buf && len && *len > 0) conn_feed(state, 0, buf, (size_t)*len);
-    return rc;
+static int my_btls_read(void *ssl, void *buf, int len) {
+    if (!g_orig_read) return -1;
+    int n = g_orig_read(ssl, buf, len);
+    if (n > 0 && buf) conn_feed(ssl, 0, buf, (size_t)n);
+    return n;
 }
 
-static int my_tramp_write(void *ssl, void *buf, size_t len) {
-    if (buf && len) conn_feed(ssl, 1, buf, len);
-    return orig_tramp_write(ssl, buf, len);
-}
+/* ---------------- NSURLSession (optional, runtime swizzle) ---------------- */
+static IMP g_orig_dataTask = NULL;
 
-static int my_tramp_read(void *ssl, void *buf, size_t len) {
-    int r = orig_tramp_read(ssl, buf, len);
-    if (r > 0 && buf) conn_feed(ssl, 0, buf, (size_t)r);
-    return r;
-}
-
-/* ---------------- TQUIC ---------------- */
-typedef void (*quic_addheaders_t)(void *self, const char *a, const char *b, char c);
-typedef void (*quic_sendrequest_t)(void *self, const char *a, int b, char c);
-static quic_addheaders_t  orig_quic_addheaders = NULL;
-static quic_sendrequest_t orig_quic_sendrequest = NULL;
-
-static void my_quic_addheaders(void *self, const char *a, const char *b, char c) {
-    char stamp[64]; now_stamp(stamp, sizeof(stamp));
-    lprintf("----------------------------------------------------------------\n");
-    lprintf("[QUIC-HDR] %s conn=%p a=%s b=%s c=%d\n", stamp, self,
-            a ? a : "(null)", b ? b : "(null)", (int)c);
-    orig_quic_addheaders(self, a, b, c);
-}
-
-static void my_quic_sendrequest(void *self, const char *a, int b, char c) {
-    char stamp[64]; now_stamp(stamp, sizeof(stamp));
-    lprintf("----------------------------------------------------------------\n");
-    lprintf("[QUIC-REQ] %s conn=%p len=%d flag=%d\n", stamp, self, b, (int)c);
-    if (a && b > 0 && b < (1 << 20)) {
-        char *pb = (char *)malloc((size_t)b + 1);
-        if (pb) {
-            printable_dump((const unsigned char *)a, (size_t)b, pb, (size_t)b + 1);
-            lprintf("--- body:\n%s\n", pb);
-            free(pb);
-        }
-    }
-    orig_quic_sendrequest(self, a, b, c);
-}
-
-/* ---------------- NSURLSession (opt-in) ---------------- */
-%group NSURLSessionLog
-%hook NSURLSession
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))handler {
+static id my_dataTask(id self, SEL _cmd, NSURLRequest *req, id handler) {
     if (!sw_disable() && sw_hook_ns()) {
         @try {
             char stamp[64]; now_stamp(stamp, sizeof(stamp));
-            NSString *meth = request.HTTPMethod ?: @"GET";
+            NSString *meth = req.HTTPMethod ?: @"GET";
+            NSString *url  = req.URL.absoluteString ?: @"(null)";
             lprintf("----------------------------------------------------------------\n");
-            lprintf("[NS-REQ] %s %s %s\n", stamp, meth.UTF8String ?: "GET",
-                    request.URL.absoluteString.UTF8String ?: "(null)");
-            NSDictionary *hs = request.allHTTPHeaderFields;
+            lprintf("[NS-REQ] %s %s %s\n", stamp, meth.UTF8String ?: "GET", url.UTF8String ?: "?");
+            NSDictionary *hs = req.allHTTPHeaderFields;
             for (NSString *k in hs)
                 lprintf("    %s: %s\n", k.UTF8String ?: "?", [[hs objectForKey:k] UTF8String] ?: "?");
-            NSData *b = request.HTTPBody;
+            NSData *b = req.HTTPBody;
             if (b.length) {
                 size_t n = (size_t)b.length > 16384 ? 16384 : (size_t)b.length;
                 char *pb = (char *)malloc(n + 1);
@@ -410,100 +363,95 @@ static void my_quic_sendrequest(void *self, const char *a, int b, char c) {
             }
         } @catch (id e) {}
     }
-    return %orig;
+    if (!g_orig_dataTask) return nil;
+    id (*fn)(id, SEL, NSURLRequest *, id) = (id (*)(id, SEL, NSURLRequest *, id))g_orig_dataTask;
+    return fn(self, _cmd, req, handler);
 }
-%end
-%end
+
+static void install_ns_hook(void) {
+    @autoreleasepool {
+        Class cls = objc_getClass("NSURLSession");
+        if (!cls) return;
+        SEL sel = @selector(dataTaskWithRequest:completionHandler:);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) return;
+        g_orig_dataTask = method_setImplementation(m, (IMP)my_dataTask);
+        lprintf("[SKPNetLog] NSURLSession swizzled\n");
+    }
+}
 
 /* ---------------- base / install ---------------- */
 static void *get_base_unityframework(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
-        if (strstr(name, "UnityFramework")) {
+        if (name && strstr(name, "UnityFramework"))
             return (void *)(_dyld_get_image_header(i) + _dyld_get_image_vmaddr_slide(i));
-        }
     }
     return NULL;
 }
 
-static int safe_hook(void *target, void *hook, void **orig) {
-    if (!target || !hook) return 0;
-    unsigned char first[4];
-    memcpy(first, target, 4);
-    static const unsigned char z[4] = {0, 0, 0, 0};
-    if (!memcmp(first, z, 4)) return 0;      /* sanity: not mapped/zeroed */
-    MSHookFunction(target, hook, orig);
-    return 1;
+/* swap a pointer in writable data; returns previous value */
+static void *swap_ptr(void *base, unsigned long rva, void *newval) {
+    void **slot = (void **)((uintptr_t)base + rva);
+    void *old = *slot;
+    *slot = newval;
+    return old;
 }
 
-static void install_phase2(void) {
-    if (g_phase2 || sw_disable()) return;
-    void *base = get_base_unityframework();
-    if (!base) return;
-
-    safe_hook((void *)((uintptr_t)base + RVA_IL2CPP_TLS_WRITE_SHIM),  (void *)my_shim_write,  (void **)&orig_shim_write);
-    safe_hook((void *)((uintptr_t)base + RVA_IL2CPP_TLS_READ_SHIM),   (void *)my_shim_read,   (void **)&orig_shim_read);
-    safe_hook((void *)((uintptr_t)base + RVA_BTLS_WRITE_TRAMPOLINE),  (void *)my_tramp_write, (void **)&orig_tramp_write);
-    safe_hook((void *)((uintptr_t)base + RVA_BTLS_READ_TRAMPOLINE),   (void *)my_tramp_read,  (void **)&orig_tramp_read);
-
-    /* TQUIC — resolve from the already-mapped image list (never force-load) */
-    for (uint32_t j = 0; j < _dyld_image_count(); j++) {
-        const char *nm = _dyld_get_image_name(j);
-        if (strstr(nm, "Tquic.framework")) {
-            void *h = dlopen(nm, RTLD_LAZY | RTLD_NOLOAD);
-            if (h) {
-                void *p1 = dlsym(h, "__ZN15TnetQuicRequest10AddHeadersEPKcS1_b");
-                void *p2 = dlsym(h, "__ZN15TnetQuicRequest11SendRequestEPKcib");
-                if (p1) safe_hook(p1, (void *)my_quic_addheaders,  (void **)&orig_quic_addheaders);
-                if (p2) safe_hook(p2, (void *)my_quic_sendrequest, (void **)&orig_quic_sendrequest);
-            }
-            break;
-        }
+static void rearm_once(void *base) {
+    void **rslot = (void **)((uintptr_t)base + RVA_PTR_SSL_READ);
+    void **wslot = (void **)((uintptr_t)base + RVA_PTR_SSL_WRITE);
+    if (*rslot && *rslot != (void *)my_btls_read) {
+        if (!g_orig_read) g_orig_read = (btls_read_t)*rslot;
+        *rslot = (void *)my_btls_read;
     }
-
-    g_phase2 = 1;
-    char stamp[64]; now_stamp(stamp, sizeof(stamp));
-    lprintf("[SKPNetLog] phase2 installed %s base=%p\n", stamp, base);
+    if (*wslot && *wslot != (void *)my_btls_write) {
+        if (!g_orig_write) g_orig_write = (btls_write_t)*wslot;
+        *wslot = (void *)my_btls_write;
+    }
 }
 
-/*
- * Timing WITHOUT hooking anything tiny:
- * The engine installer il2cpp_unity_install_unitytls_interface is a 12-byte
- * thunk (too small for a 16-byte arm64 hook — hooking it corrupts the next
- * function). Instead we poll the global it writes: qword_987D440 (RVA 0x987D440)
- * — non-zero means the engine finished installing UnityTls, i.e. il2cpp/unity
- * TLS subsystem is up and the 4 hook targets are fully mapped. Then install.
- */
-#define RVA_UNITYTLS_IFACE_GLOBAL 0x987D440UL
-
-static void *watchdog(void *arg) {
-    /* wait for the image (up to ~120s) */
+static void *watcher(void *arg) {
+    (void)arg;
     void *base = NULL;
-    for (int i = 0; i < 1200 && !sw_disable(); i++) {
+    for (int i = 0; i < 1200 && !g_stop && !sw_disable(); i++) {
         base = get_base_unityframework();
         if (base) break;
         usleep(100000);
     }
     if (!base || sw_disable()) return NULL;
 
-    /* wait for UnityTls interface install (up to ~30s) */
-    volatile void **iface_global = (volatile void **)((uintptr_t)base + RVA_UNITYTLS_IFACE_GLOBAL);
-    for (int i = 0; i < 600 && !sw_disable(); i++) {
-        if (*iface_global != NULL) break;
+    /* wait until the engine resolved the BoringSSL entry points */
+    for (int i = 0; i < 1800 && !g_stop && !sw_disable(); i++) {
+        void **rslot = (void **)((uintptr_t)base + RVA_PTR_SSL_READ);
+        void **wslot = (void **)((uintptr_t)base + RVA_PTR_SSL_WRITE);
+        if (*rslot && *wslot) break;
         usleep(50000);
     }
 
-    install_phase2();
+    if (sw_disable()) return NULL;
+    rearm_once(base);
+    g_installed = (g_orig_read != NULL || g_orig_write != NULL);
+    lprintf("[SKPNetLog] v3 installed base=%p read_orig=%p write_orig=%p\n",
+            base, (void *)g_orig_read, (void *)g_orig_write);
+
+    /* keep pointers swapped if the engine ever re-resolves them */
+    while (!g_stop) {
+        sleep(3);
+        if (sw_disable()) break;
+        rearm_once(base);
+    }
     return NULL;
 }
 
-%ctor {
+__attribute__((constructor))
+static void skpnetlog_init(void) {
     @autoreleasepool {
         lock_init();
         if (sw_disable()) return;
-        %init(NSURLSessionLog);
-        lprintf("[SKPNetLog] v2 injected pid=%d\n", getpid());
+        lprintf("[SKPNetLog] v3 dylib loaded pid=%d (no-substrate build)\n", getpid());
+        if (sw_hook_ns()) install_ns_hook();
         pthread_t t;
-        if (pthread_create(&t, NULL, watchdog, NULL) == 0) pthread_detach(t);
+        if (pthread_create(&t, NULL, watcher, NULL) == 0) pthread_detach(t);
     }
 }
