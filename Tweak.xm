@@ -19,7 +19,13 @@
 #import <pthread.h>
 #import <zlib.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 void MSHookFunction(void *symbol, void *hook, void **result);
+#ifdef __cplusplus
+}
+#endif
 
 /* ---------------- config ---------------- */
 #define MAX_STREAM_BODY (4 * 1024 * 1024)  /* cap per accumulated body */
@@ -343,9 +349,9 @@ static void *my_quic_sendrequest(void *self, const char *a, int b, char c) {
         for (NSString *k in hs) lprintf("    %s: %s\n", k.UTF8String, [[hs objectForKey:k] UTF8String]);
         NSData *b = request.HTTPBody;
         if (b.length) {
-            char *pb = (char *)malloc(b.length + 1);
+            char *pb = (char *)malloc((size_t)b.length + 1);
             if (pb) {
-                printable_dump(b.bytes, b.length > 16384 ? 16384 : b.length, pb, b.length + 1);
+                printable_dump((const unsigned char *)b.bytes, (size_t)b.length > 16384 ? 16384 : (size_t)b.length, pb, (size_t)b.length + 1);
                 lprintf("--- body (%lu bytes):\n%s\n", (unsigned long)b.length, pb);
                 free(pb);
             }
