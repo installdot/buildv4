@@ -8,10 +8,11 @@
  *   (both pairs resolve "mono_btls_ssl_read"/"mono_btls_ssl_write" from libmono-btls-shared)
  *
  * Install strategy (crash-safe):
- *   Phase 1: wait for UnityFramework image, hook exported il2cpp_unity_install_unitytls_interface
- *   Phase 2: when that export is invoked by the engine (TLS subsystem initializing),
- *            install the 4 TLS I/O hooks + TQUIC hooks. Fallback timer installs phase 2
- *            after 20s if the export fired before we hooked it.
+ *   Poll the global the engine installer writes (RVA 0x987D440) instead of
+ *   hooking the installer itself — it is a 12-byte thunk, too small for a
+ *   16-byte arm64 hook patch (hooking it corrupts the adjacent function and
+ *   crashes at launch). When the global turns non-zero the TLS subsystem is
+ *   up; install the 4 TLS I/O hooks + TQUIC hooks then.
  *   All logging is mutex-protected (game does concurrent TLS I/O on worker threads).
  *
  * Kill switches (NSUserDefaults in the app's domain, standard defaults):
@@ -55,7 +56,6 @@ void MSHookFunction(void *symbol, void *hook, void **result);
 static FILE         *g_log = NULL;
 static char          g_dir[512];
 static volatile int  g_phase2 = 0;
-static volatile int  g_phase1 = 0;
 static pthread_mutex_t g_lock;         /* recursive */
 static volatile int  g_lock_init_once = 0;
 
@@ -446,14 +446,19 @@ static void install_phase2(void) {
     safe_hook((void *)((uintptr_t)base + RVA_BTLS_WRITE_TRAMPOLINE),  (void *)my_tramp_write, (void **)&orig_tramp_write);
     safe_hook((void *)((uintptr_t)base + RVA_BTLS_READ_TRAMPOLINE),   (void *)my_tramp_read,  (void **)&orig_tramp_read);
 
-    /* TQUIC — installed lazily here; framework may not be loaded yet, retry below */
-    void *h = dlopen("@rpath/Tquic.framework/Tquic", RTLD_LAZY);
-    if (!h) h = dlopen("Tquic", RTLD_LAZY);
-    if (h) {
-        void *p1 = dlsym(h, "__ZN15TnetQuicRequest10AddHeadersEPKcS1_b");
-        void *p2 = dlsym(h, "__ZN15TnetQuicRequest11SendRequestEPKcib");
-        if (p1) safe_hook(p1, (void *)my_quic_addheaders,  (void **)&orig_quic_addheaders);
-        if (p2) safe_hook(p2, (void *)my_quic_sendrequest, (void **)&orig_quic_sendrequest);
+    /* TQUIC — resolve from the already-mapped image list (never force-load) */
+    for (uint32_t j = 0; j < _dyld_image_count(); j++) {
+        const char *nm = _dyld_get_image_name(j);
+        if (strstr(nm, "Tquic.framework")) {
+            void *h = dlopen(nm, RTLD_LAZY | RTLD_NOLOAD);
+            if (h) {
+                void *p1 = dlsym(h, "__ZN15TnetQuicRequest10AddHeadersEPKcS1_b");
+                void *p2 = dlsym(h, "__ZN15TnetQuicRequest11SendRequestEPKcib");
+                if (p1) safe_hook(p1, (void *)my_quic_addheaders,  (void **)&orig_quic_addheaders);
+                if (p2) safe_hook(p2, (void *)my_quic_sendrequest, (void **)&orig_quic_sendrequest);
+            }
+            break;
+        }
     }
 
     g_phase2 = 1;
@@ -461,58 +466,34 @@ static void install_phase2(void) {
     lprintf("[SKPNetLog] phase2 installed %s base=%p\n", stamp, base);
 }
 
-/* Phase 1: hook the exported interface installer — perfect timing signal */
-typedef void (*install_unitytls_t)(const void *iface);
-static install_unitytls_t orig_install_unitytls = NULL;
-
-static void my_install_unitytls(const void *iface) {
-    orig_install_unitytls(iface);
-    install_phase2();
-}
+/*
+ * Timing WITHOUT hooking anything tiny:
+ * The engine installer il2cpp_unity_install_unitytls_interface is a 12-byte
+ * thunk (too small for a 16-byte arm64 hook — hooking it corrupts the next
+ * function). Instead we poll the global it writes: qword_987D440 (RVA 0x987D440)
+ * — non-zero means the engine finished installing UnityTls, i.e. il2cpp/unity
+ * TLS subsystem is up and the 4 hook targets are fully mapped. Then install.
+ */
+#define RVA_UNITYTLS_IFACE_GLOBAL 0x987D440UL
 
 static void *watchdog(void *arg) {
-    for (int i = 0; i < 1200 && !g_phase1 && !sw_disable(); i++) {  /* up to ~120s */
-        void *base = get_base_unityframework();
-        if (base) {
-            /* resolve the export on the already-loaded image */
-            for (uint32_t j = 0; j < _dyld_image_count(); j++) {
-                const char *nm = _dyld_get_image_name(j);
-                if (strstr(nm, "UnityFramework")) {
-                    void *h = dlopen(nm, RTLD_LAZY | RTLD_NOLOAD);
-                    if (h) {
-                        void *p = dlsym(h, "il2cpp_unity_install_unitytls_interface");
-                        if (p && safe_hook(p, (void *)my_install_unitytls, (void **)&orig_install_unitytls)) {
-                            g_phase1 = 1;
-                            lprintf("[SKPNetLog] phase1 hooked il2cpp_unity_install_unitytls_interface\n");
-                        }
-                    }
-                    break;
-                }
-            }
-            break;
-        }
+    /* wait for the image (up to ~120s) */
+    void *base = NULL;
+    for (int i = 0; i < 1200 && !sw_disable(); i++) {
+        base = get_base_unityframework();
+        if (base) break;
         usleep(100000);
     }
-    /* fallback: if engine called the export before our phase-1 hook was ready */
-    for (int i = 0; i < 200 && !g_phase2 && !sw_disable(); i++) {   /* up to 20s */
-        usleep(100000);
+    if (!base || sw_disable()) return NULL;
+
+    /* wait for UnityTls interface install (up to ~30s) */
+    volatile void **iface_global = (volatile void **)((uintptr_t)base + RVA_UNITYTLS_IFACE_GLOBAL);
+    for (int i = 0; i < 600 && !sw_disable(); i++) {
+        if (*iface_global != NULL) break;
+        usleep(50000);
     }
-    if (!g_phase2 && !sw_disable()) install_phase2();
-    /* late TQUIC retry in case the framework wasn't loaded during phase 2 */
-    for (int i = 0; i < 300 && !orig_quic_addheaders && !sw_disable(); i++) {
-        usleep(100000);
-        void *h = dlopen("@rpath/Tquic.framework/Tquic", RTLD_LAZY);
-        if (!h) h = dlopen("Tquic", RTLD_LAZY);
-        if (h) {
-            void *p1 = dlsym(h, "__ZN15TnetQuicRequest10AddHeadersEPKcS1_b");
-            void *p2 = dlsym(h, "__ZN15TnetQuicRequest11SendRequestEPKcib");
-            if ((p1 || p2) && g_phase2) {
-                if (p1) safe_hook(p1, (void *)my_quic_addheaders,  (void **)&orig_quic_addheaders);
-                if (p2) safe_hook(p2, (void *)my_quic_sendrequest, (void **)&orig_quic_sendrequest);
-                break;
-            }
-        }
-    }
+
+    install_phase2();
     return NULL;
 }
 
