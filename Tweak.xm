@@ -34,7 +34,6 @@ void MSHookFunction(void *symbol, void *hook, void **result);
 
 /* ---------------- globals ---------------- */
 static FILE *g_log = NULL;
-static FILE *g_err = NULL;
 static char  g_dir[512];
 static volatile int g_inited = 0;
 
