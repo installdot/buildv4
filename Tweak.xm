@@ -57,7 +57,7 @@ static char          g_dir[512];
 static volatile int  g_phase2 = 0;
 static volatile int  g_phase1 = 0;
 static pthread_mutex_t g_lock;         /* recursive */
-static void          g_lock_init_once = 0;
+static volatile int  g_lock_init_once = 0;
 
 static void lock_init(void) {
     if (!g_lock_init_once) {
