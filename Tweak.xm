@@ -32,6 +32,7 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+#import <strings.h>
 #import <stdarg.h>
 #import <time.h>
 #import <pthread.h>
@@ -388,14 +389,6 @@ static void *get_base_unityframework(void) {
             return (void *)(_dyld_get_image_header(i) + _dyld_get_image_vmaddr_slide(i));
     }
     return NULL;
-}
-
-/* swap a pointer in writable data; returns previous value */
-static void *swap_ptr(void *base, unsigned long rva, void *newval) {
-    void **slot = (void **)((uintptr_t)base + rva);
-    void *old = *slot;
-    *slot = newval;
-    return old;
 }
 
 static void rearm_once(void *base) {
