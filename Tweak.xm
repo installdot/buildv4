@@ -121,7 +121,7 @@ static fn_obj_new           il2cpp_object_new;
 static void* g_domain=nil; static bool g_il2cppReady=false;
 
 static bool loadIl2cppSyms(void){
-    #define SYM(var, name) do{ var=(typeof(var))dlsym(RTLD_DEFAULT,name); if(!var){L("missing %s",name); return false;} }while(0)
+    #define SYM(var, name) do{ var=(__typeof__(var))dlsym(RTLD_DEFAULT,name); if(!var){L("missing %s",name); return false;} }while(0)
     SYM(il2cpp_domain_get,             "il2cpp_domain_get");
     SYM(il2cpp_thread_attach,          "il2cpp_thread_attach");
     SYM(il2cpp_domain_get_assemblies,  "il2cpp_domain_get_assemblies");
@@ -546,13 +546,8 @@ static void drawMenu(void){
     if(!g_clsReady||!mGButton||!mGBox||!mGBeginArea) return;
     // nút bật/tắt menu
     {
-        float r[4]={14,60,86,96};
-        void* rb=il2cpp_value_box(il2cpp_object_get_class(nil)?nil:nil,r); // placeholder — sẽ fix dưới
-        // box bằng class Rect: dùng 1 object Rect tạo từ GameObject class không được —
-        // dùng chiêu: cache 1 lần class Rect từ object trả về của GUI.Box không được.
-        // → Dùng class Color (4 float cùng layout) đã scan:
-        extern void* clsColor;
-        rb=il2cpp_value_box(clsColor?clsColor:clsFloat,r);
+        float r[4]={14,60,86,96}; // Rect {x,y,w,h} == Color {r,g,b,a} — 16B, cùng ABI
+        void* rb=il2cpp_value_box(clsColor?clsColor:clsFloat,r);
         void* a[2]={rb,il2cpp_string_new(g_menuOpen?@"ZSM ◀":@"ZSM")};
         void* res=inv(mGButton,nil,a);
         if(res&&*(bool*)il2cpp_object_unbox(res)){ g_menuOpen=!g_menuOpen; cfgSave(); }
