@@ -14,6 +14,9 @@
 #import <math.h>
 #import <string.h>
 
+// mach_vm_remap không có trong iOS SDK -> tự khai báo prototype
+extern "C" kern_return_t mach_vm_remap(vm_map_t, mach_vm_address_t*, mach_vm_size_t, mach_vm_offset_t, int, vm_map_t, mach_vm_address_t, boolean_t, vm_prot_t*, vm_prot_t*, vm_inherit_t);
+
 #define L(...)  NSLog(@"[ZSM] " __VA_ARGS__)
 
 // =============================================================================================
@@ -76,7 +79,7 @@ static void cfgSave(void){
 // =============================================================================================
 typedef void* (*fn_domain_get)(void);
 typedef void* (*fn_thread_attach)(void*);
-typedef size_t(*fn_domain_assemblies)(void*, void**);
+typedef void**(*fn_domain_assemblies)(void*, size_t*);
 typedef void* (*fn_assembly_image)(void*);
 typedef size_t(*fn_img_class_count)(void*);
 typedef void* (*fn_img_class)(void*, size_t);
@@ -548,7 +551,7 @@ static void drawMenu(void){
     {
         float r[4]={14,60,86,96}; // Rect {x,y,w,h} == Color {r,g,b,a} — 16B, cùng ABI
         void* rb=il2cpp_value_box(clsColor?clsColor:clsFloat,r);
-        void* a[2]={rb,il2cpp_string_new(g_menuOpen?@"ZSM ◀":@"ZSM")};
+        void* a[2]={rb,il2cpp_string_new(g_menuOpen?"ZSM \xE2\x97\x80":"ZSM")};
         void* res=inv(mGButton,nil,a);
         if(res&&*(bool*)il2cpp_object_unbox(res)){ g_menuOpen=!g_menuOpen; cfgSave(); }
     }
