@@ -116,7 +116,7 @@ static const Il2CppAssembly **(*i_asms)(const Il2CppDomain *, size_t *) = NULL;
 static const Il2CppImage *(*i_img)(const Il2CppAssembly *) = NULL;
 static Il2CppClass *(*i_cls)(const Il2CppImage *, const char *, const char *) = NULL;
 static const MethodInfo *(*i_meth)(Il2CppClass *, const char *, int) = NULL;
-static void *(*i_parent)(Il2CppClass *) = NULL;
+static Il2CppClass *(*i_parent)(Il2CppClass *) = NULL;
 static void *(*i_strNew)(const char *) = NULL;
 
 static uintptr_t unityBase(void) {
@@ -164,9 +164,10 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
 
 static void *rtMOf(void *klass, const char *name, int argc) {
     if (!klass) return NULL;
-    const MethodInfo *m = i_meth(klass, name, argc);
+    Il2CppClass *kc = (Il2CppClass *)klass;
+    const MethodInfo *m = i_meth(kc, name, argc);
     if (m) return *(void **)m;
-    void *cur = klass;
+    Il2CppClass *cur = kc;
     for (int d = 0; d < 10 && i_parent; d++) {
         cur = i_parent(cur);
         if (!cur) break;
@@ -189,7 +190,7 @@ static void *rtHookMethod(const char *ns, const char *cls, const char *name,
     if (slot < vc) ((VirtualInvokeData *)((char *)k + 336))[slot].methodPtr = repl;
     uintptr_t base = unityBase();
     rtLog("il2cpp: HOOK %s::%s (rva=0x%lx)", cls, name,
-          orig && base ? (unsigned long)(orig - base) : 0UL);
+          orig && base ? (unsigned long)((uintptr_t)orig - base) : 0UL);
     return orig;
 }
 
@@ -341,10 +342,13 @@ static void frameWork(void) {
         void *pvm = gp ? pGetModByName(gp, i_strNew("PlayVehicleModule"), nil) : nil;
         if (pvm) {
             // GetNitrogenCollectMgr(ulong uid) — lấy UID từ vehicle
-            void *mUid = rtMOf(*(Il2CppClass **)g_veh, "get_UID", 0);
-            if (mUid) {
-                unsigned long long uid = ((unsigned long long(*)(void *))((void*)mUid))();
-                g_nMgr = pGetMgr(pvm, (void *)uid, nil);
+            void *mUidM = rtMOf(*(Il2CppClass **)g_veh, "get_UID", 0);
+            if (mUidM) {
+                void *uidFn = *(void **)mUidM;               // MethodInfo->methodPointer
+                if (uidFn) {
+                    unsigned long long uid = ((unsigned long long(*)(void *))uidFn)(g_veh);
+                    g_nMgr = pGetMgr(pvm, (void *)uid, nil);
+                }
             }
         }
     }
@@ -481,7 +485,7 @@ static void installHooks(void) {
         if (base) pSetLinVel = (void (*)(void *, float, float, float))(base + 0xCF17608);
     }
     {
-        void *k = rtFindClass("", "VehicleInputCtrl");
+        Il2CppClass *k = rtFindClass("", "VehicleInputCtrl");
         if (k) {
             const MethodInfo *m = i_meth(k, "get_KeyFlags", 0);
             if (m) pGetKeyFlags = (int (*)(void *))*(void **)m;
@@ -490,7 +494,7 @@ static void installHooks(void) {
     pNearestTP = (void *(*)(void *, float, float, float, float))
         rtMethod("", "RoadMap", "GetNearestTrackPoint", 2);
     {
-        void *k = rtFindClass("", "NssVehicle");
+        Il2CppClass *k = rtFindClass("", "NssVehicle");
         if (k) {
             const MethodInfo *m = i_meth(k, "get_Forward", 0);
             if (m) pGetVehFwd = (V3 (*)(void *))*(void **)m;
@@ -501,7 +505,7 @@ static void installHooks(void) {
         }
     }
     {
-        void *k = rtFindClass("", "PlayVehicleModule");
+        Il2CppClass *k = rtFindClass("", "PlayVehicleModule");
         if (k) {
             const MethodInfo *m = i_meth(k, "GetNitrogenCollectMgr", 1);
             if (m) pGetMgr = (void *(*)(void *, void *, void *))*(void **)m;
@@ -509,7 +513,7 @@ static void installHooks(void) {
     }
     // pSetKey qua InputModule.SetKey (instance)
     {
-        void *k = rtFindClass("", "InputModule");
+        Il2CppClass *k = rtFindClass("", "InputModule");
         if (k) {
             const MethodInfo *m = i_meth(k, "SetKey", 2);
             if (m) pSetKey = (void (*)(void *, int, unsigned char))*(void **)m;
