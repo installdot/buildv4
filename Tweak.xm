@@ -158,7 +158,6 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
     return NULL;
 }
 
-static inline void *mp(void *method){ return method ? *(void **)method : nil; }
 static void *rtMOf(void *klass, const char *name, int argc) {
     if (!klass) return NULL;
     Il2CppClass *kc = (Il2CppClass *)klass;
@@ -729,18 +728,18 @@ static void startToolkit(void) {
     rtLog("boot: il2cpp ready (%zu assemblies)", n);
     // resolve GamePub.GetInstance trước (class cốt lõi đã init lúc này)
     if (!pGetInst) {
-        void *kGP = rtFindClass("", "GamePub");
+        Il2CppClass *kGP = rtFindClass("", "GamePub");
         if (kGP) {
             const MethodInfo *m = i_meth(kGP, "GetInstance", 0);
-            if (m) pGetInst = *(void **)m;
+            if (m) pGetInst = (void *(*)(void))(*(void **)m);   // methodPointer cast
         }
     }
     // Menu cài NGAY (không đụng il2cpp class init)
     buildMenu();
     // Hooks CHỈ cài khi GamePub.GetInstance() != nil — game vào lobby xong.
     // Cài sớm force class-init giữa lúc Unity load scene → re-entrance crash.
-    if (!gHooksInstalled) {
-        void *gp = mp(pGetInst) ? ((void *(*)(void))mp(pGetInst))() : nil;
+    if (!gHooksInstalled && pGetInst) {
+        void *gp = pGetInst();
         if (!gp) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5*NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ startToolkit(); });
