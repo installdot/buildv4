@@ -30,21 +30,73 @@
 #import <string.h>
 #import <stdlib.h>              // malloc/free
 #import <stdarg.h>              // trace()
+#import <time.h>                // gettimeofday/strftime
+#import <sys/time.h>            // gettimeofday struct timeval
+#import <unistd.h>              // getpid
+#import <stdio.h>               // FILE/fopen/fprintf (log file)
 
 #define L(...)  NSLog(@"[ZSM] " __VA_ARGS__)
 
-// ==== Logging: staged trace (STEP_* = giai đoạn, PH_* = phase runtime) ====
+// ==== Logging: staged trace + file log (Documents/zsm.log) ====
 // Mỗi STEP in 1 lần duy nhất — đọc log biết crash ở khúc nào.
-static int g_stepMask=0;
+// Toàn bộ log cũng ghi vào <App>/Documents/zsm.log (lấy được qua Files app / iFunBox).
+#import <Foundation/NSFileManager.h>
+#import <Foundation/NSDate.h>
+
+static FILE* g_logFile=nil;
+static int   g_stepMask=0;
 #define STEP(n) do{ if(!(g_stepMask&(1<<n))){ g_stepMask|=(1<<n); L("STEP%d ok",(n)); } }while(0)
 enum { STEP_CTOR=0, STEP_SYM, STEP_DOMAIN, STEP_SCAN, STEP_HOOKS, STEP_PATCHES,
        STEP_HOST, STEP_RESOLVE, STEP_RACE };
+
+// mở file log trong Documents (gọi an toàn nhiều lần)
+static void logInit(void){
+    if(g_logFile) return;
+    @try {
+        NSString* docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+        if(!docs) return;
+        NSString* path=[docs stringByAppendingPathComponent:@"zsm.log"];
+        g_logFile=fopen(path.fileSystemRepresentation,"a");
+        if(g_logFile){
+            setvbuf(g_logFile,nil,_IOLBF,0);   // line-buffered — flush mỗi dòng, an toàn khi crash
+            time_t t; time(&t);
+            char ts[32]; strftime(ts,sizeof(ts),"%Y-%m-%d %H:%M:%S",localtime(&t));
+            fprintf(g_logFile,"\n==== ZSM session %s (pid %d) ====\n",ts,getpid());
+            fflush(g_logFile);
+        }
+    } @catch(NSException* e){ /* log fail không được giết app */ }
+}
+static void logWrite(const char* msg){
+    if(!g_logFile) return;
+    // timestamp
+    struct timeval tv; gettimeofday(&tv,nil);
+    struct tm tmv; localtime_r(&tv.tv_sec,&tmv);
+    char ts[40]; strftime(ts,sizeof(ts),"%H:%M:%S",&tmv);
+    fprintf(g_logFile,"[%s.%03d] %s\n",ts,(int)(tv.tv_usec/1000),msg);
+    // crash-safe: flush ngay (line-buffered đã set, nhưng fflush cả để chắc)
+    fflush(g_logFile);
+}
+// đường dẫn log để in ra Console 1 lần (người dùng lấy file bằng iFunBox/Files)
+static NSString* logPath(void){
+    NSString* docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
+    return [docs stringByAppendingPathComponent:@"zsm.log"];
+}
+
 static void trace(const char* fmt,...) __attribute__((format(printf,1,2)));
 static void trace(const char* fmt,...){
-    va_list ap; va_start(ap,fmt);
-    char buf[256]; vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
+    char buf[256]; va_list ap; va_start(ap,fmt);
+    vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
     NSLog(@"[ZSM] %s",buf);
+    logWrite(buf);
 }
+// macro L cũng ghi file — mọi NSLog qua L đều lưu lại
+// LƯU Ý: @(...) boxing không nhận multi-arg → dùng stringWithFormat:
+#undef L
+#define L(...) do{ \
+    NSString* _s=[NSString stringWithFormat:__VA_ARGS__]; \
+    NSLog(@"[ZSM] %@",_s); \
+    logWrite([_s cStringUsingEncoding:NSUTF8StringEncoding]); \
+}while(0)
 
 // ==== 0. Config ====
 static bool   g_menuOpen=false;
@@ -788,7 +840,9 @@ __attribute__((constructor))
 static void zsmInit(void){
     cfgLoad();
     findBase();
-    L("ctor v2.2 base=0x%llx",(unsigned long long)g_base);
+    logInit();                      // mở Documents/zsm.log
+    L("ctor v2.3 base=0x%llx",(unsigned long long)g_base);
+    L("logfile: %@",logPath());     // in đường dẫn để lấy file
     STEP(STEP_CTOR);
     dispatch_async(dispatch_get_main_queue(), ^{
         g_driver=[ZSMDriver new];
