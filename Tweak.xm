@@ -107,7 +107,7 @@ static bool   g_accelOn=true;
 static float  g_accelMult=1.30f;
 static float  g_topAddPct=0.0f;
 static bool   g_hideKmph=false;
-static bool   g_noSlowDrift=true;
+static bool   g_noSlowDrift=false;  // v2.6: mặc định OFF — cô lập nghi phạm, bật từ menu
 static bool   g_autoCutDrift=true;
 static bool   g_autoFastOut=false;
 static bool   g_contMini=true;
@@ -787,8 +787,24 @@ static void hook_OnGUI(void* self){
     drawMenu();
 }
 static void* orig_UpdateECU=nil;
+static double g_lastFrameTickT=0;
+static void frameTick(void);            // forward — def dưới
+static bool  resolveAll(void);          // forward
+static bool  trySpawnMenuHost(void);    // forward
+static void  applyAcPatches(void);      // forward
 static void hook_UpdateECU(void* self,float dt){
     if(orig_UpdateECU) ((void(*)(void*,float))orig_UpdateECU)(self,dt);
+    // UpdateECU chạy TRÊN Unity player loop (main thread) — nơi AN TOÀN duy nhất để gọi
+    // il2cpp API (GC/server alloc đồng bộ player loop). UpdateECU chạy mỗi xe mỗi frame
+    // → throttle frameTick theo thời gian (~10 lần/giây là đủ).
+    double nowt=CACurrentMediaTime();
+    if(nowt-g_lastFrameTickT>0.1){
+        g_lastFrameTickT=nowt;
+        // host spawn + patch toggle chạy trên player loop (an toàn il2cpp)
+        if(!g_hostSpawned && resolveAll()) trySpawnMenuHost();
+        applyAcPatches();
+        frameTick();
+    }
     if(g_accelOn&&g_accelMult>1.001f&&off_mTorque){
         float* t=(float*)((char*)self+off_mTorque);
         if(*t>0) *t*=g_accelMult;
@@ -887,9 +903,8 @@ static bool trySpawnMenuHost(void){
             hooksDone=true;
             applyAcPatches();
         }
-        if(!g_hostSpawned && resolveAll()) trySpawnMenuHost();
-        applyAcPatches();
-        frameTick();
+        // Mọi il2cpp invoke (trySpawnMenuHost/applyAcPatches-toggle/frameTick) đã chuyển
+        // vào hook_UpdateECU (Unity player loop). CADisplayLink chỉ phục vụ giai đoạn init.
     } @catch(NSException* e){
         static int n=0; if(n++<3) L("tick exc: %s", e.name.UTF8String);
     }
