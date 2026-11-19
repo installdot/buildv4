@@ -792,6 +792,7 @@ static void frameTick(void);            // forward — def dưới
 static bool  resolveAll(void);          // forward
 static bool  trySpawnMenuHost(void);    // forward
 static void  applyAcPatches(void);      // forward
+static bool  g_hostSpawned=false;       // forward-def (định nghĩa thật ở section 8)
 static void hook_UpdateECU(void* self,float dt){
     if(orig_UpdateECU) ((void(*)(void*,float))orig_UpdateECU)(self,dt);
     // UpdateECU chạy TRÊN Unity player loop (main thread) — nơi AN TOÀN duy nhất để gọi
@@ -845,7 +846,7 @@ static void applyAcPatches(void){
 }
 
 // ==== 8. Menu host ====
-static bool g_hostSpawned=false;
+// g_hostSpawned đã khai báo forward ở section 7 (trước hook_UpdateECU)
 static bool trySpawnMenuHost(void){
     if(g_hostSpawned||!g_clsReady||!clsGameObject||!clsDemoGUIMsg) return false;
     void* gp=inv(mGetInst,nil,nil);
