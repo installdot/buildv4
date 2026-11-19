@@ -199,9 +199,10 @@ static void* g_domain=nil; static bool g_il2cppReady=false;
 
 static bool loadIl2cppSyms(void){
     // C++ (ObjC++) cấm gán void* → fn-ptr ngầm; cast tường minh từng symbol.
+    // LƯU Ý: L() macro format là ObjC %@ — %s với char* sẽ crash; dùng trace() (printf-style).
     #define SYM(var, name) do{ \
         void* _p = dlsym(RTLD_DEFAULT, name); \
-        if(!_p){ L("STEP1 FAIL: missing %s", name); return false; } \
+        if(!_p){ trace("STEP1 FAIL: missing %s", name); return false; } \
         memcpy(&(var), &_p, sizeof(void*)); \
     }while(0)
     SYM(il2cpp_domain_get,             "il2cpp_domain_get");
