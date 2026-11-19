@@ -1,540 +1,495 @@
-// ZSM Drift Tweak v3.0 — il2cpp only, UIKit menu, KHONG patch code
+// Tweak.xm — Race Toolkit v2 (iOS, IL2CPP VTable & Metadata Hook)
 //
-// Vi sao v2.x crash:
-//   patchRet() ghi RET vao __TEXT page -> vm_protect bo VM_PROT_EXEC tren CA PAGE 16KB
-//   -> thread Unity dang chay code khac cung page fault ngay -> SIGSEGV.
-//   Log dung ngay sau "patchRet 0x46a9644" xac nhan dieu nay.
-//
-// v3.0:
-//   * KHONG ghi 1 byte code nao (khong patchRet, khong inline hook).
-//   * Anticheat chan qua il2cpp: CryptoBase.crackHandler = null,
-//     CheckPointReportMgr.SetEnable(false) qua MatchMgr->MatchCommonComponent.
-//   * Gameplay: goi THANG native method pointer (MethodInfo->methodPointer) va
-//     doc/ghi field offset truc tiep — khong il2cpp_runtime_invoke (nguon GC race).
-//   * Menu: UIKit native (UIWindow subclass hitTest passthrough) — khong hook OnGUI,
-//     khong chan touch cua game.
+// Features:
+// 1. Drift không mất tốc: hook DriftingSlideVelDamping (RVA 0x7C713DC) — chặn ma sát
+//    drift native PHY_VehicleApplyExtraDriftFriction. Không đổi top speed.
+// 2. Gia tốc: ghi mExtraKMPH (0x44) + mExtraTorque (0x48) trên PowerChain — chỉ là
+//    extra velocity có sẵn của xe, bộ đếm km/h (ReadVehicleKMPH) KHÔNG thay đổi.
+//    Bật sau 5s từ khi xuất phát.
+// 3. No2 kéo dài: ForceDelayEndExtraVelocity(N2O) liên tục trong PowerChain::Update —
+//    đẩy thời điểm kết thúc N2O ra sau mỗi frame.
+// 4. Miniboost: ForceCanTriggerOnce(Mini/Air/FallingGround) liên tục.
+// 5. Auto End Drift: ExitCurDriftState + ForceClearDriftParams khi thả nút drift.
 
-#import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <QuartzCore/QuartzCore.h>
-#import <mach/mach.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <dlfcn.h>
-#import <libkern/OSCacheControl.h>
 #import <math.h>
 #import <string.h>
-#import <stdlib.h>
-#import <stdarg.h>
+#import <time.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <signal.h>
 #import <unistd.h>
-#import <stdio.h>
+#import <fcntl.h>
 
-// ================= LOG =================
-static FILE* g_log=nil;
-static void zsmLog(const char* fmt,...) __attribute__((format(printf,1,2)));
-static void zsmLog(const char* fmt,...){
-    char buf[512]; va_list ap; va_start(ap,fmt);
-    vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
-    NSLog(@"[ZSM] %s",buf);
-    if(g_log){ fputs(buf,g_log); fputc('\n',g_log); fflush(g_log); }
-}
-#define L(...) zsmLog(__VA_ARGS__)
-static void logInit(void){
-    if(g_log) return;
-    @try{
-        NSString* d=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
-        if(!d) return;
-        g_log=fopen([[d stringByAppendingPathComponent:@"zsm.log"] fileSystemRepresentation],"a");
-        if(g_log){ setvbuf(g_log,nil,_IOLBF,0); fprintf(g_log,"\n==== ZSM v3.0 ====\n"); fflush(g_log); }
-    }@catch(NSException*e){}
+#pragma mark - Logger
+
+static int gLogFd = -1;
+static char gLogPath[1024];
+
+static void rtLogOpen(void) {
+    if (gLogFd >= 0) return;
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
+    NSString *p = [doc stringByAppendingPathComponent:@"racetoolkit.log"];
+    [p getFileSystemRepresentation:gLogPath maxLength:sizeof(gLogPath)];
+    gLogFd = open(gLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
 }
 
-// ================= CONFIG =================
-static bool  g_accelOn=true;       static float g_accelMult=1.30f;
-static bool  g_autoCutDrift=true;  static bool  g_autoFastOut=false;
-static bool  g_contMini=true;      static float g_miniInterval=1.0f;
-static float g_extraKmph=0.0f;     static float g_extraDur=1.0f;
-static bool  g_steerAssist=false;  static float g_steerStrength=0.60f;
-static bool  g_steerInvert=false;
-
-static void cfgSave(void){
-    NSUserDefaults*d=[NSUserDefaults standardUserDefaults];
-    [d setBool:g_accelOn forKey:@"z_accel"];   [d setFloat:g_accelMult forKey:@"z_mult"];
-    [d setBool:g_autoCutDrift forKey:@"z_cut"];[d setBool:g_autoFastOut forKey:@"z_fastout"];
-    [d setBool:g_contMini forKey:@"z_mini"];   [d setFloat:g_miniInterval forKey:@"z_miniInt"];
-    [d setFloat:g_extraKmph forKey:@"z_exKmph"];[d setFloat:g_extraDur forKey:@"z_exDur"];
-    [d setBool:g_steerAssist forKey:@"z_steer"];[d setFloat:g_steerStrength forKey:@"z_steerStr"];
-    [d setBool:g_steerInvert forKey:@"z_invert"];
-    [d synchronize];
-}
-static void cfgLoad(void){
-    NSUserDefaults*d=[NSUserDefaults standardUserDefaults];
-    if([d objectForKey:@"z_accel"])  g_accelOn=[d boolForKey:@"z_accel"];
-    if([d objectForKey:@"z_mult"])   g_accelMult=[d floatForKey:@"z_mult"];
-    if([d objectForKey:@"z_cut"])    g_autoCutDrift=[d boolForKey:@"z_cut"];
-    g_autoFastOut=[d boolForKey:@"z_fastout"];
-    if([d objectForKey:@"z_mini"])   g_contMini=[d boolForKey:@"z_mini"];
-    if([d floatForKey:@"z_miniInt"]>0.2f) g_miniInterval=[d floatForKey:@"z_miniInt"];
-    g_extraKmph=[d floatForKey:@"z_exKmph"];
-    if([d floatForKey:@"z_exDur"]>0.2f) g_extraDur=[d floatForKey:@"z_exDur"];
-    g_steerAssist=[d boolForKey:@"z_steer"];
-    if([d floatForKey:@"z_steerStr"]>0) g_steerStrength=[d floatForKey:@"z_steerStr"];
-    g_steerInvert=[d boolForKey:@"z_invert"];
-    if(g_accelMult<1)g_accelMult=1; if(g_accelMult>2.5f)g_accelMult=2.5f;
+static void rtLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void rtLog(const char *fmt, ...) {
+    if (gLogFd < 0) rtLogOpen();
+    if (gLogFd < 0) return;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    char buf[2048];
+    int n = snprintf(buf, sizeof(buf), "[%ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000000);
+    va_list ap; va_start(ap, fmt);
+    int m = vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    va_end(ap);
+    if (m < 0) return;
+    size_t total = (size_t)n + (size_t)m;
+    if (total + 1 < sizeof(buf)) { buf[total++] = '\n'; buf[total] = '\0'; }
+    write(gLogFd, buf, total);
 }
 
-// ================= IL2CPP SYMS =================
-typedef void*  (*f_v)(void);
-typedef void*  (*f_vp)(void*);
-typedef const void** (*f_asms)(void*,size_t*);
-typedef size_t (*f_cnt)(void*);
-typedef void*  (*f_cls)(void*,size_t);
-typedef const char* (*f_nm)(void*);
-typedef void*  (*f_meth)(void*,const char*,int);
-typedef void*  (*f_fld)(void*,const char*);
-typedef size_t (*f_off)(void*);
+#pragma mark - Crash reporter
 
-static f_v     i_domain;   static f_vp i_attach;
-static f_asms  i_asms;     static f_vp i_img;
-static f_cnt   i_cnt;      static f_cls i_cls;
-static f_nm    i_name, i_ns;
-static f_meth  i_meth;     static f_fld i_fld;  static f_off i_off;
-static f_v     i_corlib;   static f_vp i_ocls, i_parent;
-static void*  (*i_str)(const char*);   // il2cpp_string_new
-static f_vp    i_ctype, i_tobj;
-static void* g_domain=nil;
-static bool  g_ready=false;
-
-static bool loadSyms(void){
-    #define S(v,n) do{ void*_p=dlsym(RTLD_DEFAULT,n); if(!_p) return false; memcpy(&v,&_p,sizeof(void*)); }while(0)
-    S(i_domain,"il2cpp_domain_get");            S(i_attach,"il2cpp_thread_attach");
-    S(i_asms,"il2cpp_domain_get_assemblies");   S(i_img,"il2cpp_assembly_get_image");
-    S(i_cnt,"il2cpp_image_get_class_count");    S(i_cls,"il2cpp_image_get_class");
-    S(i_name,"il2cpp_class_get_name");          S(i_ns,"il2cpp_class_get_namespace");
-    S(i_meth,"il2cpp_class_get_method_from_name");
-    S(i_fld,"il2cpp_class_get_field_from_name");
-    S(i_off,"il2cpp_field_get_offset");
-    S(i_corlib,"il2cpp_get_corlib");            S(i_ocls,"il2cpp_object_get_class");
-    S(i_str,"il2cpp_string_new");               S(i_parent,"il2cpp_class_get_parent");
-    S(i_ctype,"il2cpp_class_get_type");         S(i_tobj,"il2cpp_type_get_object");
-    #undef S
-    return true;
-}
-// MethodInfo->methodPointer (offset 0) — goi thang, KHONG runtime_invoke
-static inline void* mp(void* method){ return method ? *(void**)method : nil; }
-static void* mOf(void* k,const char* n,int c){ return k? i_meth(k,n,c):nil; }
-static size_t fOff(void* obj,const char* name){
-    void* k=obj? i_ocls(obj):nil;
-    void* f=k? i_fld(k,name):nil;
-    return f? i_off(f):0;
+static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
+    char msg[300];
+    int len = snprintf(msg, sizeof(msg), "\n===== CRASH signal=%d faultAddr=%p PC=%p =====\n",
+                       sig, info ? info->si_addr : 0,
+                       uap ? (void *)((ucontext_t *)uap)->uc_mcontext->__ss.__pc : 0);
+    write(gLogFd, msg, len);
+    fsync(gLogFd);
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
-// ================= CLASS/METHOD CACHE =================
-static void *kGamePub,*kVehicleFast,*kExtraVelFast,*kExtraVelTrig,*kInputModule,
-            *kRoadMap,*kMatchMgr,*kCryptoBase,*kExtraVelType;
-static void *mGetInst,*mGetModByName,*mGetMyVehicle,*mForceEndDrift,*mFastOut,
-            *mForceMini,*mAddEV,*mSetKey,*mGetKeyFlags,*mNearestTP,
-            *mMatchCommon;
-static bool g_clsOk=false;
+static void rtInstallCrashHandler(void) {
+    static char altStack[64 * 1024];
+    stack_t ss = { .ss_sp = altStack, .ss_size = sizeof(altStack), .ss_flags = 0 };
+    sigaltstack(&ss, NULL);
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = rtSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
+    for (size_t i = 0; i < 6; i++) sigaction(sigs[i], &sa, NULL);
+}
 
-static void scanClasses(void){
-    if(g_clsOk) return;
-    if(!g_domain) return;
-    size_t n=0;
-    const void** asms=i_asms(g_domain,&n);
-    if(!asms||!n) return;
-    for(size_t i=0;i<n;i++){
-        void* img=i_img((void*)asms[i]); if(!img) continue;
-        size_t cnt=i_cnt(img);
-        for(size_t c=0;c<cnt;c++){
-            void* k=i_cls(img,c); if(!k) continue;
-            const char* ns=i_ns(k); const char* nm=i_name(k); if(!nm) continue;
-            bool gb=!ns||!ns[0];
-            #define T(cc,slot) if(cc && !slot) slot=k;
-            T(gb&&!strcmp(nm,"GamePub"),kGamePub)
-            T(gb&&!strcmp(nm,"VehicleFast"),kVehicleFast)
-            T(gb&&!strcmp(nm,"ExtraVelocityFast"),kExtraVelFast)
-            T(gb&&!strcmp(nm,"ExtraVelocityTriggerFast"),kExtraVelTrig)
-            T(gb&&!strcmp(nm,"InputModule"),kInputModule)
-            T(gb&&!strcmp(nm,"RoadMap"),kRoadMap)
-            T(gb&&!strcmp(nm,"MatchMgr"),kMatchMgr)
-            T(gb&&!strcmp(nm,"CryptoBase"),kCryptoBase)
-            T(gb&&!strcmp(nm,"ExtraVelocityType"),kExtraVelType)
-            #undef T
+#pragma mark - State
+
+static BOOL gDriftNoSlow    = YES;  // drift khong mat toc
+static BOOL gSpeedBoost     = NO;   // gia toc an (mExtraKMPH)
+static float gSpeedKmh      = 0.f;  // 0..120
+static BOOL gProlongN2O     = YES;  // keo dai no2
+static BOOL gFullMiniBoost  = NO;
+static BOOL gAutoDriftEnd   = YES;
+static double gGoTime       = 0.0;
+static double gNextN2OProlong = 0.0;
+static BOOL gHooksInstalled = NO;
+
+static inline double nowSeconds(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+#pragma mark - IL2CPP API
+
+typedef struct Il2CppDomain Il2CppDomain;
+typedef struct Il2CppAssembly Il2CppAssembly;
+typedef struct Il2CppImage Il2CppImage;
+typedef struct Il2CppClass Il2CppClass;
+typedef struct MethodInfo MethodInfo;
+typedef struct { void *methodPtr; const MethodInfo *method; } VirtualInvokeData;
+
+static Il2CppDomain *(*il2cpp_domain_get)(void) = NULL;
+static const Il2CppAssembly **(*il2cpp_domain_get_assemblies)(const Il2CppDomain *, size_t *) = NULL;
+static const Il2CppImage *(*il2cpp_assembly_get_image)(const Il2CppAssembly *) = NULL;
+static Il2CppClass *(*il2cpp_class_from_name)(const Il2CppImage *, const char *, const char *) = NULL;
+static const MethodInfo *(*il2cpp_class_get_method_from_name)(Il2CppClass *, const char *, int) = NULL;
+
+static uintptr_t unityFrameworkBase(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, "UnityFramework")) return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+
+static BOOL rtInitIl2CppApi(void) {
+    if (il2cpp_domain_get) return YES;
+    void *handle = RTLD_DEFAULT;
+    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "UnityFramework")) { handle = dlopen(name, RTLD_NOW | RTLD_NOLOAD); break; }
+    }
+    *(void **)&il2cpp_domain_get = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_domain_get");
+    *(void **)&il2cpp_domain_get_assemblies = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
+    *(void **)&il2cpp_assembly_get_image = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    *(void **)&il2cpp_class_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_from_name");
+    *(void **)&il2cpp_class_get_method_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_class_get_method_from_name) return NO;
+    rtLog("il2cpp: API resolved");
+    return YES;
+}
+
+static Il2CppClass *rtFindClass(const char *ns, const char *name) {
+    if (!il2cpp_domain_get) return NULL;
+    Il2CppDomain *domain = il2cpp_domain_get();
+    if (!domain) return NULL;
+    size_t count = 0;
+    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &count);
+    if (!assemblies || !count) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        Il2CppClass *k = il2cpp_class_from_name(image, ns ?: "", name);
+        if (k) return k;
+    }
+    return NULL;
+}
+
+static void *rtHookMethod(const char *ns, const char *className, const char *methodName,
+                          int argsCount, void *replacement) {
+    Il2CppClass *klass = rtFindClass(ns, className);
+    if (!klass) { rtLog("il2cpp: class %s NOT FOUND", className); return NULL; }
+    const MethodInfo *method = il2cpp_class_get_method_from_name(klass, methodName, argsCount);
+    if (!method) { rtLog("il2cpp: %s::%s(%d) NOT FOUND", className, methodName, argsCount); return NULL; }
+
+    void *orig = *(void **)((char *)method + 0);
+    *(void **)((char *)method + 0) = replacement;
+
+    uint16_t slot = *(uint16_t *)((char *)method + 88);
+    uint16_t vcount = *(uint16_t *)((char *)klass + 306);
+    uintptr_t base = unityFrameworkBase();
+    uintptr_t rva = base && orig ? (uintptr_t)orig - base : 0;
+
+    if (slot < vcount) {
+        VirtualInvokeData *vt = (VirtualInvokeData *)((char *)klass + 336);
+        vt[slot].methodPtr = replacement;
+    }
+    rtLog("il2cpp: HOOK %s::%s (slot %u rva=0x%lx) orig=%p -> rep=%p",
+          className, methodName, slot, (unsigned long)rva, orig, replacement);
+    return orig;
+}
+
+static void *rtMethodPtr(const char *ns, const char *className, const char *methodName, int argsCount) {
+    Il2CppClass *k = rtFindClass(ns, className);
+    if (!k) return NULL;
+    const MethodInfo *m = il2cpp_class_get_method_from_name(k, methodName, argsCount);
+    return m ? *(void **)m : NULL;
+}
+
+#pragma mark - Originals
+
+static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
+static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
+static void  (*orig_DriftSlideVelDamping)(void *, float, float, int, float, const void *) = NULL;
+static void  (*orig_Drift_Release)(void *, const void *) = NULL;
+static void  (*orig_Drift_Exit)(void *, const void *) = NULL;
+static void  (*orig_Drift_ForceClear)(void *, const void *) = NULL;
+static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
+
+static void  (*ExtraVelMgr_ForceOnce)(void *, int) = NULL;
+static int   (*ExtraVelFast_ForceDelayEnd)(void *, int) = NULL;
+
+#pragma mark - Hooks
+
+// 1. Race start
+static void hook_GoImpEnter(void *self, const void *method) {
+    if (orig_GameGo_ImpEnter) orig_GameGo_ImpEnter(self, method);
+    gGoTime = nowSeconds();
+    gNextN2OProlong = 0.0;
+    rtLog("race started, boost gate 5s");
+}
+
+// 2. Gia tốc AN (mExtraKMPH = extra velocity field riêng của xe — KHÔNG đụng top speed
+//    nên bộ đếm km/h (ReadVehicleKMPH đọc SimOutput) KHÔNG đổi. Xe vẫn nhanh hơn vì
+//    PowerChain cộng mExtraKMPH vào vận tốc cuối mỗi frame.
+static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
+    if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
+    if (!self) return;
+
+    if (gSpeedBoost && gSpeedKmh > 0.f && gGoTime > 0.0 && (nowSeconds() - gGoTime) >= 5.0) {
+        // mExtraKMPH (0x44): cộng vận tốc phụ; mExtraTorque (0x48): lực đẩy phụ.
+        // Đây là 2 trường extra-velocity chuẩn của PowerChain — server telemetry
+        // (SdcExtraVelocity) đã có channel cho chúng, không tạo giá trị lạ.
+        *(float *)((char *)self + 0x44) = gSpeedKmh;
+        *(float *)((char *)self + 0x48) = gSpeedKmh * 0.35f;
+    }
+
+    // 3. No2 kéo dài: ForceDelayEndExtraVelocity(N2O=1) mỗi 0.4s — đẩy thời điểm kết thúc.
+    if (gProlongN2O && ExtraVelFast_ForceDelayEnd && gGoTime > 0.0 && nowSeconds() >= gNextN2OProlong) {
+        void *veh = *(void **)((char *)self + 0x10);  // mVehicle (DynamicVehicle) at 0x10
+        if (veh) {
+            ExtraVelFast_ForceDelayEnd(veh, 1);  // N2O
+            ExtraVelFast_ForceDelayEnd(veh, 14); // SuperN2O
         }
-        g_clsOk = kGamePub&&kVehicleFast&&kExtraVelTrig&&kInputModule&&kRoadMap;
-        if(g_clsOk){ L("classes ok"); return; }
+        gNextN2OProlong = nowSeconds() + 0.4;
     }
-    L("classes incomplete: pub=%p veh=%p trig=%p in=%p road=%p match=%p crypto=%p",
-      kGamePub,kVehicleFast,kExtraVelTrig,kInputModule,kRoadMap,kMatchMgr,kCryptoBase);
 }
 
-static bool resolveMethods(void){
-    if(!g_clsOk) return false;
-    if(mGetInst) return true;
-    mGetInst      = mOf(kGamePub,"GetInstance",0);
-    mGetModByName = mOf(kGamePub,"GetModuleByName",2);
-    mGetMyVehicle = mOf(kVehicleFast,"GetMyVehicle",0);
-    mForceEndDrift= mOf(kVehicleFast,"ForceEndDrifting",1);
-    mFastOut      = mOf(kVehicleFast,"DoFastOutCorners",1);
-    mForceMini    = mOf(kExtraVelTrig,"ForceCanTriggerOncePassiveMini",1);
-    mAddEV        = mOf(kExtraVelFast,"AddExtraVelocity",6);
-    mSetKey       = mOf(kInputModule,"SetKey",2);
-    mGetKeyFlags  = mOf(kInputModule,"get_KeyFlags",0);
-    mNearestTP    = mOf(kRoadMap,"GetNearestTrackPoint",2);
-    if(kMatchMgr) mMatchCommon = mOf(kMatchMgr,"get_MatchCommonComponent",0);
-    L("methods: inst=%p veh=%p fed=%p mini=%p setkey=%p tp=%p mc=%p",
-      mGetInst,mGetMyVehicle,mForceEndDrift,mForceMini,mSetKey,mNearestTP,mMatchCommon);
-    return mGetInst&&mGetMyVehicle&&mForceEndDrift&&mSetKey;
+// 4. DRIFT KHÔNG MẤT TỐC: chặn ma sát drift native. DriftingSlideVelDamping là hàm duy nhất
+//    tính (slerpCoef, extraMPS) rồi gọi PHY_VehicleApplyExtraDriftFriction. Không gọi orig
+//    = không mất tốc khi drift. Không đổi top speed, không đổi km/h hiển thị.
+static void hook_DriftSlideVelDamping(void *self, float curMPS, float dampingCoef,
+                                       int driftStateType, float deltaTime, const void *method) {
+    if (gDriftNoSlow) return;  // bỏ toàn bộ ma sát — orig KHÔNG chạy
+    if (orig_DriftSlideVelDamping)
+        orig_DriftSlideVelDamping(self, curMPS, dampingCoef, driftStateType, deltaTime, method);
 }
 
-// ================= ANTICHEAT qua il2cpp (khong patch) =================
-// Tat bao cao checkpoint qua il2cpp (khong ghi code):
-//   GamePub.GetInstance() -> GetModuleByName("MatchMgr") -> get_MatchCommonComponent()
-//   -> GetCheckPointReportMgr() -> SetEnable(false)
-static bool g_acDone=false;
-static void disableAnticheat(void){
-    if(g_acDone) return;
-    if(!mp(mGetInst)||!mp(mGetModByName)||!mp(mMatchCommon)||!i_str){ return; }
-    void* gp=((void*(*)(void))mp(mGetInst))();
-    if(!gp) return;                                  // GamePub chua init -> thu lai tick sau
-    void* mm=((void*(*)(void*,void*,void*))mp(mGetModByName))(gp,i_str("MatchMgr"),nil);
-    if(!mm){ L("anticheat: MatchMgr chua co"); return; }
-    void* mc=((void*(*)(void*))mp(mMatchCommon))(mm);
-    if(!mc){ L("anticheat: MatchCommonComponent chua co"); return; }
-    static void* mGetCp=nil,*mSetEn=nil;
-    if(!mGetCp){
-        void* k=i_ocls(mc);
-        mGetCp=mOf(k,"GetCheckPointReportMgr",0);
-        if(!mGetCp && i_parent){
-            void* cur=k;
-            for(int d=0;d<10 && !mGetCp;d++){
-                cur=i_parent(cur);
-                if(!cur) break;
-                mGetCp=mOf(cur,"GetCheckPointReportMgr",0);
-            }
-        }
-        if(!mGetCp){ L("anticheat: GetCheckPointReportMgr not found"); g_acDone=true; return; }
+// 5. Mini boost
+static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
+    if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
+    if (!gFullMiniBoost || !self) return;
+    if (ExtraVelMgr_ForceOnce) {
+        ExtraVelMgr_ForceOnce(self, 2);   // Mini
+        ExtraVelMgr_ForceOnce(self, 3);   // Air
+        ExtraVelMgr_ForceOnce(self, 11);  // FallingGround
     }
-    if(!mGetCp){ L("anticheat: GetCheckPointReportMgr not found"); g_acDone=true; return; }
-    void* cp=((void*(*)(void*))mp(mGetCp))(mc);
-    if(!cp){ L("anticheat: CheckPointReportMgr null"); g_acDone=true; return; }
-    mSetEn=mOf(i_ocls(cp),"SetEnable",1);
-    if(!mSetEn){ L("anticheat: SetEnable not found"); g_acDone=true; return; }
-    ((void(*)(void*,bool))mp(mSetEn))(cp,false);
-    L("anticheat: CheckPointReportMgr.SetEnable(false) OK");
-    g_acDone=true;
 }
 
-// ================= GAME STATE =================
-typedef struct { float x,y,z; } V3;
-
-static void *g_veh=nil, *g_ecu=nil, *g_input=nil, *g_road=nil, *g_lastTP=nil;
-static size_t off_mECU=0, off_mState=0, off_mTorque=0;
-static double g_nextMini=0, g_nextEV=0;
-static bool   g_prevDrift=false;
-
-static bool tick(void){
-    if(!g_ready||!resolveMethods()) return false;
-
-    // --- my vehicle (goi thang methodPointer) ---
-    g_veh = ((void*(*)(void))mp(mGetMyVehicle))();
-    if(!g_veh){ g_ecu=nil; g_input=nil; g_road=nil; g_lastTP=nil; g_prevDrift=false; return false; }
-
-    // --- InputModule / RoadMap: lay 1 lan ---
-    if(!g_input||!g_road){
-        void* gp=((void*(*)(void))mp(mGetInst))();
-        if(gp){
-            if(!g_input && i_str) g_input=((void*(*)(void*,void*,void*))mp(mGetModByName))(gp,i_str("InputModule"),nil);
-            if(!g_road  && i_str) g_road =((void*(*)(void*,void*,void*))mp(mGetModByName))(gp,i_str("RoadMap"),nil);
-        }
-        if(!g_input) return false;
-    }
-
-    // --- ECU + offsets (cache) ---
-    static void* mDV=nil;
-    if(!off_mECU){
-        if(!mDV){
-            void* k=i_ocls(g_veh);
-            mDV=mOf(k,"GetDynamicVehicle",0);
-            if(!mDV && i_parent){
-                void* cur=k;
-                for(int d=0;d<10 && !mDV;d++){ cur=i_parent(cur); if(!cur) break; mDV=mOf(cur,"GetDynamicVehicle",0); }
-            }
-        }
-        if(!mDV){ L("GetDynamicVehicle not found"); return false; }
-        void* dv=((void*(*)(void*))mp(mDV))(g_veh);
-        if(!dv) return false;
-        off_mECU=fOff(dv,"mECU");
-        if(!off_mECU) return false;
-        g_ecu=*(void**)((char*)dv+off_mECU);
-        if(!g_ecu) return false;
-        off_mState =fOff(g_ecu,"mState");
-        off_mTorque=fOff(g_ecu,"mEngineTorque");
-        L("offsets: ecu=%zu state=%zu torque=%zu",off_mECU,off_mState,off_mTorque);
-    } else if(!g_ecu && mDV){
-        void* dv=((void*(*)(void*))mp(mDV))(g_veh);
-        if(dv) g_ecu=*(void**)((char*)dv+off_mECU);
-    }
-    if(!g_ecu) return false;
-
-    // --- state ---
-    int vState = off_mState? *(int*)((char*)g_ecu+off_mState) : 0;
-
-    // --- key flags ---
-    int kf = mGetKeyFlags? ((int(*)(void*))mp(mGetKeyFlags))(g_input) : 0;
-    bool driftKey=(kf>>8)&1;
-
-    // --- accel an: chi ghi torque field, khong doi top speed ---
-    if(g_accelOn && g_accelMult>1.001f && off_mTorque){
-        float* t=(float*)((char*)g_ecu+off_mTorque);
-        if(*t>0.0f) *t*=g_accelMult;
-    }
-
-    // --- tha nut drift -> ket thuc ngay ---
-    if(g_prevDrift && !driftKey && vState==2){
-        if(g_autoCutDrift && mp(mForceEndDrift)) ((void(*)(void*))mp(mForceEndDrift))(g_veh);
-        if(g_autoFastOut && mp(mFastOut))        ((void(*)(void*))mp(mFastOut))(g_veh);
-    }
-    g_prevDrift=driftKey;
-
-    double now=CACurrentMediaTime();
-
-    // --- miniboost lien tuc khi drift ---
-    if(vState==2 && g_contMini && mp(mForceMini) && now>=g_nextMini){
-        ((void(*)(void*))mp(mForceMini))(g_veh);
-        g_nextMini=now+g_miniInterval;
-    }
-    // --- boost them (ExtraVelocityType.Mini=1) ---
-    if(g_extraKmph>0.5f && mp(mAddEV) && now>=g_nextEV){
-        ((int(*)(void*,int,float,float,float,bool))mp(mAddEV))(g_veh,1,g_extraKmph,g_extraKmph*0.35f,g_extraDur,false);
-        g_nextEV=now+1.0;
-    }
-    // --- steering assist ve track line ---
-    if(g_steerAssist && mp(mNearestTP) && g_road && mp(mSetKey)){
-        static void* mPos=nil,*mFwd=nil;
-        if(!mPos){ void* k=i_ocls(g_veh); mPos=mOf(k,"get_Position",0); mFwd=mOf(k,"get_Forward",0); }
-        if(mPos&&mFwd){
-            V3 p=((V3(*)(void*))mp(mPos))(g_veh);
-            V3 f=((V3(*)(void*))mp(mFwd))(g_veh);
-            void* tp=((void*(*)(void*,float,float,float,float))mp(mNearestTP))(g_road,p.x,p.y,p.z,3.4e38f);
-            if(tp){
-                g_lastTP=tp;
-                void* mDir=mOf(i_ocls(tp),"get_Direction",0);
-                if(mDir){
-                    V3 d=((V3(*)(void*))mp(mDir))(tp);
-                    float cx=f.x*d.z-f.z*d.x;
-                    float dot=f.x*d.x+f.z*d.z;
-                    float deg=atan2f(cx,dot)*57.29578f;
-                    if(g_steerInvert) deg=-deg;
-                    float dead=30.0f-28.0f*g_steerStrength;
-                    ((void(*)(void*,int,bool))mp(mSetKey))(g_input,1,deg<-dead);
-                    ((void(*)(void*,int,bool))mp(mSetKey))(g_input,2,deg> dead);
-                }
-            } else g_lastTP=nil;
-        }
-    }
-    return true;
+// 6. Auto End Drift — hook riêng cho từng hàm, tránh recursion
+static void hook_DriftRelease(void *self, const void *method) {
+    if (orig_Drift_Release) orig_Drift_Release(self, method);
+    if (!gAutoDriftEnd || !self) return;
+    if (orig_Drift_Exit)       orig_Drift_Exit(self, nullptr);
+    if (orig_Drift_ForceClear) orig_Drift_ForceClear(self, nullptr);
+}
+static void hook_DriftExit(void *self, const void *method) {
+    if (orig_Drift_Exit) orig_Drift_Exit(self, method);
+}
+static void hook_DriftClear(void *self, const void *method) {
+    if (orig_Drift_ForceClear) orig_Drift_ForceClear(self, method);
 }
 
-// ================= UIKIT MENU =================
-@interface ZSMRoot : UIWindow
+#pragma mark - Install
+
+static BOOL rtHooksDisabled(void) {
+    char path[1200];
+    const char *dir = strrchr(gLogPath, '/');
+    if (!dir) return NO;
+    size_t n = (size_t)(dir - gLogPath);
+    if (n + 10 >= sizeof(path)) return NO;
+    memcpy(path, gLogPath, n); memcpy(path + n, "/no_hooks", 10);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) { close(fd); return YES; }
+    return NO;
+}
+
+static void installHooks(void) {
+    if (rtHooksDisabled()) { rtLog("install: SKIPPED (no_hooks)"); return; }
+    rtLog("install: v2 hooks");
+
+    // Race start (5s gate)
+    orig_GameGo_ImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+
+    // PowerChain: gia tốc an + N2O prolong
+    orig_PowerChain_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
+
+    // DRIFT NO-SLOW: hook DriftingSlideVelDamping (rva 0x7C713DC)
+    orig_DriftSlideVelDamping = (void (*)(void *, float, float, int, float, const void *))
+        rtHookMethod("", "NssVehicleDriftHelper", "DriftingSlideVelDamping", 4, (void *)hook_DriftSlideVelDamping);
+
+    // Mini boost
+    orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
+        rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
+    ExtraVelMgr_ForceOnce = (void (*)(void *, int))
+        rtMethodPtr("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
+
+    // N2O prolong helper
+    ExtraVelFast_ForceDelayEnd = (int (*)(void *, int))
+        rtMethodPtr("", "ExtraVelocityFast", "ForceDelayEndExtraVelocity", 2);
+
+    // Auto end drift
+    orig_Drift_Release = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
+    orig_Drift_Exit = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ExitCurDriftState", 0, (void *)hook_DriftExit);
+    orig_Drift_ForceClear = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftClear);
+
+    rtLog("install: done");
+}
+
+#pragma mark - UI
+
+@interface RCPassThroughWindow : UIWindow
 @end
-@interface ZSMUI : NSObject
-@property(nonatomic,strong) ZSMRoot* win;
-@property(nonatomic,strong) UIButton* fab;
-@property(nonatomic,strong) UIView* panel;
-@property(nonatomic,strong) UIScrollView* scroll;
-@property(nonatomic) BOOL open;
+@implementation RCPassThroughWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (!hit) return nil;
+    if (hit == self) return nil;
+    if (hit == self.rootViewController.view) return nil;
+    return hit;
+}
+- (BOOL)canBecomeKeyWindow { return NO; }
 @end
 
-@implementation ZSMRoot
-// chi nhan touch ben trong subview cua ta -> moi cho khac roi xuong game
-- (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e{
-    UIView* v=[super hitTest:p withEvent:e];
-    return (v==self)? nil : v;
-}
+@interface RCMenu : NSObject
+@property (nonatomic, strong) RCPassThroughWindow *window;
+@property (nonatomic, strong) UIButton *fab;
+@property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UILabel *speedLabel;
 @end
 
-static ZSMUI* g_ui=nil;
+static RCMenu *gMenu = nil;
 
-@implementation ZSMUI
+@implementation RCMenu
 
-- (UILabel*)mkLabel:(NSString*)t y:(CGFloat)y size:(CGFloat)s color:(UIColor*)c {
-    UILabel* l=[UILabel new];
-    l.text=t; l.font=[UIFont boldSystemFontOfSize:s];
-    l.textColor=c?:UIColor.whiteColor;
-    l.frame=CGRectMake(12,y,self.scroll.bounds.size.width-24,20);
-    l.autoresizingMask=UIViewAutoresizingFlexibleWidth;
-    return l;
+- (UISwitch *)switchAtY:(CGFloat)y title:(NSString *)t on:(BOOL)on action:(SEL)a {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, 205, 32)];
+    l.text = t; l.textColor = UIColor.whiteColor;
+    l.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    [self.panel addSubview:l];
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(226, y, 51, 31)];
+    sw.onTintColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.55 alpha:1.0];
+    sw.on = on;
+    [sw addTarget:self action:a forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:sw];
+    return sw;
 }
-- (UISwitch*)mkSwitch:(CGFloat)y get:(BOOL*)get {
-    UISwitch* s=[UISwitch new];
-    s.frame=CGRectMake(self.scroll.bounds.size.width-64,y-4,51,31);
-    s.on=*get; s.tag=(NSInteger)get;
-    s.autoresizingMask=UIViewAutoresizingFlexibleLeftMargin;
-    [s addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
-    return s;
-}
-- (void)swChanged:(UISwitch*)s{ BOOL* p=(BOOL*)s.tag; if(p){ *p=s.on; cfgSave(); } }
-- (UISlider*)mkSlider:(CGFloat)y min:(float)mn max:(float)mx get:(float*)get {
-    UISlider* sl=[UISlider new];
-    sl.frame=CGRectMake(12,y,self.scroll.bounds.size.width-24,28);
-    sl.minimumValue=mn; sl.maximumValue=mx; sl.value=*get;
-    sl.tag=(NSInteger)get;
-    sl.autoresizingMask=UIViewAutoresizingFlexibleWidth;
-    [sl addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
-    return sl;
-}
-- (void)slChanged:(UISlider*)s{ float* p=(float*)s.tag; if(p){ *p=s.value; cfgSave(); } }
 
-- (void)buildPanel:(CGRect)r {
-    self.panel=[[UIView alloc] initWithFrame:r];
-    self.panel.backgroundColor=[UIColor colorWithWhite:0.06 alpha:0.94];
-    self.panel.layer.cornerRadius=14;
-    self.panel.layer.borderWidth=1;
-    self.panel.layer.borderColor=[UIColor colorWithWhite:0.35 alpha:1].CGColor;
-    self.panel.autoresizingMask=UIViewAutoresizingFlexibleRightMargin|UIViewAutoresizingFlexibleBottomMargin;
-    self.panel.userInteractionEnabled=YES;   // panel nhan touch; ngoai panel hitTest tra nil -> game nhan
+- (void)build {
+    CGRect screen = UIScreen.mainScreen.bounds;
+    self.window = [[RCPassThroughWindow alloc] initWithFrame:screen];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            if (sc.activationState != UISceneActivationStateForegroundActive) continue;
+            self.window.windowScene = (UIWindowScene *)sc;
+            break;
+        }
+    }
+    self.window.windowLevel = UIWindowLevelAlert + 1;
+    self.window.backgroundColor = UIColor.clearColor;
+    self.window.opaque = NO;
+    self.window.rootViewController = [[UIViewController alloc] init];
+    self.window.rootViewController.view.backgroundColor = UIColor.clearColor;
+    self.window.rootViewController.view.opaque = NO;
+    self.window.hidden = NO;
 
-    UILabel* title=[UILabel new];
-    title.text=@"  ZSM DRIFT MENU";
-    title.font=[UIFont boldSystemFontOfSize:15];
-    title.textColor=[UIColor colorWithRed:.3 green:.85 blue:1 alpha:1];
-    title.frame=CGRectMake(0,0,r.size.width,40);
+    UIView *host = self.window.rootViewController.view;
+
+    self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.fab.frame = CGRectMake(screen.size.width - 68, 96, 56, 56);
+    self.fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.45 blue:0.90 alpha:0.92];
+    self.fab.layer.cornerRadius = 28;
+    self.fab.layer.borderWidth = 1.5;
+    self.fab.layer.borderColor = UIColor.whiteColor.CGColor;
+    [self.fab setTitle:@"R" forState:UIControlStateNormal];
+    self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:24];
+    [self.fab addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
+    [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
+    [host addSubview:self.fab];
+
+    CGFloat w = 310, h = 300;
+    self.panel = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - w) / 2,
+                                                        (screen.size.height - h) / 2, w, h)];
+    self.panel.backgroundColor = [UIColor colorWithWhite:0.09 alpha:0.96];
+    self.panel.layer.cornerRadius = 14;
+    self.panel.layer.borderWidth = 1;
+    self.panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
+    self.panel.hidden = YES;
+    [host addSubview:self.panel];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 260, 26)];
+    title.text = @"Race Toolkit";
+    title.textColor = UIColor.whiteColor;
+    title.font = [UIFont boldSystemFontOfSize:17];
     [self.panel addSubview:title];
 
-    self.scroll=[[UIScrollView alloc] initWithFrame:CGRectMake(0,44,r.size.width,r.size.height-52)];
-    self.scroll.showsVerticalScrollIndicator=YES;
-    [self.panel addSubview:self.scroll];
+    [self switchAtY:42  title:@"Drift Khong Mat Toc" on:gDriftNoSlow  action:@selector(onDriftNoSlow:)];
+    [self switchAtY:78  title:@"Gia Toc An"          on:gSpeedBoost   action:@selector(onSpeed:)];
+    [self switchAtY:114 title:@"No2 Keo Dai"         on:gProlongN2O   action:@selector(onN2O:)];
+    [self switchAtY:150 title:@"Inf Mini Boost"      on:gFullMiniBoost action:@selector(onMini:)];
+    [self switchAtY:186 title:@"Auto End Drift"      on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
 
-    CGFloat W=r.size.width, y=4;
-    #define LABEL(t,c) { UILabel* l=[self mkLabel:(t) y:y size:12 color:(c)]; [self.scroll addSubview:l]; y+=18; }
-    #define SWITCH(t,var) { UILabel* l=[self mkLabel:(t) y:y size:13 color:UIColor.whiteColor]; [self.scroll addSubview:l]; \
-                            UISwitch* s=[self mkSwitch:y get:&var]; [self.scroll addSubview:s]; y+=38; }
-    #define SLIDER(t,var,mn,mx) { UILabel* l=[self mkLabel:(t) y:y size:12 color:UIColor.lightGrayColor]; [self.scroll addSubview:l]; y+=18; \
-                            UISlider* s=[self mkSlider:y min:(mn) max:(mx) get:&var]; [self.scroll addSubview:s]; y+=34; }
+    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 222, 268, 22)];
+    self.speedLabel.textColor = UIColor.whiteColor;
+    self.speedLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    self.speedLabel.text = [self speedText];
+    [self.panel addSubview:self.speedLabel];
 
-    LABEL(@"== GIA TOC AN ==", [UIColor colorWithRed:.3 green:.85 blue:1 alpha:1])
-    SWITCH(@"Bat gia toc (torque)", g_accelOn)
-    SLIDER(@"Luc day", g_accelMult, 1.0f, 2.5f)
-    y+=6;
-    LABEL(@"== DRIFT ==", [UIColor colorWithRed:.3 green:.85 blue:1 alpha:1])
-    SWITCH(@"Tu ngat khi tha nut", g_autoCutDrift)
-    SWITCH(@"Fast-out khi tha", g_autoFastOut)
-    y+=6;
-    LABEL(@"== MINI BOOST ==", [UIColor colorWithRed:.3 green:.85 blue:1 alpha:1])
-    SWITCH(@"Lien tuc + miniboost", g_contMini)
-    SLIDER(@"Chu ky (giay)", g_miniInterval, 0.2f, 3.0f)
-    SLIDER(@"Boost them km/h", g_extraKmph, 0.0f, 80.0f)
-    SLIDER(@"Thoi luong (giay)", g_extraDur, 0.3f, 3.0f)
-    y+=6;
-    LABEL(@"== LAI TU DONG ==", [UIColor colorWithRed:.3 green:.85 blue:1 alpha:1])
-    SWITCH(@"Bam track line", g_steerAssist)
-    SLIDER(@"Do manh lai", g_steerStrength, 0.0f, 1.0f)
-    SWITCH(@"Dao chieu", g_steerInvert)
-    y+=6;
-    LABEL(@"== ANTICHEAT ==", [UIColor colorWithRed:.3 green:.85 blue:1 alpha:1])
-    LABEL(@"CrackHandler + CheckPoint da tat qua il2cpp", UIColor.lightGrayColor)
-    #undef LABEL
-    #undef SWITCH
-    #undef SLIDER
-
-    self.scroll.contentSize=CGSizeMake(W,y+10);
+    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 248, 268, 32)];
+    slider.minimumValue = 0.f; slider.maximumValue = 120.f;
+    slider.value = gSpeedKmh;
+    slider.tintColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.55 alpha:1.0];
+    [slider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:slider];
 }
 
-- (void)onFab {
-    self.open=!self.open;
-    [UIView animateWithDuration:0.2 animations:^{
-        self.panel.alpha=self.open?1:0;
-        self.panel.transform=self.open?CGAffineTransformIdentity:CGAffineTransformMakeScale(0.9,0.9);
-    }];
-    if(self.open) self.panel.hidden=NO;
-    else dispatch_after(dispatch_time(DISPATCH_TIME_NOW,200*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
-        if(!self.open) self.panel.hidden=YES;
-    });
+- (NSString *)speedText {
+    return [NSString stringWithFormat:@"Extra km/h (hidden): %d — 5s gate", (int)gSpeedKmh];
 }
-
-- (void)onRotate {
-    CGRect b=[UIScreen mainScreen].bounds;
-    self.win.frame=b;
-    self.fab.frame=CGRectMake(6,b.size.height*0.42,64,44);
-    self.panel.frame=CGRectMake(MAX(70.0,b.size.width*0.5-150),90,300,MIN(b.size.height-160,560));
-    self.scroll.frame=CGRectMake(0,44,self.panel.bounds.size.width,self.panel.bounds.size.height-52);
-    L("rotate -> %.0fx%.0f",b.size.width,b.size.height);
+- (void)togglePanel {
+    self.panel.hidden = !self.panel.hidden;
+    self.window.hidden = NO;
 }
-- (void)attach {
-    CGFloat sw=[UIScreen mainScreen].bounds.size.width;
-    CGFloat sh=[UIScreen mainScreen].bounds.size.height;
-    self.win=[[ZSMRoot alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.win.windowLevel=UIWindowLevelAlert-1;      // duoi alert, tren game
-    self.win.backgroundColor=UIColor.clearColor;
-    UIViewController* vc=[UIViewController new];
-    vc.view.backgroundColor=UIColor.clearColor;
-    self.win.rootViewController=vc;
-    self.win.hidden=NO;
-
-    self.fab=[UIButton buttonWithType:UIButtonTypeSystem];
-    self.fab.frame=CGRectMake(6,sh*0.42,64,44);
-    [self.fab setTitle:@"ZSM" forState:UIControlStateNormal];
-    [self.fab setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    self.fab.titleLabel.font=[UIFont boldSystemFontOfSize:14];
-    self.fab.backgroundColor=[UIColor colorWithRed:.1 green:.5 blue:.9 alpha:0.9];
-    self.fab.layer.cornerRadius=10;
-    [self.fab addTarget:self action:@selector(onFab) forControlEvents:UIControlEventTouchUpInside];
-    [self.win addSubview:self.fab];
-
-    CGRect pr=CGRectMake(sw*0.5-150, 90, 300, MIN(sh-160, 560));
-    if(pr.origin.x<70) pr.origin.x=70;
-    [self buildPanel:pr];
-    self.panel.alpha=0; self.panel.hidden=YES;
-    [self.win addSubview:self.panel];
-    // theo doi xoay man hinh: anchor lai fab + panel
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onRotate)
-                                                 name:UIApplicationDidChangeStatusBarOrientationNotification object:nil];
-    L("menu attached (fab %.0f,%.0f)",self.fab.frame.origin.x,self.fab.frame.origin.y);
+- (void)dragFab:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.fab.superview];
+    self.fab.center = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
+    [g setTranslation:CGPointZero inView:self.fab.superview];
+}
+- (void)onDriftNoSlow:(UISwitch *)s { gDriftNoSlow   = s.isOn; rtLog("driftNoSlow=%d",s.isOn); }
+- (void)onSpeed:(UISwitch *)s       { gSpeedBoost    = s.isOn; rtLog("speedBoost=%d",s.isOn); }
+- (void)onN2O:(UISwitch *)s         { gProlongN2O    = s.isOn; rtLog("prolongN2O=%d",s.isOn); }
+- (void)onMini:(UISwitch *)s        { gFullMiniBoost = s.isOn; rtLog("mini=%d",s.isOn); }
+- (void)onAutoDrift:(UISwitch *)s   { gAutoDriftEnd  = s.isOn; rtLog("autoDrift=%d",s.isOn); }
+- (void)onSpeedChanged:(UISlider *)s {
+    gSpeedKmh = s.value;
+    self.speedLabel.text = [self speedText];
+    rtLog("speed=%d",(int)gSpeedKmh);
 }
 @end
 
-// ================= DRIVER =================
-@interface ZSMDriver : NSObject
-- (void)tick:(CADisplayLink*)dl;
-@end
-@implementation ZSMDriver
-- (void)tick:(CADisplayLink*)dl{
-    (void)dl;
-    @try{
-        if(!g_ready){
-            if(!loadSyms()) return;
-            g_domain=i_domain();
-            if(!g_domain) return;
-            i_attach(g_domain);
-            g_ready=true;
-            L("il2cpp attached domain=%p",g_domain);
-        }
-        if(!g_clsOk) scanClasses();
-        if(!g_clsOk) return;
-        if(!resolveMethods()) return;
-        if(!g_ui){ g_ui=[ZSMUI new]; [g_ui attach]; }
-        disableAnticheat();
-        tick();
-    }@catch(NSException*e){
-        static int n=0; if(n++<3) L("tick exc: %s",e.name.UTF8String);
+#pragma mark - Bootstrap
+
+static void buildMenuSafely(void) {
+    if (gMenu) return;
+    @try {
+        gMenu = [RCMenu new];
+        [gMenu build];
+        rtLog("UI: menu built");
+    } @catch (NSException *e) {
+        gMenu = nil;
+        rtLog("UI: build FAILED: %s", e.reason.UTF8String ?: "?");
     }
 }
-@end
-static ZSMDriver* g_drv=nil;
 
-__attribute__((constructor))
-static void zsmInit(void){
-    cfgLoad();
-    logInit();
-    L("ctor v3.0");
-    dispatch_async(dispatch_get_main_queue(),^{
-        g_drv=[ZSMDriver new];
-        CADisplayLink* l=[CADisplayLink displayLinkWithTarget:g_drv selector:@selector(tick:)];
-        l.preferredFramesPerSecond=30;
-        [l addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        L("driver started");
-    });
+static void startToolkit(void) {
+    static int tries = 0;
+    if (!rtInitIl2CppApi()) {
+        if (++tries > 60) { rtLog("bootstrap: gave up il2cpp api"); buildMenuSafely(); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ startToolkit(); });
+        return;
+    }
+    Il2CppDomain *domain = il2cpp_domain_get();
+    size_t count = 0;
+    const Il2CppAssembly **asms = domain ? il2cpp_domain_get_assemblies(domain, &count) : NULL;
+    if (!asms || !count) {
+        if (++tries > 60) { rtLog("bootstrap: gave up domain"); buildMenuSafely(); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ startToolkit(); });
+        return;
+    }
+    rtLog("bootstrap: IL2CPP ready (%zu assemblies)", count);
+    if (!gHooksInstalled) { gHooksInstalled = YES; installHooks(); }
+    buildMenuSafely();
+}
+
+__attribute__((constructor)) static void RCInit(void) {
+    rtLogOpen();
+    rtInstallCrashHandler();
+    rtLog("=== RaceToolkit v2 session start === log=%s pid=%d", gLogPath, getpid());
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ startToolkit(); });
 }
