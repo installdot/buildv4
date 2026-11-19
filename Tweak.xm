@@ -134,7 +134,7 @@ static void *kGamePub,*kVehicleFast,*kExtraVelFast,*kExtraVelTrig,*kInputModule,
             *kRoadMap,*kMatchMgr,*kCryptoBase,*kExtraVelType;
 static void *mGetInst,*mGetModByName,*mGetMyVehicle,*mForceEndDrift,*mFastOut,
             *mForceMini,*mAddEV,*mSetKey,*mGetKeyFlags,*mNearestTP,
-            *mMatchCommon,*mGetCpReporter,*mSetEnable;
+            *mMatchCommon;
 static bool g_clsOk=false;
 
 static void scanClasses(void){
@@ -233,7 +233,6 @@ static void *g_veh=nil, *g_ecu=nil, *g_input=nil, *g_road=nil, *g_lastTP=nil;
 static size_t off_mECU=0, off_mState=0, off_mTorque=0;
 static double g_nextMini=0, g_nextEV=0;
 static bool   g_prevDrift=false;
-static int    g_failCount=0;
 
 static bool tick(void){
     if(!g_ready||!resolveMethods()) return false;
