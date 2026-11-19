@@ -29,8 +29,22 @@
 #import <math.h>
 #import <string.h>
 #import <stdlib.h>              // malloc/free
+#import <stdarg.h>              // trace()
 
 #define L(...)  NSLog(@"[ZSM] " __VA_ARGS__)
+
+// ==== Logging: staged trace (STEP_* = giai đoạn, PH_* = phase runtime) ====
+// Mỗi STEP in 1 lần duy nhất — đọc log biết crash ở khúc nào.
+static int g_stepMask=0;
+#define STEP(n) do{ if(!(g_stepMask&(1<<n))){ g_stepMask|=(1<<n); L("STEP%d ok",(n)); } }while(0)
+enum { STEP_CTOR=0, STEP_SYM, STEP_DOMAIN, STEP_SCAN, STEP_HOOKS, STEP_PATCHES,
+       STEP_HOST, STEP_RESOLVE, STEP_RACE };
+static void trace(const char* fmt,...) __attribute__((format(printf,1,2)));
+static void trace(const char* fmt,...){
+    va_list ap; va_start(ap,fmt);
+    char buf[256]; vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
+    NSLog(@"[ZSM] %s",buf);
+}
 
 // ==== 0. Config ====
 static bool   g_menuOpen=false;
@@ -135,7 +149,7 @@ static bool loadIl2cppSyms(void){
     // C++ (ObjC++) cấm gán void* → fn-ptr ngầm; cast tường minh từng symbol.
     #define SYM(var, name) do{ \
         void* _p = dlsym(RTLD_DEFAULT, name); \
-        if(!_p){ L("missing %s", name); return false; } \
+        if(!_p){ L("STEP1 FAIL: missing %s", name); return false; } \
         memcpy(&(var), &_p, sizeof(void*)); \
     }while(0)
     SYM(il2cpp_domain_get,             "il2cpp_domain_get");
@@ -160,6 +174,7 @@ static bool loadIl2cppSyms(void){
     SYM(il2cpp_type_get_object,        "il2cpp_type_get_object");
     SYM(il2cpp_object_new,             "il2cpp_object_new");
     #undef SYM
+    STEP(STEP_SYM);
     return true;
 }
 
@@ -216,14 +231,15 @@ static void buildStrCache(void){
 
 static void scanClasses(void){
     if(g_clsReady) return;
-    void* corlib=il2cpp_get_corlib(); if(!corlib) return;
+    STEP(STEP_SCAN);
+    void* corlib=il2cpp_get_corlib(); if(!corlib){ L("STEP2: corlib nil"); return; }
     clsFloat=il2cpp_class_from_name(corlib,"System","Single");
     clsBool =il2cpp_class_from_name(corlib,"System","Boolean");
     clsInt  =il2cpp_class_from_name(corlib,"System","Int32");
-    if(!clsFloat||!clsBool||!clsInt) return;
+    if(!clsFloat||!clsBool||!clsInt){ L("STEP2: primitive classes nil"); return; }
     size_t n=0;
     const void** asms=il2cpp_domain_get_assemblies(g_domain,&n);   // (domain, &size) → mảng
-    if(!asms||!n) return;
+    if(!asms||!n){ L("STEP2: assemblies nil/0 (n=%zu)",n); return; }
     for(size_t i=0;i<n;i++){
         void* img=il2cpp_assembly_get_image((void*)asms[i]); if(!img) continue;
         size_t cnt=il2cpp_image_get_class_count(img);
@@ -251,8 +267,13 @@ static void scanClasses(void){
         g_clsReady = clsGamePub&&clsVehicleFast&&clsExtraVelFast&&clsExtraVelTrigFast
                    &&clsInputModule&&clsRoadMap&&clsEnumExtraVelType
                    &&clsGUI&&clsColor&&clsGameObject&&clsNssVehicle;
-        if(g_clsReady){ buildStrCache(); L("classes+strings ready"); return; }
+        if(g_clsReady){ buildStrCache(); L("STEP2 ok: classes+strings ready"); return; }
     }
+    // Scan xong toàn bộ assembly mà vẫn thiếu — báo thiếu gì
+    trace("STEP2 incomplete: GamePub=%d VehFast=%d EVFast=%d EVTrig=%d InMod=%d RoadMap=%d EVType=%d GUI=%d Color=%d GO=%d NssVeh=%d DemoGUI=%d",
+          clsGamePub!=nil,clsVehicleFast!=nil,clsExtraVelFast!=nil,clsExtraVelTrigFast!=nil,
+          clsInputModule!=nil,clsRoadMap!=nil,clsEnumExtraVelType!=nil,
+          clsGUI!=nil,clsColor!=nil,clsGameObject!=nil,clsNssVehicle!=nil,clsDemoGUIMsg!=nil);
 }
 
 // ==== 3. Patch + hook ====
@@ -367,9 +388,10 @@ static bool reloc16(uint32_t* dst,uint64_t dstAddr,uint32_t* src,uint64_t srcAdd
 static bool hookRVA(uintptr_t rva,void* repl,void** origTramp){
     if(!g_base) return false;
     uintptr_t target=g_base+rva;
-    uint8_t* tr=(uint8_t*)trampAlloc(64); if(!tr) return false;
+    trace("hook 0x%llx: alloc tramp...", (unsigned long long)rva);
+    uint8_t* tr=(uint8_t*)trampAlloc(64); if(!tr){ L("hook 0x%llx FAIL: tramp alloc",(unsigned long long)rva); return false; }
     if(!reloc16((uint32_t*)tr,(uint64_t)tr,(uint32_t*)target,target)){
-        L("reloc fail 0x%llx — skip",(unsigned long long)rva);
+        L("hook 0x%llx FAIL: reloc (B out of range) — skip",(unsigned long long)rva);
         return false;
     }
     uint32_t* back=(uint32_t*)(tr+16);
@@ -379,9 +401,10 @@ static bool hookRVA(uintptr_t rva,void* repl,void** origTramp){
     uint32_t entry[4];
     entry[0]=0x58000050; entry[1]=0xD61F0200;
     *(uint64_t*)(entry+2)=(uint64_t)repl;
-    if(!memWrite(target,entry,16)) return false;
+    trace("hook 0x%llx: patching entry...", (unsigned long long)rva);
+    if(!memWrite(target,entry,16)){ L("hook 0x%llx FAIL: memWrite",(unsigned long long)rva); return false; }
     *origTramp=tr;
-    L("hook 0x%llx ok",(unsigned long long)rva);
+    L("hook 0x%llx OK",(unsigned long long)rva);
     return true;
 }
 
@@ -394,7 +417,7 @@ static void *g_inputModule=nil,*g_roadMap=nil,*g_lastTP=nil;
 
 static bool resolveAll(void){
     if(!g_clsReady) return false;
-    if(mGetInst) return true;
+    if(mGetInst){ STEP(STEP_RESOLVE); return true; }
     mGetInst        = mOf(clsGamePub,"GetInstance",0);
     mGetModuleByName= mOf(clsGamePub,"GetModuleByName",2);
     mGetMyVehicle   = mOf(clsVehicleFast,"GetMyVehicle",0);
@@ -410,11 +433,13 @@ static bool resolveAll(void){
     mGColor         = mOf(clsGUI,"set_backgroundColor",1);
     mGLabel         = mOf(clsGUI,"Label",2);
     mGSliderR       = mOf(clsGUI,"HorizontalScrollbar",6);
+    trace("resolve: inst=%p veh=%p fed=%p fastout=%p mini=%p adev=%p setkey=%p kf=%p tp=%p box=%p btn=%p lbl=%p slider=%p",
+          mGetInst,mGetMyVehicle,mForceEndDrift,mFastOut,mForceMini,mAddEV,mSetKey,mGetKeyFlags,
+          mNearestTP,mGBox,mGButton,mGLabel,mGSliderR);
     if(!mGetInst||!mGetMyVehicle||!mForceEndDrift||!mSetKey||!mGetKeyFlags||!mGBox||!mGButton){
-        L("resolveAll incomplete");
+        L("STEP4 FAIL: critical methods missing (xem log trên)");
         return false;
     }
-    L("methods resolved");
     return true;
 }
 
@@ -435,14 +460,20 @@ static void frameTick(void){
         return;
     }
     if(!g_inRace){
-        if(il2cpp_object_get_class(veh)!=clsNssVehicle) return;
-        g_inRace=true; L("entered race");
+        void* vk=il2cpp_object_get_class(veh);
+        if(vk!=clsNssVehicle){
+            static int guardLogged=0;
+            if(guardLogged<3){ trace("race guard: class %p != NssVehicle %p (log #1/3)",vk,clsNssVehicle); ++guardLogged; }
+            return;
+        }
+        g_inRace=true; L("STEP6 ok: entered race, veh=%p",veh);
     }
     if(!g_inputModule||!g_roadMap){
         void* gp=inv(mGetInst,nil,nil);
         if(gp&&mGetModuleByName){
             if(!g_inputModule){ void* a[2]={il2cpp_string_new("InputModule"),gp};
-                                g_inputModule=inv(mGetModuleByName,gp,a); }
+                                g_inputModule=inv(mGetModuleByName,gp,a);
+                                if(g_inputModule) trace("input module: %p",g_inputModule); }
             if(!g_roadMap){     void* a[2]={il2cpp_string_new("RoadMap"),gp};
                                 g_roadMap=inv(mGetModuleByName,gp,a); }
         }
@@ -456,14 +487,15 @@ static void frameTick(void){
     static void* mGetDV=nil,*mGetVS=nil; static void* lastEcuClass=nil;
     if(!mGetDV){
         mGetDV=mOf(il2cpp_object_get_class(veh),"GetDynamicVehicle",0);
-        if(!mGetDV) return;
+        if(!mGetDV){ L("STEP6: GetDynamicVehicle not found"); return; }
     }
     void* dv=inv(mGetDV,veh,nil);
     if(!dv) return;
     if(!off_mECU){
         void* f=il2cpp_class_get_field_from_name(il2cpp_object_get_class(dv),"mECU");
         off_mECU=f?il2cpp_field_get_offset(f):0;
-        if(!off_mECU) return;
+        if(!off_mECU){ L("STEP6: mECU field not found"); return; }
+        trace("off mECU=%zu",off_mECU);
     }
     void* ecu=*(void**)((char*)dv+off_mECU);
     if(!ecu) return;
@@ -485,7 +517,8 @@ static void frameTick(void){
                     off_pcForceTop=f4?il2cpp_field_get_offset(f4):0;
                 }
             }
-            L("offs tq=%zu top=%zu pc=%zu pcf=%zu",off_mTorque,off_mNormalTop,off_mPowerChain,off_pcForceTop);
+            L("STEP6 offsets: tq=%zu top=%zu pc=%zu pcf=%zu (VS=%p)",
+              off_mTorque,off_mNormalTop,off_mPowerChain,off_pcForceTop,mGetVS);
         }
     }
     int vState=0;
@@ -496,6 +529,7 @@ static void frameTick(void){
 
     bool released=g_prevDriftKey&&!driftKey;
     if(released&&vState==2){
+        trace("drift release detected (state=%d) — cutting",vState);
         if(g_autoCutDrift){ void* a[1]={veh}; inv(mForceEndDrift,nil,a); }
         if(g_autoFastOut){ void* a[1]={veh}; inv(mFastOut,nil,a); }
     }
@@ -512,7 +546,7 @@ static void frameTick(void){
         if(et){
             void* a[6]={veh,et,boxF(kmph),boxF(tq),boxF(dur),boxB(imm)};
             inv(mAddEV,nil,a);
-        }
+        } else trace("ExtraVelocityType box nil");
         g_nextExtraT=now+1.0;
     }
 
@@ -583,6 +617,8 @@ static float menuSliderR(float x,float y,float w,float h,float v,float lo,float 
 
 static void drawMenu(void){
     if(!g_clsReady||!mGButton||!mGBox) return;
+    static int firstRuns=0;
+    if(firstRuns<2){ trace("drawMenu frame #%d (btn=%p box=%p)",firstRuns,mGButton,mGBox); ++firstRuns; }
     @try {
         if(menuBtnR(14,60,86,36,g_menuOpen?STR_BTN_CLOSE:STR_BTN_OPEN)){ g_menuOpen=!g_menuOpen; cfgSave(); }
         if(!g_menuOpen) return;
@@ -674,6 +710,8 @@ static uint32_t sv_crack[4],sv_cheatcp[4],sv_sdcev[4],sv_actorcp[4];
 static bool done_crack,done_cheatcp,done_sdcev,done_actorcp;
 static void applyAcPatches(void){
     if(!g_base) return;
+    bool any=!done_crack&&!done_cheatcp&&!done_sdcev&&!done_actorcp;
+    if(any) trace("STEP3b: applying anticheat patches...");
     g_blockCrack  ?patchRet(0xC7B4F20,sv_crack,&done_crack)    :unpatchRet(0xC7B4F20,sv_crack,&done_crack);
     g_blockCheatCp?patchRet(0x46A9644,sv_cheatcp,&done_cheatcp):unpatchRet(0x46A9644,sv_cheatcp,&done_cheatcp);
     g_blockSdcEV  ?patchRet(0x991481C,sv_sdcev,&done_sdcev)    :unpatchRet(0x991481C,sv_sdcev,&done_sdcev);
@@ -685,20 +723,23 @@ static bool g_hostSpawned=false;
 static bool trySpawnMenuHost(void){
     if(g_hostSpawned||!g_clsReady||!clsGameObject||!clsDemoGUIMsg) return false;
     void* gp=inv(mGetInst,nil,nil);
-    if(!gp) return false;
+    if(!gp){ trace("STEP5: GamePub nil — chờ tick sau"); return false; }
+    STEP(STEP_HOST);
     void* mCtor=mOf(clsGameObject,".ctor",1);
     void* mAdd =mOf(clsGameObject,"AddComponent",1);
-    if(!mCtor||!mAdd) return false;
+    if(!mCtor||!mAdd){ L("STEP5 FAIL: ctor=%p add=%p",mCtor,mAdd); return false; }
     void* go=il2cpp_object_new(clsGameObject);
-    if(!go) return false;
+    if(!go){ L("STEP5 FAIL: object_new nil"); return false; }
+    trace("STEP5: GameObject created %p",go);
     { void* a[1]={il2cpp_string_new("ZSMMenuHost")}; inv(mCtor,go,a); }
     void* t=il2cpp_type_get_object(il2cpp_class_get_type(clsDemoGUIMsg));
-    if(!t) return false;
+    if(!t){ L("STEP5 FAIL: type object nil"); return false; }
+    trace("STEP5: AddComponent(DemoGUIMessage)...");
     { void* a[1]={t}; inv(mAdd,go,a); }
     g_hostSpawned=true;
-    L("menu host spawned");
+    L("STEP5 ok: menu host spawned");
     if(!hookRVA(0xCA27DCC,(void*)hook_OnGUI,&orig_OnGUI))
-        L("!! OnGUI hook fail");
+        L("!! OnGUI hook fail — menu sẽ không hiện");
     return true;
 }
 
@@ -711,23 +752,25 @@ static bool trySpawnMenuHost(void){
     (void)dl;
     @try {
         if(!g_il2cppReady){
+            trace("STEP1: resolving il2cpp syms...");
             if(!loadIl2cppSyms()) return;
             g_domain=il2cpp_domain_get();
-            if(!g_domain) return;
+            if(!g_domain){ L("STEP1 FAIL: domain nil"); return; }
             il2cpp_thread_attach(g_domain);
             g_il2cppReady=true;
-            L("il2cpp attached");
+            L("STEP0 ok: il2cpp attached, domain=%p",g_domain);
         }
-        if(!g_base) findBase();
-        if(!g_base) return;
+        if(!g_base){ findBase(); if(g_base) trace("base=0x%llx",(unsigned long long)g_base); }
+        if(!g_base){ L("STEP0 FAIL: UnityFramework image not found"); return; }
         if(!g_clsReady) scanClasses();
         if(!g_clsReady) return;
         static bool hooksDone=false;
         if(!hooksDone){
+            trace("STEP3: installing 3 hooks...");
             bool ok1=hookRVA(0x7AF8938,(void*)hook_UpdateECU,&orig_UpdateECU);
             bool ok2=hookRVA(0x7C713DC,(void*)hook_Damping,&orig_Damping);
             bool ok3=hookRVA(0x7AFC4A0,(void*)hook_KMPH,&orig_KMPH);
-            L("hooks ecu=%d damp=%d kmph=%d",ok1,ok2,ok3);
+            L("STEP3 done: ecu=%d damp=%d kmph=%d",ok1,ok2,ok3);
             hooksDone=true;
             applyAcPatches();
         }
@@ -745,7 +788,8 @@ __attribute__((constructor))
 static void zsmInit(void){
     cfgLoad();
     findBase();
-    L("ctor v2.1 base=0x%llx",(unsigned long long)g_base);
+    L("ctor v2.2 base=0x%llx",(unsigned long long)g_base);
+    STEP(STEP_CTOR);
     dispatch_async(dispatch_get_main_queue(), ^{
         g_driver=[ZSMDriver new];
         CADisplayLink* dl=[CADisplayLink displayLinkWithTarget:g_driver selector:@selector(tick:)];
