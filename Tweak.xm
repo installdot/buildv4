@@ -78,7 +78,6 @@ static void rtInstallCrashHandler(void) {
 #pragma mark - State
 
 static BOOL gDriftNoSlow    = YES;   // drift không ma sát
-static float gDriftSlide    = 0.60f; // 0..1 độ trượt khi drift
 static BOOL gSpeedBoost     = NO;
 static float gSpeedKmh      = 0.f;   // extra km/h ẩn (không đổi km/h UI)
 static BOOL gAutoNavigate   = YES;   // tự điều hướng track line
@@ -219,7 +218,6 @@ static void  (*pSetLinVel)(void *, float, float, float) = NULL; // (ent, x,y,z)
 static V3    (*pGetVehFwd)(void *) = NULL;          // IVehicle.get_Forward
 static V3    (*pGetVehPos)(void *) = NULL;
 static void *(*pGetDynVeh)(void *) = NULL;
-static void *(*pGetPhyCtrl)(void *) = NULL;
 static void *(*pGetMgr)(void *, void *, void *) = NULL;   // PlayVehicleModule.GetNitrogenCollectMgr(uid)
 static void *(*pGetMyVehicle)(void) = NULL;                // VehicleFast.GetMyVehicle()
 static void *(*pGetInst)(void) = NULL;
