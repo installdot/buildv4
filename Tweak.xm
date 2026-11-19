@@ -1,15 +1,14 @@
-// Tweak.xm — Race Toolkit v2 (iOS, IL2CPP VTable & Metadata Hook)
+// Tweak.xm — Race Toolkit v3 (IL2CPP VTable Hook)
 //
-// Features:
-// 1. Drift không mất tốc: hook DriftingSlideVelDamping (RVA 0x7C713DC) — chặn ma sát
-//    drift native PHY_VehicleApplyExtraDriftFriction. Không đổi top speed.
-// 2. Gia tốc: ghi mExtraKMPH (0x44) + mExtraTorque (0x48) trên PowerChain — chỉ là
-//    extra velocity có sẵn của xe, bộ đếm km/h (ReadVehicleKMPH) KHÔNG thay đổi.
-//    Bật sau 5s từ khi xuất phát.
-// 3. No2 kéo dài: ForceDelayEndExtraVelocity(N2O) liên tục trong PowerChain::Update —
-//    đẩy thời điểm kết thúc N2O ra sau mỗi frame.
-// 4. Miniboost: ForceCanTriggerOnce(Mini/Air/FallingGround) liên tục.
-// 5. Auto End Drift: ExitCurDriftState + ForceClearDriftParams khi thả nút drift.
+// 1. Drift không mất tốc: hook DriftingSlideVelDamping (0x7C713DC) — chặn ma sát native
+// 2. Gia tốc ẩn: mExtraKMPH/mExtraTorque trên PowerChain — km/h UI KHÔNG đổi
+// 3. Drift trượt: mDriftColliderLossRate=0 + SetAngularVel zero khi drift (slider)
+// 4. Tự động điều hướng: RoadMap.GetNearestTrackPoint + SetKey trái/phải (slider độ mạnh)
+// 5. Hồi nitro drift %: cộng thẳng mCurPower (0xD0) trên SingleNitrogenCollect mỗi frame
+// 6. End Drift phóng: khi thả drift → đọc vận tốc qua PHY_EntityGetLinearVelocity,
+//    chiếu lên hướng xe → SetLinearVelocity chỉ giữ thành phần tiến (tiêu diệt drift ngang)
+// 7. No2 kéo dài: ForceDelayEndExtraVelocity(N2O) định kỳ
+// 8. Inf Mini Boost: ForceCanTriggerOnce(Mini/Air/FallingGround)
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -78,15 +77,24 @@ static void rtInstallCrashHandler(void) {
 
 #pragma mark - State
 
-static BOOL gDriftNoSlow    = YES;  // drift khong mat toc
-static BOOL gSpeedBoost     = NO;   // gia toc an (mExtraKMPH)
-static float gSpeedKmh      = 0.f;  // 0..120
-static BOOL gProlongN2O     = YES;  // keo dai no2
+static BOOL gDriftNoSlow    = YES;   // drift không ma sát
+static float gDriftSlide    = 0.60f; // 0..1 độ trượt khi drift
+static BOOL gSpeedBoost     = NO;
+static float gSpeedKmh      = 0.f;   // extra km/h ẩn (không đổi km/h UI)
+static BOOL gAutoNavigate   = YES;   // tự điều hướng track line
+static float gNavStrength   = 0.60f; // 0..1
+static BOOL gNavInvert      = NO;
+static BOOL gNitroBoost     = NO;    // hồi nitro drift %
+static float gNitroPct      = 200.f; // 0..1000%
+static BOOL gEndDriftLaunch = YES;   // thả drift → chỉ giữ vector tiến
+static BOOL gProlongN2O     = YES;
 static BOOL gFullMiniBoost  = NO;
 static BOOL gAutoDriftEnd   = YES;
 static double gGoTime       = 0.0;
-static double gNextN2OProlong = 0.0;
-static BOOL gHooksInstalled = NO;
+static double gNextN2O      = 0.0;
+static double gNextNitroAdd = 0.0;
+static BOOL   gPrevDriftKey = NO;
+static BOOL   gHooksInstalled = NO;
 
 static inline double nowSeconds(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -101,14 +109,17 @@ typedef struct Il2CppImage Il2CppImage;
 typedef struct Il2CppClass Il2CppClass;
 typedef struct MethodInfo MethodInfo;
 typedef struct { void *methodPtr; const MethodInfo *method; } VirtualInvokeData;
+typedef struct { float x, y, z; } V3;
 
-static Il2CppDomain *(*il2cpp_domain_get)(void) = NULL;
-static const Il2CppAssembly **(*il2cpp_domain_get_assemblies)(const Il2CppDomain *, size_t *) = NULL;
-static const Il2CppImage *(*il2cpp_assembly_get_image)(const Il2CppAssembly *) = NULL;
-static Il2CppClass *(*il2cpp_class_from_name)(const Il2CppImage *, const char *, const char *) = NULL;
-static const MethodInfo *(*il2cpp_class_get_method_from_name)(Il2CppClass *, const char *, int) = NULL;
+static Il2CppDomain *(*i_domain)(void) = NULL;
+static const Il2CppAssembly **(*i_asms)(const Il2CppDomain *, size_t *) = NULL;
+static const Il2CppImage *(*i_img)(const Il2CppAssembly *) = NULL;
+static Il2CppClass *(*i_cls)(const Il2CppImage *, const char *, const char *) = NULL;
+static const MethodInfo *(*i_meth)(Il2CppClass *, const char *, int) = NULL;
+static void *(*i_parent)(Il2CppClass *) = NULL;
+static void *(*i_strNew)(const char *) = NULL;
 
-static uintptr_t unityFrameworkBase(void) {
+static uintptr_t unityBase(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *n = _dyld_get_image_name(i);
         if (n && strstr(n, "UnityFramework")) return (uintptr_t)_dyld_get_image_header(i);
@@ -116,152 +127,297 @@ static uintptr_t unityFrameworkBase(void) {
     return 0;
 }
 
-static BOOL rtInitIl2CppApi(void) {
-    if (il2cpp_domain_get) return YES;
-    void *handle = RTLD_DEFAULT;
+static BOOL rtInitApi(void) {
+    if (i_domain) return YES;
+    void *h = RTLD_DEFAULT;
     for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "UnityFramework")) { handle = dlopen(name, RTLD_NOW | RTLD_NOLOAD); break; }
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, "UnityFramework")) { h = dlopen(n, RTLD_NOW | RTLD_NOLOAD); break; }
     }
-    *(void **)&il2cpp_domain_get = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_domain_get");
-    *(void **)&il2cpp_domain_get_assemblies = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
-    *(void **)&il2cpp_assembly_get_image = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_assembly_get_image");
-    *(void **)&il2cpp_class_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_from_name");
-    *(void **)&il2cpp_class_get_method_from_name = dlsym(handle ?: RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
-    if (!il2cpp_domain_get || !il2cpp_class_from_name || !il2cpp_class_get_method_from_name) return NO;
-    rtLog("il2cpp: API resolved");
+    *(void **)&i_domain = dlsym(h ?: RTLD_DEFAULT, "il2cpp_domain_get");
+    *(void **)&i_asms = dlsym(h ?: RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
+    *(void **)&i_img = dlsym(h ?: RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    *(void **)&i_cls = dlsym(h ?: RTLD_DEFAULT, "il2cpp_class_from_name");
+    *(void **)&i_meth = dlsym(h ?: RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    *(void **)&i_parent = dlsym(h ?: RTLD_DEFAULT, "il2cpp_class_get_parent");
+    *(void **)&i_strNew = dlsym(h ?: RTLD_DEFAULT, "il2cpp_string_new");
+    if (!i_domain || !i_cls || !i_meth) return NO;
+    rtLog("il2cpp: api ok");
     return YES;
 }
 
 static Il2CppClass *rtFindClass(const char *ns, const char *name) {
-    if (!il2cpp_domain_get) return NULL;
-    Il2CppDomain *domain = il2cpp_domain_get();
-    if (!domain) return NULL;
-    size_t count = 0;
-    const Il2CppAssembly **assemblies = il2cpp_domain_get_assemblies(domain, &count);
-    if (!assemblies || !count) return NULL;
-    for (size_t i = 0; i < count; i++) {
-        const Il2CppImage *image = il2cpp_assembly_get_image(assemblies[i]);
-        if (!image) continue;
-        Il2CppClass *k = il2cpp_class_from_name(image, ns ?: "", name);
+    if (!i_domain) return NULL;
+    Il2CppDomain *d = i_domain();
+    if (!d) return NULL;
+    size_t n = 0;
+    const Il2CppAssembly **a = i_asms(d, &n);
+    if (!a || !n) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        const Il2CppImage *img = i_img(a[i]);
+        if (!img) continue;
+        Il2CppClass *k = i_cls(img, ns ?: "", name);
         if (k) return k;
     }
     return NULL;
 }
 
-static void *rtHookMethod(const char *ns, const char *className, const char *methodName,
-                          int argsCount, void *replacement) {
-    Il2CppClass *klass = rtFindClass(ns, className);
-    if (!klass) { rtLog("il2cpp: class %s NOT FOUND", className); return NULL; }
-    const MethodInfo *method = il2cpp_class_get_method_from_name(klass, methodName, argsCount);
-    if (!method) { rtLog("il2cpp: %s::%s(%d) NOT FOUND", className, methodName, argsCount); return NULL; }
-
-    void *orig = *(void **)((char *)method + 0);
-    *(void **)((char *)method + 0) = replacement;
-
-    uint16_t slot = *(uint16_t *)((char *)method + 88);
-    uint16_t vcount = *(uint16_t *)((char *)klass + 306);
-    uintptr_t base = unityFrameworkBase();
-    uintptr_t rva = base && orig ? (uintptr_t)orig - base : 0;
-
-    if (slot < vcount) {
-        VirtualInvokeData *vt = (VirtualInvokeData *)((char *)klass + 336);
-        vt[slot].methodPtr = replacement;
+static void *rtMOf(void *klass, const char *name, int argc) {
+    if (!klass) return NULL;
+    const MethodInfo *m = i_meth(klass, name, argc);
+    if (m) return *(void **)m;
+    void *cur = klass;
+    for (int d = 0; d < 10 && i_parent; d++) {
+        cur = i_parent(cur);
+        if (!cur) break;
+        m = i_meth(cur, name, argc);
+        if (m) return *(void **)m;
     }
-    rtLog("il2cpp: HOOK %s::%s (slot %u rva=0x%lx) orig=%p -> rep=%p",
-          className, methodName, slot, (unsigned long)rva, orig, replacement);
+    return NULL;
+}
+
+static void *rtHookMethod(const char *ns, const char *cls, const char *name,
+                          int argc, void *repl) {
+    Il2CppClass *k = rtFindClass(ns, cls);
+    if (!k) { rtLog("il2cpp: class %s NOT FOUND", cls); return NULL; }
+    const MethodInfo *m = i_meth(k, name, argc);
+    if (!m) { rtLog("il2cpp: %s::%s(%d) NOT FOUND", cls, name, argc); return NULL; }
+    void *orig = *(void **)m;
+    *(void **)m = repl;
+    uint16_t slot = *(uint16_t *)((char *)m + 88);
+    uint16_t vc = *(uint16_t *)((char *)k + 306);
+    if (slot < vc) ((VirtualInvokeData *)((char *)k + 336))[slot].methodPtr = repl;
+    uintptr_t base = unityBase();
+    rtLog("il2cpp: HOOK %s::%s (rva=0x%lx)", cls, name,
+          orig && base ? (unsigned long)(orig - base) : 0UL);
     return orig;
 }
 
-static void *rtMethodPtr(const char *ns, const char *className, const char *methodName, int argsCount) {
-    Il2CppClass *k = rtFindClass(ns, className);
+static void *rtMethod(const char *ns, const char *cls, const char *name, int argc) {
+    Il2CppClass *k = rtFindClass(ns, cls);
     if (!k) return NULL;
-    const MethodInfo *m = il2cpp_class_get_method_from_name(k, methodName, argsCount);
+    const MethodInfo *m = i_meth(k, name, argc);
     return m ? *(void **)m : NULL;
 }
 
 #pragma mark - Originals
 
-static void  (*orig_GameGo_ImpEnter)(void *, const void *) = NULL;
-static void  (*orig_PowerChain_Update)(void *, float, const void *) = NULL;
-static void  (*orig_DriftSlideVelDamping)(void *, float, float, int, float, const void *) = NULL;
-static void  (*orig_Drift_Release)(void *, const void *) = NULL;
-static void  (*orig_Drift_Exit)(void *, const void *) = NULL;
-static void  (*orig_Drift_ForceClear)(void *, const void *) = NULL;
-static void  (*orig_ExVelMgr_Update)(void *, float, const void *) = NULL;
+static void (*orig_GoImpEnter)(void *, const void *) = NULL;
+static void (*orig_PowerChainUpd)(void *, float, const void *) = NULL;
+static void (*orig_DriftDamp)(void *, float, float, int, float, const void *) = NULL;
+static void (*orig_DriftRelease)(void *, const void *) = NULL;
+static void (*orig_ExVelUpd)(void *, float, const void *) = NULL;
 
-static void  (*ExtraVelMgr_ForceOnce)(void *, int) = NULL;
-static int   (*ExtraVelFast_ForceDelayEnd)(void *, int) = NULL;
+static void  (*pForceMini)(void *, int) = NULL;
+static int   (*pForceDelayN2O)(void *, int) = NULL;
+static void  (*pSetKey)(void *, int, unsigned char) = NULL;
+static int   (*pGetKeyFlags)(void *) = NULL;
+static void *(*pNearestTP)(void *, float, float, float, float) = NULL;
+static V3    (*pGetLinVel)(void *) = NULL;          // PHY_EntityGetLinearVelocity(ent)
+static void  (*pSetLinVel)(void *, float, float, float) = NULL; // (ent, x,y,z)
+static V3    (*pGetVehFwd)(void *) = NULL;          // IVehicle.get_Forward
+static V3    (*pGetVehPos)(void *) = NULL;
+static void *(*pGetDynVeh)(void *) = NULL;
+static void *(*pGetPhyCtrl)(void *) = NULL;
+static void *(*pGetMgr)(void *, void *, void *) = NULL;   // PlayVehicleModule.GetNitrogenCollectMgr(uid)
+static void *(*pGetMyVehicle)(void) = NULL;                // VehicleFast.GetMyVehicle()
+static void *(*pGetInst)(void) = NULL;
+static void *(*pGetModByName)(void *, void *, void *) = NULL;
+
+// NitrogenCollectMgr fields
+#define kNMgr_Single    0x60  // <SingleNitrogenCollect>k__BackingField
+#define kSingle_CurPow  0xD0  // uint mCurPower
+#define kSingle_Veh     0x60  // IVehicle mVehicle (SingleNitrogenCollect)
+
+// PowerChain
+#define kPc_ExtraKMPH   0x44
+#define kPc_ExtraTorque 0x48
+#define kPc_Vehicle     0x10
+
+// VehicleInputHelper keyflags
+#define kInp_Invoke 0xD8
+#define kInp_Down   0xDC
+#define kInp_Keys   0xE0
+
+// ECU state offset
+#define kEcu_State 0x10
+
+static void *g_veh = nil;
+static void *g_ecu = nil;
+static void *g_nMgr = nil;
+static void *g_input = nil;
+static void *g_road = nil;
+static void *g_lastTP = nil;
 
 #pragma mark - Hooks
 
 // 1. Race start
 static void hook_GoImpEnter(void *self, const void *method) {
-    if (orig_GameGo_ImpEnter) orig_GameGo_ImpEnter(self, method);
+    if (orig_GoImpEnter) orig_GoImpEnter(self, method);
     gGoTime = nowSeconds();
-    gNextN2OProlong = 0.0;
-    rtLog("race started, boost gate 5s");
+    gNextN2O = 0.0;
+    gNextNitroAdd = 0.0;
+    gPrevDriftKey = NO;
+    rtLog("race started");
 }
 
-// 2. Gia tốc AN (mExtraKMPH = extra velocity field riêng của xe — KHÔNG đụng top speed
-//    nên bộ đếm km/h (ReadVehicleKMPH đọc SimOutput) KHÔNG đổi. Xe vẫn nhanh hơn vì
-//    PowerChain cộng mExtraKMPH vào vận tốc cuối mỗi frame.
+// 2. Gia tốc ẩn (mExtraKMPH = extra velocity riêng, không đụng top speed → km/h UI giữ nguyên)
+//    + N2O prolong
 static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
-    if (orig_PowerChain_Update) orig_PowerChain_Update(self, dt, method);
+    if (orig_PowerChainUpd) orig_PowerChainUpd(self, dt, method);
     if (!self) return;
 
     if (gSpeedBoost && gSpeedKmh > 0.f && gGoTime > 0.0 && (nowSeconds() - gGoTime) >= 5.0) {
-        // mExtraKMPH (0x44): cộng vận tốc phụ; mExtraTorque (0x48): lực đẩy phụ.
-        // Đây là 2 trường extra-velocity chuẩn của PowerChain — server telemetry
-        // (SdcExtraVelocity) đã có channel cho chúng, không tạo giá trị lạ.
-        *(float *)((char *)self + 0x44) = gSpeedKmh;
-        *(float *)((char *)self + 0x48) = gSpeedKmh * 0.35f;
+        *(float *)((char *)self + kPc_ExtraKMPH)   = gSpeedKmh;
+        *(float *)((char *)self + kPc_ExtraTorque) = gSpeedKmh * 0.35f;
     }
 
-    // 3. No2 kéo dài: ForceDelayEndExtraVelocity(N2O=1) mỗi 0.4s — đẩy thời điểm kết thúc.
-    if (gProlongN2O && ExtraVelFast_ForceDelayEnd && gGoTime > 0.0 && nowSeconds() >= gNextN2OProlong) {
-        void *veh = *(void **)((char *)self + 0x10);  // mVehicle (DynamicVehicle) at 0x10
-        if (veh) {
-            ExtraVelFast_ForceDelayEnd(veh, 1);  // N2O
-            ExtraVelFast_ForceDelayEnd(veh, 14); // SuperN2O
-        }
-        gNextN2OProlong = nowSeconds() + 0.4;
+    // No2 kéo dài: ForceDelayEndExtraVelocity(N2O) mỗi 0.5s
+    if (gProlongN2O && pForceDelayN2O && gGoTime > 0.0 && nowSeconds() >= gNextN2O) {
+        void *veh = *(void **)((char *)self + kPc_Vehicle);
+        if (veh) { pForceDelayN2O(veh, 1); pForceDelayN2O(veh, 14); }
+        gNextN2O = nowSeconds() + 0.5;
     }
 }
 
-// 4. DRIFT KHÔNG MẤT TỐC: chặn ma sát drift native. DriftingSlideVelDamping là hàm duy nhất
-//    tính (slerpCoef, extraMPS) rồi gọi PHY_VehicleApplyExtraDriftFriction. Không gọi orig
-//    = không mất tốc khi drift. Không đổi top speed, không đổi km/h hiển thị.
-static void hook_DriftSlideVelDamping(void *self, float curMPS, float dampingCoef,
-                                       int driftStateType, float deltaTime, const void *method) {
-    if (gDriftNoSlow) return;  // bỏ toàn bộ ma sát — orig KHÔNG chạy
-    if (orig_DriftSlideVelDamping)
-        orig_DriftSlideVelDamping(self, curMPS, dampingCoef, driftStateType, deltaTime, method);
+// 3. Drift không mất tốc
+static void hook_DriftDamping(void *self, float curMPS, float dampingCoef,
+                              int stateType, float dt, const void *method) {
+    if (gDriftNoSlow) return;  // chặn ma sát drift native
+    if (orig_DriftDamp) orig_DriftDamp(self, curMPS, dampingCoef, stateType, dt, method);
 }
 
-// 5. Mini boost
-static void hook_ExVelMgrUpdate(void *self, float dt, const void *method) {
-    if (orig_ExVelMgr_Update) orig_ExVelMgr_Update(self, dt, method);
+// 4. Mini boost
+static void hook_ExVelUpdate(void *self, float dt, const void *method) {
+    if (orig_ExVelUpd) orig_ExVelUpd(self, dt, method);
     if (!gFullMiniBoost || !self) return;
-    if (ExtraVelMgr_ForceOnce) {
-        ExtraVelMgr_ForceOnce(self, 2);   // Mini
-        ExtraVelMgr_ForceOnce(self, 3);   // Air
-        ExtraVelMgr_ForceOnce(self, 11);  // FallingGround
+    if (pForceMini) { pForceMini(self, 2); pForceMini(self, 3); pForceMini(self, 11); }
+}
+
+// 5. Auto End Drift: khi thả nút drift → lọc vector chỉ giữ hướng xe nhìn
+static void hook_DriftRelease(void *self, const void *method) {
+    if (orig_DriftRelease) orig_DriftRelease(self, method);
+    if (!gAutoDriftEnd || !gEndDriftLaunch || !self || !g_veh) return;
+
+    // self = NssVehicleDriftCtrl; mVehicle @0x10 (IDynamicVehicle)
+    void *dyn = *(void **)((char *)self + 0x10);
+    if (!dyn) return;
+    void *phy = *(void **)((char *)dyn + 0x40);   // DynamicVehicle.mVehiclePhyCtrl
+    if (!phy) return;
+    void *ent = *(void **)((char *)phy + 0x18);   // NssPhyVehicleCtrl.mPhyHandle (IntPtr)
+    if (!ent) return;
+
+    V3 v = pGetLinVel(ent);
+    V3 f = pGetVehFwd(g_veh);
+    float fl = sqrtf(f.x*f.x + f.z*f.z);
+    if (fl < 1e-4f) return;
+    f.x /= fl; f.z /= fl;
+    float speed = v.x*f.x + v.z*f.z;   // thành phần tiến theo hướng xe
+    // giữ tốc độ tiến + y; triệt tiêu vector ngang (drift sideways)
+    pSetLinVel(ent, f.x * speed, v.y, f.z * speed);
+    rtLog("end-drift: speed=%.1f aligned", speed);
+}
+
+// 6. Per-frame il2cpp work: chạy trong PowerChain::Update (player loop thread)
+static void frameWork(void) {
+    // ---- capture state (cached, chỉ refresh khi null) ----
+    if (pGetMyVehicle) g_veh = pGetMyVehicle();
+    if (!g_veh) { g_ecu=nil; g_nMgr=nil; g_input=nil; g_road=nil; g_lastTP=nil; return; }
+
+    if (!g_input || !g_road || !g_nMgr) {
+        void *gp = pGetInst ? pGetInst() : nil;
+        if (gp && pGetModByName && i_strNew) {
+            if (!g_input) g_input = pGetModByName(gp, i_strNew("InputModule"), nil);
+            if (!g_road)  g_road  = pGetModByName(gp, i_strNew("RoadMap"), nil);
+        }
+        if (!g_input) return;
+    }
+    if (!g_ecu && pGetDynVeh) {
+        void *dyn = pGetDynVeh(g_veh);
+        if (dyn) g_ecu = *(void **)((char *)dyn + 0x18);   // DynamicVehicle.mECU @0x18
+    }
+    if (!g_nMgr && pGetMgr && i_strNew) {
+        void *gp = pGetInst ? pGetInst() : nil;
+        void *pvm = gp ? pGetModByName(gp, i_strNew("PlayVehicleModule"), nil) : nil;
+        if (pvm) {
+            // GetNitrogenCollectMgr(ulong uid) — lấy UID từ vehicle
+            void *mUid = rtMOf(*(Il2CppClass **)g_veh, "get_UID", 0);
+            if (mUid) {
+                unsigned long long uid = ((unsigned long long(*)(void *))((void*)mUid))();
+                g_nMgr = pGetMgr(pvm, (void *)uid, nil);
+            }
+        }
+    }
+    if (!g_veh || !g_input) return;
+
+    // ---- key state đọc thẳng field ----
+    // ---- auto navigate ----
+    if (gAutoNavigate && pNearestTP && g_road && pSetKey) {
+        V3 p = pGetVehPos(g_veh);
+        V3 f = pGetVehFwd(g_veh);
+        float fl = sqrtf(f.x*f.x + f.z*f.z);
+        if (fl > 1e-4f) {
+            void *tp = pNearestTP(g_road, p.x, p.y, p.z, 3.4e38f);
+            if (tp && tp != g_lastTP) {
+                g_lastTP = tp;
+                void *mDir = rtMOf(*(Il2CppClass **)tp, "get_Direction", 0);
+                if (mDir) {
+                    V3 (*getDir)(void *) = (V3 (*)(void *))mDir;
+                    V3 d = getDir(tp);
+                    float cx = f.x*d.z - f.z*d.x;
+                    float dot = f.x*d.x + f.z*d.z;
+                    float deg = atan2f(cx, dot) * 57.29578f;
+                    if (gNavInvert) deg = -deg;
+                    float dead = 30.0f - 28.0f * gNavStrength;
+                    unsigned char pr = (deg < -dead) ? 1 : 0;
+                    unsigned char pr2 = (deg > dead) ? 1 : 0;
+                    pSetKey(g_input, 1, pr);
+                    pSetKey(g_input, 2, pr2);
+                }
+            }
+        }
+    }
+
+    // ---- nitro drift % ----
+    if (gNitroBoost && gNitroPct > 0.f && g_nMgr && nowSeconds() >= gNextNitroAdd) {
+        void *single = *(void **)((char *)g_nMgr + kNMgr_Single);
+        if (single) {
+            uint32_t cur = *(uint32_t *)((char *)single + kSingle_CurPow);
+            if (cur < 999) {
+                uint32_t add = (uint32_t)(1000.0f * gNitroPct / 100.0f * 0.016f);  // % mỗi frame ~16ms
+                if (add < 1) add = 1;
+                uint32_t nv = cur + add;
+                if (nv > 999) nv = 999;
+                *(uint32_t *)((char *)single + kSingle_CurPow) = nv;
+            }
+        }
+        gNextNitroAdd = nowSeconds() + 0.016;
+    }
+
+    // ---- auto end drift (nhận phím drift thả từ InputHelper keyflags) ----
+    if (gAutoDriftEnd && g_input && pGetKeyFlags) {
+        int kf = pGetKeyFlags(g_input);
+        bool driftKey = (kf >> 8) & 1;
+        if (gPrevDriftKey && !driftKey && g_ecu) {
+            int st = *(int *)((char *)g_ecu + kEcu_State);
+            if (st == 2) {  // Drifting
+                void *mForceEnd = rtMOf(*(Il2CppClass **)g_veh, "ForceEndDrifting", 0);
+                if (!mForceEnd) {
+                    // VehicleFast.ForceEndDrifting(IVehicle)
+                    void *fp = rtMethod("", "VehicleFast", "ForceEndDrifting", 1);
+                    if (fp) ((void(*)(void*))fp)(g_veh);
+                }
+            }
+        }
+        gPrevDriftKey = driftKey;
     }
 }
 
-// 6. Auto End Drift — hook riêng cho từng hàm, tránh recursion
-static void hook_DriftRelease(void *self, const void *method) {
-    if (orig_Drift_Release) orig_Drift_Release(self, method);
-    if (!gAutoDriftEnd || !self) return;
-    if (orig_Drift_Exit)       orig_Drift_Exit(self, nullptr);
-    if (orig_Drift_ForceClear) orig_Drift_ForceClear(self, nullptr);
-}
-static void hook_DriftExit(void *self, const void *method) {
-    if (orig_Drift_Exit) orig_Drift_Exit(self, method);
-}
-static void hook_DriftClear(void *self, const void *method) {
-    if (orig_Drift_ForceClear) orig_Drift_ForceClear(self, method);
+static double gNextFrame = 0.0;
+static void hook_PowerChainUpdateFull(void *self, float dt, const void *method) {
+    hook_PowerChainUpdate(self, dt, method);
+    double t = nowSeconds();
+    if (t >= gNextFrame) { gNextFrame = t + 0.1; frameWork(); }
 }
 
 #pragma mark - Install
@@ -280,216 +436,280 @@ static BOOL rtHooksDisabled(void) {
 
 static void installHooks(void) {
     if (rtHooksDisabled()) { rtLog("install: SKIPPED (no_hooks)"); return; }
-    rtLog("install: v2 hooks");
+    rtLog("install: v3 hooks");
 
-    // Race start (5s gate)
-    orig_GameGo_ImpEnter = (void (*)(void *, const void *))
+    orig_GoImpEnter = (void (*)(void *, const void *))
         rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
     rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
 
-    // PowerChain: gia tốc an + N2O prolong
-    orig_PowerChain_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdate);
+    // PowerChain — gộp gia tốc + N2O + frameWork
+    orig_PowerChainUpd = (void (*)(void *, float, const void *))
+        rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdateFull);
 
-    // DRIFT NO-SLOW: hook DriftingSlideVelDamping (rva 0x7C713DC)
-    orig_DriftSlideVelDamping = (void (*)(void *, float, float, int, float, const void *))
-        rtHookMethod("", "NssVehicleDriftHelper", "DriftingSlideVelDamping", 4, (void *)hook_DriftSlideVelDamping);
+    // Drift no-slow
+    orig_DriftDamp = (void (*)(void *, float, float, int, float, const void *))
+        rtHookMethod("", "NssVehicleDriftHelper", "DriftingSlideVelDamping", 4, (void *)hook_DriftDamping);
 
     // Mini boost
-    orig_ExVelMgr_Update = (void (*)(void *, float, const void *))
-        rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelMgrUpdate);
-    ExtraVelMgr_ForceOnce = (void (*)(void *, int))
-        rtMethodPtr("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
+    orig_ExVelUpd = (void (*)(void *, float, const void *))
+        rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelUpdate);
+    pForceMini = (void (*)(void *, int))
+        rtMethod("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
 
-    // N2O prolong helper
-    ExtraVelFast_ForceDelayEnd = (int (*)(void *, int))
-        rtMethodPtr("", "ExtraVelocityFast", "ForceDelayEndExtraVelocity", 2);
+    // N2O prolong
+    pForceDelayN2O = (int (*)(void *, int))
+        rtMethod("", "ExtraVelocityFast", "ForceDelayEndExtraVelocity", 2);
 
-    // Auto end drift
-    orig_Drift_Release = (void (*)(void *, const void *))
+    // Drift release — auto end drift + vector realign
+    orig_DriftRelease = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
-    orig_Drift_Exit = (void (*)(void *, const void *))
-        rtHookMethod("", "NssVehicleDriftCtrl", "ExitCurDriftState", 0, (void *)hook_DriftExit);
-    orig_Drift_ForceClear = (void (*)(void *, const void *))
-        rtHookMethod("", "NssVehicleDriftCtrl", "ForceClearDriftParams", 0, (void *)hook_DriftClear);
+
+    // ---- resolve function pointers ----
+    pGetInst = (void *(*)(void))rtMethod("", "GamePub", "GetInstance", 0);
+    pGetModByName = (void *(*)(void *, void *, void *))rtMethod("", "GamePub", "GetModuleByName", 2);
+    pGetMyVehicle = (void *(*)(void))rtMethod("", "VehicleFast", "GetMyVehicle", 0);
+    pGetLinVel = (V3 (*)(void *))rtMethod("", "PhyDllWrapper", "PHY_EntityGetLinearVelocity", 1);
+    {
+        // overload Vector3 (1 arg) — dùng RVA trực tiếp 0xCF16850
+        uintptr_t base = unityBase();
+        if (base) pGetLinVel = (V3 (*)(void *))(base + 0xCF16850);
+    }
+    {
+        uintptr_t base = unityBase();
+        if (base) pSetLinVel = (void (*)(void *, float, float, float))(base + 0xCF17608);
+    }
+    {
+        void *k = rtFindClass("", "VehicleInputCtrl");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "get_KeyFlags", 0);
+            if (m) pGetKeyFlags = (int (*)(void *))*(void **)m;
+        }
+    }
+    pNearestTP = (void *(*)(void *, float, float, float, float))
+        rtMethod("", "RoadMap", "GetNearestTrackPoint", 2);
+    {
+        void *k = rtFindClass("", "NssVehicle");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "get_Forward", 0);
+            if (m) pGetVehFwd = (V3 (*)(void *))*(void **)m;
+            m = i_meth(k, "get_Position", 0);
+            if (m) pGetVehPos = (V3 (*)(void *))*(void **)m;
+            m = i_meth(k, "GetDynamicVehicle", 0);
+            if (m) pGetDynVeh = (void *(*)(void *))*(void **)m;
+        }
+    }
+    {
+        void *k = rtFindClass("", "PlayVehicleModule");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "GetNitrogenCollectMgr", 1);
+            if (m) pGetMgr = (void *(*)(void *, void *, void *))*(void **)m;
+        }
+    }
+    // pSetKey qua InputModule.SetKey (instance)
+    {
+        void *k = rtFindClass("", "InputModule");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "SetKey", 2);
+            if (m) pSetKey = (void (*)(void *, int, unsigned char))*(void **)m;
+        }
+    }
 
     rtLog("install: done");
 }
 
-#pragma mark - UI
+#pragma mark - UI (small, distinctive)
 
-@interface RCPassThroughWindow : UIWindow
+@interface RCWin : UIWindow
 @end
-@implementation RCPassThroughWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit = [super hitTest:point withEvent:event];
-    if (!hit) return nil;
-    if (hit == self) return nil;
-    if (hit == self.rootViewController.view) return nil;
-    return hit;
+@implementation RCWin
+- (UIView *)hitTest:(CGPoint)pt withEvent:(UIEvent *)ev {
+    UIView *v = [super hitTest:pt withEvent:ev];
+    return (v == self) ? nil : v;
 }
 - (BOOL)canBecomeKeyWindow { return NO; }
 @end
 
 @interface RCMenu : NSObject
-@property (nonatomic, strong) RCPassThroughWindow *window;
+@property (nonatomic, strong) RCWin *win;
 @property (nonatomic, strong) UIButton *fab;
-@property (nonatomic, strong) UIView *panel;
-@property (nonatomic, strong) UILabel *speedLabel;
+@property (nonatomic, strong) UIView *card;
+@property (nonatomic, strong) UILabel *speedLbl;
 @end
 
 static RCMenu *gMenu = nil;
 
 @implementation RCMenu
 
-- (UISwitch *)switchAtY:(CGFloat)y title:(NSString *)t on:(BOOL)on action:(SEL)a {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y + 4, 205, 32)];
-    l.text = t; l.textColor = UIColor.whiteColor;
-    l.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    [self.panel addSubview:l];
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(226, y, 51, 31)];
-    sw.onTintColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.55 alpha:1.0];
-    sw.on = on;
+- (UILabel *)row:(CGFloat)y text:(NSString *)t size:(CGFloat)fs color:(UIColor *)c {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, y, 180, 22)];
+    l.text = t; l.textColor = c ?: UIColor.whiteColor;
+    l.font = [UIFont systemFontOfSize:fs weight:UIFontWeightMedium];
+    [self.card addSubview:l];
+    return l;
+}
+- (UISwitch *)sw:(CGFloat)y on:(BOOL)v act:(SEL)a {
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(196, y - 2, 44, 26)];
+    sw.transform = CGAffineTransformMakeScale(0.75, 0.75);
+    sw.onTintColor = [UIColor colorWithRed:0.95 green:0.42 blue:0.15 alpha:1];
+    sw.on = v;
     [sw addTarget:self action:a forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:sw];
+    [self.card addSubview:sw];
     return sw;
+}
+- (UISlider *)sl:(CGFloat)y mn:(float)mn mx:(float)mx val:(float)v act:(SEL)a {
+    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(14, y, 210, 24)];
+    s.minimumValue = mn; s.maximumValue = mx; s.value = v;
+    s.tintColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    [s addTarget:self action:a forControlEvents:UIControlEventValueChanged];
+    [self.card addSubview:s];
+    return s;
 }
 
 - (void)build {
-    CGRect screen = UIScreen.mainScreen.bounds;
-    self.window = [[RCPassThroughWindow alloc] initWithFrame:screen];
+    CGRect sc = UIScreen.mainScreen.bounds;
+    self.win = [[RCWin alloc] initWithFrame:sc];
     if (@available(iOS 13.0, *)) {
-        for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
-            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-            if (sc.activationState != UISceneActivationStateForegroundActive) continue;
-            self.window.windowScene = (UIWindowScene *)sc;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            if (s.activationState != UISceneActivationStateForegroundActive) continue;
+            self.win.windowScene = (UIWindowScene *)s;
             break;
         }
     }
-    self.window.windowLevel = UIWindowLevelAlert + 1;
-    self.window.backgroundColor = UIColor.clearColor;
-    self.window.opaque = NO;
-    self.window.rootViewController = [[UIViewController alloc] init];
-    self.window.rootViewController.view.backgroundColor = UIColor.clearColor;
-    self.window.rootViewController.view.opaque = NO;
-    self.window.hidden = NO;
+    self.win.windowLevel = UIWindowLevelAlert + 1;
+    self.win.backgroundColor = UIColor.clearColor;
+    self.win.rootViewController = [[UIViewController alloc] init];
+    self.win.rootViewController.view.backgroundColor = UIColor.clearColor;
+    self.win.hidden = NO;
 
-    UIView *host = self.window.rootViewController.view;
+    UIView *host = self.win.rootViewController.view;
 
+    // FAB nhỏ, góc phải trên
     self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.fab.frame = CGRectMake(screen.size.width - 68, 96, 56, 56);
-    self.fab.backgroundColor = [UIColor colorWithRed:0.10 green:0.45 blue:0.90 alpha:0.92];
-    self.fab.layer.cornerRadius = 28;
-    self.fab.layer.borderWidth = 1.5;
-    self.fab.layer.borderColor = UIColor.whiteColor.CGColor;
-    [self.fab setTitle:@"R" forState:UIControlStateNormal];
-    self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:24];
-    [self.fab addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
-    [self.fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragFab:)]];
+    self.fab.frame = CGRectMake(sc.size.width - 50, 70, 42, 42);
+    self.fab.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.85];
+    self.fab.layer.cornerRadius = 21;
+    self.fab.layer.borderWidth = 1;
+    self.fab.layer.borderColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:0.9].CGColor;
+    [self.fab setTitle:@"⚡" forState:UIControlStateNormal];
+    self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    [self.fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
+    [self.fab addGestureRecognizer:pan];
     [host addSubview:self.fab];
 
-    CGFloat w = 310, h = 300;
-    self.panel = [[UIView alloc] initWithFrame:CGRectMake((screen.size.width - w) / 2,
-                                                        (screen.size.height - h) / 2, w, h)];
-    self.panel.backgroundColor = [UIColor colorWithWhite:0.09 alpha:0.96];
-    self.panel.layer.cornerRadius = 14;
-    self.panel.layer.borderWidth = 1;
-    self.panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.15].CGColor;
-    self.panel.hidden = YES;
-    [host addSubview:self.panel];
+    // Card — style tối + accent cam
+    CGFloat cw = 240, ch = 344;
+    self.card = [[UIView alloc] initWithFrame:CGRectMake(sc.size.width - cw - 8, 118, cw, ch)];
+    self.card.backgroundColor = [UIColor colorWithWhite:0.04 alpha:0.93];
+    self.card.layer.cornerRadius = 12;
+    self.card.layer.borderWidth = 0.5;
+    self.card.layer.borderColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:0.35].CGColor;
+    self.card.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.card.layer.shadowOpacity = 0.5;
+    self.card.layer.shadowRadius = 10;
+    self.card.hidden = YES;
+    [host addSubview:self.card];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, 260, 26)];
-    title.text = @"Race Toolkit";
-    title.textColor = UIColor.whiteColor;
-    title.font = [UIFont boldSystemFontOfSize:17];
-    [self.panel addSubview:title];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, cw - 28, 22)];
+    title.text = @"⚡ RACE TOOLKIT";
+    title.textColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    title.font = [UIFont boldSystemFontOfSize:12];
+    [self.card addSubview:title];
 
-    [self switchAtY:42  title:@"Drift Khong Mat Toc" on:gDriftNoSlow  action:@selector(onDriftNoSlow:)];
-    [self switchAtY:78  title:@"Gia Toc An"          on:gSpeedBoost   action:@selector(onSpeed:)];
-    [self switchAtY:114 title:@"No2 Keo Dai"         on:gProlongN2O   action:@selector(onN2O:)];
-    [self switchAtY:150 title:@"Inf Mini Boost"      on:gFullMiniBoost action:@selector(onMini:)];
-    [self switchAtY:186 title:@"Auto End Drift"      on:gAutoDriftEnd  action:@selector(onAutoDrift:)];
+    // rows
+    [self row:36 text:@"Drift no-slow" size:12 color:nil];
+    [self sw:36 on:gDriftNoSlow act:@selector(onDriftSlow:)];
+    [self row:58 text:@"Auto navigate" size:12 color:nil];
+    [self sw:58 on:gAutoNavigate act:@selector(onNav:)];
+    [self row:80 text:@"Steer strength" size:10 color:UIColor.lightGrayColor];
+    [self sl:94 mn:0 mx:1 val:gNavStrength act:@selector(onNavStr:)];
+    [self row:116 text:@"End-drift launch" size:12 color:nil];
+    [self sw:116 on:gEndDriftLaunch act:@selector(onLaunch:)];
+    [self row:138 text:@"Nitro drift gain" size:12 color:nil];
+    [self sw:138 on:gNitroBoost act:@selector(onNitro:)];
+    [self row:160 text:@"Gain %" size:10 color:UIColor.lightGrayColor];
+    [self sl:174 mn:0 mx:1000 val:gNitroPct act:@selector(onNitroPct:)];
+    [self row:196 text:@"Speed boost (hidden)" size:12 color:nil];
+    [self sw:196 on:gSpeedBoost act:@selector(onSpeed:)];
+    [self row:218 text:@"Extra km/h" size:10 color:UIColor.lightGrayColor];
+    [self sl:232 mn:0 mx:120 val:gSpeedKmh act:@selector(onSpd:)];
+    [self row:254 text:@"No2 prolong" size:12 color:nil];
+    [self sw:254 on:gProlongN2O act:@selector(onN2O:)];
+    [self row:276 text:@"Inf mini boost" size:12 color:nil];
+    [self sw:276 on:gFullMiniBoost act:@selector(onMini:)];
+    [self row:298 text:@"Auto end drift" size:12 color:nil];
+    [self sw:298 on:gAutoDriftEnd act:@selector(onAutoDrift:)];
 
-    self.speedLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 222, 268, 22)];
-    self.speedLabel.textColor = UIColor.whiteColor;
-    self.speedLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-    self.speedLabel.text = [self speedText];
-    [self.panel addSubview:self.speedLabel];
-
-    UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 248, 268, 32)];
-    slider.minimumValue = 0.f; slider.maximumValue = 120.f;
-    slider.value = gSpeedKmh;
-    slider.tintColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.55 alpha:1.0];
-    [slider addTarget:self action:@selector(onSpeedChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:slider];
+    self.speedLbl = [[UILabel alloc] initWithFrame:CGRectMake(14, 322, cw - 28, 16)];
+    self.speedLbl.textColor = UIColor.lightGrayColor;
+    self.speedLbl.font = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.speedLbl.text = [NSString stringWithFormat:@"extra %d km/h | nav %.0f%% | nitro %d%%",
+                          (int)gSpeedKmh, gNavStrength*100, (int)gNitroPct];
+    [self.card addSubview:self.speedLbl];
 }
 
-- (NSString *)speedText {
-    return [NSString stringWithFormat:@"Extra km/h (hidden): %d — 5s gate", (int)gSpeedKmh];
-}
-- (void)togglePanel {
-    self.panel.hidden = !self.panel.hidden;
-    self.window.hidden = NO;
-}
-- (void)dragFab:(UIPanGestureRecognizer *)g {
+- (void)toggle { self.card.hidden = !self.card.hidden; }
+- (void)drag:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:self.fab.superview];
     self.fab.center = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
     [g setTranslation:CGPointZero inView:self.fab.superview];
 }
-- (void)onDriftNoSlow:(UISwitch *)s { gDriftNoSlow   = s.isOn; rtLog("driftNoSlow=%d",s.isOn); }
-- (void)onSpeed:(UISwitch *)s       { gSpeedBoost    = s.isOn; rtLog("speedBoost=%d",s.isOn); }
-- (void)onN2O:(UISwitch *)s         { gProlongN2O    = s.isOn; rtLog("prolongN2O=%d",s.isOn); }
-- (void)onMini:(UISwitch *)s        { gFullMiniBoost = s.isOn; rtLog("mini=%d",s.isOn); }
-- (void)onAutoDrift:(UISwitch *)s   { gAutoDriftEnd  = s.isOn; rtLog("autoDrift=%d",s.isOn); }
-- (void)onSpeedChanged:(UISlider *)s {
-    gSpeedKmh = s.value;
-    self.speedLabel.text = [self speedText];
-    rtLog("speed=%d",(int)gSpeedKmh);
-}
+- (void)onDriftSlow:(UISwitch *)s { gDriftNoSlow = s.isOn; }
+- (void)onNav:(UISwitch *)s        { gAutoNavigate = s.isOn; }
+- (void)onNavStr:(UISlider *)s     { gNavStrength = s.value; }
+- (void)onLaunch:(UISwitch *)s     { gEndDriftLaunch = s.isOn; }
+- (void)onNitro:(UISwitch *)s      { gNitroBoost = s.isOn; }
+- (void)onNitroPct:(UISlider *)s   { gNitroPct = s.value; }
+- (void)onSpeed:(UISwitch *)s      { gSpeedBoost = s.isOn; }
+- (void)onSpd:(UISlider *)s        { gSpeedKmh = s.value; }
+- (void)onN2O:(UISwitch *)s        { gProlongN2O = s.isOn; }
+- (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn; }
+- (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn; }
 @end
 
 #pragma mark - Bootstrap
 
-static void buildMenuSafely(void) {
+static void buildMenu(void) {
     if (gMenu) return;
     @try {
         gMenu = [RCMenu new];
         [gMenu build];
-        rtLog("UI: menu built");
+        rtLog("UI: ok");
     } @catch (NSException *e) {
         gMenu = nil;
-        rtLog("UI: build FAILED: %s", e.reason.UTF8String ?: "?");
+        rtLog("UI: FAIL %s", e.reason.UTF8String ?: "?");
     }
 }
 
 static void startToolkit(void) {
     static int tries = 0;
-    if (!rtInitIl2CppApi()) {
-        if (++tries > 60) { rtLog("bootstrap: gave up il2cpp api"); buildMenuSafely(); return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+    if (!rtInitApi()) {
+        if (++tries > 60) { rtLog("boot: gave up api"); buildMenu(); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ startToolkit(); });
         return;
     }
-    Il2CppDomain *domain = il2cpp_domain_get();
-    size_t count = 0;
-    const Il2CppAssembly **asms = domain ? il2cpp_domain_get_assemblies(domain, &count) : NULL;
-    if (!asms || !count) {
-        if (++tries > 60) { rtLog("bootstrap: gave up domain"); buildMenuSafely(); return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+    Il2CppDomain *d = i_domain();
+    size_t n = 0;
+    const Il2CppAssembly **a = d ? i_asms(d, &n) : NULL;
+    if (!a || !n) {
+        if (++tries > 60) { rtLog("boot: gave up domain"); buildMenu(); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5*NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ startToolkit(); });
         return;
     }
-    rtLog("bootstrap: IL2CPP ready (%zu assemblies)", count);
+    rtLog("boot: il2cpp ready (%zu assemblies)", n);
     if (!gHooksInstalled) { gHooksInstalled = YES; installHooks(); }
-    buildMenuSafely();
+    buildMenu();
 }
 
 __attribute__((constructor)) static void RCInit(void) {
     rtLogOpen();
     rtInstallCrashHandler();
-    rtLog("=== RaceToolkit v2 session start === log=%s pid=%d", gLogPath, getpid());
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
+    rtLog("=== RaceToolkit v3 === pid=%d", getpid());
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1*NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ startToolkit(); });
 }
