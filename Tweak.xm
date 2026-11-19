@@ -15,7 +15,6 @@
 #import <time.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <signal.h>
 #import <unistd.h>
 #import <fcntl.h>
 
@@ -51,28 +50,9 @@ static void rtLog(const char *fmt, ...) {
 
 #pragma mark - Crash reporter
 
-static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
-    char msg[300];
-    int len = snprintf(msg, sizeof(msg), "\n===== CRASH signal=%d faultAddr=%p PC=%p =====\n",
-                       sig, info ? info->si_addr : 0,
-                       uap ? (void *)((ucontext_t *)uap)->uc_mcontext->__ss.__pc : 0);
-    write(gLogFd, msg, len);
-    fsync(gLogFd);
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
-static void rtInstallCrashHandler(void) {
-    static char altStack[64 * 1024];
-    stack_t ss = { .ss_sp = altStack, .ss_size = sizeof(altStack), .ss_flags = 0 };
-    sigaltstack(&ss, NULL);
-    struct sigaction sa; memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = rtSignalHandler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigemptyset(&sa.sa_mask);
-    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
-    for (size_t i = 0; i < 6; i++) sigaction(sigs[i], &sa, NULL);
-}
+// KHÔNG cài signal handler — il2cpp dùng SIGSEGV trên protected page làm cơ chế
+// null-check managed (NullReferenceException). Ghi đè handler + re-raise SIG_DFL
+// sẽ biến MỌI managed NRE thành hard crash. Crash reporting để Unity/il2cpp tự lo.
 
 #pragma mark - State
 
@@ -753,7 +733,6 @@ static void startToolkit(void) {
 
 __attribute__((constructor)) static void RCInit(void) {
     rtLogOpen();
-    rtInstallCrashHandler();
     rtLog("=== RaceToolkit v3 === pid=%d", getpid());
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1*NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ startToolkit(); });
