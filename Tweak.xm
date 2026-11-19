@@ -1,855 +1,719 @@
-// ZSM Drift Tweak — Speed Drifters VN (UnityFramework, il2cpp arm64) — v2.1 crash-fix
+// Tweak.xm — Race Toolkit v3 (IL2CPP VTable Hook)
 //
-// Fix so với v1 (crash vài giây sau inject):
-//  F1  Resolve method/field MỘT LẦN, cache con trỏ — không gọi il2cpp API trong hot-hook
-//      (UpdateECU chạy trên thread Unity physics; il2cpp API + GC không thread-safe).
-//  F2  frameTick: null-guard toàn bộ; xác thực class MyVehicle đúng 1 lần (clsNssVehicle).
-//  F3  Menu IMGUI: GUI.*(Rect,...) thuần — bỏ GUILayout (nguồn exception-storm chính:
-//      overload Label(string,GUIStyle) match 2-arg và nhận nil GUILayoutOption[] sai kiểu).
-//      Rect/Color box dùng clsColor (struct 16B, cùng ABI).
-//  F4  spawnMenuHost chỉ chạy khi GamePub.GetInstance() != null.
-//  F5  hook_OnGUI + tick wrap @try/@catch.
-//  F6  reloc16 fail → không ghi entry (không nửa-patch); icache invalidate nguyên page.
-//  F7  Patch mạnh (SdcEV/ActorCp) mặc định OFF.
-//  F8  Steering assist throttle mỗi 3 tick.
-//  F9  inv() log exception 1 lần/method; invoke bỏ qua khi obj=nil.
-//  F10 HorizontalScrollbar 6-arg (Rect,value,size,left,right,style) — khớp dump.cs:505698.
-//
-// Anchor RVA verify trên UnityFramework.i64 (imagebase 0x0, cryptid=0 → RVA==offset==IDB):
-//   UpdateECU 0x7AF8938 | Damping 0x7C713DC | KMPH 0x7AFC4A0 | ForceEndDrifting 0xAC74000
-//   ForceMini 0x50DBB58 | AddEV 0x50D5F4C | NotifyCrack 0xC7B4F20 | ReportCheat 0x46A9644
-//   SdcEV.Update 0x991481C | ActorCp.Update 0x4B3B260 | DemoGUI.OnGUI 0xCA27DCC
+// 1. Drift không mất tốc: hook DriftingSlideVelDamping (0x7C713DC) — chặn ma sát native
+// 2. Gia tốc ẩn: mExtraKMPH/mExtraTorque trên PowerChain — km/h UI KHÔNG đổi
+// 3. Drift trượt: mDriftColliderLossRate=0 + SetAngularVel zero khi drift (slider)
+// 4. Tự động điều hướng: RoadMap.GetNearestTrackPoint + SetKey trái/phải (slider độ mạnh)
+// 5. Hồi nitro drift %: cộng thẳng mCurPower (0xD0) trên SingleNitrogenCollect mỗi frame
+// 6. End Drift phóng: khi thả drift → đọc vận tốc qua PHY_EntityGetLinearVelocity,
+//    chiếu lên hướng xe → SetLinearVelocity chỉ giữ thành phần tiến (tiêu diệt drift ngang)
+// 7. No2 kéo dài: ForceDelayEndExtraVelocity(N2O) định kỳ
+// 8. Inf Mini Boost: ForceCanTriggerOnce(Mini/Air/FallingGround)
 
-#import <Foundation/Foundation.h>
-#import <QuartzCore/QuartzCore.h>
-#import <mach/mach.h>
-#import <mach-o/dyld.h>
-#import <dlfcn.h>
-#import <libkern/OSCacheControl.h>
+#import <UIKit/UIKit.h>
 #import <math.h>
 #import <string.h>
-#import <stdlib.h>              // malloc/free
-#import <stdarg.h>              // trace()
-#import <time.h>                // gettimeofday/strftime
-#import <sys/time.h>            // gettimeofday struct timeval
-#import <unistd.h>              // getpid
-#import <stdio.h>               // FILE/fopen/fprintf (log file)
+#import <time.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <signal.h>
+#import <unistd.h>
+#import <fcntl.h>
 
-#define L(...)  NSLog(@"[ZSM] " __VA_ARGS__)
+#pragma mark - Logger
 
-// ==== Logging: staged trace + file log (Documents/zsm.log) ====
-// Mỗi STEP in 1 lần duy nhất — đọc log biết crash ở khúc nào.
-// Toàn bộ log cũng ghi vào <App>/Documents/zsm.log (lấy được qua Files app / iFunBox).
-#import <Foundation/NSFileManager.h>
-#import <Foundation/NSDate.h>
+static int gLogFd = -1;
+static char gLogPath[1024];
 
-static FILE* g_logFile=nil;
-static int   g_stepMask=0;
-#define STEP(n) do{ if(!(g_stepMask&(1<<n))){ g_stepMask|=(1<<n); L("STEP%d ok",(n)); } }while(0)
-enum { STEP_CTOR=0, STEP_SYM, STEP_DOMAIN, STEP_SCAN, STEP_HOOKS, STEP_PATCHES,
-       STEP_HOST, STEP_RESOLVE, STEP_RACE };
+static void rtLogOpen(void) {
+    if (gLogFd >= 0) return;
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject ?: NSTemporaryDirectory();
+    NSString *p = [doc stringByAppendingPathComponent:@"racetoolkit.log"];
+    [p getFileSystemRepresentation:gLogPath maxLength:sizeof(gLogPath)];
+    gLogFd = open(gLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+}
 
-// mở file log trong Documents (gọi an toàn nhiều lần)
-static void logInit(void){
-    if(g_logFile) return;
-    @try {
-        NSString* docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
-        if(!docs) return;
-        NSString* path=[docs stringByAppendingPathComponent:@"zsm.log"];
-        g_logFile=fopen(path.fileSystemRepresentation,"a");
-        if(g_logFile){
-            setvbuf(g_logFile,nil,_IOLBF,0);   // line-buffered — flush mỗi dòng, an toàn khi crash
-            time_t t; time(&t);
-            char ts[32]; strftime(ts,sizeof(ts),"%Y-%m-%d %H:%M:%S",localtime(&t));
-            fprintf(g_logFile,"\n==== ZSM session %s (pid %d) ====\n",ts,getpid());
-            fflush(g_logFile);
+static void rtLog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void rtLog(const char *fmt, ...) {
+    if (gLogFd < 0) rtLogOpen();
+    if (gLogFd < 0) return;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    char buf[2048];
+    int n = snprintf(buf, sizeof(buf), "[%ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec / 1000000);
+    va_list ap; va_start(ap, fmt);
+    int m = vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+    va_end(ap);
+    if (m < 0) return;
+    size_t total = (size_t)n + (size_t)m;
+    if (total + 1 < sizeof(buf)) { buf[total++] = '\n'; buf[total] = '\0'; }
+    write(gLogFd, buf, total);
+}
+
+#pragma mark - Crash reporter
+
+static void rtSignalHandler(int sig, siginfo_t *info, void *uap) {
+    char msg[300];
+    int len = snprintf(msg, sizeof(msg), "\n===== CRASH signal=%d faultAddr=%p PC=%p =====\n",
+                       sig, info ? info->si_addr : 0,
+                       uap ? (void *)((ucontext_t *)uap)->uc_mcontext->__ss.__pc : 0);
+    write(gLogFd, msg, len);
+    fsync(gLogFd);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void rtInstallCrashHandler(void) {
+    static char altStack[64 * 1024];
+    stack_t ss = { .ss_sp = altStack, .ss_size = sizeof(altStack), .ss_flags = 0 };
+    sigaltstack(&ss, NULL);
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = rtSignalHandler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
+    for (size_t i = 0; i < 6; i++) sigaction(sigs[i], &sa, NULL);
+}
+
+#pragma mark - State
+
+static BOOL gDriftNoSlow    = YES;   // drift không ma sát
+static float gDriftSlide    = 0.60f; // 0..1 độ trượt khi drift
+static BOOL gSpeedBoost     = NO;
+static float gSpeedKmh      = 0.f;   // extra km/h ẩn (không đổi km/h UI)
+static BOOL gAutoNavigate   = YES;   // tự điều hướng track line
+static float gNavStrength   = 0.60f; // 0..1
+static BOOL gNavInvert      = NO;
+static BOOL gNitroBoost     = NO;    // hồi nitro drift %
+static float gNitroPct      = 200.f; // 0..1000%
+static BOOL gEndDriftLaunch = YES;   // thả drift → chỉ giữ vector tiến
+static BOOL gProlongN2O     = YES;
+static BOOL gFullMiniBoost  = NO;
+static BOOL gAutoDriftEnd   = YES;
+static double gGoTime       = 0.0;
+static double gNextN2O      = 0.0;
+static double gNextNitroAdd = 0.0;
+static BOOL   gPrevDriftKey = NO;
+static BOOL   gHooksInstalled = NO;
+
+static inline double nowSeconds(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+#pragma mark - IL2CPP API
+
+typedef struct Il2CppDomain Il2CppDomain;
+typedef struct Il2CppAssembly Il2CppAssembly;
+typedef struct Il2CppImage Il2CppImage;
+typedef struct Il2CppClass Il2CppClass;
+typedef struct MethodInfo MethodInfo;
+typedef struct { void *methodPtr; const MethodInfo *method; } VirtualInvokeData;
+typedef struct { float x, y, z; } V3;
+
+static Il2CppDomain *(*i_domain)(void) = NULL;
+static const Il2CppAssembly **(*i_asms)(const Il2CppDomain *, size_t *) = NULL;
+static const Il2CppImage *(*i_img)(const Il2CppAssembly *) = NULL;
+static Il2CppClass *(*i_cls)(const Il2CppImage *, const char *, const char *) = NULL;
+static const MethodInfo *(*i_meth)(Il2CppClass *, const char *, int) = NULL;
+static Il2CppClass *(*i_parent)(Il2CppClass *) = NULL;
+static void *(*i_strNew)(const char *) = NULL;
+
+static uintptr_t unityBase(void) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, "UnityFramework")) return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+
+static BOOL rtInitApi(void) {
+    if (i_domain) return YES;
+    void *h = RTLD_DEFAULT;
+    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, "UnityFramework")) { h = dlopen(n, RTLD_NOW | RTLD_NOLOAD); break; }
+    }
+    *(void **)&i_domain = dlsym(h ?: RTLD_DEFAULT, "il2cpp_domain_get");
+    *(void **)&i_asms = dlsym(h ?: RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
+    *(void **)&i_img = dlsym(h ?: RTLD_DEFAULT, "il2cpp_assembly_get_image");
+    *(void **)&i_cls = dlsym(h ?: RTLD_DEFAULT, "il2cpp_class_from_name");
+    *(void **)&i_meth = dlsym(h ?: RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+    *(void **)&i_parent = dlsym(h ?: RTLD_DEFAULT, "il2cpp_class_get_parent");
+    *(void **)&i_strNew = dlsym(h ?: RTLD_DEFAULT, "il2cpp_string_new");
+    if (!i_domain || !i_cls || !i_meth) return NO;
+    rtLog("il2cpp: api ok");
+    return YES;
+}
+
+static Il2CppClass *rtFindClass(const char *ns, const char *name) {
+    if (!i_domain) return NULL;
+    Il2CppDomain *d = i_domain();
+    if (!d) return NULL;
+    size_t n = 0;
+    const Il2CppAssembly **a = i_asms(d, &n);
+    if (!a || !n) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        const Il2CppImage *img = i_img(a[i]);
+        if (!img) continue;
+        Il2CppClass *k = i_cls(img, ns ?: "", name);
+        if (k) return k;
+    }
+    return NULL;
+}
+
+static void *rtMOf(void *klass, const char *name, int argc) {
+    if (!klass) return NULL;
+    Il2CppClass *kc = (Il2CppClass *)klass;
+    const MethodInfo *m = i_meth(kc, name, argc);
+    if (m) return *(void **)m;
+    Il2CppClass *cur = kc;
+    for (int d = 0; d < 10 && i_parent; d++) {
+        cur = i_parent(cur);
+        if (!cur) break;
+        m = i_meth(cur, name, argc);
+        if (m) return *(void **)m;
+    }
+    return NULL;
+}
+
+static void *rtHookMethod(const char *ns, const char *cls, const char *name,
+                          int argc, void *repl) {
+    Il2CppClass *k = rtFindClass(ns, cls);
+    if (!k) { rtLog("il2cpp: class %s NOT FOUND", cls); return NULL; }
+    const MethodInfo *m = i_meth(k, name, argc);
+    if (!m) { rtLog("il2cpp: %s::%s(%d) NOT FOUND", cls, name, argc); return NULL; }
+    void *orig = *(void **)m;
+    *(void **)m = repl;
+    uint16_t slot = *(uint16_t *)((char *)m + 88);
+    uint16_t vc = *(uint16_t *)((char *)k + 306);
+    if (slot < vc) ((VirtualInvokeData *)((char *)k + 336))[slot].methodPtr = repl;
+    uintptr_t base = unityBase();
+    rtLog("il2cpp: HOOK %s::%s (rva=0x%lx)", cls, name,
+          orig && base ? (unsigned long)((uintptr_t)orig - base) : 0UL);
+    return orig;
+}
+
+static void *rtMethod(const char *ns, const char *cls, const char *name, int argc) {
+    Il2CppClass *k = rtFindClass(ns, cls);
+    if (!k) return NULL;
+    const MethodInfo *m = i_meth(k, name, argc);
+    return m ? *(void **)m : NULL;
+}
+
+#pragma mark - Originals
+
+static void (*orig_GoImpEnter)(void *, const void *) = NULL;
+static void (*orig_PowerChainUpd)(void *, float, const void *) = NULL;
+static void (*orig_DriftDamp)(void *, float, float, int, float, const void *) = NULL;
+static void (*orig_DriftRelease)(void *, const void *) = NULL;
+static void (*orig_ExVelUpd)(void *, float, const void *) = NULL;
+
+static void  (*pForceMini)(void *, int) = NULL;
+static int   (*pForceDelayN2O)(void *, int) = NULL;
+static void  (*pSetKey)(void *, int, unsigned char) = NULL;
+static int   (*pGetKeyFlags)(void *) = NULL;
+static void *(*pNearestTP)(void *, float, float, float, float) = NULL;
+static V3    (*pGetLinVel)(void *) = NULL;          // PHY_EntityGetLinearVelocity(ent)
+static void  (*pSetLinVel)(void *, float, float, float) = NULL; // (ent, x,y,z)
+static V3    (*pGetVehFwd)(void *) = NULL;          // IVehicle.get_Forward
+static V3    (*pGetVehPos)(void *) = NULL;
+static void *(*pGetDynVeh)(void *) = NULL;
+static void *(*pGetPhyCtrl)(void *) = NULL;
+static void *(*pGetMgr)(void *, void *, void *) = NULL;   // PlayVehicleModule.GetNitrogenCollectMgr(uid)
+static void *(*pGetMyVehicle)(void) = NULL;                // VehicleFast.GetMyVehicle()
+static void *(*pGetInst)(void) = NULL;
+static void *(*pGetModByName)(void *, void *, void *) = NULL;
+
+// NitrogenCollectMgr fields
+#define kNMgr_Single    0x60  // <SingleNitrogenCollect>k__BackingField
+#define kSingle_CurPow  0xD0  // uint mCurPower
+#define kSingle_Veh     0x60  // IVehicle mVehicle (SingleNitrogenCollect)
+
+// PowerChain
+#define kPc_ExtraKMPH   0x44
+#define kPc_ExtraTorque 0x48
+#define kPc_Vehicle     0x10
+
+// VehicleInputHelper keyflags
+#define kInp_Invoke 0xD8
+#define kInp_Down   0xDC
+#define kInp_Keys   0xE0
+
+// ECU state offset
+#define kEcu_State 0x10
+
+static void *g_veh = nil;
+static void *g_ecu = nil;
+static void *g_nMgr = nil;
+static void *g_input = nil;
+static void *g_road = nil;
+static void *g_lastTP = nil;
+
+#pragma mark - Hooks
+
+// 1. Race start
+static void hook_GoImpEnter(void *self, const void *method) {
+    if (orig_GoImpEnter) orig_GoImpEnter(self, method);
+    gGoTime = nowSeconds();
+    gNextN2O = 0.0;
+    gNextNitroAdd = 0.0;
+    gPrevDriftKey = NO;
+    rtLog("race started");
+}
+
+// 2. Gia tốc ẩn (mExtraKMPH = extra velocity riêng, không đụng top speed → km/h UI giữ nguyên)
+//    + N2O prolong
+static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
+    if (orig_PowerChainUpd) orig_PowerChainUpd(self, dt, method);
+    if (!self) return;
+
+    if (gSpeedBoost && gSpeedKmh > 0.f && gGoTime > 0.0 && (nowSeconds() - gGoTime) >= 5.0) {
+        *(float *)((char *)self + kPc_ExtraKMPH)   = gSpeedKmh;
+        *(float *)((char *)self + kPc_ExtraTorque) = gSpeedKmh * 0.35f;
+    }
+
+    // No2 kéo dài: ForceDelayEndExtraVelocity(N2O) mỗi 0.5s
+    if (gProlongN2O && pForceDelayN2O && gGoTime > 0.0 && nowSeconds() >= gNextN2O) {
+        void *veh = *(void **)((char *)self + kPc_Vehicle);
+        if (veh) { pForceDelayN2O(veh, 1); pForceDelayN2O(veh, 14); }
+        gNextN2O = nowSeconds() + 0.5;
+    }
+}
+
+// 3. Drift không mất tốc
+static void hook_DriftDamping(void *self, float curMPS, float dampingCoef,
+                              int stateType, float dt, const void *method) {
+    if (gDriftNoSlow) return;  // chặn ma sát drift native
+    if (orig_DriftDamp) orig_DriftDamp(self, curMPS, dampingCoef, stateType, dt, method);
+}
+
+// 4. Mini boost
+static void hook_ExVelUpdate(void *self, float dt, const void *method) {
+    if (orig_ExVelUpd) orig_ExVelUpd(self, dt, method);
+    if (!gFullMiniBoost || !self) return;
+    if (pForceMini) { pForceMini(self, 2); pForceMini(self, 3); pForceMini(self, 11); }
+}
+
+// 5. Auto End Drift: khi thả nút drift → lọc vector chỉ giữ hướng xe nhìn
+static void hook_DriftRelease(void *self, const void *method) {
+    if (orig_DriftRelease) orig_DriftRelease(self, method);
+    if (!gAutoDriftEnd || !gEndDriftLaunch || !self || !g_veh) return;
+
+    // self = NssVehicleDriftCtrl; mVehicle @0x10 (IDynamicVehicle)
+    void *dyn = *(void **)((char *)self + 0x10);
+    if (!dyn) return;
+    void *phy = *(void **)((char *)dyn + 0x40);   // DynamicVehicle.mVehiclePhyCtrl
+    if (!phy) return;
+    void *ent = *(void **)((char *)phy + 0x18);   // NssPhyVehicleCtrl.mPhyHandle (IntPtr)
+    if (!ent) return;
+
+    V3 v = pGetLinVel(ent);
+    V3 f = pGetVehFwd(g_veh);
+    float fl = sqrtf(f.x*f.x + f.z*f.z);
+    if (fl < 1e-4f) return;
+    f.x /= fl; f.z /= fl;
+    float speed = v.x*f.x + v.z*f.z;   // thành phần tiến theo hướng xe
+    // giữ tốc độ tiến + y; triệt tiêu vector ngang (drift sideways)
+    pSetLinVel(ent, f.x * speed, v.y, f.z * speed);
+    rtLog("end-drift: speed=%.1f aligned", speed);
+}
+
+// 6. Per-frame il2cpp work: chạy trong PowerChain::Update (player loop thread)
+static void frameWork(void) {
+    // ---- capture state (cached, chỉ refresh khi null) ----
+    if (pGetMyVehicle) g_veh = pGetMyVehicle();
+    if (!g_veh) { g_ecu=nil; g_nMgr=nil; g_input=nil; g_road=nil; g_lastTP=nil; return; }
+
+    if (!g_input || !g_road || !g_nMgr) {
+        void *gp = pGetInst ? pGetInst() : nil;
+        if (gp && pGetModByName && i_strNew) {
+            if (!g_input) g_input = pGetModByName(gp, i_strNew("InputModule"), nil);
+            if (!g_road)  g_road  = pGetModByName(gp, i_strNew("RoadMap"), nil);
         }
-    } @catch(NSException* e){ /* log fail không được giết app */ }
-}
-static void logWrite(const char* msg){
-    if(!g_logFile) return;
-    // timestamp
-    struct timeval tv; gettimeofday(&tv,nil);
-    struct tm tmv; localtime_r(&tv.tv_sec,&tmv);
-    char ts[40]; strftime(ts,sizeof(ts),"%H:%M:%S",&tmv);
-    fprintf(g_logFile,"[%s.%03d] %s\n",ts,(int)(tv.tv_usec/1000),msg);
-    // crash-safe: flush ngay (line-buffered đã set, nhưng fflush cả để chắc)
-    fflush(g_logFile);
-}
-// đường dẫn log để in ra Console 1 lần (người dùng lấy file bằng iFunBox/Files)
-static NSString* logPath(void){
-    NSString* docs=NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,NSUserDomainMask,YES).firstObject;
-    return [docs stringByAppendingPathComponent:@"zsm.log"];
-}
-
-static void trace(const char* fmt,...) __attribute__((format(printf,1,2)));
-static void trace(const char* fmt,...){
-    char buf[256]; va_list ap; va_start(ap,fmt);
-    vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
-    NSLog(@"[ZSM] %s",buf);
-    logWrite(buf);
-}
-// macro L cũng ghi file — mọi NSLog qua L đều lưu lại
-// LƯU Ý: @(...) boxing không nhận multi-arg → dùng stringWithFormat:
-#undef L
-#define L(...) do{ \
-    NSString* _s=[NSString stringWithFormat:__VA_ARGS__]; \
-    NSLog(@"[ZSM] %@",_s); \
-    logWrite([_s cStringUsingEncoding:NSUTF8StringEncoding]); \
-}while(0)
-
-// ==== 0. Config ====
-static bool   g_menuOpen=false;
-static bool   g_accelOn=true;
-static float  g_accelMult=1.30f;
-static float  g_topAddPct=0.0f;
-static bool   g_hideKmph=false;
-static bool   g_noSlowDrift=true;
-static bool   g_autoCutDrift=true;
-static bool   g_autoFastOut=false;
-static bool   g_contMini=true;
-static float  g_miniInterval=1.0f;
-static float  g_extraKmph=0.0f;
-static float  g_extraDur=1.0f;
-static bool   g_steerAssist=false;
-static float  g_steerStrength=0.6f;
-static bool   g_steerInvert=false;
-static bool   g_blockCrack=true;
-static bool   g_blockCheatCp=true;
-static bool   g_blockSdcEV=false;
-static bool   g_blockActorCp=false;
-static float  g_kmphScale=1.0f;
-
-static void cfgLoad(void){
-    NSUserDefaults*d=[NSUserDefaults standardUserDefaults];
-    if([d objectForKey:@"zsm_accelOn"])     g_accelOn     =[d boolForKey:@"zsm_accelOn"];
-    if([d objectForKey:@"zsm_accelMult"])   g_accelMult   =[d floatForKey:@"zsm_accelMult"];
-    g_topAddPct    =[d floatForKey:@"zsm_topAddPct"];
-    g_hideKmph     =[d boolForKey:@"zsm_hideKmph"];
-    if([d objectForKey:@"zsm_noSlowDrift"]) g_noSlowDrift =[d boolForKey:@"zsm_noSlowDrift"];
-    if([d objectForKey:@"zsm_autoCutDrift"])g_autoCutDrift=[d boolForKey:@"zsm_autoCutDrift"];
-    g_autoFastOut  =[d boolForKey:@"zsm_autoFastOut"];
-    if([d objectForKey:@"zsm_contMini"])    g_contMini    =[d boolForKey:@"zsm_contMini"];
-    g_miniInterval =[d floatForKey:@"zsm_miniInterval"]; if(g_miniInterval<0.3f) g_miniInterval=1.0f;
-    g_extraKmph    =[d floatForKey:@"zsm_extraKmph"];
-    g_extraDur     =[d floatForKey:@"zsm_extraDur"];     if(g_extraDur<0.3f)     g_extraDur=1.0f;
-    g_steerAssist  =[d boolForKey:@"zsm_steerAssist"];
-    g_steerStrength=[d floatForKey:@"zsm_steerStrength"];if(g_steerStrength<=0)  g_steerStrength=0.6f;
-    g_steerInvert  =[d boolForKey:@"zsm_steerInvert"];
-    if(g_accelMult<1) g_accelMult=1; if(g_accelMult>2.5f) g_accelMult=2.5f;
-}
-static void cfgSave(void){
-    NSUserDefaults*d=[NSUserDefaults standardUserDefaults];
-    [d setBool:g_accelOn forKey:@"zsm_accelOn"];           [d setFloat:g_accelMult forKey:@"zsm_accelMult"];
-    [d setFloat:g_topAddPct forKey:@"zsm_topAddPct"];      [d setBool:g_hideKmph forKey:@"zsm_hideKmph"];
-    [d setBool:g_noSlowDrift forKey:@"zsm_noSlowDrift"];   [d setBool:g_autoCutDrift forKey:@"zsm_autoCutDrift"];
-    [d setBool:g_autoFastOut forKey:@"zsm_autoFastOut"];   [d setBool:g_contMini forKey:@"zsm_contMini"];
-    [d setFloat:g_miniInterval forKey:@"zsm_miniInterval"];[d setFloat:g_extraKmph forKey:@"zsm_extraKmph"];
-    [d setFloat:g_extraDur forKey:@"zsm_extraDur"];        [d setBool:g_steerAssist forKey:@"zsm_steerAssist"];
-    [d setFloat:g_steerStrength forKey:@"zsm_steerStrength"];[d setBool:g_steerInvert forKey:@"zsm_steerInvert"];
-    [d synchronize];
-}
-
-// ==== 1. il2cpp ====
-typedef void* (*fn_domain_get)(void);
-typedef void* (*fn_thread_attach)(void*);
-typedef const void** (*fn_domain_assemblies)(void*, size_t*);
-typedef void* (*fn_assembly_image)(void*);
-typedef size_t(*fn_img_class_count)(void*);
-typedef void* (*fn_img_class)(void*, size_t);
-typedef const char* (*fn_class_name)(void*);
-typedef const char* (*fn_class_ns)(void*);
-typedef void* (*fn_cls_method)(void*, const char*, int);
-typedef void* (*fn_cls_field)(void*, const char*);
-typedef size_t(*fn_field_off)(void*);
-typedef void* (*fn_runtime_invoke)(void*, void*, void**, void**);
-typedef void* (*fn_value_box)(void*, void*);
-typedef void* (*fn_object_unbox)(void*);
-typedef void* (*fn_string_new)(const char*);
-typedef void* (*fn_get_corlib)(void);
-typedef void* (*fn_cls_from_name)(void*, const char*, const char*);
-typedef void* (*fn_obj_class)(void*);
-typedef void* (*fn_cls_type)(void*);
-typedef void* (*fn_type_obj)(void*);
-typedef void* (*fn_obj_new)(void*);
-
-static fn_domain_get        il2cpp_domain_get;
-static fn_thread_attach     il2cpp_thread_attach;
-static fn_domain_assemblies il2cpp_domain_get_assemblies;
-static fn_assembly_image    il2cpp_assembly_get_image;
-static fn_img_class_count   il2cpp_image_get_class_count;
-static fn_img_class         il2cpp_image_get_class;
-static fn_class_name        il2cpp_class_get_name;
-static fn_class_ns          il2cpp_class_get_namespace;
-static fn_cls_method        il2cpp_class_get_method_from_name;
-static fn_cls_field         il2cpp_class_get_field_from_name;
-static fn_field_off         il2cpp_field_get_offset;
-static fn_runtime_invoke    il2cpp_runtime_invoke;
-static fn_value_box         il2cpp_value_box;
-static fn_object_unbox      il2cpp_object_unbox;
-static fn_string_new        il2cpp_string_new;
-static fn_get_corlib        il2cpp_get_corlib;
-static fn_cls_from_name     il2cpp_class_from_name;
-static fn_obj_class         il2cpp_object_get_class;
-static fn_cls_type          il2cpp_class_get_type;
-static fn_type_obj          il2cpp_type_get_object;
-static fn_obj_new           il2cpp_object_new;
-
-static void* g_domain=nil; static bool g_il2cppReady=false;
-
-static bool loadIl2cppSyms(void){
-    // C++ (ObjC++) cấm gán void* → fn-ptr ngầm; cast tường minh từng symbol.
-    // LƯU Ý: L() macro format là ObjC %@ — %s với char* sẽ crash; dùng trace() (printf-style).
-    #define SYM(var, name) do{ \
-        void* _p = dlsym(RTLD_DEFAULT, name); \
-        if(!_p){ trace("STEP1 FAIL: missing %s", name); return false; } \
-        memcpy(&(var), &_p, sizeof(void*)); \
-    }while(0)
-    SYM(il2cpp_domain_get,             "il2cpp_domain_get");
-    SYM(il2cpp_thread_attach,          "il2cpp_thread_attach");
-    SYM(il2cpp_domain_get_assemblies,  "il2cpp_domain_get_assemblies");
-    SYM(il2cpp_assembly_get_image,     "il2cpp_assembly_get_image");
-    SYM(il2cpp_image_get_class_count,  "il2cpp_image_get_class_count");
-    SYM(il2cpp_image_get_class,        "il2cpp_image_get_class");
-    SYM(il2cpp_class_get_name,         "il2cpp_class_get_name");
-    SYM(il2cpp_class_get_namespace,    "il2cpp_class_get_namespace");
-    SYM(il2cpp_class_get_method_from_name,"il2cpp_class_get_method_from_name");
-    SYM(il2cpp_class_get_field_from_name, "il2cpp_class_get_field_from_name");
-    SYM(il2cpp_field_get_offset,       "il2cpp_field_get_offset");
-    SYM(il2cpp_runtime_invoke,         "il2cpp_runtime_invoke");
-    SYM(il2cpp_value_box,              "il2cpp_value_box");
-    SYM(il2cpp_object_unbox,           "il2cpp_object_unbox");
-    SYM(il2cpp_string_new,             "il2cpp_string_new");
-    SYM(il2cpp_get_corlib,             "il2cpp_get_corlib");
-    SYM(il2cpp_class_from_name,        "il2cpp_class_from_name");
-    SYM(il2cpp_object_get_class,       "il2cpp_object_get_class");
-    SYM(il2cpp_class_get_type,         "il2cpp_class_get_type");
-    SYM(il2cpp_type_get_object,        "il2cpp_type_get_object");
-    SYM(il2cpp_object_new,             "il2cpp_object_new");
-    #undef SYM
-    STEP(STEP_SYM);
-    return true;
-}
-
-static void* inv(void* method, void* obj, void** args){
-    if(!method||!obj) return nil;
-    void* exc=nil;
-    void* r=il2cpp_runtime_invoke(method,obj,args,&exc);
-    if(exc){
-        static void* lastBad=nil;
-        if(lastBad!=method){ lastBad=method; L("invoke exc @%p",(void*)method); }
-        return nil;
+        if (!g_input) return;
     }
-    return r;
-}
-static void* mOf(void* k,const char* n,int c){ return k?il2cpp_class_get_method_from_name(k,n,c):nil; }
-
-static void *clsFloat,*clsBool,*clsInt,*clsColor;
-static void* boxF(float v){ return clsFloat?il2cpp_value_box(clsFloat,&v):nil; }
-static void* boxB(bool v){  return clsBool ?il2cpp_value_box(clsBool,&v):nil; }
-static void* boxI(int v){   return clsInt  ?il2cpp_value_box(clsInt,&v):nil; }
-
-// ==== 2. Class scan ====
-static void *clsGamePub,*clsVehicleFast,*clsExtraVelFast,*clsExtraVelTrigFast,
-            *clsInputModule,*clsRoadMap,*clsEnumExtraVelType,
-            *clsGUI,*clsGameObject,*clsNssVehicle,*clsDemoGUIMsg;
-static bool  g_clsReady=false;
-
-static void** g_strCache=nil; static int g_strCount=0;
-enum { STR_BTN_OPEN,STR_BTN_CLOSE,STR_TITLE,
-       S_GA1,S_GA2,S_GA3,S_GA4,
-       S_DR1,S_DR2,S_DR3,
-       S_MB1,S_MB2,S_MB3,S_MB4,
-       S_ST1,S_ST2,S_ST3,
-       S_AC1,S_AC2,S_AC3,S_AC4,
-       S_LBL_TOC,S_LBL_DR,S_LBL_MB,S_LBL_ST,S_LBL_AC,
-       STR_COUNT };
-static const char* g_strTabSrc[STR_COUNT]={
-    "ZSM","ZSM <","  ZSM DRIFT MENU",
-    "Bat gia toc an (torque)","Luc day 0-150%","Top speed +0-100%","Gia dong ho km/h",
-    "Drift khong giam toc","Tu ngat drift khi tha nut","Fast-out-corners khi tha",
-    "Lien tuc + miniboost","Chu ky miniboost (s)","Boost them km/h (0=off)","Thoi luong boost (s)",
-    "Tu lai ve track line","Steering strength","Dao chieu lai",
-    "Chan NotifyCrack","Chan bao cheat checkpoint","Chan SdcExtraVelocity",
-    "Chan ActorCpReporter (nguy hiem)",
-    "== Gia toc (an) ==","== Drift ==","== Mini boost ==","== Steering assist ==",
-    "== Chong anticheat ==",
-};
-static void* str(int i){ return (i>=0&&i<g_strCount&&g_strCache)?g_strCache[i]:nil; }
-static void buildStrCache(void){
-    g_strCount=STR_COUNT;
-    g_strCache=(void**)malloc(sizeof(void*)*STR_COUNT);
-    for(int i=0;i<STR_COUNT;i++) g_strCache[i]=il2cpp_string_new(g_strTabSrc[i]);
-}
-
-static void scanClasses(void){
-    if(g_clsReady) return;
-    STEP(STEP_SCAN);
-    void* corlib=il2cpp_get_corlib(); if(!corlib){ L("STEP2: corlib nil"); return; }
-    clsFloat=il2cpp_class_from_name(corlib,"System","Single");
-    clsBool =il2cpp_class_from_name(corlib,"System","Boolean");
-    clsInt  =il2cpp_class_from_name(corlib,"System","Int32");
-    if(!clsFloat||!clsBool||!clsInt){ L("STEP2: primitive classes nil"); return; }
-    size_t n=0;
-    const void** asms=il2cpp_domain_get_assemblies(g_domain,&n);   // (domain, &size) → mảng
-    if(!asms||!n){ L("STEP2: assemblies nil/0 (n=%zu)",n); return; }
-    for(size_t i=0;i<n;i++){
-        void* img=il2cpp_assembly_get_image((void*)asms[i]); if(!img) continue;
-        size_t cnt=il2cpp_image_get_class_count(img);
-        for(size_t c=0;c<cnt;c++){
-            void* k=il2cpp_image_get_class(img,c); if(!k) continue;
-            const char* ns=il2cpp_class_get_namespace(k);
-            const char* nm=il2cpp_class_get_name(k); if(!nm) continue;
-            bool gb=!ns||!ns[0];
-            const char* nsS=ns?ns:"";
-            #define TK(cond,slot) if(cond && !slot) slot=k;
-            TK(gb && !strcmp(nm,"GamePub"),                       clsGamePub)
-            TK(!strcmp(nsS,"UnityEngine") && !strcmp(nm,"GUI"),       clsGUI)
-            TK(!strcmp(nsS,"UnityEngine") && !strcmp(nm,"Color"),     clsColor)
-            TK(!strcmp(nsS,"UnityEngine") && !strcmp(nm,"GameObject"),clsGameObject)
-            TK(gb && !strcmp(nm,"VehicleFast"),               clsVehicleFast)
-            TK(gb && !strcmp(nm,"ExtraVelocityFast"),         clsExtraVelFast)
-            TK(gb && !strcmp(nm,"ExtraVelocityTriggerFast"),  clsExtraVelTrigFast)
-            TK(gb && !strcmp(nm,"InputModule"),               clsInputModule)
-            TK(gb && !strcmp(nm,"RoadMap"),                   clsRoadMap)
-            TK(gb && !strcmp(nm,"ExtraVelocityType"),         clsEnumExtraVelType)
-            TK(gb && !strcmp(nm,"NssVehicle"),                clsNssVehicle)
-            TK(!strcmp(nsS,"RootMotion") && !strcmp(nm,"DemoGUIMessage"), clsDemoGUIMsg)
-            #undef TK
-        }
-        g_clsReady = clsGamePub&&clsVehicleFast&&clsExtraVelFast&&clsExtraVelTrigFast
-                   &&clsInputModule&&clsRoadMap&&clsEnumExtraVelType
-                   &&clsGUI&&clsColor&&clsGameObject&&clsNssVehicle;
-        if(g_clsReady){ buildStrCache(); L("STEP2 ok: classes+strings ready"); return; }
+    if (!g_ecu && pGetDynVeh) {
+        void *dyn = pGetDynVeh(g_veh);
+        if (dyn) g_ecu = *(void **)((char *)dyn + 0x18);   // DynamicVehicle.mECU @0x18
     }
-    // Scan xong toàn bộ assembly mà vẫn thiếu — báo thiếu gì
-    trace("STEP2 incomplete: GamePub=%d VehFast=%d EVFast=%d EVTrig=%d InMod=%d RoadMap=%d EVType=%d GUI=%d Color=%d GO=%d NssVeh=%d DemoGUI=%d",
-          clsGamePub!=nil,clsVehicleFast!=nil,clsExtraVelFast!=nil,clsExtraVelTrigFast!=nil,
-          clsInputModule!=nil,clsRoadMap!=nil,clsEnumExtraVelType!=nil,
-          clsGUI!=nil,clsColor!=nil,clsGameObject!=nil,clsNssVehicle!=nil,clsDemoGUIMsg!=nil);
-}
-
-// ==== 3. Patch + hook ====
-static uintptr_t g_base=0;
-static void findBase(void){
-    for(uint32_t i=_dyld_image_count(); i-->0;){
-        const char* nm=_dyld_get_image_name(i);
-        if(nm && strstr(nm,"UnityFramework")){ g_base=(uintptr_t)_dyld_get_image_vmaddr_slide(i); return; }
-    }
-}
-static bool memWrite(uintptr_t addr,const void* data,size_t len){
-    vm_address_t page=(vm_address_t)(addr&~((uintptr_t)vm_page_size-1));
-    vm_size_t sz=(vm_size_t)(((addr+len+vm_page_size-1)&~(vm_page_size-1))-page);
-    if(vm_protect(mach_task_self(),page,sz,0,VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)!=KERN_SUCCESS){
-        L("vm_protect fail @%p",(void*)addr); return false;
-    }
-    memcpy((void*)addr,data,len);
-    vm_protect(mach_task_self(),page,sz,0,VM_PROT_READ|VM_PROT_EXECUTE);
-    sys_icache_invalidate((void*)page,sz);
-    return true;
-}
-static bool patchRet(uintptr_t rva,uint32_t saved[4],bool* done){
-    if(!g_base||*done) return *done;
-    uintptr_t a=g_base+rva;
-    if(!saved[0]) memcpy(saved,(void*)a,16);
-    uint32_t ret=0xD65F03C0;
-    if(!memWrite(a,&ret,4)) return false;
-    *done=true; L("patchRet 0x%llx",(unsigned long long)rva); return true;
-}
-static bool unpatchRet(uintptr_t rva,uint32_t saved[4],bool* done){
-    if(!*done) return true;
-    if(!memWrite(g_base+rva,saved,16)) return false;
-    *done=false; return true;
-}
-static uint8_t* g_trampBase=nil; static size_t g_trampOff=0;
-static void* trampAlloc(size_t sz){
-    if(!g_trampBase){
-        // SDK 26+ không expose mach_vm.h; dùng vm_remap (trên arm64 vm_address_t == 64-bit)
-        vm_address_t dst=0;
-        vm_address_t src=(vm_address_t)(((uintptr_t)&trampAlloc)&~((uintptr_t)vm_page_size-1));
-        vm_prot_t cur=0,mx=0;
-        if(vm_remap(mach_task_self(),&dst,(vm_size_t)vm_page_size,0,VM_FLAGS_ANYWHERE,
-                    mach_task_self(),src,FALSE,&cur,&mx,VM_INHERIT_COPY)!=KERN_SUCCESS){
-            L("vm_remap fail"); return nil;
-        }
-        if(vm_protect(mach_task_self(),dst,(vm_size_t)vm_page_size,0,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS){
-            L("tramp RW fail"); return nil;
-        }
-        g_trampBase=(uint8_t*)dst; g_trampOff=0;
-        L("trampoline @%p",(void*)dst);
-    }
-    void* p=g_trampBase+g_trampOff; g_trampOff+=(sz+15)&~15UL; return p;
-}
-static bool reloc16(uint32_t* dst,uint64_t dstAddr,uint32_t* src,uint64_t srcAddr){
-    for(int i=0;i<4;i++){
-        uint32_t ins=src[i];
-        uint64_t pc=srcAddr+4ULL*i,npc=dstAddr+4ULL*i;
-        uint32_t op=ins&0x1F000000;
-        if((ins&0x9F000000)==0x90000000){ // ADRP
-            int64_t imm=(int64_t)(((ins>>29)&3)|(((ins>>5)&0x7FFFF)<<2));
-            if(imm&0x100000) imm-=0x200000;
-            uint64_t tgt=(pc&~0xFFFULL)+(imm<<12);
-            int64_t npg=((int64_t)tgt-(int64_t)(npc&~0xFFFULL))>>12;
-            dst[i]=(ins&0x9F00001F)|(uint32_t)((npg&3)<<29)|(uint32_t)(((npg>>2)&0x7FFFF)<<5)|0x90000000;
-        } else if((ins&0x9F000000)==0x10000000){ // ADR
-            int64_t imm=(int64_t)(((ins>>29)&3)|(((ins>>5)&0x7FFFF)<<2));
-            if(imm&0x100000) imm-=0x200000;
-            int64_t off=(int64_t)(pc+imm-npc);
-            dst[i]=(ins&0x9F00001F)|(uint32_t)((off&3)<<29)|(uint32_t)(((off>>2)&0x7FFFF)<<5);
-        } else if(op==0x94000000){ // BL
-            int64_t off=(int64_t)(ins&0x03FFFFFF); if(off&0x2000000) off-=0x4000000;
-            uint64_t tgt=pc+off*4, back=srcAddr+16;
-            dst[i]=0x58000030; dst[i+1]=0xD63F0200;
-            *(uint64_t*)(dst+i+2)=tgt;
-            uint32_t* b=(uint32_t*)(dst+i+4);
-            b[0]=0x58000050; b[1]=0xD61F0200;
-            *(uint64_t*)(b+2)=back;
-            return true;
-        } else if(op==0x14000000){ // B
-            int64_t off=(int64_t)(ins&0x03FFFFFF); if(off&0x2000000) off-=0x4000000;
-            uint64_t tgt=pc+off*4, back=srcAddr+16;
-            dst[i]=0x58000050; dst[i+1]=0xD61F0200;
-            *(uint64_t*)(dst+i+2)=tgt;
-            uint32_t* b=(uint32_t*)(dst+i+4);
-            b[0]=0x58000050; b[1]=0xD61F0200;
-            *(uint64_t*)(b+2)=back;
-            return true;
-        } else if((ins&0xFF000010)==0x54000000){ // B.cond
-            int64_t off=(int64_t)((ins>>5)&0x7FFFF); if(off&0x40000) off-=0x80000;
-            int64_t noff=(pc+off*4-(int64_t)npc)/4;
-            if(noff<-(1<<18)||noff>=(1<<18)) return false;
-            dst[i]=(ins&0xFF00001F)|(uint32_t)((noff&0x7FFFF)<<5);
-        } else if((ins&0x7E000000)==0x34000000){ // CBZ/CBNZ
-            int64_t off=(int64_t)((ins>>5)&0x7FFFF); if(off&0x40000) off-=0x80000;
-            int64_t noff=(pc+off*4-(int64_t)npc)/4;
-            if(noff<-(1<<18)||noff>=(1<<18)) return false;
-            dst[i]=(ins&0xFF00001F)|(uint32_t)((noff&0x7FFFF)<<5);
-        } else if((ins&0x7E000000)==0x36000000){ // TBZ/TBNZ
-            int64_t off=(int64_t)((ins>>5)&0x3FFF); if(off&0x2000) off-=0x4000;
-            int64_t noff=(pc+off*4-(int64_t)npc)/4;
-            if(noff<-(1<<13)||noff>=(1<<13)) return false;
-            dst[i]=(ins&0xFFF8001F)|(uint32_t)((noff&0x3FFF)<<5);
-        } else if((ins&0xFF000000)==0x18000000){ // LDR literal
-            int64_t off=(int64_t)((ins>>5)&0x7FFFF); if(off&0x40000) off-=0x80000;
-            int64_t noff=(pc+off*4-(int64_t)npc)/4;
-            if(noff<-(1<<18)||noff>=(1<<18)) return false;
-            dst[i]=(ins&0xFF00001F)|(uint32_t)((noff&0x7FFFF)<<5);
-        } else dst[i]=ins;
-    }
-    return true;
-}
-static bool hookRVA(uintptr_t rva,void* repl,void** origTramp){
-    if(!g_base) return false;
-    uintptr_t target=g_base+rva;
-    trace("hook 0x%llx: alloc tramp...", (unsigned long long)rva);
-    uint8_t* tr=(uint8_t*)trampAlloc(64); if(!tr){ L("hook 0x%llx FAIL: tramp alloc",(unsigned long long)rva); return false; }
-    if(!reloc16((uint32_t*)tr,(uint64_t)tr,(uint32_t*)target,target)){
-        L("hook 0x%llx FAIL: reloc (B out of range) — skip",(unsigned long long)rva);
-        return false;
-    }
-    uint32_t* back=(uint32_t*)(tr+16);
-    back[0]=0x58000050; back[1]=0xD61F0200;
-    *(uint64_t*)(back+2)=target+16;
-    sys_icache_invalidate(tr,64);
-    uint32_t entry[4];
-    entry[0]=0x58000050; entry[1]=0xD61F0200;
-    *(uint64_t*)(entry+2)=(uint64_t)repl;
-    trace("hook 0x%llx: patching entry...", (unsigned long long)rva);
-    if(!memWrite(target,entry,16)){ L("hook 0x%llx FAIL: memWrite",(unsigned long long)rva); return false; }
-    *origTramp=tr;
-    L("hook 0x%llx OK",(unsigned long long)rva);
-    return true;
-}
-
-// ==== 4. Method cache ====
-static void *mGetInst,*mGetModuleByName,*mGetMyVehicle,*mForceEndDrift,*mFastOut,
-            *mForceMini,*mAddEV,*mSetKey,*mGetKeyFlags,*mNearestTP,
-            *mGBox,*mGButton,*mGColor,*mGLabel,*mGSliderR;
-static size_t off_mECU=0,off_mTorque=0,off_mNormalTop=0,off_mPowerChain=0,off_pcForceTop=0;
-static void *g_inputModule=nil,*g_roadMap=nil,*g_lastTP=nil;
-
-static bool resolveAll(void){
-    if(!g_clsReady) return false;
-    if(mGetInst){ STEP(STEP_RESOLVE); return true; }
-    mGetInst        = mOf(clsGamePub,"GetInstance",0);
-    mGetModuleByName= mOf(clsGamePub,"GetModuleByName",2);
-    mGetMyVehicle   = mOf(clsVehicleFast,"GetMyVehicle",0);
-    mForceEndDrift  = mOf(clsVehicleFast,"ForceEndDrifting",1);
-    mFastOut        = mOf(clsVehicleFast,"DoFastOutCorners",1);
-    mForceMini      = mOf(clsExtraVelTrigFast,"ForceCanTriggerOncePassiveMini",1);
-    mAddEV          = mOf(clsExtraVelFast,"AddExtraVelocity",6);
-    mSetKey         = mOf(clsInputModule,"SetKey",2);
-    mGetKeyFlags    = mOf(clsInputModule,"get_KeyFlags",0);
-    mNearestTP      = mOf(clsRoadMap,"GetNearestTrackPoint",2);
-    mGBox           = mOf(clsGUI,"Box",2);
-    mGButton        = mOf(clsGUI,"Button",2);
-    mGColor         = mOf(clsGUI,"set_backgroundColor",1);
-    mGLabel         = mOf(clsGUI,"Label",2);
-    mGSliderR       = mOf(clsGUI,"HorizontalScrollbar",6);
-    trace("resolve: inst=%p veh=%p fed=%p fastout=%p mini=%p adev=%p setkey=%p kf=%p tp=%p box=%p btn=%p lbl=%p slider=%p",
-          mGetInst,mGetMyVehicle,mForceEndDrift,mFastOut,mForceMini,mAddEV,mSetKey,mGetKeyFlags,
-          mNearestTP,mGBox,mGButton,mGLabel,mGSliderR);
-    if(!mGetInst||!mGetMyVehicle||!mForceEndDrift||!mSetKey||!mGetKeyFlags||!mGBox||!mGButton){
-        L("STEP4 FAIL: critical methods missing (xem log trên)");
-        return false;
-    }
-    return true;
-}
-
-// ==== 5. Gameplay tick ====
-static bool g_prevDriftKey=false;
-static double g_nextMiniT=0,g_nextExtraT=0;
-static int    g_tickDiv=0;
-static bool   g_inRace=false;
-
-static void frameTick(void){
-    if(!g_clsReady||!resolveAll()) return;
-    if(++g_tickDiv>3) g_tickDiv=0;
-
-    void* veh=inv(mGetMyVehicle,nil,nil);
-    if(!veh){
-        if(g_inRace){ g_inRace=false; g_inputModule=nil; g_roadMap=nil; g_lastTP=nil;
-                      g_prevDriftKey=false; L("left race"); }
-        return;
-    }
-    if(!g_inRace){
-        void* vk=il2cpp_object_get_class(veh);
-        if(vk!=clsNssVehicle){
-            static int guardLogged=0;
-            if(guardLogged<3){ trace("race guard: class %p != NssVehicle %p (log #1/3)",vk,clsNssVehicle); ++guardLogged; }
-            return;
-        }
-        g_inRace=true; L("STEP6 ok: entered race, veh=%p",veh);
-    }
-    if(!g_inputModule||!g_roadMap){
-        void* gp=inv(mGetInst,nil,nil);
-        if(gp&&mGetModuleByName){
-            if(!g_inputModule){ void* a[2]={il2cpp_string_new("InputModule"),gp};
-                                g_inputModule=inv(mGetModuleByName,gp,a);
-                                if(g_inputModule) trace("input module: %p",g_inputModule); }
-            if(!g_roadMap){     void* a[2]={il2cpp_string_new("RoadMap"),gp};
-                                g_roadMap=inv(mGetModuleByName,gp,a); }
-        }
-        if(!g_inputModule) return;
-    }
-    void* rK=inv(mGetKeyFlags,g_inputModule,nil);
-    if(!rK) return;
-    int keyFlags=*(int*)il2cpp_object_unbox(rK);
-    bool driftKey=(keyFlags>>8)&1;
-
-    static void* mGetDV=nil,*mGetVS=nil; static void* lastEcuClass=nil;
-    if(!mGetDV){
-        mGetDV=mOf(il2cpp_object_get_class(veh),"GetDynamicVehicle",0);
-        if(!mGetDV){ L("STEP6: GetDynamicVehicle not found"); return; }
-    }
-    void* dv=inv(mGetDV,veh,nil);
-    if(!dv) return;
-    if(!off_mECU){
-        void* f=il2cpp_class_get_field_from_name(il2cpp_object_get_class(dv),"mECU");
-        off_mECU=f?il2cpp_field_get_offset(f):0;
-        if(!off_mECU){ L("STEP6: mECU field not found"); return; }
-        trace("off mECU=%zu",off_mECU);
-    }
-    void* ecu=*(void**)((char*)dv+off_mECU);
-    if(!ecu) return;
-    void* ecuK=il2cpp_object_get_class(ecu);
-    if(ecuK!=lastEcuClass){
-        lastEcuClass=ecuK;
-        mGetVS=mOf(ecuK,"get_VehicleState",0);
-        if(!off_mTorque){
-            void* f =il2cpp_class_get_field_from_name(ecuK,"mEngineTorque");
-            off_mTorque=f ?il2cpp_field_get_offset(f):0;
-            void* f2=il2cpp_class_get_field_from_name(ecuK,"mNormalTopMPS");
-            off_mNormalTop=f2?il2cpp_field_get_offset(f2):0;
-            void* f3=il2cpp_class_get_field_from_name(ecuK,"mPowerChain");
-            off_mPowerChain=f3?il2cpp_field_get_offset(f3):0;
-            if(off_mPowerChain){
-                void* pc=*(void**)((char*)ecu+off_mPowerChain);
-                if(pc){
-                    void* f4=il2cpp_class_get_field_from_name(il2cpp_object_get_class(pc),"mForceTopMPS");
-                    off_pcForceTop=f4?il2cpp_field_get_offset(f4):0;
+    if (!g_nMgr && pGetMgr && i_strNew) {
+        void *gp = pGetInst ? pGetInst() : nil;
+        void *pvm = gp ? pGetModByName(gp, i_strNew("PlayVehicleModule"), nil) : nil;
+        if (pvm) {
+            // GetNitrogenCollectMgr(ulong uid) — lấy UID từ vehicle
+            void *mUidM = rtMOf(*(Il2CppClass **)g_veh, "get_UID", 0);
+            if (mUidM) {
+                void *uidFn = *(void **)mUidM;               // MethodInfo->methodPointer
+                if (uidFn) {
+                    unsigned long long uid = ((unsigned long long(*)(void *))uidFn)(g_veh);
+                    g_nMgr = pGetMgr(pvm, (void *)uid, nil);
                 }
             }
-            L("STEP6 offsets: tq=%zu top=%zu pc=%zu pcf=%zu (VS=%p)",
-              off_mTorque,off_mNormalTop,off_mPowerChain,off_pcForceTop,mGetVS);
         }
     }
-    int vState=0;
-    if(mGetVS){
-        void* r=inv(mGetVS,ecu,nil);
-        if(r) vState=*(int*)il2cpp_object_unbox(r);
-    }
+    if (!g_veh || !g_input) return;
 
-    bool released=g_prevDriftKey&&!driftKey;
-    if(released&&vState==2){
-        trace("drift release detected (state=%d) — cutting",vState);
-        if(g_autoCutDrift){ void* a[1]={veh}; inv(mForceEndDrift,nil,a); }
-        if(g_autoFastOut){ void* a[1]={veh}; inv(mFastOut,nil,a); }
-    }
-    g_prevDriftKey=driftKey;
-
-    double now=CACurrentMediaTime();
-    if(vState==2&&g_contMini&&mForceMini&&now>=g_nextMiniT){
-        void* a[1]={veh}; inv(mForceMini,nil,a);
-        g_nextMiniT=now+g_miniInterval;
-    }
-    if(g_extraKmph>0.5f&&mAddEV&&now>=g_nextExtraT){
-        int evType=1; float kmph=g_extraKmph,tq=g_extraKmph*0.35f,dur=g_extraDur; bool imm=false;
-        void* et=il2cpp_value_box(clsEnumExtraVelType,&evType);
-        if(et){
-            void* a[6]={veh,et,boxF(kmph),boxF(tq),boxF(dur),boxB(imm)};
-            inv(mAddEV,nil,a);
-        } else trace("ExtraVelocityType box nil");
-        g_nextExtraT=now+1.0;
-    }
-
-    if(g_steerAssist&&g_tickDiv==0&&mSetKey&&mNearestTP&&g_roadMap){
-        static void* mVehGetPos=nil,*mVehGetFwd=nil;
-        if(!mVehGetPos){
-            void* k=il2cpp_object_get_class(veh);
-            mVehGetPos=mOf(k,"get_Position",0);
-            mVehGetFwd=mOf(k,"get_Forward",0);
-            if(!mVehGetPos||!mVehGetFwd) return;
-        }
-        void* rp=inv(mVehGetPos,veh,nil);
-        void* rf=inv(mVehGetFwd,veh,nil);
-        if(!rp||!rf) return;
-        float* pos=(float*)il2cpp_object_unbox(rp);
-        float* fwd=(float*)il2cpp_object_unbox(rf);
-        if(!pos||!fwd) return;
-        void* vec3K=il2cpp_object_get_class(rp);
-        void* aTP[2]={il2cpp_value_box(vec3K,pos),g_lastTP};
-        void* tp=inv(mNearestTP,g_roadMap,aTP);
-        if(tp){
-            g_lastTP=tp;
-            static void* mDir=nil; static void* lastTpClass=nil;
-            void* tpK=il2cpp_object_get_class(tp);
-            if(!mDir||tpK!=lastTpClass){ lastTpClass=tpK; mDir=mOf(tpK,"get_Direction",0); }
-            void* rd=mDir?inv(mDir,tp,nil):nil;
-            if(rd){
-                float* dir=(float*)il2cpp_object_unbox(rd);
-                float cx=fwd[0]*dir[2]-fwd[2]*dir[0];
-                float dot=fwd[0]*dir[0]+fwd[2]*dir[2];
-                float deg=atan2f(cx,dot)*57.29578f;
-                if(g_steerInvert) deg=-deg;
-                float dead=30.0f-28.0f*g_steerStrength;
-                bool wantL=(deg<-dead),wantR=(deg>dead);
-                void* aL[2]={boxI(1),boxB(wantL)};
-                void* aR[2]={boxI(2),boxB(wantR)};
-                inv(mSetKey,g_inputModule,aL);
-                inv(mSetKey,g_inputModule,aR);
-            }
-        } else g_lastTP=nil;
-    }
-}
-
-// ==== 6. Menu (GUI.* Rect-based, zero-alloc) ====
-static void menuLabelR(float x,float y,float w,float h,int idx){
-    if(!mGLabel) return;
-    float r[4]={x,y,w,h};
-    void* rr=il2cpp_value_box(clsColor,r); if(!rr) return;
-    void* a[2]={rr,str(idx)};
-    inv(mGLabel,nil,a);
-}
-static bool menuBtnR(float x,float y,float w,float h,int idx){
-    if(!mGButton) return false;
-    float r[4]={x,y,w,h};
-    void* rr=il2cpp_value_box(clsColor,r); if(!rr) return false;
-    void* a[2]={rr,str(idx)};
-    void* res=inv(mGButton,nil,a);
-    return res&&*(bool*)il2cpp_object_unbox(res);
-}
-static float menuSliderR(float x,float y,float w,float h,float v,float lo,float hi){
-    if(!mGSliderR) return v;
-    float r[4]={x,y,w,h};
-    void* rr=il2cpp_value_box(clsColor,r); if(!rr) return v;
-    void* a[6]={rr,boxF(v),boxF(1.0f),boxF(lo),boxF(hi),nil};
-    void* res=inv(mGSliderR,nil,a);
-    return res?*(float*)il2cpp_object_unbox(res):v;
-}
-
-static void drawMenu(void){
-    if(!g_clsReady||!mGButton||!mGBox) return;
-    static int firstRuns=0;
-    if(firstRuns<2){ trace("drawMenu frame #%d (btn=%p box=%p)",firstRuns,mGButton,mGBox); ++firstRuns; }
-    @try {
-        if(menuBtnR(14,60,86,36,g_menuOpen?STR_BTN_CLOSE:STR_BTN_OPEN)){ g_menuOpen=!g_menuOpen; cfgSave(); }
-        if(!g_menuOpen) return;
-        if(mGColor){
-            float bg[4]={0.05f,0.05f,0.09f,0.82f};
-            void* c=il2cpp_value_box(clsColor,bg);
-            if(c){ void* ca[1]={c}; inv(mGColor,nil,ca); }
-        }
-        { float wb[4]={10,40,320,700};
-          void* r=il2cpp_value_box(clsColor,wb);
-          if(r){ void* ba[2]={r,str(STR_TITLE)}; inv(mGBox,nil,ba);} }
-
-        float x=16,y=52,w=296;
-        menuLabelR(x,y,w,22,S_LBL_TOC); y+=24;
-        if(menuBtnR(x,y,w,26,S_GA1)) g_accelOn=!g_accelOn; y+=30;
-        menuLabelR(x,y,w,20,S_GA2); y+=22;
-        { float pct=(g_accelMult-1.0f)*100.0f;
-          float nv=menuSliderR(x,y,w,20,pct,0,150);
-          g_accelMult=1.0f+nv/100.0f; y+=24; }
-        menuLabelR(x,y,w,20,S_GA3); y+=22;
-        g_topAddPct=menuSliderR(x,y,w,20,g_topAddPct,0,100); y+=24;
-        if(menuBtnR(x,y,w,26,S_GA4)) g_hideKmph=!g_hideKmph; y+=34;
-        menuLabelR(x,y,w,22,S_LBL_DR); y+=24;
-        if(menuBtnR(x,y,w,26,S_DR1)) g_noSlowDrift=!g_noSlowDrift; y+=30;
-        if(menuBtnR(x,y,w,26,S_DR2)) g_autoCutDrift=!g_autoCutDrift; y+=30;
-        if(menuBtnR(x,y,w,26,S_DR3)) g_autoFastOut=!g_autoFastOut; y+=34;
-        menuLabelR(x,y,w,22,S_LBL_MB); y+=24;
-        if(menuBtnR(x,y,w,26,S_MB1)) g_contMini=!g_contMini; y+=30;
-        menuLabelR(x,y,w,20,S_MB2); y+=22;
-        g_miniInterval=menuSliderR(x,y,w,20,g_miniInterval,0.2f,3.0f); y+=24;
-        menuLabelR(x,y,w,20,S_MB3); y+=22;
-        g_extraKmph=menuSliderR(x,y,w,20,g_extraKmph,0,80); y+=24;
-        menuLabelR(x,y,w,20,S_MB4); y+=22;
-        g_extraDur=menuSliderR(x,y,w,20,g_extraDur,0.3f,3.0f); y+=28;
-        menuLabelR(x,y,w,22,S_LBL_ST); y+=24;
-        if(menuBtnR(x,y,w,26,S_ST1)) g_steerAssist=!g_steerAssist; y+=30;
-        menuLabelR(x,y,w,20,S_ST2); y+=22;
-        { float s=g_steerStrength*100.0f;
-          g_steerStrength=menuSliderR(x,y,w,20,s,0,100)/100.0f; } y+=24;
-        if(menuBtnR(x,y,w,26,S_ST3)) g_steerInvert=!g_steerInvert; y+=34;
-        menuLabelR(x,y,w,22,S_LBL_AC); y+=24;
-        if(menuBtnR(x,y,w,26,S_AC1)) g_blockCrack=!g_blockCrack; y+=30;
-        if(menuBtnR(x,y,w,26,S_AC2)) g_blockCheatCp=!g_blockCheatCp; y+=30;
-        if(menuBtnR(x,y,w,26,S_AC3)) g_blockSdcEV=!g_blockSdcEV; y+=30;
-        if(menuBtnR(x,y,w,26,S_AC4)) g_blockActorCp=!g_blockActorCp; y+=30;
-        cfgSave();
-    } @catch(NSException* e){
-        static int logged=0; if(logged++<3) L("menu exc: %@",e.name);
-    }
-}
-
-// ==== 7. Hook bodies ====
-static void* orig_OnGUI=nil;
-static void hook_OnGUI(void* self){
-    if(orig_OnGUI) ((void(*)(void*))orig_OnGUI)(self);
-    drawMenu();
-}
-static void* orig_UpdateECU=nil;
-static void hook_UpdateECU(void* self,float dt){
-    if(orig_UpdateECU) ((void(*)(void*,float))orig_UpdateECU)(self,dt);
-    if(g_accelOn&&g_accelMult>1.001f&&off_mTorque){
-        float* t=(float*)((char*)self+off_mTorque);
-        if(*t>0) *t*=g_accelMult;
-    }
-    if(g_topAddPct>0.5f&&off_mPowerChain&&off_pcForceTop){
-        void* pc=*(void**)((char*)self+off_mPowerChain);
-        if(pc){
-            static float baseTop=0;
-            if(baseTop<=0&&off_mNormalTop) baseTop=*(float*)((char*)self+off_mNormalTop);
-            if(baseTop>0){
-                *(float*)((char*)pc+off_pcForceTop)=baseTop*(1.0f+g_topAddPct/100.0f);
-                g_kmphScale=1.0f/(1.0f+g_topAddPct/100.0f);
+    // ---- key state đọc thẳng field ----
+    // ---- auto navigate ----
+    if (gAutoNavigate && pNearestTP && g_road && pSetKey) {
+        V3 p = pGetVehPos(g_veh);
+        V3 f = pGetVehFwd(g_veh);
+        float fl = sqrtf(f.x*f.x + f.z*f.z);
+        if (fl > 1e-4f) {
+            void *tp = pNearestTP(g_road, p.x, p.y, p.z, 3.4e38f);
+            if (tp && tp != g_lastTP) {
+                g_lastTP = tp;
+                void *mDir = rtMOf(*(Il2CppClass **)tp, "get_Direction", 0);
+                if (mDir) {
+                    V3 (*getDir)(void *) = (V3 (*)(void *))mDir;
+                    V3 d = getDir(tp);
+                    float cx = f.x*d.z - f.z*d.x;
+                    float dot = f.x*d.x + f.z*d.z;
+                    float deg = atan2f(cx, dot) * 57.29578f;
+                    if (gNavInvert) deg = -deg;
+                    float dead = 30.0f - 28.0f * gNavStrength;
+                    unsigned char pr = (deg < -dead) ? 1 : 0;
+                    unsigned char pr2 = (deg > dead) ? 1 : 0;
+                    pSetKey(g_input, 1, pr);
+                    pSetKey(g_input, 2, pr2);
+                }
             }
         }
     }
-}
-static void* orig_Damping=nil;
-static void hook_Damping(void* self,float curMPS,float dampingCoef,int stateType,float dt){
-    if(g_noSlowDrift) return;
-    if(orig_Damping) ((void(*)(void*,float,float,int,float))orig_Damping)(self,curMPS,dampingCoef,stateType,dt);
-}
-static void* orig_KMPH=nil;
-static float hook_KMPH(void* self){
-    float v=orig_KMPH?((float(*)(void*))orig_KMPH)(self):0;
-    return (g_hideKmph&&g_kmphScale<1.0f)? v*g_kmphScale : v;
-}
 
-static uint32_t sv_crack[4],sv_cheatcp[4],sv_sdcev[4],sv_actorcp[4];
-static bool done_crack,done_cheatcp,done_sdcev,done_actorcp;
-static void applyAcPatches(void){
-    if(!g_base) return;
-    bool any=!done_crack&&!done_cheatcp&&!done_sdcev&&!done_actorcp;
-    if(any) trace("STEP3b: applying anticheat patches...");
-    g_blockCrack  ?patchRet(0xC7B4F20,sv_crack,&done_crack)    :unpatchRet(0xC7B4F20,sv_crack,&done_crack);
-    g_blockCheatCp?patchRet(0x46A9644,sv_cheatcp,&done_cheatcp):unpatchRet(0x46A9644,sv_cheatcp,&done_cheatcp);
-    g_blockSdcEV  ?patchRet(0x991481C,sv_sdcev,&done_sdcev)    :unpatchRet(0x991481C,sv_sdcev,&done_sdcev);
-    g_blockActorCp?patchRet(0x4B3B260,sv_actorcp,&done_actorcp):unpatchRet(0x4B3B260,sv_actorcp,&done_actorcp);
-}
-
-// ==== 8. Menu host ====
-static bool g_hostSpawned=false;
-static bool trySpawnMenuHost(void){
-    if(g_hostSpawned||!g_clsReady||!clsGameObject||!clsDemoGUIMsg) return false;
-    void* gp=inv(mGetInst,nil,nil);
-    if(!gp){ trace("STEP5: GamePub nil — chờ tick sau"); return false; }
-    STEP(STEP_HOST);
-    void* mCtor=mOf(clsGameObject,".ctor",1);
-    void* mAdd =mOf(clsGameObject,"AddComponent",1);
-    if(!mCtor||!mAdd){ L("STEP5 FAIL: ctor=%p add=%p",mCtor,mAdd); return false; }
-    void* go=il2cpp_object_new(clsGameObject);
-    if(!go){ L("STEP5 FAIL: object_new nil"); return false; }
-    trace("STEP5: GameObject created %p",go);
-    { void* a[1]={il2cpp_string_new("ZSMMenuHost")}; inv(mCtor,go,a); }
-    void* t=il2cpp_type_get_object(il2cpp_class_get_type(clsDemoGUIMsg));
-    if(!t){ L("STEP5 FAIL: type object nil"); return false; }
-    trace("STEP5: AddComponent(DemoGUIMessage)...");
-    { void* a[1]={t}; inv(mAdd,go,a); }
-    g_hostSpawned=true;
-    L("STEP5 ok: menu host spawned");
-    if(!hookRVA(0xCA27DCC,(void*)hook_OnGUI,&orig_OnGUI))
-        L("!! OnGUI hook fail — menu sẽ không hiện");
-    return true;
-}
-
-// ==== 9. Driver ====
-@interface ZSMDriver : NSObject
-- (void)tick:(CADisplayLink*)dl;
-@end
-@implementation ZSMDriver
-- (void)tick:(CADisplayLink*)dl{
-    (void)dl;
-    @try {
-        if(!g_il2cppReady){
-            trace("STEP1: resolving il2cpp syms...");
-            if(!loadIl2cppSyms()) return;
-            g_domain=il2cpp_domain_get();
-            if(!g_domain){ L("STEP1 FAIL: domain nil"); return; }
-            il2cpp_thread_attach(g_domain);
-            g_il2cppReady=true;
-            L("STEP0 ok: il2cpp attached, domain=%p",g_domain);
+    // ---- nitro drift % ----
+    if (gNitroBoost && gNitroPct > 0.f && g_nMgr && nowSeconds() >= gNextNitroAdd) {
+        void *single = *(void **)((char *)g_nMgr + kNMgr_Single);
+        if (single) {
+            uint32_t cur = *(uint32_t *)((char *)single + kSingle_CurPow);
+            if (cur < 999) {
+                uint32_t add = (uint32_t)(1000.0f * gNitroPct / 100.0f * 0.016f);  // % mỗi frame ~16ms
+                if (add < 1) add = 1;
+                uint32_t nv = cur + add;
+                if (nv > 999) nv = 999;
+                *(uint32_t *)((char *)single + kSingle_CurPow) = nv;
+            }
         }
-        if(!g_base){ findBase(); if(g_base) trace("base=0x%llx",(unsigned long long)g_base); }
-        if(!g_base){ L("STEP0 FAIL: UnityFramework image not found"); return; }
-        if(!g_clsReady) scanClasses();
-        if(!g_clsReady) return;
-        static bool hooksDone=false;
-        if(!hooksDone){
-            trace("STEP3: installing 3 hooks...");
-            bool ok1=hookRVA(0x7AF8938,(void*)hook_UpdateECU,&orig_UpdateECU);
-            bool ok2=hookRVA(0x7C713DC,(void*)hook_Damping,&orig_Damping);
-            bool ok3=hookRVA(0x7AFC4A0,(void*)hook_KMPH,&orig_KMPH);
-            L("STEP3 done: ecu=%d damp=%d kmph=%d",ok1,ok2,ok3);
-            hooksDone=true;
-            applyAcPatches();
+        gNextNitroAdd = nowSeconds() + 0.016;
+    }
+
+    // ---- auto end drift (nhận phím drift thả từ InputHelper keyflags) ----
+    if (gAutoDriftEnd && g_input && pGetKeyFlags) {
+        int kf = pGetKeyFlags(g_input);
+        bool driftKey = (kf >> 8) & 1;
+        if (gPrevDriftKey && !driftKey && g_ecu) {
+            int st = *(int *)((char *)g_ecu + kEcu_State);
+            if (st == 2) {  // Drifting
+                void *mForceEnd = rtMOf(*(Il2CppClass **)g_veh, "ForceEndDrifting", 0);
+                if (!mForceEnd) {
+                    // VehicleFast.ForceEndDrifting(IVehicle)
+                    void *fp = rtMethod("", "VehicleFast", "ForceEndDrifting", 1);
+                    if (fp) ((void(*)(void*))fp)(g_veh);
+                }
+            }
         }
-        if(!g_hostSpawned && resolveAll()) trySpawnMenuHost();
-        applyAcPatches();
-        frameTick();
-    } @catch(NSException* e){
-        static int n=0; if(n++<3) L("tick exc: %@",e.name);
+        gPrevDriftKey = driftKey;
     }
 }
-@end
-static ZSMDriver* g_driver=nil;
 
-__attribute__((constructor))
-static void zsmInit(void){
-    cfgLoad();
-    findBase();
-    logInit();                      // mở Documents/zsm.log
-    L("ctor v2.3 base=0x%llx",(unsigned long long)g_base);
-    L("logfile: %@",logPath());     // in đường dẫn để lấy file
-    STEP(STEP_CTOR);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        g_driver=[ZSMDriver new];
-        CADisplayLink* dl=[CADisplayLink displayLinkWithTarget:g_driver selector:@selector(tick:)];
-        dl.preferredFramesPerSecond=30;
-        [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        L("displaylink started");
-    });
+static double gNextFrame = 0.0;
+static void hook_PowerChainUpdateFull(void *self, float dt, const void *method) {
+    hook_PowerChainUpdate(self, dt, method);
+    double t = nowSeconds();
+    if (t >= gNextFrame) { gNextFrame = t + 0.1; frameWork(); }
+}
+
+#pragma mark - Install
+
+static BOOL rtHooksDisabled(void) {
+    char path[1200];
+    const char *dir = strrchr(gLogPath, '/');
+    if (!dir) return NO;
+    size_t n = (size_t)(dir - gLogPath);
+    if (n + 10 >= sizeof(path)) return NO;
+    memcpy(path, gLogPath, n); memcpy(path + n, "/no_hooks", 10);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) { close(fd); return YES; }
+    return NO;
+}
+
+static void installHooks(void) {
+    if (rtHooksDisabled()) { rtLog("install: SKIPPED (no_hooks)"); return; }
+    rtLog("install: v3 hooks");
+
+    orig_GoImpEnter = (void (*)(void *, const void *))
+        rtHookMethod("", "GameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "RaceKingGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "FreePracticeGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+    rtHookMethod("", "ActionSpeedGameGoState", "ImpEnter", 0, (void *)hook_GoImpEnter);
+
+    // PowerChain — gộp gia tốc + N2O + frameWork
+    orig_PowerChainUpd = (void (*)(void *, float, const void *))
+        rtHookMethod("", "NssPhyVehiclePowerChain", "Update", 1, (void *)hook_PowerChainUpdateFull);
+
+    // Drift no-slow
+    orig_DriftDamp = (void (*)(void *, float, float, int, float, const void *))
+        rtHookMethod("", "NssVehicleDriftHelper", "DriftingSlideVelDamping", 4, (void *)hook_DriftDamping);
+
+    // Mini boost
+    orig_ExVelUpd = (void (*)(void *, float, const void *))
+        rtHookMethod("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)hook_ExVelUpdate);
+    pForceMini = (void (*)(void *, int))
+        rtMethod("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
+
+    // N2O prolong
+    pForceDelayN2O = (int (*)(void *, int))
+        rtMethod("", "ExtraVelocityFast", "ForceDelayEndExtraVelocity", 2);
+
+    // Drift release — auto end drift + vector realign
+    orig_DriftRelease = (void (*)(void *, const void *))
+        rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
+
+    // ---- resolve function pointers ----
+    pGetInst = (void *(*)(void))rtMethod("", "GamePub", "GetInstance", 0);
+    pGetModByName = (void *(*)(void *, void *, void *))rtMethod("", "GamePub", "GetModuleByName", 2);
+    pGetMyVehicle = (void *(*)(void))rtMethod("", "VehicleFast", "GetMyVehicle", 0);
+    pGetLinVel = (V3 (*)(void *))rtMethod("", "PhyDllWrapper", "PHY_EntityGetLinearVelocity", 1);
+    {
+        // overload Vector3 (1 arg) — dùng RVA trực tiếp 0xCF16850
+        uintptr_t base = unityBase();
+        if (base) pGetLinVel = (V3 (*)(void *))(base + 0xCF16850);
+    }
+    {
+        uintptr_t base = unityBase();
+        if (base) pSetLinVel = (void (*)(void *, float, float, float))(base + 0xCF17608);
+    }
+    {
+        Il2CppClass *k = rtFindClass("", "VehicleInputCtrl");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "get_KeyFlags", 0);
+            if (m) pGetKeyFlags = (int (*)(void *))*(void **)m;
+        }
+    }
+    pNearestTP = (void *(*)(void *, float, float, float, float))
+        rtMethod("", "RoadMap", "GetNearestTrackPoint", 2);
+    {
+        Il2CppClass *k = rtFindClass("", "NssVehicle");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "get_Forward", 0);
+            if (m) pGetVehFwd = (V3 (*)(void *))*(void **)m;
+            m = i_meth(k, "get_Position", 0);
+            if (m) pGetVehPos = (V3 (*)(void *))*(void **)m;
+            m = i_meth(k, "GetDynamicVehicle", 0);
+            if (m) pGetDynVeh = (void *(*)(void *))*(void **)m;
+        }
+    }
+    {
+        Il2CppClass *k = rtFindClass("", "PlayVehicleModule");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "GetNitrogenCollectMgr", 1);
+            if (m) pGetMgr = (void *(*)(void *, void *, void *))*(void **)m;
+        }
+    }
+    // pSetKey qua InputModule.SetKey (instance)
+    {
+        Il2CppClass *k = rtFindClass("", "InputModule");
+        if (k) {
+            const MethodInfo *m = i_meth(k, "SetKey", 2);
+            if (m) pSetKey = (void (*)(void *, int, unsigned char))*(void **)m;
+        }
+    }
+
+    rtLog("install: done");
+}
+
+#pragma mark - UI (small, distinctive)
+
+@interface RCWin : UIWindow
+@end
+@implementation RCWin
+- (UIView *)hitTest:(CGPoint)pt withEvent:(UIEvent *)ev {
+    UIView *v = [super hitTest:pt withEvent:ev];
+    return (v == self) ? nil : v;
+}
+- (BOOL)canBecomeKeyWindow { return NO; }
+@end
+
+@interface RCMenu : NSObject
+@property (nonatomic, strong) RCWin *win;
+@property (nonatomic, strong) UIButton *fab;
+@property (nonatomic, strong) UIView *card;
+@property (nonatomic, strong) UILabel *speedLbl;
+@end
+
+static RCMenu *gMenu = nil;
+
+@implementation RCMenu
+
+- (UILabel *)row:(CGFloat)y text:(NSString *)t size:(CGFloat)fs color:(UIColor *)c {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(14, y, 180, 22)];
+    l.text = t; l.textColor = c ?: UIColor.whiteColor;
+    l.font = [UIFont systemFontOfSize:fs weight:UIFontWeightMedium];
+    [self.card addSubview:l];
+    return l;
+}
+- (UISwitch *)sw:(CGFloat)y on:(BOOL)v act:(SEL)a {
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(196, y - 2, 44, 26)];
+    sw.transform = CGAffineTransformMakeScale(0.75, 0.75);
+    sw.onTintColor = [UIColor colorWithRed:0.95 green:0.42 blue:0.15 alpha:1];
+    sw.on = v;
+    [sw addTarget:self action:a forControlEvents:UIControlEventValueChanged];
+    [self.card addSubview:sw];
+    return sw;
+}
+- (UISlider *)sl:(CGFloat)y mn:(float)mn mx:(float)mx val:(float)v act:(SEL)a {
+    UISlider *s = [[UISlider alloc] initWithFrame:CGRectMake(14, y, 210, 24)];
+    s.minimumValue = mn; s.maximumValue = mx; s.value = v;
+    s.tintColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    [s addTarget:self action:a forControlEvents:UIControlEventValueChanged];
+    [self.card addSubview:s];
+    return s;
+}
+
+- (void)build {
+    CGRect sc = UIScreen.mainScreen.bounds;
+    self.win = [[RCWin alloc] initWithFrame:sc];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            if (s.activationState != UISceneActivationStateForegroundActive) continue;
+            self.win.windowScene = (UIWindowScene *)s;
+            break;
+        }
+    }
+    self.win.windowLevel = UIWindowLevelAlert + 1;
+    self.win.backgroundColor = UIColor.clearColor;
+    self.win.rootViewController = [[UIViewController alloc] init];
+    self.win.rootViewController.view.backgroundColor = UIColor.clearColor;
+    self.win.hidden = NO;
+
+    UIView *host = self.win.rootViewController.view;
+
+    // FAB nhỏ, góc phải trên
+    self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.fab.frame = CGRectMake(sc.size.width - 50, 70, 42, 42);
+    self.fab.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.85];
+    self.fab.layer.cornerRadius = 21;
+    self.fab.layer.borderWidth = 1;
+    self.fab.layer.borderColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:0.9].CGColor;
+    [self.fab setTitle:@"⚡" forState:UIControlStateNormal];
+    self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    [self.fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
+    [self.fab addGestureRecognizer:pan];
+    [host addSubview:self.fab];
+
+    // Card — style tối + accent cam
+    CGFloat cw = 240, ch = 344;
+    self.card = [[UIView alloc] initWithFrame:CGRectMake(sc.size.width - cw - 8, 118, cw, ch)];
+    self.card.backgroundColor = [UIColor colorWithWhite:0.04 alpha:0.93];
+    self.card.layer.cornerRadius = 12;
+    self.card.layer.borderWidth = 0.5;
+    self.card.layer.borderColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:0.35].CGColor;
+    self.card.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.card.layer.shadowOpacity = 0.5;
+    self.card.layer.shadowRadius = 10;
+    self.card.hidden = YES;
+    [host addSubview:self.card];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, cw - 28, 22)];
+    title.text = @"⚡ RACE TOOLKIT";
+    title.textColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    title.font = [UIFont boldSystemFontOfSize:12];
+    [self.card addSubview:title];
+
+    // rows
+    [self row:36 text:@"Drift no-slow" size:12 color:nil];
+    [self sw:36 on:gDriftNoSlow act:@selector(onDriftSlow:)];
+    [self row:58 text:@"Auto navigate" size:12 color:nil];
+    [self sw:58 on:gAutoNavigate act:@selector(onNav:)];
+    [self row:80 text:@"Steer strength" size:10 color:UIColor.lightGrayColor];
+    [self sl:94 mn:0 mx:1 val:gNavStrength act:@selector(onNavStr:)];
+    [self row:116 text:@"End-drift launch" size:12 color:nil];
+    [self sw:116 on:gEndDriftLaunch act:@selector(onLaunch:)];
+    [self row:138 text:@"Nitro drift gain" size:12 color:nil];
+    [self sw:138 on:gNitroBoost act:@selector(onNitro:)];
+    [self row:160 text:@"Gain %" size:10 color:UIColor.lightGrayColor];
+    [self sl:174 mn:0 mx:1000 val:gNitroPct act:@selector(onNitroPct:)];
+    [self row:196 text:@"Speed boost (hidden)" size:12 color:nil];
+    [self sw:196 on:gSpeedBoost act:@selector(onSpeed:)];
+    [self row:218 text:@"Extra km/h" size:10 color:UIColor.lightGrayColor];
+    [self sl:232 mn:0 mx:120 val:gSpeedKmh act:@selector(onSpd:)];
+    [self row:254 text:@"No2 prolong" size:12 color:nil];
+    [self sw:254 on:gProlongN2O act:@selector(onN2O:)];
+    [self row:276 text:@"Inf mini boost" size:12 color:nil];
+    [self sw:276 on:gFullMiniBoost act:@selector(onMini:)];
+    [self row:298 text:@"Auto end drift" size:12 color:nil];
+    [self sw:298 on:gAutoDriftEnd act:@selector(onAutoDrift:)];
+
+    self.speedLbl = [[UILabel alloc] initWithFrame:CGRectMake(14, 322, cw - 28, 16)];
+    self.speedLbl.textColor = UIColor.lightGrayColor;
+    self.speedLbl.font = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightRegular];
+    self.speedLbl.text = [NSString stringWithFormat:@"extra %d km/h | nav %.0f%% | nitro %d%%",
+                          (int)gSpeedKmh, gNavStrength*100, (int)gNitroPct];
+    [self.card addSubview:self.speedLbl];
+}
+
+- (void)toggle { self.card.hidden = !self.card.hidden; }
+- (void)drag:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:self.fab.superview];
+    self.fab.center = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
+    [g setTranslation:CGPointZero inView:self.fab.superview];
+}
+- (void)onDriftSlow:(UISwitch *)s { gDriftNoSlow = s.isOn; }
+- (void)onNav:(UISwitch *)s        { gAutoNavigate = s.isOn; }
+- (void)onNavStr:(UISlider *)s     { gNavStrength = s.value; }
+- (void)onLaunch:(UISwitch *)s     { gEndDriftLaunch = s.isOn; }
+- (void)onNitro:(UISwitch *)s      { gNitroBoost = s.isOn; }
+- (void)onNitroPct:(UISlider *)s   { gNitroPct = s.value; }
+- (void)onSpeed:(UISwitch *)s      { gSpeedBoost = s.isOn; }
+- (void)onSpd:(UISlider *)s        { gSpeedKmh = s.value; }
+- (void)onN2O:(UISwitch *)s        { gProlongN2O = s.isOn; }
+- (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn; }
+- (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn; }
+@end
+
+#pragma mark - Bootstrap
+
+static void buildMenu(void) {
+    if (gMenu) return;
+    @try {
+        gMenu = [RCMenu new];
+        [gMenu build];
+        rtLog("UI: ok");
+    } @catch (NSException *e) {
+        gMenu = nil;
+        rtLog("UI: FAIL %s", e.reason.UTF8String ?: "?");
+    }
+}
+
+static void startToolkit(void) {
+    static int tries = 0;
+    if (!rtInitApi()) {
+        if (++tries > 60) { rtLog("boot: gave up api"); buildMenu(); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ startToolkit(); });
+        return;
+    }
+    Il2CppDomain *d = i_domain();
+    size_t n = 0;
+    const Il2CppAssembly **a = d ? i_asms(d, &n) : NULL;
+    if (!a || !n) {
+        if (++tries > 60) { rtLog("boot: gave up domain"); buildMenu(); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ startToolkit(); });
+        return;
+    }
+    rtLog("boot: il2cpp ready (%zu assemblies)", n);
+    if (!gHooksInstalled) { gHooksInstalled = YES; installHooks(); }
+    buildMenu();
+}
+
+__attribute__((constructor)) static void RCInit(void) {
+    rtLogOpen();
+    rtInstallCrashHandler();
+    rtLog("=== RaceToolkit v3 === pid=%d", getpid());
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1*NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ startToolkit(); });
 }
