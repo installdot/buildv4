@@ -35,6 +35,7 @@
 #import <sys/time.h>            // gettimeofday struct timeval
 #import <unistd.h>              // getpid
 #import <stdio.h>               // FILE/fopen/fprintf (log file)
+#import <sys/mman.h>            // mmap/mprotect/MAP_ANON (trampoline)
 
 #define L(...)  zsmLog(__VA_ARGS__)
 
@@ -366,7 +367,14 @@ static bool memWrite(uintptr_t addr,const void* data,size_t len){
     if(vm_protect(mach_task_self(),page,sz,0,VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)!=KERN_SUCCESS){
         L("vm_protect fail @%p",(void*)addr); return false;
     }
-    memcpy((void*)addr,data,len);
+    // Race-safe: Unity thread có thể đang thực thi target. Với len<=16 (1 cacheline)
+    // dùng single STP (128-bit store) — atomic theo ARMv8, không bao giờ thấy nửa patch.
+    if(len==16 && ((addr&15)==0)){
+        uint64_t lo,hi; memcpy(&lo,data,8); memcpy(&hi,(const char*)data+8,8);
+        __asm__ volatile("stp %0, %1, [%2]" :: "r"(lo), "r"(hi), "r"(addr) : "memory");
+    } else {
+        memcpy((void*)addr,data,len);
+    }
     vm_protect(mach_task_self(),page,sz,0,VM_PROT_READ|VM_PROT_EXECUTE);
     sys_icache_invalidate((void*)page,sz);
     return true;
@@ -389,24 +397,33 @@ static bool unpatchRet(uintptr_t rva,uint32_t saved[4],bool* done){
     if(!memWrite(g_base+rva,saved,16)) return false;
     *done=false; return true;
 }
-static uint8_t* g_trampBase=nil; static size_t g_trampOff=0;
+static uint8_t* g_trampBase=nil; static size_t g_trampOff=0; static size_t g_trampCap=0;
 static void* trampAlloc(size_t sz){
     if(!g_trampBase){
-        // SDK 26+ không expose mach_vm.h; dùng vm_remap (trên arm64 vm_address_t == 64-bit)
-        vm_address_t dst=0;
-        vm_address_t src=(vm_address_t)(((uintptr_t)&trampAlloc)&~((uintptr_t)vm_page_size-1));
-        vm_prot_t cur=0,mx=0;
-        if(vm_remap(mach_task_self(),&dst,(vm_size_t)vm_page_size,0,VM_FLAGS_ANYWHERE,
-                    mach_task_self(),src,FALSE,&cur,&mx,VM_INHERIT_COPY)!=KERN_SUCCESS){
-            L("vm_remap fail"); return nil;
-        }
-        if(vm_protect(mach_task_self(),dst,(vm_size_t)vm_page_size,0,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS){
-            L("tramp RW fail"); return nil;
-        }
-        g_trampBase=(uint8_t*)dst; g_trampOff=0;
-        L("trampoline @%p",(void*)dst);
+        // W^X flip pattern — hoạt động mọi iOS (không phụ thuộc RWX hay file-backed COW):
+        //   mmap anonymous RW → ghi trampolines → mprotect RX → CPU thực thi.
+        // Nếu sau này cần thêm trampoline: mprotect về RW, ghi, về RX lại (trampSeal).
+        size_t cap=16*1024;
+        void* p=mmap(nil,cap,PROT_READ|PROT_WRITE,
+                     MAP_PRIVATE|MAP_ANON,-1,0);
+        if(p==MAP_FAILED||!p){ L("tramp mmap fail"); return nil; }
+        g_trampBase=(uint8_t*)p; g_trampOff=0; g_trampCap=cap;
+        L("trampoline alloc @%p (RW, %zu bytes)",p,cap);
     }
-    void* p=g_trampBase+g_trampOff; g_trampOff+=(sz+15)&~15UL; return p;
+    if(g_trampOff+sz>g_trampCap){ L("tramp full"); return nil; }
+    void* p=g_trampBase+g_trampOff;
+    g_trampOff+=(sz+15)&~15UL;
+    return p;
+}
+// seal: chuyển cả vùng trampoline sang RX — GỌI SAU KHI ghi xong TẤT CẢ trampolines
+static bool trampSeal(void){
+    if(!g_trampBase) return false;
+    if(mprotect(g_trampBase,g_trampCap,PROT_READ|PROT_EXEC)!=0){
+        L("tramp mprotect RX fail"); return false;
+    }
+    sys_icache_invalidate(g_trampBase,g_trampOff);
+    L("trampoline sealed RX @%p+%zu",(void*)g_trampBase,g_trampOff);
+    return true;
 }
 static bool reloc16(uint32_t* dst,uint64_t dstAddr,uint32_t* src,uint64_t srcAddr){
     for(int i=0;i<4;i++){
@@ -482,21 +499,22 @@ static bool hookRVA(uintptr_t rva,void* repl,void** origTramp){
           (unsigned long long)rva,probe[0],probe[1],probe[2],probe[3]);
     trace("hook 0x%llx: alloc tramp...", (unsigned long long)rva);
     uint8_t* tr=(uint8_t*)trampAlloc(64); if(!tr){ L("hook 0x%llx FAIL: tramp alloc",(unsigned long long)rva); return false; }
+    // reloc 4 lệnh gốc vào trampoline (PC tính theo trampoline — nơi code sẽ thực thi)
     if(!reloc16((uint32_t*)tr,(uint64_t)tr,probe,target)){
         L("hook 0x%llx FAIL: reloc (B out of range) — skip",(unsigned long long)rva);
         return false;
     }
+    // trở về target+16: LDR X16,[PC,#8]; BR X16; .quad
     uint32_t* back=(uint32_t*)(tr+16);
     back[0]=0x58000050; back[1]=0xD61F0200;
     *(uint64_t*)(back+2)=target+16;
-    sys_icache_invalidate(tr,64);
     uint32_t entry[4];
     entry[0]=0x58000050; entry[1]=0xD61F0200;
     *(uint64_t*)(entry+2)=(uint64_t)repl;
     trace("hook 0x%llx: patching entry...", (unsigned long long)rva);
     if(!memWrite(target,entry,16)){ L("hook 0x%llx FAIL: memWrite",(unsigned long long)rva); return false; }
     *origTramp=tr;
-    L("hook 0x%llx OK",(unsigned long long)rva);
+    L("hook 0x%llx OK tramp=%p",(unsigned long long)rva,tr);
     return true;
 }
 
@@ -863,6 +881,9 @@ static bool trySpawnMenuHost(void){
             bool ok2=hookRVA(0x7C713DC,(void*)hook_Damping,&orig_Damping);
             bool ok3=hookRVA(0x7AFC4A0,(void*)hook_KMPH,&orig_KMPH);
             L("STEP3 done: ecu=%d damp=%d kmph=%d",ok1,ok2,ok3);
+            // OnGUI hook cũng dùng trampoline — cài trước khi seal
+            if(!g_hostSpawned && resolveAll()) trySpawnMenuHost();
+            trampSeal();               // W→X: trampolines executable từ đây
             hooksDone=true;
             applyAcPatches();
         }
