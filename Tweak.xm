@@ -7,8 +7,7 @@
 // 5. Hồi nitro drift %: cộng thẳng mCurPower (0xD0) trên SingleNitrogenCollect mỗi frame
 // 6. End Drift phóng: khi thả drift → đọc vận tốc qua PHY_EntityGetLinearVelocity,
 //    chiếu lên hướng xe → SetLinearVelocity chỉ giữ thành phần tiến (tiêu diệt drift ngang)
-// 7. No2 kéo dài: ForceDelayEndExtraVelocity(N2O) định kỳ
-// 8. Inf Mini Boost: ForceCanTriggerOnce(Mini/Air/FallingGround)
+// 7. Inf Mini Boost: ForceCanTriggerOnce(Mini/Air/FallingGround)
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -159,6 +158,7 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
     return NULL;
 }
 
+static inline void *mp(void *method){ return method ? *(void **)method : nil; }
 static void *rtMOf(void *klass, const char *name, int argc) {
     if (!klass) return NULL;
     Il2CppClass *kc = (Il2CppClass *)klass;
@@ -455,7 +455,6 @@ static void installHooks(void) {
         rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
 
     // ---- resolve function pointers ----
-    pGetInst = (void *(*)(void))rtMethod("", "GamePub", "GetInstance", 0);
     pGetModByName = (void *(*)(void *, void *, void *))rtMethod("", "GamePub", "GetModuleByName", 2);
     pGetMyVehicle = (void *(*)(void))rtMethod("", "VehicleFast", "GetMyVehicle", 0);
     pGetLinVel = (V3 (*)(void *))rtMethod("", "PhyDllWrapper", "PHY_EntityGetLinearVelocity", 1);
@@ -611,6 +610,8 @@ static RCMenu *gMenu = nil;
     self.card.layer.shadowRadius = 10;
     self.card.hidden = YES;
     self.card.userInteractionEnabled = YES;
+    UIPanGestureRecognizer *cardPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragCard:)];
+    [self.card addGestureRecognizer:cardPan];
     [host addSubview:self.card];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, cw - 28, 22)];
@@ -649,6 +650,26 @@ static RCMenu *gMenu = nil;
     [self.card addSubview:self.speedLbl];
 }
 
+- (void)dragCard:(UIPanGestureRecognizer *)g {
+    static CGPoint startCenter; static BOOL dragging = NO;
+    if (g.state == UIGestureRecognizerStateBegan) {
+        CGPoint p = [g locationInView:self.card];
+        // chỉ kéo khi chạm vào vùng header (0..36pt từ trên)
+        if (p.y <= 36.f) { dragging = YES; startCenter = self.card.center; }
+        else { dragging = NO; return; }
+    }
+    if (!dragging) return;
+    if (g.state == UIGestureRecognizerStateChanged) {
+        CGPoint t = [g translationInView:self.card.superview];
+        CGRect b = UIScreen.mainScreen.bounds;
+        CGPoint c = startCenter;
+        c.x += t.x; c.y += t.y;
+        c.x = MAX(self.card.bounds.size.width/2, MIN(b.size.width - self.card.bounds.size.width/2, c.x));
+        c.y = MAX(self.card.bounds.size.height/2, MIN(b.size.height - self.card.bounds.size.height/2, c.y));
+        self.card.center = c;
+    }
+    if (g.state == UIGestureRecognizerStateEnded) dragging = NO;
+}
 - (void)toggle { self.card.hidden = !self.card.hidden; }
 - (void)drag:(UIPanGestureRecognizer *)g {
     if (g.state == UIGestureRecognizerStateChanged) {
@@ -706,8 +727,29 @@ static void startToolkit(void) {
         return;
     }
     rtLog("boot: il2cpp ready (%zu assemblies)", n);
-    if (!gHooksInstalled) { gHooksInstalled = YES; installHooks(); }
+    // resolve GamePub.GetInstance trước (class cốt lõi đã init lúc này)
+    if (!pGetInst) {
+        void *kGP = rtFindClass("", "GamePub");
+        if (kGP) {
+            const MethodInfo *m = i_meth(kGP, "GetInstance", 0);
+            if (m) pGetInst = *(void **)m;
+        }
+    }
+    // Menu cài NGAY (không đụng il2cpp class init)
     buildMenu();
+    // Hooks CHỈ cài khi GamePub.GetInstance() != nil — game vào lobby xong.
+    // Cài sớm force class-init giữa lúc Unity load scene → re-entrance crash.
+    if (!gHooksInstalled) {
+        void *gp = mp(pGetInst) ? ((void *(*)(void))mp(pGetInst))() : nil;
+        if (!gp) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ startToolkit(); });
+            return;
+        }
+        rtLog("boot: GamePub ready — installing hooks");
+        gHooksInstalled = YES;
+        installHooks();
+    }
 }
 
 __attribute__((constructor)) static void RCInit(void) {
