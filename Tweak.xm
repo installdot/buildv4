@@ -35,7 +35,7 @@
 #import <unistd.h>              // getpid
 #import <stdio.h>               // FILE/fopen/fprintf (log file)
 
-#define L(...)  NSLog(@"[ZSM] " __VA_ARGS__)
+#define L(...)  zsmLog(__VA_ARGS__)
 
 // ==== Logging: staged trace + file log (Documents/zsm.log) ====
 // Mỗi STEP in 1 lần duy nhất — đọc log biết crash ở khúc nào.
@@ -89,14 +89,15 @@ static void trace(const char* fmt,...){
     NSLog(@"[ZSM] %s",buf);
     logWrite(buf);
 }
-// macro L cũng ghi file — mọi NSLog qua L đều lưu lại
-// LƯU Ý: @(...) boxing không nhận multi-arg → dùng stringWithFormat:
-#undef L
-#define L(...) do{ \
-    NSString* _s=[NSString stringWithFormat:__VA_ARGS__]; \
-    NSLog(@"[ZSM] %@",_s); \
-    logWrite([_s cStringUsingEncoding:NSUTF8StringEncoding]); \
-}while(0)
+// L = printf-style wrapper (trả về 1 hàm duy nhất — không macro variadic ObjC format
+// vì "..." trong method call bắt buộc @"..." cho literal; printf-style thì không)
+static void zsmLog(const char* fmt,...) __attribute__((format(printf,1,2)));
+static void zsmLog(const char* fmt,...){
+    char buf[512]; va_list ap; va_start(ap,fmt);
+    vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
+    NSLog(@"[ZSM] %s",buf);
+    logWrite(buf);
+}
 
 // ==== 0. Config ====
 static bool   g_menuOpen=false;
@@ -237,7 +238,7 @@ static void* inv(void* method, void* obj, void** args){
     void* r=il2cpp_runtime_invoke(method,obj,args,&exc);
     if(exc){
         static void* lastBad=nil;
-        if(lastBad!=method){ lastBad=method; L("invoke exc @%p",(void*)method); }
+        if(lastBad!=method){ lastBad=method; L("invoke exc @%p",method); }
         return nil;
     }
     return r;
@@ -719,7 +720,7 @@ static void drawMenu(void){
         if(menuBtnR(x,y,w,26,S_AC4)) g_blockActorCp=!g_blockActorCp; y+=30;
         cfgSave();
     } @catch(NSException* e){
-        static int logged=0; if(logged++<3) L("menu exc: %@",e.name);
+        static int logged=0; if(logged++<3) L("menu exc: %s", e.name.UTF8String);
     }
 }
 
@@ -831,7 +832,7 @@ static bool trySpawnMenuHost(void){
         applyAcPatches();
         frameTick();
     } @catch(NSException* e){
-        static int n=0; if(n++<3) L("tick exc: %@",e.name);
+        static int n=0; if(n++<3) L("tick exc: %s", e.name.UTF8String);
     }
 }
 @end
@@ -843,7 +844,7 @@ static void zsmInit(void){
     findBase();
     logInit();                      // mở Documents/zsm.log
     L("ctor v2.3 base=0x%llx",(unsigned long long)g_base);
-    L("logfile: %@",logPath());     // in đường dẫn để lấy file
+    L("logfile: %s",logPath().UTF8String);     // in đường dẫn để lấy file
     STEP(STEP_CTOR);
     dispatch_async(dispatch_get_main_queue(), ^{
         g_driver=[ZSMDriver new];
