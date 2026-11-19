@@ -528,7 +528,11 @@ static void installHooks(void) {
 @implementation RCWin
 - (UIView *)hitTest:(CGPoint)pt withEvent:(UIEvent *)ev {
     UIView *v = [super hitTest:pt withEvent:ev];
-    return (v == self) ? nil : v;
+    // nil → UIKit chuyển touch xuống window của game (passthrough)
+    if (v == nil || v == self) return nil;
+    // root view là container trong suốt phủ toàn màn — không nhận touch
+    if (v == self.rootViewController.view) return nil;
+    return v;   // fab / card / subview của chúng → nhận bình thường
 }
 - (BOOL)canBecomeKeyWindow { return NO; }
 @end
@@ -597,6 +601,7 @@ static RCMenu *gMenu = nil;
     self.fab.layer.borderColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:0.9].CGColor;
     [self.fab setTitle:@"⚡" forState:UIControlStateNormal];
     self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    self.fab.userInteractionEnabled = YES;
     [self.fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
     [self.fab addGestureRecognizer:pan];
@@ -613,6 +618,7 @@ static RCMenu *gMenu = nil;
     self.card.layer.shadowOpacity = 0.5;
     self.card.layer.shadowRadius = 10;
     self.card.hidden = YES;
+    self.card.userInteractionEnabled = YES;
     [host addSubview:self.card];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, cw - 28, 22)];
