@@ -23,11 +23,13 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach.h>
+#import <mach/mach_vm.h>        // mach_vm_remap/mach_vm_address_t (SDK mới tách khỏi mach.h)
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <libkern/OSCacheControl.h>
 #import <math.h>
 #import <string.h>
+#import <stdlib.h>              // malloc/free
 
 #define L(...)  NSLog(@"[ZSM] " __VA_ARGS__)
 
@@ -86,7 +88,7 @@ static void cfgSave(void){
 // ==== 1. il2cpp ====
 typedef void* (*fn_domain_get)(void);
 typedef void* (*fn_thread_attach)(void*);
-typedef size_t(*fn_domain_assemblies)(void*, void**);
+typedef const void** (*fn_domain_assemblies)(void*, size_t*);
 typedef void* (*fn_assembly_image)(void*);
 typedef size_t(*fn_img_class_count)(void*);
 typedef void* (*fn_img_class)(void*, size_t);
@@ -221,7 +223,7 @@ static void scanClasses(void){
     clsInt  =il2cpp_class_from_name(corlib,"System","Int32");
     if(!clsFloat||!clsBool||!clsInt) return;
     size_t n=0;
-    void** asms=(void**)il2cpp_domain_get_assemblies(g_domain,&n);
+    const void** asms=il2cpp_domain_get_assemblies(g_domain,&n);   // (domain, &size) → mảng
     if(!asms||!n) return;
     for(size_t i=0;i<n;i++){
         void* img=il2cpp_assembly_get_image(asms[i]); if(!img) continue;
@@ -263,13 +265,13 @@ static void findBase(void){
     }
 }
 static bool memWrite(uintptr_t addr,const void* data,size_t len){
-    vm_address_t page=addr&~(vm_page_size-1);
-    vm_size_t sz=((addr+len+vm_page_size-1)&~(vm_page_size-1))-page;
-    if(vm_protect(mach_task_self(),page,sz,false,VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)!=KERN_SUCCESS){
+    vm_address_t page=(vm_address_t)(addr&~((uintptr_t)vm_page_size-1));
+    vm_size_t sz=(vm_size_t)(((addr+len+vm_page_size-1)&~(vm_page_size-1))-page);
+    if(vm_protect(mach_task_self(),page,sz,0,VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)!=KERN_SUCCESS){
         L("vm_protect fail @%p",(void*)addr); return false;
     }
     memcpy((void*)addr,data,len);
-    vm_protect(mach_task_self(),page,sz,false,VM_PROT_READ|VM_PROT_EXECUTE);
+    vm_protect(mach_task_self(),page,sz,0,VM_PROT_READ|VM_PROT_EXECUTE);
     sys_icache_invalidate((void*)page,sz);
     return true;
 }
@@ -290,13 +292,13 @@ static uint8_t* g_trampBase=nil; static size_t g_trampOff=0;
 static void* trampAlloc(size_t sz){
     if(!g_trampBase){
         mach_vm_address_t dst=0;
-        vm_address_t src=((vm_address_t)&trampAlloc)&~(vm_page_size-1);
+        mach_vm_address_t src=(mach_vm_address_t)(((uintptr_t)&trampAlloc)&~(vm_page_size-1));
         vm_prot_t cur=0,mx=0;
-        if(mach_vm_remap(mach_task_self(),&dst,vm_page_size,0,VM_FLAGS_ANYWHERE,
+        if(mach_vm_remap(mach_task_self(),&dst,(mach_vm_size_t)vm_page_size,0,VM_FLAGS_ANYWHERE,
                          mach_task_self(),src,FALSE,&cur,&mx,VM_INHERIT_COPY)!=KERN_SUCCESS){
             L("vm_remap fail"); return nil;
         }
-        if(vm_protect(mach_task_self(),(vm_address_t)dst,vm_page_size,0,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS){
+        if(vm_protect(mach_task_self(),(vm_address_t)dst,(vm_size_t)vm_page_size,0,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS){
             L("tramp RW fail"); return nil;
         }
         g_trampBase=(uint8_t*)dst; g_trampOff=0;
