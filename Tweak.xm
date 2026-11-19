@@ -131,7 +131,8 @@ static fn_obj_new           il2cpp_object_new;
 static void* g_domain=nil; static bool g_il2cppReady=false;
 
 static bool loadIl2cppSyms(void){
-    #define SYM(var, name) do{ var=(typeof(var))dlsym(RTLD_DEFAULT,name); if(!var){L("missing %s",name); return false;} }while(0)
+    // dlsym trả void* — gán thẳng, không cần cast (typeof/__typeof__ không portable trên mọi toolchain)
+    #define SYM(var, name) do{ var=dlsym(RTLD_DEFAULT,name); if(!(var)){L("missing %s",name); return false;} }while(0)
     SYM(il2cpp_domain_get,             "il2cpp_domain_get");
     SYM(il2cpp_thread_attach,          "il2cpp_thread_attach");
     SYM(il2cpp_domain_get_assemblies,  "il2cpp_domain_get_assemblies");
