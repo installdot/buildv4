@@ -7,8 +7,7 @@
 // 5. Hồi nitro drift %: cộng thẳng mCurPower (0xD0) trên SingleNitrogenCollect mỗi frame
 // 6. End Drift phóng: khi thả drift → đọc vận tốc qua PHY_EntityGetLinearVelocity,
 //    chiếu lên hướng xe → SetLinearVelocity chỉ giữ thành phần tiến (tiêu diệt drift ngang)
-// 7. No2 kéo dài: ForceDelayEndExtraVelocity(N2O) định kỳ
-// 8. Inf Mini Boost: ForceCanTriggerOnce(Mini/Air/FallingGround)
+// 7. Inf Mini Boost: ForceCanTriggerOnce(Mini/Air/FallingGround)
 
 #import <UIKit/UIKit.h>
 #import <math.h>
@@ -86,11 +85,9 @@ static BOOL gNavInvert      = NO;
 static BOOL gNitroBoost     = NO;    // hồi nitro drift %
 static float gNitroPct      = 200.f; // 0..1000%
 static BOOL gEndDriftLaunch = YES;   // thả drift → chỉ giữ vector tiến
-static BOOL gProlongN2O     = YES;
 static BOOL gFullMiniBoost  = NO;
 static BOOL gAutoDriftEnd   = YES;
 static double gGoTime       = 0.0;
-static double gNextN2O      = 0.0;
 static double gNextNitroAdd = 0.0;
 static BOOL   gPrevDriftKey = NO;
 static BOOL   gHooksInstalled = NO;
@@ -161,6 +158,7 @@ static Il2CppClass *rtFindClass(const char *ns, const char *name) {
     return NULL;
 }
 
+static inline void *mp(void *method){ return method ? *(void **)method : nil; }
 static void *rtMOf(void *klass, const char *name, int argc) {
     if (!klass) return NULL;
     Il2CppClass *kc = (Il2CppClass *)klass;
@@ -209,7 +207,6 @@ static void (*orig_DriftRelease)(void *, const void *) = NULL;
 static void (*orig_ExVelUpd)(void *, float, const void *) = NULL;
 
 static void  (*pForceMini)(void *, int) = NULL;
-static int   (*pForceDelayN2O)(void *, int) = NULL;
 static void  (*pSetKey)(void *, int, unsigned char) = NULL;
 static int   (*pGetKeyFlags)(void *) = NULL;
 static void *(*pNearestTP)(void *, float, float, float, float) = NULL;
@@ -254,7 +251,6 @@ static void *g_lastTP = nil;
 static void hook_GoImpEnter(void *self, const void *method) {
     if (orig_GoImpEnter) orig_GoImpEnter(self, method);
     gGoTime = nowSeconds();
-    gNextN2O = 0.0;
     gNextNitroAdd = 0.0;
     gPrevDriftKey = NO;
     rtLog("race started");
@@ -271,12 +267,6 @@ static void hook_PowerChainUpdate(void *self, float dt, const void *method) {
         *(float *)((char *)self + kPc_ExtraTorque) = gSpeedKmh * 0.35f;
     }
 
-    // No2 kéo dài: ForceDelayEndExtraVelocity(N2O) mỗi 0.5s
-    if (gProlongN2O && pForceDelayN2O && gGoTime > 0.0 && nowSeconds() >= gNextN2O) {
-        void *veh = *(void **)((char *)self + kPc_Vehicle);
-        if (veh) { pForceDelayN2O(veh, 1); pForceDelayN2O(veh, 14); }
-        gNextN2O = nowSeconds() + 0.5;
-    }
 }
 
 // 3. Drift không mất tốc
@@ -460,16 +450,11 @@ static void installHooks(void) {
     pForceMini = (void (*)(void *, int))
         rtMethod("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
 
-    // N2O prolong
-    pForceDelayN2O = (int (*)(void *, int))
-        rtMethod("", "ExtraVelocityFast", "ForceDelayEndExtraVelocity", 2);
-
     // Drift release — auto end drift + vector realign
     orig_DriftRelease = (void (*)(void *, const void *))
         rtHookMethod("", "NssVehicleDriftCtrl", "ReleaseDrifting", 0, (void *)hook_DriftRelease);
 
     // ---- resolve function pointers ----
-    pGetInst = (void *(*)(void))rtMethod("", "GamePub", "GetInstance", 0);
     pGetModByName = (void *(*)(void *, void *, void *))rtMethod("", "GamePub", "GetModuleByName", 2);
     pGetMyVehicle = (void *(*)(void))rtMethod("", "VehicleFast", "GetMyVehicle", 0);
     pGetLinVel = (V3 (*)(void *))rtMethod("", "PhyDllWrapper", "PHY_EntityGetLinearVelocity", 1);
@@ -528,14 +513,18 @@ static void installHooks(void) {
 @implementation RCWin
 - (UIView *)hitTest:(CGPoint)pt withEvent:(UIEvent *)ev {
     UIView *v = [super hitTest:pt withEvent:ev];
-    return (v == self) ? nil : v;
+    // nil → UIKit chuyển touch xuống window của game (passthrough)
+    if (v == nil || v == self) return nil;
+    // root view là container trong suốt phủ toàn màn — không nhận touch
+    if (v == self.rootViewController.view) return nil;
+    return v;   // fab / card / subview của chúng → nhận bình thường
 }
 - (BOOL)canBecomeKeyWindow { return NO; }
 @end
 
 @interface RCMenu : NSObject
 @property (nonatomic, strong) RCWin *win;
-@property (nonatomic, strong) UIButton *fab;
+@property (nonatomic, strong) UIView *fab;
 @property (nonatomic, strong) UIView *card;
 @property (nonatomic, strong) UILabel *speedLbl;
 @end
@@ -589,16 +578,23 @@ static RCMenu *gMenu = nil;
     UIView *host = self.win.rootViewController.view;
 
     // FAB nhỏ, góc phải trên
-    self.fab = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.fab.frame = CGRectMake(sc.size.width - 50, 70, 42, 42);
+    self.fab = [[UIView alloc] initWithFrame:CGRectMake(sc.size.width - 50, 70, 42, 42)];
     self.fab.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.85];
     self.fab.layer.cornerRadius = 21;
     self.fab.layer.borderWidth = 1;
     self.fab.layer.borderColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:0.9].CGColor;
-    [self.fab setTitle:@"⚡" forState:UIControlStateNormal];
-    self.fab.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    [self.fab addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    self.fab.userInteractionEnabled = YES;
+    UILabel *ic = [[UILabel alloc] initWithFrame:self.fab.bounds];
+    ic.text = @"⚡"; ic.textAlignment = NSTextAlignmentCenter;
+    ic.font = [UIFont boldSystemFontOfSize:17];
+    ic.textColor = UIColor.whiteColor;
+    ic.userInteractionEnabled = NO;   // để gesture nhận touch, không bị label nuốt
+    [self.fab addSubview:ic];
+    // Tap để mở menu — UITapGestureRecognizer không xung đột với pan
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggle)];
+    [self.fab addGestureRecognizer:tap];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)];
+    pan.maximumNumberOfTouches = 1;
     [self.fab addGestureRecognizer:pan];
     [host addSubview:self.fab];
 
@@ -613,6 +609,9 @@ static RCMenu *gMenu = nil;
     self.card.layer.shadowOpacity = 0.5;
     self.card.layer.shadowRadius = 10;
     self.card.hidden = YES;
+    self.card.userInteractionEnabled = YES;
+    UIPanGestureRecognizer *cardPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragCard:)];
+    [self.card addGestureRecognizer:cardPan];
     [host addSubview:self.card];
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, cw - 28, 22)];
@@ -638,8 +637,6 @@ static RCMenu *gMenu = nil;
     [self sw:196 on:gSpeedBoost act:@selector(onSpeed:)];
     [self row:218 text:@"Extra km/h" size:10 color:UIColor.lightGrayColor];
     [self sl:232 mn:0 mx:120 val:gSpeedKmh act:@selector(onSpd:)];
-    [self row:254 text:@"No2 prolong" size:12 color:nil];
-    [self sw:254 on:gProlongN2O act:@selector(onN2O:)];
     [self row:276 text:@"Inf mini boost" size:12 color:nil];
     [self sw:276 on:gFullMiniBoost act:@selector(onMini:)];
     [self row:298 text:@"Auto end drift" size:12 color:nil];
@@ -653,11 +650,38 @@ static RCMenu *gMenu = nil;
     [self.card addSubview:self.speedLbl];
 }
 
+- (void)dragCard:(UIPanGestureRecognizer *)g {
+    static CGPoint startCenter; static BOOL dragging = NO;
+    if (g.state == UIGestureRecognizerStateBegan) {
+        CGPoint p = [g locationInView:self.card];
+        // chỉ kéo khi chạm vào vùng header (0..36pt từ trên)
+        if (p.y <= 36.f) { dragging = YES; startCenter = self.card.center; }
+        else { dragging = NO; return; }
+    }
+    if (!dragging) return;
+    if (g.state == UIGestureRecognizerStateChanged) {
+        CGPoint t = [g translationInView:self.card.superview];
+        CGRect b = UIScreen.mainScreen.bounds;
+        CGPoint c = startCenter;
+        c.x += t.x; c.y += t.y;
+        c.x = MAX(self.card.bounds.size.width/2, MIN(b.size.width - self.card.bounds.size.width/2, c.x));
+        c.y = MAX(self.card.bounds.size.height/2, MIN(b.size.height - self.card.bounds.size.height/2, c.y));
+        self.card.center = c;
+    }
+    if (g.state == UIGestureRecognizerStateEnded) dragging = NO;
+}
 - (void)toggle { self.card.hidden = !self.card.hidden; }
 - (void)drag:(UIPanGestureRecognizer *)g {
-    CGPoint t = [g translationInView:self.fab.superview];
-    self.fab.center = CGPointMake(self.fab.center.x + t.x, self.fab.center.y + t.y);
-    [g setTranslation:CGPointZero inView:self.fab.superview];
+    if (g.state == UIGestureRecognizerStateChanged) {
+        CGPoint t = [g translationInView:self.fab.superview];
+        CGRect b = UIScreen.mainScreen.bounds;
+        CGPoint c = self.fab.center;
+        c.x += t.x; c.y += t.y;
+        c.x = MAX(24.0, MIN(b.size.width - 24.0, c.x));
+        c.y = MAX(30.0, MIN(b.size.height - 30.0, c.y));
+        self.fab.center = c;
+        [g setTranslation:CGPointZero inView:self.fab.superview];
+    }
 }
 - (void)onDriftSlow:(UISwitch *)s { gDriftNoSlow = s.isOn; }
 - (void)onNav:(UISwitch *)s        { gAutoNavigate = s.isOn; }
@@ -667,7 +691,6 @@ static RCMenu *gMenu = nil;
 - (void)onNitroPct:(UISlider *)s   { gNitroPct = s.value; }
 - (void)onSpeed:(UISwitch *)s      { gSpeedBoost = s.isOn; }
 - (void)onSpd:(UISlider *)s        { gSpeedKmh = s.value; }
-- (void)onN2O:(UISwitch *)s        { gProlongN2O = s.isOn; }
 - (void)onMini:(UISwitch *)s       { gFullMiniBoost = s.isOn; }
 - (void)onAutoDrift:(UISwitch *)s  { gAutoDriftEnd = s.isOn; }
 @end
@@ -704,8 +727,29 @@ static void startToolkit(void) {
         return;
     }
     rtLog("boot: il2cpp ready (%zu assemblies)", n);
-    if (!gHooksInstalled) { gHooksInstalled = YES; installHooks(); }
+    // resolve GamePub.GetInstance trước (class cốt lõi đã init lúc này)
+    if (!pGetInst) {
+        void *kGP = rtFindClass("", "GamePub");
+        if (kGP) {
+            const MethodInfo *m = i_meth(kGP, "GetInstance", 0);
+            if (m) pGetInst = *(void **)m;
+        }
+    }
+    // Menu cài NGAY (không đụng il2cpp class init)
     buildMenu();
+    // Hooks CHỈ cài khi GamePub.GetInstance() != nil — game vào lobby xong.
+    // Cài sớm force class-init giữa lúc Unity load scene → re-entrance crash.
+    if (!gHooksInstalled) {
+        void *gp = mp(pGetInst) ? ((void *(*)(void))mp(pGetInst))() : nil;
+        if (!gp) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5*NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ startToolkit(); });
+            return;
+        }
+        rtLog("boot: GamePub ready — installing hooks");
+        gHooksInstalled = YES;
+        installHooks();
+    }
 }
 
 __attribute__((constructor)) static void RCInit(void) {
