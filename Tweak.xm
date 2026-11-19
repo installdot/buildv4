@@ -31,11 +31,14 @@
 
 // ================= LOG =================
 static FILE* g_log=nil;
-#define L(...) do{ \
-    NSString* _s=[NSString stringWithFormat:__VA_ARGS__]; \
-    NSLog(@"[ZSM] %@",_s); \
-    if(g_log){ fputs([_s UTF8String],g_log); fputc('\n',g_log); fflush(g_log);} \
-}while(0)
+static void zsmLog(const char* fmt,...) __attribute__((format(printf,1,2)));
+static void zsmLog(const char* fmt,...){
+    char buf[512]; va_list ap; va_start(ap,fmt);
+    vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
+    NSLog(@"[ZSM] %s",buf);
+    if(g_log){ fputs(buf,g_log); fputc('\n',g_log); fflush(g_log); }
+}
+#define L(...) zsmLog(__VA_ARGS__)
 static void logInit(void){
     if(g_log) return;
     @try{
@@ -97,10 +100,10 @@ static f_cnt   i_cnt;      static f_cls i_cls;
 static f_nm    i_name, i_ns;
 static f_meth  i_meth;     static f_fld i_fld;  static f_off i_off;
 static f_v     i_corlib;   static f_vp i_ocls, i_parent;
-static f_vp    i_str;      // il2cpp_string_new(const char*)
+static void*  (*i_str)(const char*);   // il2cpp_string_new
 static f_vp    i_ctype, i_tobj;
 static void* g_domain=nil;
-static bool  g_symOk=false;
+static bool  g_ready=false;
 
 static bool loadSyms(void){
     #define S(v,n) do{ void*_p=dlsym(RTLD_DEFAULT,n); if(!_p) return false; memcpy(&v,&_p,sizeof(void*)); }while(0)
@@ -146,7 +149,7 @@ static void scanClasses(void){
         for(size_t c=0;c<cnt;c++){
             void* k=i_cls(img,c); if(!k) continue;
             const char* ns=i_ns(k); const char* nm=i_name(k); if(!nm) continue;
-            bool gb=!ns||!ns[0]; const char* s=ns?ns:"";
+            bool gb=!ns||!ns[0];
             #define T(cc,slot) if(cc && !slot) slot=k;
             T(gb&&!strcmp(nm,"GamePub"),kGamePub)
             T(gb&&!strcmp(nm,"VehicleFast"),kVehicleFast)
@@ -517,7 +520,7 @@ static ZSMUI* g_ui=nil;
         disableAnticheat();
         tick();
     }@catch(NSException*e){
-        static int n=0; if(n++<3) L("tick exc: %@",e.name);
+        static int n=0; if(n++<3) L("tick exc: %s",e.name.UTF8String);
     }
 }
 @end
