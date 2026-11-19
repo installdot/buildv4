@@ -81,7 +81,7 @@ static double gNextNit  = 0;      // ~60 Hz nitro add
 
 static void *g_domain = nil;
 static void *(*fpAttach)(void*) = NULL;
-static Il2CppClass *(*i_ocls)(void*) = NULL;
+static void *(*i_ocls)(void*) = NULL;
 static void *gVeh = nil;          // IVehicle (main player)
 static void *gEcu = nil;          // NssPhyVehicleECU
 static void *gInp = nil;          // InputModule
