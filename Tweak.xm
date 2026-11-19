@@ -24,6 +24,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>       // mach_header_64/MH_MAGIC_64
 #import <dlfcn.h>
 #import <libkern/OSCacheControl.h>
 #import <math.h>
@@ -332,11 +333,32 @@ static void scanClasses(void){
 
 // ==== 3. Patch + hook ====
 static uintptr_t g_base=0;
+// probe an toàn: đọc mem qua mach vm_read — trả false thay vì SIGSEGV khi addr không map
+static bool safePeek(uintptr_t addr,void* out,size_t len){
+    vm_size_t got=0;
+    return vm_read_overwrite(mach_task_self(),(vm_address_t)addr,(vm_size_t)len,
+                             (vm_address_t)out,&got)==KERN_SUCCESS;
+}
 static void findBase(void){
     for(uint32_t i=_dyld_image_count(); i-->0;){
         const char* nm=_dyld_get_image_name(i);
-        if(nm && strstr(nm,"UnityFramework")){ g_base=(uintptr_t)_dyld_get_image_vmaddr_slide(i); return; }
+        if(nm && strstr(nm,"UnityFramework")){
+            uintptr_t slide=(uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            // validate: Mach-O header phải đọc được + magic đúng (64-bit LE)
+            const mach_header_64* mh=(const mach_header_64*)(slide? slide : 0);
+            if(!mh){ continue; }
+            uint32_t magic=0;
+            if(!safePeek((uintptr_t)mh,&magic,4) || magic!=MH_MAGIC_64){
+                L("findBase: image %u magic mismatch (0x%x) — skip",i,magic);
+                continue;
+            }
+            g_base=slide;
+            L("findBase OK: slide=0x%llx magic=0x%x ncmds=%u",
+              (unsigned long long)slide,magic,mh->ncmds);
+            return;
+        }
     }
+    L("findBase FAIL: no valid UnityFramework image");
 }
 static bool memWrite(uintptr_t addr,const void* data,size_t len){
     vm_address_t page=(vm_address_t)(addr&~((uintptr_t)vm_page_size-1));
@@ -352,7 +374,12 @@ static bool memWrite(uintptr_t addr,const void* data,size_t len){
 static bool patchRet(uintptr_t rva,uint32_t saved[4],bool* done){
     if(!g_base||*done) return *done;
     uintptr_t a=g_base+rva;
-    if(!saved[0]) memcpy(saved,(void*)a,16);
+    if(!saved[0]){
+        if(!safePeek(a,saved,16)){
+            L("patchRet 0x%llx FAIL: target unmapped",(unsigned long long)rva);
+            return false;
+        }
+    }
     uint32_t ret=0xD65F03C0;
     if(!memWrite(a,&ret,4)) return false;
     *done=true; L("patchRet 0x%llx",(unsigned long long)rva); return true;
@@ -442,9 +469,20 @@ static bool reloc16(uint32_t* dst,uint64_t dstAddr,uint32_t* src,uint64_t srcAdd
 static bool hookRVA(uintptr_t rva,void* repl,void** origTramp){
     if(!g_base) return false;
     uintptr_t target=g_base+rva;
+    trace("hook 0x%llx: target=0x%llx (base=0x%llx)",
+          (unsigned long long)rva,(unsigned long long)target,(unsigned long long)g_base);
+    // probe an toàn: target phải đọc được 16B trước khi reloc — tránh SIGSEGV trong reloc16
+    uint32_t probe[4]={0,0,0,0};
+    if(!safePeek(target,probe,16)){
+        L("hook 0x%llx FAIL: target 0x%llx unmapped — binary khác version?",
+          (unsigned long long)rva,(unsigned long long)target);
+        return false;
+    }
+    trace("hook 0x%llx: insn[0..3]=%08x %08x %08x %08x",
+          (unsigned long long)rva,probe[0],probe[1],probe[2],probe[3]);
     trace("hook 0x%llx: alloc tramp...", (unsigned long long)rva);
     uint8_t* tr=(uint8_t*)trampAlloc(64); if(!tr){ L("hook 0x%llx FAIL: tramp alloc",(unsigned long long)rva); return false; }
-    if(!reloc16((uint32_t*)tr,(uint64_t)tr,(uint32_t*)target,target)){
+    if(!reloc16((uint32_t*)tr,(uint64_t)tr,probe,target)){
         L("hook 0x%llx FAIL: reloc (B out of range) — skip",(unsigned long long)rva);
         return false;
     }
