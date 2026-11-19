@@ -81,6 +81,7 @@ static double gNextNit  = 0;      // ~60 Hz nitro add
 
 static void *g_domain = nil;
 static void *(*fpAttach)(void*) = NULL;
+static Il2CppClass *(*i_ocls)(void*) = NULL;
 static void *gVeh = nil;          // IVehicle (main player)
 static void *gEcu = nil;          // NssPhyVehicleECU
 static void *gInp = nil;          // InputModule
@@ -218,7 +219,6 @@ static void *(*pMyVeh)(void) = NULL;
 static void *(*pMgrByUid)(void *, unsigned long long) = NULL;
 static void *(*pDynVeh)(void *) = NULL;
 static void *(*pGetDir)(void *) = NULL;
-static Il2CppClass *(*i_ocls)(void*) = NULL;
 
 static inline double now2(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
