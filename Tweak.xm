@@ -193,7 +193,7 @@ static void *Hook(const char *ns, const char *cls, const char *mname, int argc, 
     return orig;
 }
 
-static void *Ptr(const char *ns, const char *cls, const char *mname, int argc) {
+static void *GetM(const char *ns, const char *cls, const char *mname, int argc) {
     return MP(FindClass(ns, cls), mname, argc);
 }
 
@@ -218,7 +218,7 @@ static void *(*pMyVeh)(void) = NULL;
 static void *(*pMgrByUid)(void *, unsigned long long) = NULL;
 static void *(*pDynVeh)(void *) = NULL;
 static void *(*pGetDir)(void *) = NULL;
-static void *(*i_ocls)(void*) = NULL;
+static Il2CppClass *(*i_ocls)(void*) = NULL;
 
 static inline double now2(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -331,7 +331,7 @@ static void Tick10(void) {
         void *gp = pInst ? pInst() : nil;
         void *pvm = gp ? pMod(gp, fpStr("PlayVehicleModule"), nil) : nil;
         if (pvm) {
-            void *mUid = MP(i_ocls(gVeh), "get_UID", 0);
+            void *mUid = MP((Il2CppClass *)i_ocls(gVeh), "get_UID", 0);
             if (mUid) {
                 unsigned long long uid = ((unsigned long long(*)(void *))mUid)(gVeh);
                 gNG = pMgrByUid(pvm, uid);
@@ -351,7 +351,7 @@ static void Tick10(void) {
         if (gPrevDrft && !dk) {
             int st = *(int *)((char *)gEcu + ECU_STATE);
             if (st == 2) {   // Drifting
-                void *fp = Ptr("", "VehicleFast", "ForceEndDrifting", 1);
+                void *fp = GetM("", "VehicleFast", "ForceEndDrifting", 1);
                 if (fp) ((void (*)(void *))fp)(gVeh);
                 // kill drift vector luôn (hook_DriftRel chỉ chạy khi game tự gọi Release)
                 void *dv = pDynVeh ? pDynVeh(gVeh) : nil;
@@ -386,7 +386,7 @@ static void Tick10(void) {
             void *tp = pNearest(gRoad, p.x, p.y, p.z, 3.4e38f);
             if (tp && tp != gLastTP) {
                 gLastTP = tp;
-                if (!pGetDir) pGetDir = MP(i_ocls(tp), "get_Direction", 0);
+                if (!pGetDir) pGetDir = (void *(*)(void *))MP((Il2CppClass *)i_ocls(tp), "get_Direction", 0);
                 if (pGetDir) {
                     V3 d = ((V3(*)(void *))pGetDir)(tp);
                     float cx = f.x * d.z - f.z * d.x;
@@ -427,10 +427,10 @@ static void Install(void) {
         Hook("", "ExtraVelocityTriggerMgr", "Update", 1, (void *)h_XvUpdate);
 
     // ---- resolve pointers ----
-    pMini = (void (*)(void *, int))Ptr("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
-    pInst = (void *(*)(void))Ptr("", "GamePub", "GetInstance", 0);
-    pMod  = (void *(*)(void *, void *, void *))Ptr("", "GamePub", "GetModuleByName", 2);
-    pMyVeh = (void *(*)(void))Ptr("", "VehicleFast", "GetMyVehicle", 0);
+    pMini = (void (*)(void *, int))GetM("", "ExtraVelocityTriggerMgr", "ForceCanTriggerOnce", 1);
+    pInst = (void *(*)(void))GetM("", "GamePub", "GetInstance", 0);
+    pMod  = (void *(*)(void *, void *, void *))GetM("", "GamePub", "GetModuleByName", 2);
+    pMyVeh = (void *(*)(void))GetM("", "VehicleFast", "GetMyVehicle", 0);
     {
         void *k = (void *)FindClass("", "VehicleInputCtrl");
         pKeyFlags = (int (*)(void *))MP((Il2CppClass *)k, "get_KeyFlags", 0);
@@ -645,7 +645,7 @@ static RTMenu *menu = nil;
 // ───────────────────────────── BOOTSTRAP ─────────────────────────────
 static RTMenu *menuRef = nil;
 static BOOL gMenuMade = NO;
-static BOOL gHooked = NO;
+
 
 static void BuildMenu(void) {
     if (gMenuMade) return;
@@ -664,6 +664,7 @@ static void TryHooks(void) {
     if (gHooked) return;
     if (!pInst) {
         void *k = (void *)FindClass("", "GamePub");
+        if (!k) return;
         pInst = (void *(*)(void))MP((Il2CppClass *)k, "GetInstance", 0);
         if (!pInst) return;
     }
