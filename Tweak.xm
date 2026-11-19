@@ -23,7 +23,6 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>        // mach_vm_remap/mach_vm_address_t (SDK mới tách khỏi mach.h)
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
 #import <libkern/OSCacheControl.h>
@@ -226,7 +225,7 @@ static void scanClasses(void){
     const void** asms=il2cpp_domain_get_assemblies(g_domain,&n);   // (domain, &size) → mảng
     if(!asms||!n) return;
     for(size_t i=0;i<n;i++){
-        void* img=il2cpp_assembly_get_image(asms[i]); if(!img) continue;
+        void* img=il2cpp_assembly_get_image((void*)asms[i]); if(!img) continue;
         size_t cnt=il2cpp_image_get_class_count(img);
         for(size_t c=0;c<cnt;c++){
             void* k=il2cpp_image_get_class(img,c); if(!k) continue;
@@ -291,14 +290,15 @@ static bool unpatchRet(uintptr_t rva,uint32_t saved[4],bool* done){
 static uint8_t* g_trampBase=nil; static size_t g_trampOff=0;
 static void* trampAlloc(size_t sz){
     if(!g_trampBase){
-        mach_vm_address_t dst=0;
-        mach_vm_address_t src=(mach_vm_address_t)(((uintptr_t)&trampAlloc)&~(vm_page_size-1));
+        // SDK 26+ không expose mach_vm.h; dùng vm_remap (trên arm64 vm_address_t == 64-bit)
+        vm_address_t dst=0;
+        vm_address_t src=(vm_address_t)(((uintptr_t)&trampAlloc)&~((uintptr_t)vm_page_size-1));
         vm_prot_t cur=0,mx=0;
-        if(mach_vm_remap(mach_task_self(),&dst,(mach_vm_size_t)vm_page_size,0,VM_FLAGS_ANYWHERE,
-                         mach_task_self(),src,FALSE,&cur,&mx,VM_INHERIT_COPY)!=KERN_SUCCESS){
+        if(vm_remap(mach_task_self(),&dst,(vm_size_t)vm_page_size,0,VM_FLAGS_ANYWHERE,
+                    mach_task_self(),src,FALSE,&cur,&mx,VM_INHERIT_COPY)!=KERN_SUCCESS){
             L("vm_remap fail"); return nil;
         }
-        if(vm_protect(mach_task_self(),(vm_address_t)dst,(vm_size_t)vm_page_size,0,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS){
+        if(vm_protect(mach_task_self(),dst,(vm_size_t)vm_page_size,0,VM_PROT_READ|VM_PROT_WRITE)!=KERN_SUCCESS){
             L("tramp RW fail"); return nil;
         }
         g_trampBase=(uint8_t*)dst; g_trampOff=0;
